@@ -34,6 +34,13 @@ pub fn build(b: *std.Build) void {
     // Add the options module
     exe.root_module.addOptions("build_options", options);
 
+    const flags = b.dependency("flags", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe.root_module.addImport("flags", flags.module("flags"));
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
