@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/StableKeepr.iml" filepath="$PROJECT_DIR$/.idea/StableKeepr.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/DiffKeep.iml" filepath="$PROJECT_DIR$/.idea/DiffKeep.iml" />
     </modules>
   </component>
 </project>

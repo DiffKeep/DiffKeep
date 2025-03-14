@@ -41,6 +41,13 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("flags", flags.module("flags"));
 
+    // Add zigimg
+    const zigimg = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("zigimg", zigimg.module("zigimg"));
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -70,7 +77,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/test.zig"),
         .target = target,
         .optimize = optimize,
     });

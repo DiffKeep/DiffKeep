@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ZLSSettings">
+    <option name="buildOnSave" value="true" />
     <option name="buildOnSaveStep" value="" />
     <option name="inlayHints" value="false" />
     <option name="inlayHintsCompact" value="false" />
+    <option name="zlsPath" value="$USER_HOME$/.zvm/bin/zls" />
+  </component>
+  <component name="ZigProjectSettings">
+    <option name="explicitPathToStd" value="$USER_HOME$/.zvm/0.14.0/lib/std" />
+    <option name="toolchainPath" value="$USER_HOME$/.zvm/bin" />
   </component>
 </project>
