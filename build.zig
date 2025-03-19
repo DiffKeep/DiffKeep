@@ -69,6 +69,61 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // *** sqlite ***
+    // Add SQLite as a module
+    const sqlite_module = b.addStaticLibrary(.{
+        .name = "sqlite",
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add SQLite source file
+    sqlite_module.addCSourceFile(.{
+        .file = b.path("lib/sqlite/sqlite3.c"),
+        .flags = &[_][]const u8{
+            "-std=c99",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-DSQLITE_ENABLE_RTREE",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_ENABLE_JSON1",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_USE_URI=1",
+            "-DSQLITE_ENABLE_COLUMN_METADATA",
+        },
+    });
+
+    // Add vector search extension
+    sqlite_module.addCSourceFile(.{
+        .file = b.path("lib/sqlite-vec/sqlite-vec.c"),
+        .flags = &[_][]const u8{
+            "-std=gnu99",
+            "-D_GNU_SOURCE",
+            "-DSQLITE_CORE",
+            "-DSQLITE_EXTENSION_INIT1=",
+        },
+    });
+
+    // Link with math library
+    sqlite_module.linkLibC();
+    sqlite_module.linkSystemLibrary("m");
+    sqlite_module.addIncludePath(b.path("lib/sqlite"));
+    sqlite_module.addIncludePath(b.path("lib/sqlite-vec"));
+
+    // Link SQLite with our executable
+    exe.linkLibrary(sqlite_module);
+
+    // Add include directories
+    exe.addIncludePath(b.path("lib/sqlite"));
+    exe.addIncludePath(b.path("lib/sqlite-vec"));
+
+    const sqlite_module_zig = b.addModule("sqlite", .{
+        .root_source_file = b.path("src/sqlite.zig"),
+    });
+    sqlite_module_zig.addIncludePath(b.path("lib/sqlite"));
+    sqlite_module_zig.addIncludePath(b.path("lib/sqlite-vec"));
+
+    exe.root_module.addImport("sqlite", sqlite_module_zig);
+
     const test_full_directory_exe = b.addExecutable(.{
         .name = "test_full_directory",
         .root_source_file = b.path("src/test_parse_all_in_dir.zig"),
@@ -104,6 +159,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+
+    exe_unit_tests.root_module.addImport("sqlite", sqlite_module_zig);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request

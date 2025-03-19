@@ -1,7 +1,6 @@
 const std = @import("std");
 const flags = @import("flags");
-const zigimg = @import("zigimg");
-const importInfo = @import("image/png-data.zig");
+const db = @import("db.zig");
 
 const build_options = @import("build_options");
 
@@ -32,9 +31,10 @@ else
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(gpa.allocator());
-    defer std.process.argsFree(gpa.allocator(), args);
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
     const options = flags.parseOrExit(args, "stablekeepr", Flags, .{
         // Use the `colors` option to provide a colorscheme for the error/help messages.
@@ -53,30 +53,29 @@ pub fn main() !void {
         return;
     }
 
-    try log.log("Parsing file: {s}\n", .{options.parse_file});
-    const file = try std.fs.cwd().openFile(options.parse_file, .{});
-    defer file.close();
-
-    var info_buffer: [16384 * 128]u8 = undefined;
-    var info_stream = std.io.StreamSource{ .buffer = std.io.fixedBufferStream(info_buffer[0..]) };
-
-    var infoOptions = importInfo.PngInfoOptions{
-        .processor = importInfo.init(info_stream.writer(), gpa.allocator()),
-    };
-    defer importInfo.deinit(&infoOptions.processor);
-    var stream = zigimg.Image.Stream{ .file = file };
-    var result = try zigimg.formats.png.load(&stream, gpa.allocator(), infoOptions.get());
-    defer result.deinit(gpa.allocator());
-
-    if (infoOptions.processor.prompt) |prompt| {
-        try log.output("Prompt: {s}\n", .{prompt});
-    } else {
-        try log.output("No prompt found in image\n", .{});
+    if (options.parse_file != null) {
+        try log.log("Parsing file: {s}\n", .{options.parse_file orelse ""});
+        const file = try std.fs.cwd().openFile(options.parse_file orelse "", .{});
+        defer file.close();
     }
-    if (infoOptions.processor.workflow) |workflow| {
-        try log.output("Workflow: {s}\n", .{workflow});
-    } else {
-        try log.output("No workflow found in image\n", .{});
+
+    // Initialize the vector database
+    var vector_db = try db.VectorDb.init(allocator, "diffkeep.db");
+    defer vector_db.deinit();
+
+    // Example: Store an image embedding
+    const example_embedding = [_]f32{0.1, 0.2, 0.3} ++ [_]f32{0.0} ** 509;
+    try vector_db.storeImageEmbedding(1, &example_embedding);
+
+    // Example: Find similar images
+    const query_embedding = [_]f32{0.11, 0.19, 0.31} ++ [_]f32{0.0} ** 509;
+    var results = try vector_db.findSimilarImages(&query_embedding, 10);
+    defer results.deinit();
+
+    // Print results
+    std.debug.print("Found {} similar images\n", .{results.items.len});
+    for (results.items) |result| {
+        std.debug.print("Image ID: {}, Distance: {d:.6}\n", .{result.id, result.distance});
     }
 
 }
@@ -92,7 +91,7 @@ const Flags = struct {
         .parse_file = "Path to the file to parse.",
     };
 
-    parse_file: []const u8,
+    parse_file: ?[]const u8,
     version: bool,
 
     // Optional declaration to define shorthands. These can be chained e.g '-fs large'.
