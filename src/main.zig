@@ -1,6 +1,7 @@
 const std = @import("std");
 const flags = @import("flags");
 const db = @import("db.zig");
+const embedding = @import("embedding.zig");
 
 const build_options = @import("build_options");
 
@@ -63,6 +64,12 @@ pub fn main() !void {
     var vector_db = try db.VectorDb.init(allocator, "diffkeep.db");
     defer vector_db.deinit();
 
+    const prompt = "A beautiful sunset over the ocean";
+    const embed = try embedding.createEmbedding(allocator, prompt);
+    defer allocator.free(embed);
+
+    try storeEmbeddingInDatabase(&vector_db, prompt, embed);
+
     // Example: Store an image embedding
     const example_embedding = [_]f32{0.1, 0.2, 0.3} ++ [_]f32{0.0} ** 509;
     try vector_db.storeImageEmbedding(1, &example_embedding);
@@ -78,6 +85,21 @@ pub fn main() !void {
         std.debug.print("Image ID: {}, Distance: {d:.6}\n", .{result.id, result.distance});
     }
 
+}
+
+// Function to store the embedding in the SQLite database
+fn storeEmbeddingInDatabase(vdb: *db.VectorDb, prompt: []const u8, emb: []const f32) !void {
+    const sql = "INSERT INTO embeddings (prompt, embedding) VALUES (?, ?)";
+    var stmt = try vdb.db.prepare(sql);
+    defer stmt.deinit();
+
+    try stmt.bind(1, prompt);
+    try stmt.bindBlob(2, std.mem.sliceAsBytes(emb));
+
+    const ok = try stmt.step();
+    if (!ok) {
+        std.log.err("Error executing prepared statement", .{});
+    }
 }
 
 const Flags = struct {
