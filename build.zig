@@ -41,13 +41,6 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("flags", flags.module("flags"));
 
-    // Add zigimg
-    const zigimg = b.dependency("zigimg", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("zigimg", zigimg.module("zigimg"));
-
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -75,6 +68,34 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default, which is "install".
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const test_full_directory_exe = b.addExecutable(.{
+        .name = "test_full_directory",
+        .root_source_file = b.path("src/test_parse_all_in_dir.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_test_full_directory = b.addRunArtifact(test_full_directory_exe);
+    if (b.args) |args| {
+        run_test_full_directory.addArgs(args);
+    }
+
+    const test_full_directory_step = b.step("test_full_directory", "Run the parser on all files in directory");
+    test_full_directory_step.dependOn(&run_test_full_directory.step);
+
+    const get_workflow_exe = b.addExecutable(.{
+        .name = "get_workflow",
+        .root_source_file = b.path("src/get_workflow_chunk.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const get_workflow = b.addRunArtifact(get_workflow_exe);
+    if (b.args) |args| {
+        get_workflow.addArgs(args);
+    }
+
+    const get_workflow_step = b.step("get_workflow", "Get the workflow chunk from a single PNG file");
+    get_workflow_step.dependOn(&get_workflow.step);
 
     const exe_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/test.zig"),

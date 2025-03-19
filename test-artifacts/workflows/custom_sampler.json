@@ -1,0 +1,911 @@
+{
+  "last_node_id": 175,
+  "last_link_id": 328,
+  "nodes": [
+    {
+      "id": 65,
+      "type": "VAEDecode",
+      "pos": [
+        2065.2000122070312,
+        80
+      ],
+      "size": {
+        "0": 200,
+        "1": 50
+      },
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 317
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 290
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            300
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      }
+    },
+    {
+      "id": 6,
+      "type": "EmptyLatentImage",
+      "pos": [
+        1330,
+        818
+      ],
+      "size": {
+        "0": 280,
+        "1": 100
+      },
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "link": 236,
+          "widget": {
+            "name": "width"
+          }
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "link": 237,
+          "widget": {
+            "name": "height"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            302
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage"
+      },
+      "widgets_values": [
+        1024,
+        1024,
+        1
+      ]
+    },
+    {
+      "id": 165,
+      "type": "KarrasScheduler",
+      "pos": [
+        1295,
+        1002
+      ],
+      "size": {
+        "0": 315,
+        "1": 130
+      },
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sigma_max",
+          "type": "FLOAT",
+          "link": 314,
+          "widget": {
+            "name": "sigma_max"
+          }
+        },
+        {
+          "name": "sigma_min",
+          "type": "FLOAT",
+          "link": 313,
+          "widget": {
+            "name": "sigma_min"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            315
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KarrasScheduler"
+      },
+      "widgets_values": [
+        50,
+        14.614642,
+        0.0291675,
+        7
+      ]
+    },
+    {
+      "id": 168,
+      "type": "Get sigmas as float",
+      "pos": [
+        1035,
+        497
+      ],
+      "size": {
+        "0": 210,
+        "1": 46
+      },
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 310
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 326
+        }
+      ],
+      "outputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": [
+            314
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Get sigmas as float"
+      }
+    },
+    {
+      "id": 175,
+      "type": "SamplerDPMPP_3M_SDE_DynETA",
+      "pos": [
+        1295,
+        80
+      ],
+      "size": {
+        "0": 315,
+        "1": 130
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            328
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerDPMPP_3M_SDE_DynETA"
+      },
+      "widgets_values": [
+        "highres-pyramid",
+        1,
+        0,
+        1
+      ]
+    },
+    {
+      "id": 164,
+      "type": "Automatic CFG",
+      "pos": [
+        1295,
+        653
+      ],
+      "size": {
+        "0": 315,
+        "1": 82
+      },
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 305
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            306
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Automatic CFG"
+      },
+      "widgets_values": [
+        true,
+        false
+      ]
+    },
+    {
+      "id": 125,
+      "type": "T5TextEncode",
+      "pos": [
+        1330,
+        491
+      ],
+      "size": {
+        "0": 280,
+        "1": 80
+      },
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "T5",
+          "type": "T5",
+          "link": 264
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            304
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "T5TextEncode"
+      },
+      "widgets_values": [
+        "ugly, wip, beginner, incoherent, blurry, grainy, indistinct, distorted, painting"
+      ]
+    },
+    {
+      "id": 167,
+      "type": "Manual scheduler",
+      "pos": [
+        501,
+        224
+      ],
+      "size": {
+        "0": 315,
+        "1": 106
+      },
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 308
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            327
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Manual scheduler"
+      },
+      "widgets_values": [
+        "sigmin",
+        1,
+        true
+      ]
+    },
+    {
+      "id": 166,
+      "type": "Manual scheduler",
+      "pos": [
+        507,
+        45
+      ],
+      "size": {
+        "0": 315,
+        "1": 106
+      },
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 307
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            326
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Manual scheduler"
+      },
+      "widgets_values": [
+        "sigmax",
+        1,
+        true
+      ]
+    },
+    {
+      "id": 169,
+      "type": "Get sigmas as float",
+      "pos": [
+        889,
+        694
+      ],
+      "size": {
+        "0": 210,
+        "1": 46
+      },
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 311
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 327
+        }
+      ],
+      "outputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": [
+            313
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Get sigmas as float"
+      }
+    },
+    {
+      "id": 144,
+      "type": "T5v11Loader",
+      "pos": [
+        865,
+        80
+      ],
+      "size": {
+        "0": 380,
+        "1": 154
+      },
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "T5",
+          "type": "T5",
+          "links": [
+            263,
+            264
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "T5v11Loader"
+      },
+      "widgets_values": [
+        "model-00001-of-00002.safetensors",
+        "xxl",
+        "folder",
+        "gpu",
+        "FP16"
+      ]
+    },
+    {
+      "id": 20,
+      "type": "PixArtCheckpointLoader",
+      "pos": [
+        50,
+        80
+      ],
+      "size": {
+        "0": 400,
+        "1": 82
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            305,
+            307,
+            308,
+            310,
+            311
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PixArtCheckpointLoader"
+      },
+      "widgets_values": [
+        "PixArt-XL-2-1024-MS.pth",
+        "PixArtMS_XL_2"
+      ]
+    },
+    {
+      "id": 128,
+      "type": "PixArtResolutionSelect",
+      "pos": [
+        1010,
+        314
+      ],
+      "size": {
+        "0": 220,
+        "1": 102
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            236
+          ],
+          "shape": 3,
+          "slot_index": 0
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            237
+          ],
+          "shape": 3,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PixArtResolutionSelect"
+      },
+      "widgets_values": [
+        "PixArtMS_Sigma_XL_2",
+        "1.21"
+      ]
+    },
+    {
+      "id": 162,
+      "type": "SaveImage",
+      "pos": [
+        2315.2000122070312,
+        80
+      ],
+      "size": {
+        "0": 315,
+        "1": 270
+      },
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 300
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "pixart/pixart"
+      ]
+    },
+    {
+      "id": 163,
+      "type": "SamplerCustomNoise",
+      "pos": [
+        1776,
+        311
+      ],
+      "size": {
+        "0": 355.20001220703125,
+        "1": 490
+      },
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 306
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 303
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 304
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 328
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 315
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 302
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "links": [
+            317
+          ],
+          "shape": 3,
+          "slot_index": 0
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "links": null,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomNoise"
+      },
+      "widgets_values": [
+        true,
+        false,
+        "uniform",
+        292946239899798,
+        "fixed",
+        5
+      ]
+    },
+    {
+      "id": 113,
+      "type": "T5TextEncode",
+      "pos": [
+        1330,
+        290
+      ],
+      "size": {
+        "0": 280,
+        "1": 120
+      },
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "T5",
+          "type": "T5",
+          "link": 263
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            303
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "T5TextEncode"
+      },
+      "widgets_values": [
+        "this is the prompt text! it has lots of cool stuff in it"
+      ]
+    },
+    {
+      "id": 156,
+      "type": "ExtraVAELoader",
+      "pos": [
+        1667,
+        68
+      ],
+      "size": {
+        "0": 315,
+        "1": 106
+      },
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            290
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ExtraVAELoader"
+      },
+      "widgets_values": [
+        "1_5-twinkleVAE_v10Darken.pt",
+        "kl-f8",
+        "FP16"
+      ]
+    }
+  ],
+  "links": [
+    [
+      236,
+      128,
+      0,
+      6,
+      0,
+      "INT"
+    ],
+    [
+      237,
+      128,
+      1,
+      6,
+      1,
+      "INT"
+    ],
+    [
+      263,
+      144,
+      0,
+      113,
+      0,
+      "T5"
+    ],
+    [
+      264,
+      144,
+      0,
+      125,
+      0,
+      "T5"
+    ],
+    [
+      290,
+      156,
+      0,
+      65,
+      1,
+      "VAE"
+    ],
+    [
+      300,
+      65,
+      0,
+      162,
+      0,
+      "IMAGE"
+    ],
+    [
+      302,
+      6,
+      0,
+      163,
+      5,
+      "LATENT"
+    ],
+    [
+      303,
+      113,
+      0,
+      163,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      304,
+      125,
+      0,
+      163,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      305,
+      20,
+      0,
+      164,
+      0,
+      "MODEL"
+    ],
+    [
+      306,
+      164,
+      0,
+      163,
+      0,
+      "MODEL"
+    ],
+    [
+      307,
+      20,
+      0,
+      166,
+      0,
+      "MODEL"
+    ],
+    [
+      308,
+      20,
+      0,
+      167,
+      0,
+      "MODEL"
+    ],
+    [
+      310,
+      20,
+      0,
+      168,
+      0,
+      "MODEL"
+    ],
+    [
+      311,
+      20,
+      0,
+      169,
+      0,
+      "MODEL"
+    ],
+    [
+      313,
+      169,
+      0,
+      165,
+      1,
+      "FLOAT"
+    ],
+    [
+      314,
+      168,
+      0,
+      165,
+      0,
+      "FLOAT"
+    ],
+    [
+      315,
+      165,
+      0,
+      163,
+      4,
+      "SIGMAS"
+    ],
+    [
+      317,
+      163,
+      0,
+      65,
+      0,
+      "LATENT"
+    ],
+    [
+      326,
+      166,
+      0,
+      168,
+      1,
+      "SIGMAS"
+    ],
+    [
+      327,
+      167,
+      0,
+      169,
+      1,
+      "SIGMAS"
+    ],
+    [
+      328,
+      175,
+      0,
+      163,
+      3,
+      "SAMPLER"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workspace_info": {
+      "id": "KEd4jtVRyGx61VwqSdsUd"
+    }
+  },
+  "version": 0.4,
+  "widget_idx_map": {
+    "163": {
+      "noise_seed": 3
+    }
+  }
+}
