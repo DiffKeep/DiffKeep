@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("flags", flags.module("flags"));
 
+    // llama.cpp
     const dep = b.dependency("llama_cpp", .{});
 
     const llama_cpp = b.addTranslateC(.{
@@ -50,11 +51,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    llama_cpp.defineCMacro("BUILD_SHARED_LIBS", "OFF");
 
     llama_cpp.addIncludePath(dep.path("include"));
     llama_cpp.addIncludePath(dep.path("ggml/include"));
-    llama_cpp.addIncludePath(dep.path("ggml/src"));
-    llama_cpp.addIncludePath(dep.path("src"));
 
     const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
     exe.addLibraryPath(bin.path(switch (target.result.os.tag) {

@@ -45,8 +45,22 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, thread_pool
             try walkDirectory(allocator, full_path, thread_pool); // Recurse into subdirectories
             allocator.free(full_path); // Free after the recursive call
         } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".png")) {
-            // full_path will be freed by processFile
-            thread_pool.spawnWg(&wg, processFile, .{ allocator, full_path });
+            var file = try std.fs.cwd().openFile(full_path, .{});
+            defer file.close();
+
+            const file_size = try file.getEndPos();
+            const buffer = try allocator.alloc(u8, file_size);
+            errdefer allocator.free(buffer);
+
+            const bytes_read = try file.readAll(buffer);
+            if (bytes_read != file_size) {
+                allocator.free(buffer);
+                allocator.free(full_path);
+                continue; // Skip this file if we couldn't read it completely
+            }
+
+            // Spawn a thread to process the file
+            thread_pool.spawnWg(&wg, processFile, .{ allocator, full_path, buffer });
         } else {
             allocator.free(full_path); // Free if not used
         }
@@ -57,13 +71,16 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, thread_pool
 fn processFile(
     allocator: std.mem.Allocator,
     full_path: []const u8,
+    buffer: []const u8,
 ) void {
-    _ = file_count.fetchAdd(1, .acq_rel);
     defer allocator.free(full_path);
+    defer allocator.free(buffer);
+
+    _ = file_count.fetchAdd(1, .acq_rel);
     //std.debug.print("Parsing file {d}, {s}\n", .{count, full_path });
     var parser = PngParser.init(allocator);
     defer parser.deinit();
-    parser.parseFile(full_path) catch return;
+    parser.parseBuffer(buffer) catch return;
 
     var comfy_parser = ComfyParser.init(allocator);
 

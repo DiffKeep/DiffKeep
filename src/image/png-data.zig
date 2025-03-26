@@ -46,19 +46,40 @@ pub const PngParser = struct {
         const file = try std.fs.cwd().openFile(file_path, .{});
         defer file.close();
 
-        try self.parseStream(file.reader());
+        const file_size = try file.getEndPos();
+        const buffer = try self.allocator.alloc(u8, file_size);
+        defer self.allocator.free(buffer);
+
+        const bytes_read = try file.readAll(buffer);
+        if (bytes_read != file_size) {
+            return error.IncompleteRead;
+        }
+
+        try self.parseBuffer(buffer);
     }
 
     /// Parse a PNG from a reader stream
     pub fn parseStream(self: *PngParser, reader: anytype) !void {
+        var buffer = std.ArrayList(u8).init(self.allocator);
+        defer buffer.deinit();
+        try reader.readAllArrayList(&buffer, std.math.maxInt(usize));
+
+        try self.parseBuffer(buffer.items);
+    }
+
+    /// Parse a PNG from a buffer
+    pub fn parseBuffer(self: *PngParser, buffer: []const u8) !void {
         // Clear any previous chunks
         for (self.chunks.items) |*chunk| chunk.deinit(self.allocator);
         self.chunks.clearRetainingCapacity();
 
+        var stream = std.io.fixedBufferStream(buffer);
+        var buffered_reader = stream.reader();
+
         // Check PNG signature
         const png_signature = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
         var signature: [8]u8 = undefined;
-        try reader.readNoEof(&signature);
+        try buffered_reader.readNoEof(&signature);
 
         if (!std.mem.eql(u8, &signature, &png_signature)) {
             return error.InvalidPngSignature;
@@ -67,19 +88,19 @@ pub const PngParser = struct {
         // Read chunks until IEND
         while (true) {
             // Read chunk length (4 bytes, big endian)
-            const length = try reader.readInt(u32, .big);
+            const length = try buffered_reader.readInt(u32, .big);
 
             // Read chunk type (4 bytes)
             var chunk_type: [4]u8 = undefined;
-            try reader.readNoEof(&chunk_type);
+            try buffered_reader.readNoEof(&chunk_type);
 
             // Allocate and read chunk data
             const data = try self.allocator.alloc(u8, length);
             errdefer self.allocator.free(data);
-            try reader.readNoEof(data);
+            try buffered_reader.readNoEof(data);
 
             // Read CRC (4 bytes)
-            const crc = try reader.readInt(u32, .big);
+            const crc = try buffered_reader.readInt(u32, .big);
 
             // Store the chunk
             try self.chunks.append(.{
