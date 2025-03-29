@@ -3,9 +3,6 @@ const PngParser = @import("image/png-data.zig").PngParser;
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
 const Atomic = std.atomic.Value(i64);
 
-// Add a constant for the buffer size
-const BUFFER_SIZE = 8388608; // 8 MB buffer
-
 /// WARNING
 /// WIP - do not use
 /// WARNING
@@ -15,13 +12,11 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    // Use a fixed buffer allocator for the thread pool to avoid excessive allocations
-    //var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     //defer arena.deinit();
     var thread_pool: std.Thread.Pool = undefined;
     try thread_pool.init(.{
         .allocator = gpa.allocator(),
-        .n_jobs = 15, // Adjust number of threads as needed
+        .n_jobs = 16, // Adjust number of threads as needed
     });
     defer thread_pool.deinit();
 
@@ -73,13 +68,22 @@ fn processFile(
     var parser = PngParser.init(arena_allocator);
     defer parser.deinit();
 
-    var buffer: [BUFFER_SIZE]u8 = undefined;
-    var bytes_read: usize = 0;
-    while (true) {
-        bytes_read = file.read(buffer[0..]) catch return;
-        if (bytes_read == 0) break;
-        parser.parseBuffer(buffer[0..bytes_read]) catch return;
-    }
+    const file_size = file.getEndPos() catch {
+        std.debug.print("Failed getting files size of {s}", .{full_path});
+        return;
+    };
+    const buffer = arena_allocator.alloc(u8, file_size) catch {
+        std.debug.print("OOM error reading file {s}", .{full_path});
+        return;
+    };
+    _ = file.read(buffer) catch {
+        std.debug.print("error reading file into buffer: {s}", .{full_path});
+        return;
+    };
+    parser.parseBuffer(buffer) catch {
+        std.debug.print("error parsing reading file {s}", .{full_path});
+        return;
+    };
 
     var comfy_parser = ComfyParser.init(arena_allocator);
 
