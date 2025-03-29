@@ -3,21 +3,24 @@ const PngParser = @import("image/png-data.zig").PngParser;
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
 const Atomic = std.atomic.Value(i64);
 
+// Add a constant for the buffer size
+const BUFFER_SIZE = 8388608; // 8 MB buffer
+
 /// WARNING
 /// WIP - do not use
 /// WARNING
 pub fn main() !void {
-    const test_dir_path = "/home/qt/genai/comfyui/output/2025"; // Adjust path as needed
+    const test_dir_path = "/home/qt/genai/comfyui/output/temp"; // Adjust path as needed
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     // Use a fixed buffer allocator for the thread pool to avoid excessive allocations
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
+    //var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    //defer arena.deinit();
     var thread_pool: std.Thread.Pool = undefined;
     try thread_pool.init(.{
-        .allocator = arena.allocator(),
+        .allocator = gpa.allocator(),
         .n_jobs = 15, // Adjust number of threads as needed
     });
     defer thread_pool.deinit();
@@ -40,29 +43,13 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, thread_pool
     var dir_iter = dir.iterate();
     while (try dir_iter.next()) |entry| {
         const full_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
+        defer allocator.free(full_path);
 
         if (entry.kind == .directory) {
             try walkDirectory(allocator, full_path, thread_pool); // Recurse into subdirectories
-            allocator.free(full_path); // Free after the recursive call
         } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".png")) {
-            var file = try std.fs.cwd().openFile(full_path, .{});
-            defer file.close();
-
-            const file_size = try file.getEndPos();
-            const buffer = try allocator.alloc(u8, file_size);
-            errdefer allocator.free(buffer);
-
-            const bytes_read = try file.readAll(buffer);
-            if (bytes_read != file_size) {
-                allocator.free(buffer);
-                allocator.free(full_path);
-                continue; // Skip this file if we couldn't read it completely
-            }
-
             // Spawn a thread to process the file
-            thread_pool.spawnWg(&wg, processFile, .{ allocator, full_path, buffer });
-        } else {
-            allocator.free(full_path); // Free if not used
+            thread_pool.spawnWg(&wg, processFile, .{ allocator, try allocator.dupe(u8, full_path) });
         }
     }
     wg.wait();
@@ -71,27 +58,38 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, thread_pool
 fn processFile(
     allocator: std.mem.Allocator,
     full_path: []const u8,
-    buffer: []const u8,
 ) void {
     defer allocator.free(full_path);
-    defer allocator.free(buffer);
 
     _ = file_count.fetchAdd(1, .acq_rel);
-    //std.debug.print("Parsing file {d}, {s}\n", .{count, full_path });
-    var parser = PngParser.init(allocator);
-    defer parser.deinit();
-    parser.parseBuffer(buffer) catch return;
 
-    var comfy_parser = ComfyParser.init(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var file = std.fs.cwd().openFile(full_path, .{}) catch return;
+    defer file.close();
+
+    var parser = PngParser.init(arena_allocator);
+    defer parser.deinit();
+
+    var buffer: [BUFFER_SIZE]u8 = undefined;
+    var bytes_read: usize = 0;
+    while (true) {
+        bytes_read = file.read(buffer[0..]) catch return;
+        if (bytes_read == 0) break;
+        parser.parseBuffer(buffer[0..bytes_read]) catch return;
+    }
+
+    var comfy_parser = ComfyParser.init(arena_allocator);
 
     // Check if we have any tEXt chunks
     const text_chunks = parser.getTExtChunks();
-    defer parser.allocator.free(text_chunks);
 
     var found: i64 = 0;
     for (text_chunks) |chunk| {
         var content = parser.parseTExtChunk(chunk) catch return;
-        defer content.deinit(allocator);
+        defer content.deinit(arena_allocator);
 
         if (std.mem.eql(u8, content.keyword, "prompt")) {
             found += 1;
@@ -101,10 +99,8 @@ fn processFile(
             if (prompt == null) {
                 std.debug.print("Found workflow chunk but prompt is null in {s}\n", .{full_path});
                 return;
-            } else {
-                //std.debug.print("Prompt found in {s}:\n{s}\n", .{ full_path, prompt.? });
             }
-            allocator.free(prompt.?);
+            // No need to free prompt, as it's allocated using the arena allocator
         }
     }
 
@@ -113,12 +109,11 @@ fn processFile(
         for (parser.chunks.items) |found_chunk| {
             if (std.mem.eql(u8, found_chunk.type[0..4], "tEXt")) {
                 var content = parser.parseTExtChunk(found_chunk) catch return;
-                defer content.deinit(allocator);
+                defer content.deinit(arena_allocator);
                 std.debug.print("{s}: {s} ", .{ found_chunk.type, content.keyword });
             }
             std.debug.print("{s} ", .{found_chunk.type});
         }
         std.debug.print("\n", .{});
-        return;
     }
 }

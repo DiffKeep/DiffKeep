@@ -3,7 +3,7 @@ const PngParser = @import("image/png-data.zig").PngParser;
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
 
 pub fn main() !void {
-    const test_dir_path = "/home/qt/genai/comfyui/output/2025"; // Adjust path as needed
+    const test_dir_path = "/home/qt/genai/comfyui/output/temp"; // Adjust path as needed
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
