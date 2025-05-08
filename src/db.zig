@@ -30,9 +30,9 @@ pub const VectorDb = struct {
             \\CREATE TABLE IF NOT EXISTS images (
             \\  id INTEGER PRIMARY KEY,
             \\  path TEXT UNIQUE NOT NULL,
-            \\  creation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            \\  creation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             \\  positive_prompt_text TEXT NOT NULL,
-            \\  negative_prompt_text TEXT NOT NULL,
+            \\  negative_prompt_text TEXT NOT NULL
             \\);
         );
 

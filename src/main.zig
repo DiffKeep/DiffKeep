@@ -128,7 +128,7 @@ pub fn main() !void {
 
             //try log.output("Stored embedding for image ID: {d}\n", .{image_id});
 
-            // output the embedding
+            // output the embeddings
             try log.output("Total embeddings: {d}\n", .{embeddings.items.len});
             for (embeddings.items, 0..) |emb, n| {
                 try log.output("embedding {d}:\n", .{n});
@@ -148,21 +148,6 @@ pub fn main() !void {
     // Initialize the vector database
     var vector_db = try db.VectorDb.init(allocator, "diffkeep.db");
     defer vector_db.deinit();
-
-    // Example: Store an image embedding
-    const example_embedding = [_]f32{ 0.1, 0.2, 0.3 } ++ [_]f32{0.0} ** 509;
-    try vector_db.storeImageEmbedding(1, &example_embedding);
-
-    // Example: Find similar images
-    const query_embedding = [_]f32{ 0.11, 0.19, 0.31 } ++ [_]f32{0.0} ** 509;
-    var results = try vector_db.findSimilarImages(&query_embedding, 10);
-    defer results.deinit();
-
-    // Print results
-    std.debug.print("Found {} similar images\n", .{results.items.len});
-    for (results.items) |result| {
-        std.debug.print("Image ID: {}, Distance: {d:.6}\n", .{ result.id, result.distance });
-    }
 }
 
 // Helper function to get or create an image ID
