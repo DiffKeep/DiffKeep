@@ -22,10 +22,13 @@ pub const PoolOptions = struct {
     n_gpu_layers: ?u32 = null,
     n_ctx: u32 = 2048,
     n_batch: u32 = 64,
+    n_ubatch: u32 = 64,
     n_threads: ?u32 = null,
     n_threads_batch: ?u32 = null,
+    embeddings: bool = false,
     flash_attn: bool = false,
     mlock: bool = false,
+    pooling_type: i32 = 1,
 };
 
 /// A single-model, single-context, thread-safe pool.
@@ -115,9 +118,12 @@ pub const Pool = struct {
 
         params.n_ctx = @intCast(self.options.n_ctx);
         params.n_batch = @intCast(self.options.n_batch);
+        params.n_ubatch = @intCast(self.options.n_ubatch);
+        params.embeddings = self.options.embeddings;
         params.n_threads = @intCast(self.options.n_threads orelse cpu_count);
         params.n_threads_batch = @intCast(self.options.n_threads_batch orelse self.options.n_threads orelse cpu_count);
         params.flash_attn = self.options.flash_attn;
+        params.pooling_type = self.options.pooling_type;
 
         return params;
     }
@@ -319,14 +325,26 @@ pub const Context = struct {
     /// Does nothing if the context is already up-to-date.
     /// Returns the number of tokens evaluated.
     pub fn evalOnce(self: *Context) !usize {
+        log.debug("Running one step", .{});
         const n_eval = @min(
             @as(usize, @intCast(self.params.n_batch)),
             self.tokens.items.len - self.n_past,
         );
+        log.debug("n_eval: {d}", .{n_eval});
 
         if (n_eval > 0) {
-            if (c.llama_decode(self.ptr, c.llama_batch_get_one(&self.tokens.items[self.n_past], @intCast(n_eval))) != 0) {
-                return error.FailedToEval;
+            if (c.llama_model_has_encoder(self.model.ptr) and !c.llama_model_has_decoder(self.model.ptr)) {
+                log.debug("Running encode", .{});
+                if (c.llama_encode(self.ptr, c.llama_batch_get_one(&self.tokens.items[self.n_past], @intCast(n_eval))) != 0) {
+                    return error.FailedToEval;
+                }
+            } else if (!c.llama_model_has_encoder(self.model.ptr) and c.llama_model_has_decoder(self.model.ptr)) {
+                log.debug("Running decode", .{});
+                if (c.llama_decode(self.ptr, c.llama_batch_get_one(&self.tokens.items[self.n_past], @intCast(n_eval))) != 0) {
+                    return error.FailedToEval;
+                }
+            } else {
+                return error.ModelHasDecodeAndEncode;
             }
 
             self.n_past += n_eval;
@@ -382,21 +400,6 @@ pub const Context = struct {
         }
 
         return token;
-    }
-
-    /// Returns the embedding for the current context state.
-    pub fn getEmbedding(self: *Context, allocator: std.mem.Allocator) ![]f32 {
-        const n_embd = @as(usize, @intCast(c.llama_n_embd(self.model.ptr)));
-        const embedding = try allocator.alloc(f32, n_embd);
-        errdefer allocator.free(embedding);
-
-        const embd_ptr = c.llama_get_embeddings(self.ptr);
-        if (embd_ptr == null) {
-            return error.EmbeddingNotAvailable;
-        }
-
-        @memcpy(embedding, embd_ptr[0..n_embd]);
-        return embedding;
     }
 };
 
@@ -483,3 +486,164 @@ const grammar = struct {
         return .{ .type = c.LLAMA_GRETYPE_ALT, .value = @intCast(i) };
     }
 };
+
+/// Create an embedding from a prompt string using the LLM
+pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, model_path: []const u8, prompt: []const u8) !std.ArrayList([]const f32) {
+    // Initialize llama options
+    var options = PoolOptions{
+        .n_ctx = 512,
+        .n_batch = 2048,
+        .n_ubatch = 2048,
+        .n_threads = null,
+        .embeddings = true,
+        .pooling_type = 0,
+    };
+
+    if (options.n_batch < options.n_ctx) {
+        log.warn("Setting batch size to {d}", .{options.n_ctx});
+        options.n_batch = options.n_ctx;
+    }
+
+    // For non-causal models, batch size must be equal to ubatch size
+    options.n_ubatch = options.n_batch;
+
+    var pool = Pool.init(allocator, options);
+    defer pool.deinit();
+
+    // Get the model context
+    var ctx = try pool.get(model_path, 5000); // 5 second timeout
+    defer pool.release(ctx);
+
+    // Prepare the context with our prompt
+    try ctx.prepare(prompt, .{
+        .seed = 0,
+        .temperature = 0.0, // Use 0 temperature for deterministic embeddings
+    });
+    var prompts = std.ArrayList([]const u8).init(allocator);
+    defer prompts.deinit();
+
+    if (ctx.tokens.items.len > options.n_ctx) {
+        // need to split the prompt into pieces
+        try chunkByTokens(allocator, prompt, ctx, options.n_ctx, &prompts);
+    } else {
+        // put the single prompt into prompts
+        const duped_prompt = try allocator.dupe(u8, prompt);
+        try prompts.append(duped_prompt);
+    }
+
+    // loop over each prompt segment and generate an embedding
+    var embeddings = std.ArrayList([]const f32).init(allocator);
+    for (prompts.items) |p| {
+        // Prepare the context with our prompt
+        try ctx.prepare(p, .{
+            .seed = 0,
+            .temperature = 0.0, // Use 0 temperature for deterministic embeddings
+        });
+        // Run the model to get embeddings
+        try ctx.eval();
+
+        // Get the embedding size from the model
+        const n_embd = @as(usize, @intCast(c.llama_model_n_embd(ctx.model.ptr)));
+        log.debug("Embedding size from model: {d}", .{n_embd});
+        const embedding = try allocator.alloc(f32, n_embd);
+        errdefer allocator.free(embedding);
+
+        // Log out the pooling type.
+        log.debug("Pooling type: {d}", .{c.llama_pooling_type(ctx.ptr)});
+
+        const embd = c.llama_get_embeddings(ctx.ptr);
+        if (embd != null) {
+            // Copy the embedding data
+            @memcpy(embedding, embd[0..n_embd]);
+        } else {
+            return error.EmbeddingFailed;
+        }
+
+        // Normalize the embedding (L2 norm)
+        var sum_squared: f32 = 0.0;
+        for (embedding) |val| {
+            sum_squared += val * val;
+        }
+
+        const norm = @sqrt(sum_squared);
+        if (norm > 0.0) {
+            for (embedding) |*val| {
+                val.* /= norm;
+            }
+        }
+
+        try embeddings.append(embedding);
+    }
+
+    return embeddings;
+}
+
+fn chunkByTokens(allocator: std.mem.Allocator, text: []const u8, ctx: *Context, max_tokens: usize, output_list: *std.ArrayList([]const u8)) !void {
+    var start: usize = 0;
+    var token_chunk = std.ArrayList(Token).init(allocator);
+    defer token_chunk.deinit();
+    while (start < text.len) {
+        var end = start;
+        var token_count: usize = 0;
+
+        // Keep extending the current chunk until we hit max tokens
+        while (end < text.len and token_count < max_tokens) {
+            // Find next semantic boundary (sentence or paragraph)
+            const next_boundary = findNextSemanticBoundary(text, end);
+
+            // Count tokens in this segment
+            const segment = text[end..next_boundary];
+            // Clear the token chunk before each use
+            token_chunk.clearAndFree();
+            try ctx.model.tokenize(&token_chunk, segment, false);
+            const segment_tokens = token_chunk.items.len;
+
+            // If adding this segment would exceed our limit, stop
+            if (token_count + segment_tokens > max_tokens and token_count > 0) {
+                break;
+            }
+
+            // Otherwise add it to our chunk
+            token_count += segment_tokens;
+            end = next_boundary;
+        }
+
+        // Create the chunk
+        if (end > start) {
+            const chunk = try allocator.dupe(u8, text[start..end]);
+            defer allocator.free(chunk);
+            try output_list.append(chunk);
+            log.debug("Chunk: {s}", .{chunk});
+            start = end;
+        } else {
+            // Fallback if we can't make progress (single token too large)
+            end = @min(start + 100, text.len);
+            const chunk = try allocator.dupe(u8, text[start..end]);
+            defer allocator.free(chunk);
+            try output_list.append(chunk);
+            log.debug("Chunk: {s}", .{chunk});
+            start = end;
+        }
+    }
+}
+
+fn findNextSemanticBoundary(text: []const u8, start: usize) usize {
+    // Look for paragraph breaks, sentence ends, etc.
+    for (text[start..], 0..) |char, i| {
+        const pos = start + i;
+
+        // Paragraph break
+        if (pos + 1 < text.len and char == '\n' and text[pos + 1] == '\n') {
+            return pos + 2;
+        }
+
+        // Sentence end
+        if (pos + 1 < text.len and (char == '.' or char == '!' or char == '?') and
+            (text[pos + 1] == ' ' or text[pos + 1] == '\n'))
+        {
+            return pos + 2;
+        }
+    }
+
+    return text.len; // If no boundary found, return end of text
+}

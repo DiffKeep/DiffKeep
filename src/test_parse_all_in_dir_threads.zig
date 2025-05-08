@@ -7,7 +7,7 @@ const Atomic = std.atomic.Value(i64);
 /// WIP - do not use
 /// WARNING
 pub fn main() !void {
-    const test_dir_path = "/home/qt/genai/comfyui/output/temp"; // Adjust path as needed
+    const test_dir_path = "/home/qt/genai/comfyui/output"; // Adjust path as needed
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

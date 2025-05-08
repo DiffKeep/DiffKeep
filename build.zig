@@ -42,29 +42,6 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("flags", flags.module("flags"));
 
-    // llama.cpp
-    const dep = b.dependency("llama_cpp", .{});
-
-    const llama_cpp = b.addTranslateC(.{
-        .root_source_file = dep.path("include/llama.h"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    llama_cpp.defineCMacro("BUILD_SHARED_LIBS", "OFF");
-
-    llama_cpp.addIncludePath(dep.path("include"));
-    llama_cpp.addIncludePath(dep.path("ggml/include"));
-
-    const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
-    exe.addLibraryPath(bin.path(switch (target.result.os.tag) {
-        .windows => ".",
-        else => "bin",
-    }));
-    exe.linkSystemLibrary("llama");
-
-    exe.root_module.addImport("llama_cpp", llama_cpp.createModule());
-
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -148,6 +125,9 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("sqlite", sqlite_module_zig);
 
+    // llamacpp
+    try addLlama(b, exe);
+
     const test_full_directory_exe = b.addExecutable(.{
         .name = "test_full_directory",
         .root_source_file = b.path("src/test_parse_all_in_dir.zig"),
@@ -191,6 +171,60 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+}
+
+fn addLlama(b: *std.Build, exe: anytype) !void {
+    const target = exe.root_module.resolved_target.?;
+    const dep = b.dependency("llama_cpp", .{});
+
+    const llama_cpp = b.addTranslateC(.{
+        .root_source_file = dep.path("include/llama.h"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+
+    llama_cpp.addIncludePath(dep.path("include"));
+    llama_cpp.addIncludePath(dep.path("ggml/include"));
+
+    const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
+    const bin_path = bin.path(switch (target.result.os.tag) {
+        .windows => ".",
+        else => "bin",
+    });
+
+    exe.addLibraryPath(bin_path);
+    exe.linkSystemLibrary("llama");
+
+    // Copy the shared libraries to the output directory
+    const install_llama_lib = b.addInstallBinFile(
+        bin_path.path(b, "libllama.so"),
+        "libllama.so"
+    );
+    const install_ggml_lib = b.addInstallBinFile(
+        bin_path.path(b, "libggml.so"),
+        "libggml.so"
+    );
+    const install_ggml_base_lib = b.addInstallBinFile(
+        bin_path.path(b, "libggml-base.so"),
+        "libggml-base.so"
+    );
+    const install_ggml_cpu_lib = b.addInstallBinFile(
+        bin_path.path(b, "libggml-cpu.so"),
+        "libggml-cpu.so"
+    );
+    const install_ggml_rpc_lib = b.addInstallBinFile(
+        bin_path.path(b, "libggml-rpc.so"),
+        "libggml-rpc.so"
+    );
+
+    b.getInstallStep().dependOn(&install_llama_lib.step);
+    b.getInstallStep().dependOn(&install_ggml_lib.step);
+    b.getInstallStep().dependOn(&install_ggml_base_lib.step);
+    b.getInstallStep().dependOn(&install_ggml_cpu_lib.step);
+    b.getInstallStep().dependOn(&install_ggml_rpc_lib.step);
+
+    exe.root_module.addImport("llama_cpp", llama_cpp.createModule());
 }
 
 // Get git version or commit hash, and append (DIRTY) if the working tree is not clean
