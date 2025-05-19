@@ -2,8 +2,12 @@ const std = @import("std");
 const flags = @import("flags");
 const db = @import("db.zig");
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
+const LibraryParser = @import("parse/parse_library.zig").LibraryParser;
 const PngParser = @import("image/png-data.zig").PngParser;
 const llama = @import("llama.zig");
+const cmdFlags = @import("cmd_flags.zig");
+const zstbi = @import("zstbi");
+const util = @import("util.zig");
 
 const build_options = @import("build_options");
 
@@ -31,6 +35,7 @@ else
         }
     };
 
+// Modify the main function where you initialize the database
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
@@ -39,7 +44,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const options = flags.parseOrExit(args, "stablekeepr", Flags, .{
+    const options = flags.parseOrExit(args, "stablekeepr", cmdFlags.Flags, .{
         // Use the `colors` option to provide a colorscheme for the error/help messages.
         // Specifying this as empty: `.colors = .{}` will disable colors.
         // Each field is a list of type `std.io.tty.Color`.
@@ -105,49 +110,32 @@ pub fn main() !void {
 
         if (found_prompt) |prompt| {
             try log.output("Prompt: {s}\n", .{prompt});
-
-            // Create embedding from the prompt
-            const model_path = options.model_path orelse "Models/msmarco-distilbert-cos-v5.safetensors";
-            var embeddings = try llama.createEmbeddingFromPrompt(allocator, model_path, prompt);
-            defer {
-                // Free each embedding slice
-                for (embeddings.items) |embd| {
-                    allocator.free(embd);
-                }
-                // Free the ArrayList itself
-                embeddings.deinit();
-            }
-
-            // Store the embedding in the database
-            //var vector_db = try db.VectorDb.init(allocator, "diffkeep.db");
-            //defer vector_db.deinit();
-
-            // Store the embedding
-            //const image_id = try getImageId(vector_db, options.parse_file.?);
-            //try vector_db.storePromptEmbedding(image_id, prompt, embedding.ptr);
-
-            //try log.output("Stored embedding for image ID: {d}\n", .{image_id});
-
-            // output the embeddings
-            try log.output("Total embeddings: {d}\n", .{embeddings.items.len});
-            for (embeddings.items, 0..) |emb, n| {
-                try log.output("embedding {d}:\n", .{n});
-                try log.output("Embedding size: {d}\n", .{emb.len});
-                try log.output("[", .{});
-                for (emb, 0..) |val, i| {
-                    if (i > 0) try log.output(", ", .{});
-                    try log.output("{d:.4}", .{val});
-                }
-                try log.output("]\n", .{});
-            }
         }
 
         return;
     }
 
-    // Initialize the vector database
-    var vector_db = try db.VectorDb.init(allocator, "diffkeep.db");
+    // Initialize the vector database with the appropriate path
+    const db_path = try util.getDataPath(allocator, &options, "diffkeep.db");
+    defer allocator.free(db_path);
+
+    try log.output("Using database at: {s}\n", .{db_path});
+
+    var vector_db = try db.VectorDb.init(allocator, db_path);
     defer vector_db.deinit();
+
+    zstbi.init(allocator);
+    defer zstbi.deinit();
+
+    // create / get the library
+    const library_path = "/home/qt/genai/comfyui/output/2025/04/";
+    const id = try vector_db.storeLibrary(library_path);
+
+    // parse the library
+    var lib_parser = try LibraryParser.init(allocator, &vector_db, &options, id, library_path);
+    defer lib_parser.deinit();
+    try lib_parser.parse();
+    try log.output("Done parsing!\n", .{});
 }
 
 // Helper function to get or create an image ID
@@ -189,30 +177,3 @@ fn storeEmbeddingInDatabase(vdb: *db.VectorDb, prompt: []const u8, emb: []const 
         std.log.err("Error executing prepared statement", .{});
     }
 }
-
-const Flags = struct {
-    pub const description =
-        \\DiffKeep runtime arguments help.
-    ;
-
-    // Optional description of some or all of the flags (must match field names in the struct).
-    pub const descriptions = .{
-        .version = "Print build version and exit.",
-        .parse_file = "Path to the file to parse.",
-        .model_path = "Path to the model to use for generating embeddings (must product 768 vectors).",
-        .search_similar = "Search term to do a search across the image database.",
-    };
-
-    parse_file: ?[]const u8,
-    version: bool,
-    model_path: ?[]const u8 = null,
-    search_similar: ?[]const u8 = null,
-
-    // Optional declaration to define shorthands. These can be chained e.g '-fs large'.
-    pub const switches = .{
-        .version = 'v',
-        .parse_file = 'f',
-        .model_path = 'm',
-        .search_similar = 's',
-    };
-};

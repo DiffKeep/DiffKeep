@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.llama);
+const util = @import("util.zig");
+const cmdFlags = @import("cmd_flags.zig");
 
 pub const c = @import("llama_cpp");
 
@@ -156,6 +158,42 @@ pub const Model = struct {
             .params = params,
             .ptr = ptr,
         };
+    }
+
+    /// Loads a model from HuggingFace if it doesn't exist locally. saves models to [dataDir]/models/filename.revision
+    pub fn loadFromHuggingFace(allocator: std.mem.Allocator, repo: []const u8, options: cmdFlags.Flags, filename: []const u8, revision: ?[]const u8, params: c.struct_llama_model_params) !Model {
+        const rev = revision orelse "main";
+        // Get data path for model
+        const model_file = try std.fmt.allocPrint(allocator, "/Models/{s}.{s}", .{ filename, rev });
+        defer allocator.free(model_file);
+        const model_path = try util.getDataPath(allocator, options, model_file);
+        defer allocator.free(model_path);
+
+        // Check if model already exists
+        if (!std.fs.cwd().access(model_path)) {
+            // Construct HuggingFace API URL
+            const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/{s}/{s}", .{ repo, rev, filename });
+            defer allocator.free(url);
+            std.debug.print("Downloading model {s}...\n", .{url});
+
+            // Download model file
+            var body = std.ArrayList(u8).init(allocator);
+            defer body.deinit();
+            var client = std.http.Client{ .allocator = allocator };
+            defer client.deinit();
+            std.debug.print("Downloading...\n", .{});
+            _ = try client.fetch(.{
+                .location = .{ .url = url },
+                .response_storage = .{ .dynamic = &body },
+                //.max_append_size = 17099152, // ~16 MB
+            });
+            const dl_file = try std.fs.cwd().createFile(model_path, .{});
+            defer dl_file.close();
+            try dl_file.writeAll(body.items);
+        }
+
+        // Load the downloaded model
+        return loadFromFile(allocator, model_path, params);
     }
 
     /// Deinitializes the model.
@@ -488,32 +526,7 @@ const grammar = struct {
 };
 
 /// Create an embedding from a prompt string using the LLM
-pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, model_path: []const u8, prompt: []const u8) !std.ArrayList([]const f32) {
-    // Initialize llama options
-    var options = PoolOptions{
-        .n_ctx = 512,
-        .n_batch = 2048,
-        .n_ubatch = 2048,
-        .n_threads = null,
-        .embeddings = true,
-        .pooling_type = 0,
-    };
-
-    if (options.n_batch < options.n_ctx) {
-        log.warn("Setting batch size to {d}", .{options.n_ctx});
-        options.n_batch = options.n_ctx;
-    }
-
-    // For non-causal models, batch size must be equal to ubatch size
-    options.n_ubatch = options.n_batch;
-
-    var pool = Pool.init(allocator, options);
-    defer pool.deinit();
-
-    // Get the model context
-    var ctx = try pool.get(model_path, 5000); // 5 second timeout
-    defer pool.release(ctx);
-
+pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, ctx: *Context, prompt: []const u8, ctx_size: u32) !std.ArrayList([]const f32) {
     // Prepare the context with our prompt
     try ctx.prepare(prompt, .{
         .seed = 0,
@@ -522,9 +535,9 @@ pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, model_path: []con
     var prompts = std.ArrayList([]const u8).init(allocator);
     defer prompts.deinit();
 
-    if (ctx.tokens.items.len > options.n_ctx) {
+    if (ctx.tokens.items.len > ctx_size) {
         // need to split the prompt into pieces
-        try chunkByTokens(allocator, prompt, ctx, options.n_ctx, &prompts);
+        try chunkByTokens(allocator, prompt, ctx, ctx_size, &prompts);
     } else {
         // put the single prompt into prompts
         const duped_prompt = try allocator.dupe(u8, prompt);

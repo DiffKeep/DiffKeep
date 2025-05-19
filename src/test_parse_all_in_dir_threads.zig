@@ -7,7 +7,7 @@ const Atomic = std.atomic.Value(i64);
 /// WIP - do not use
 /// WARNING
 pub fn main() !void {
-    const test_dir_path = "/home/qt/genai/comfyui/output"; // Adjust path as needed
+    const test_dir_path = "/home/qt/genai/comfyui/output/2025/04"; // Adjust path as needed
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -38,13 +38,15 @@ fn walkDirectory(allocator: std.mem.Allocator, dir_path: []const u8, thread_pool
     var dir_iter = dir.iterate();
     while (try dir_iter.next()) |entry| {
         const full_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
-        defer allocator.free(full_path);
 
         if (entry.kind == .directory) {
             try walkDirectory(allocator, full_path, thread_pool); // Recurse into subdirectories
+            allocator.free(full_path);                                             //
         } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".png")) {
             // Spawn a thread to process the file
-            thread_pool.spawnWg(&wg, processFile, .{ allocator, try allocator.dupe(u8, full_path) });
+            thread_pool.spawnWg(&wg, processFile, .{ allocator, full_path });
+        } else {
+            allocator.free(full_path);
         }
     }
     wg.wait();

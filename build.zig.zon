@@ -39,6 +39,14 @@
             .url = "https://github.com/ggml-org/llama.cpp/releases/download/b5223/llama-b5223-bin-ubuntu-x64.zip",
             .hash = "N-V-__8AABCbTgQWuhq1cE3rBTSyHSYhgB06eaS7yu6eQGxd",
         },
+        .zstbi = .{
+            .url = "git+https://github.com/zig-gamedev/zstbi#094c4bba5cdbec167d3f6aaa98cccccd5c99145f",
+            .hash = "zstbi-0.11.0-dev-L0Ea_-eVBwCl8RYA98PhLDw3Fhw5k7FJOHSMDKWDOvqx",
+        },
+        .zul = .{
+            .url = "git+https://github.com/karlseguin/zul.git#007aa7c4ed77272416c8111f4ce403e86abd56d3",
+            .hash = "zul-0.0.0-1oDotyJMBwBli3UBm47WYeNZSMNni_DbkT-jTtDpowDW",
+        },
     },
     .paths = .{
         // This makes *all* files, recursively, included in this package. It is generally

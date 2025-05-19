@@ -70,6 +70,11 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const zstbi = b.dependency("zstbi", .{});
+    exe.root_module.addImport("zstbi", zstbi.module("root"));
+
+    exe.root_module.addImport("zul", b.dependency("zul", .{}).module("zul"));
+
     // *** sqlite ***
     // Add SQLite as a module
     const sqlite_module = b.addStaticLibrary(.{
