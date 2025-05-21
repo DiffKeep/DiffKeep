@@ -11,7 +11,9 @@ namespace DiffKeep;
 sealed class Program
 {
     public static IConfiguration Configuration { get; private set; }
-    public static AppSettings Settings { get; private set; }
+    public static AppSettings Settings { get; set; }
+    public static string DataPath { get; private set; }
+    public static string ConfigPath { get; private set; }
     private static string DefaultDataPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "DiffKeep"
@@ -53,9 +55,13 @@ sealed class Program
     {
         // Ensure directory exists
         Directory.CreateDirectory(dataPath);
+        
+        DataPath = dataPath;
 
         // Default config file path
         string configPath = Path.Combine(dataPath, "appsettings.json");
+        
+        ConfigPath = configPath;
 
         // Create default config file if it doesn't exist
         if (!File.Exists(configPath))
@@ -70,9 +76,21 @@ sealed class Program
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
             .Build();
 
+       ReloadConfiguration(dataPath);
+    }
+    
+    public static void ReloadConfiguration(string? dataPath = null)
+    {
+        dataPath ??= DefaultDataPath;
+        
+        Configuration = new ConfigurationBuilder()
+            .SetBasePath(dataPath)
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .Build();
+
         // Bind the configuration to our settings class
         Settings = Configuration.GetSection("AppSettings").Get<AppSettings>()
-            ?? throw new InvalidOperationException("Failed to load application settings");
+                   ?? throw new InvalidOperationException("Failed to load application settings");
     }
 
     // Avalonia configuration, don't remove; also used by visual designer.

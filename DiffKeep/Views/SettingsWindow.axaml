@@ -1,0 +1,76 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:DiffKeep.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="500" d:DesignHeight="450"
+        x:Class="DiffKeep.Views.SettingsWindow"
+        x:DataType="vm:SettingsViewModel"
+        Title="Settings"
+        Width="500" MinWidth="400"
+        Height="450" MinHeight="300"
+        WindowStartupLocation="CenterOwner">
+
+    <DockPanel Margin="20">
+        <StackPanel DockPanel.Dock="Bottom" 
+                    Orientation="Horizontal" 
+                    HorizontalAlignment="Right" 
+                    Spacing="10"
+                    Margin="0,10,0,0">
+            <Button Content="Save" Command="{Binding SaveCommand}"/>
+            <Button Content="Cancel" Click="OnCancelClick"/>
+        </StackPanel>
+        
+        <ScrollViewer>
+            <StackPanel Spacing="10">
+                <StackPanel>
+                    <TextBlock Text="Theme:"/>
+                    <ComboBox SelectedItem="{Binding Theme}">
+                        <ComboBox.Items>
+                            <x:String>Light</x:String>
+                            <x:String>Dark</x:String>
+                        </ComboBox.Items>
+                    </ComboBox>
+                </StackPanel>
+                
+                <StackPanel>
+                    <TextBlock Text="Language:"/>
+                    <ComboBox SelectedItem="{Binding Language}">
+                        <ComboBox.Items>
+                            <x:String>en-US</x:String>
+                            <x:String>en-GB</x:String>
+                        </ComboBox.Items>
+                    </ComboBox>
+                </StackPanel>
+                
+                <StackPanel>
+                    <TextBlock Text="Libraries:"/>
+                    <ItemsControl ItemsSource="{Binding Libraries}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <DockPanel Margin="0,2">
+                                    <Button DockPanel.Dock="Right" 
+                                            Margin="4,0,0,0" 
+                                            Command="{Binding $parent[ItemsControl].DataContext.BrowseLibraryCommand}" 
+                                            CommandParameter="{Binding}">
+                                        <PathIcon Data="{StaticResource FolderRegular}"/>
+                                    </Button>
+                                    <Button DockPanel.Dock="Right"
+                                            Margin="4,0,0,0"
+                                            Command="{Binding $parent[ItemsControl].DataContext.DeleteLibraryCommand}"
+                                            CommandParameter="{Binding}">
+                                        <PathIcon Data="{StaticResource DeleteRegular}"/>
+                                    </Button>
+                                    <TextBox Text="{Binding Path, Mode=TwoWay}"/>
+                                </DockPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <Button Content="Add Library" 
+                            Command="{Binding AddLibraryCommand}"
+                            Margin="0,5,0,0"/>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

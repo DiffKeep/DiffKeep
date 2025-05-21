@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AvaloniaProject">
+    <option name="projectPerEditor">
+      <map>
+        <entry key="DiffKeep/App.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Dialogs/MessageDialog.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/AboutWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/ImageGalleryView.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/LeftPanel.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/MainWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/SettingsWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
+      </map>
+    </option>
+  </component>
+</project>

@@ -1,28 +1,78 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:DiffKeep.ViewModels"
+        xmlns:views="clr-namespace:DiffKeep.Views"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:converters="clr-namespace:DiffKeep.Converters"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="DiffKeep.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
         Title="DiffKeep">
+    <Window.Resources>
+        <converters:BoolToStringConverter x:Key="BoolToStringConverter" />
+    </Window.Resources>
 
     <Design.DataContext>
-        <vm:MainWindowViewModel/>
+        <vm:MainWindowViewModel />
     </Design.DataContext>
 
     <DockPanel>
         <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem Header="_Settings" Click="ShowSettingsDialog" />
+            </MenuItem>
             <MenuItem Header="_Help">
-                <MenuItem Header="_About" Click="ShowAboutDialog"/>
+                <MenuItem Header="_About" Click="ShowAboutDialog" />
             </MenuItem>
         </Menu>
 
-        <TextBlock Text="{Binding Greeting}" 
-                  HorizontalAlignment="Center" 
-                  VerticalAlignment="Center"/>
-    </DockPanel>
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition
+                    Width="{Binding LeftPanelWidth, Mode=TwoWay}" />
+                <ColumnDefinition Width="Auto" /> <!-- For the splitter -->
+                <!-- Column for the toggle button -->
+                <ColumnDefinition Width="24" />
+                <ColumnDefinition Width="*" /> <!-- Takes remaining space -->
+            </Grid.ColumnDefinitions>
+            
+            <!-- Left Panel -->
+            <views:LeftPanel Grid.Column="0" DataContext="{Binding LeftPanel}"/>
 
+            <!-- Splitter -->
+            <GridSplitter Grid.Column="1"
+                          Background="#66808080"
+                          Width="3"
+                          IsVisible="{Binding IsLeftPanelOpen}"
+                          VerticalAlignment="Stretch"
+                          HorizontalAlignment="Center"
+                          />
+            
+            <!-- Toggle Button -->
+            <Button Grid.Column="2"
+                    Width="24"
+                    Height="24"
+                    Margin="4"
+                    VerticalAlignment="Top"
+                    Command="{Binding ToggleLeftPanelCommand}">
+                <PathIcon
+                    Data="{Binding IsLeftPanelOpen,
+                Converter={StaticResource BoolToStringConverter},
+                ConverterParameter=M9 19l-7-7 7-7,
+                FallbackValue=M15 19l7-7-7-7}"
+                    Height="16"
+                    Width="16" />
+            </Button>
+
+            <!-- Main content area -->
+            <ContentControl Grid.Column="3">
+
+                <views:ImageGalleryView DataContext="{Binding ImageGallery}" />
+
+            </ContentControl>
+        </Grid>
+
+    </DockPanel>
 </Window>

@@ -3,13 +3,17 @@
              x:Class="DiffKeep.App"
              xmlns:local="using:DiffKeep"
              RequestedThemeVariant="Default">
-             <!-- "Default" ThemeVariant follows system theme variant. "Dark" or "Light" are other available options. -->
 
     <Application.DataTemplates>
         <local:ViewLocator/>
     </Application.DataTemplates>
   
     <Application.Styles>
-        <FluentTheme />
+        <SimpleTheme />
     </Application.Styles>
+    
+    <Application.Resources>
+        <StreamGeometry x:Key="FolderRegular">M21.17,3H14.95L13.23,1.28A3.93,3.93,0,0,0,10.51,0H3.83A3.83,3.83,0,0,0,0,3.83V18.17A3.83,3.83,0,0,0,3.83,22H21.17A2.83,2.83,0,0,0,24,19.17V5.83A2.83,2.83,0,0,0,21.17,3ZM22,19.17A.83.83,0,0,1,21.17,20H3.83A1.83,1.83,0,0,1,2,18.17V6H22Z</StreamGeometry>
+        <StreamGeometry x:Key="DeleteRegular">M18.363 6H5.636c-.364 0-.636.271-.636.636V19c0 1.104.896 2 2 2h10c1.104 0 2-.896 2-2V6.636A.635.635 0 0018.363 6zM8 17a1 1 0 01-2 0V9a1 1 0 012 0v8zm5 0a1 1 0 01-2 0V9a1 1 0 012 0v8zm5 0a1 1 0 01-2 0V9a1 1 0 012 0v8zm2-14h-4V2a1 1 0 00-1-1h-6a1 1 0 00-1 1v1H4a1 1 0 000 2h16a1 1 0 000-2z</StreamGeometry>
+    </Application.Resources>
 </Application>
