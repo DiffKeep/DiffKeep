@@ -10,6 +10,13 @@
         <PublishTrimmed>true</PublishTrimmed>
         <TrimMode>full</TrimMode>
         <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+        <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+        <GitThisAssembly>true</GitThisAssembly>
+
+        <Version>$(GitVersion_SemVer)</Version>
+        <AssemblyVersion>$(GitVersion_SemVer)</AssemblyVersion>
+        <FileVersion>$(GitVersion_SemVer)</FileVersion>
+        <InformationalVersion>$(GitVersion_InformationalVersion)</InformationalVersion>
     </PropertyGroup>
 
     <ItemGroup>
@@ -29,9 +36,19 @@
             <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
         </PackageReference>
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.1" />
+        <PackageReference Include="GitInfo" Version="3.5.0">
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+          <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
         <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.5" />
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <AvaloniaXaml Include="Views\AboutWindow.axaml.cs">
+        <SubType>Designer</SubType>
+      </AvaloniaXaml>
     </ItemGroup>
 </Project>
