@@ -8,47 +8,31 @@ using System.Text.Json;
 
 namespace DiffKeep.Parsing;
 
-public enum ImageGenerationTool
-{
-    Unknown,
-    ComfyUI,
-    Automatic1111,
-    Fooocus,
-    // Add more tools as needed
-}
-
 public interface IPromptParser
 {
     string ExtractPrompt(JsonDocument promptData);
     JsonDocument GetWorkflowData(JsonDocument workflowData);
 }
 
-public class ImageMetadata
+public class PngMetadataParser : IImageParser
 {
-    public ImageGenerationTool Tool { get; set; }
-    public string? Prompt { get; set; }
-    public JsonDocument? WorkflowData { get; set; }
-    public Dictionary<string, string?>? RawMetadata { get; set; }
-}
-
-public class PngMetadataParser
-{
-    private static readonly Dictionary<ImageGenerationTool, IPromptParser> Parsers = new();
+    private static readonly Dictionary<GenerationTool, IPromptParser> Parsers = new();
 
     static PngMetadataParser()
     {
         // Register parsers for different tools
-        Parsers[ImageGenerationTool.ComfyUI] = new ComfyUIParser();
-        Parsers[ImageGenerationTool.Automatic1111] = new Automatic1111Parser();
-        Parsers[ImageGenerationTool.Fooocus] = new FooocusParser();
+        Parsers[GenerationTool.ComfyUI] = new ComfyUIParser();
+        Parsers[GenerationTool.Automatic1111] = new Automatic1111Parser();
+        Parsers[GenerationTool.Fooocus] = new FooocusParser();
     }
 
-    public static ImageMetadata ParseImage(string filePath)
+    public ImageMetadata ParseImage(string filePath)
     {
+        Debug.Print($"Parsing PNG metadata for {filePath}");
         using var image = Image.NewFromFile(filePath);
         
         // Collect all metadata chunks
-        var metadataChunks = new Dictionary<string, string?>();
+        var metadataChunks = new List<KeyValuePair<string, string?>>();
         
         // Get all fields that start with "png-" as these contain the PNG chunks
         foreach (var field in image.GetFields())
@@ -61,7 +45,7 @@ public class PngMetadataParser
                 // This won't work for images that have more than 10 chunks, but we don't expect that to happen
                 var chunkName = field.Substring(14);
                 var value = image.Get(field).ToString();
-                metadataChunks[chunkName] = value;
+                metadataChunks.Add(new KeyValuePair<string, string?>(chunkName, value));
             }
         }
 
@@ -75,55 +59,101 @@ public class PngMetadataParser
         };
 
         // If we recognize the tool, use its specific parser
-        if (tool != ImageGenerationTool.Unknown && metadataChunks.Any())
+        if (tool != GenerationTool.Unknown && metadataChunks.Any())
         {
-            var parser = Parsers[tool];
-            
-
-            if (metadataChunks.TryGetValue("workflow", out var workflowJson))
+            // Check for non-JSON prompt chunks first
+            // This fixes the case where there is an additional "prompt" metadata entry that is just the image prompt
+            // Check for non-JSON prompt chunks first
+            var promptEntries = metadataChunks.Where(m => m.Key == "prompt");
+            foreach (var promptEntry in promptEntries)
             {
-                if (workflowJson != null)
+                var value = promptEntry.Value?.Trim();
+                if (string.IsNullOrEmpty(value)) continue;
+
+                // If it doesn't start with { or [, it's likely a plain text prompt
+                if (!value.StartsWith("{") && !value.StartsWith("["))
                 {
-                    var workflowData = JsonDocument.Parse(workflowJson);
-                    result.WorkflowData = parser.GetWorkflowData(workflowData);
-                    result.Prompt = parser.ExtractPrompt(workflowData);
+                    result.Prompt = value;
+                    return result;
                 }
             }
 
-            if (!metadataChunks.TryGetValue("prompt", out var promptJson) || promptJson == null) return result;
-            var promptData = JsonDocument.Parse(promptJson);
-            
+            // If we get here, we didn't find any non-JSON prompts, so try parsing JSON
+            var parser = Parsers[tool];
+    
+            var workflowEntry = metadataChunks.FirstOrDefault(m => m.Key == "workflow");
+            if (workflowEntry.Value != null)
+            {
+                try
+                {
+                    var workflowData = JsonDocument.Parse(workflowEntry.Value);
+                    result.Prompt = parser.ExtractPrompt(workflowData);
+                    return result;
+                }
+                catch
+                {
+                    // Invalid JSON in workflow, continue
+                }
+            }
+
+            // Try JSON prompts as last resort
+            foreach (var promptEntry in promptEntries)
+            {
+                if (promptEntry.Value == null) continue;
+
+                try
+                {
+                    var promptData = JsonDocument.Parse(promptEntry.Value);
+                    result.Prompt = parser.ExtractPrompt(promptData);
+                    return result;
+                }
+                catch
+                {
+                    // Invalid JSON, skip
+                }
+            }
         }
 
         return result;
     }
 
-    private static ImageGenerationTool DetectGenerationTool(Dictionary<string, string?> metadata)
+    private static GenerationTool DetectGenerationTool(List<KeyValuePair<string, string?>> metadata)
     {
         // ComfyUI typically has both 'prompt' and 'workflow' in tEXt chunks
-        if (metadata.TryGetValue("prompt", out string? value) && metadata.ContainsKey("workflow"))
+        var promptEntries = metadata.Where(m => m.Key == "prompt");
+        var hasWorkflow = metadata.Any(m => m.Key == "workflow");
+
+        if (hasWorkflow)
         {
-            try
+            foreach (var promptEntry in promptEntries)
             {
-                var promptData = JsonDocument.Parse(value ?? throw new InvalidDataException());
-                // ComfyUI prompts typically have numbered nodes with class_type
-                if (promptData.RootElement.EnumerateObject()
-                    .Any(prop => prop.Value.TryGetProperty("class_type", out _)))
+                try
                 {
-                    return ImageGenerationTool.ComfyUI;
+                    var promptData = JsonDocument.Parse(promptEntry.Value ?? throw new InvalidDataException());
+                    // ComfyUI prompts typically have numbered nodes with class_type
+                    if (promptData.RootElement.EnumerateObject()
+                        .Any(prop => prop.Value.TryGetProperty("class_type", out _)))
+                    {
+                        return GenerationTool.ComfyUI;
+                    }
+                }
+                catch 
+                {
+                    // Not a JSON prompt, continue to next one
+                    continue;
                 }
             }
-            catch { }
         }
 
         // Automatic1111 typically stores parameters in 'parameters'
-        if (metadata.TryGetValue("parameters", out string? parameters))
+        var parametersEntry = metadata.FirstOrDefault(m => m.Key == "parameters");
+        if (parametersEntry.Value != null)
         {
             try
             {
-                if (parameters != null && (parameters.Contains("Steps:") || parameters.Contains("Sampler:")))
+                if (parametersEntry.Value.Contains("Steps:") || parametersEntry.Value.Contains("Sampler:"))
                 {
-                    return ImageGenerationTool.Automatic1111;
+                    return GenerationTool.Automatic1111;
                 }
             }
             catch { }
@@ -132,9 +162,9 @@ public class PngMetadataParser
         // Fooocus has its own specific metadata pattern
         if (metadata.Any(m => m.Key.Contains("fooocus", StringComparison.OrdinalIgnoreCase)))
         {
-            return ImageGenerationTool.Fooocus;
+            return GenerationTool.Fooocus;
         }
 
-        return ImageGenerationTool.Unknown;
+        return GenerationTool.Unknown;
     }
 }

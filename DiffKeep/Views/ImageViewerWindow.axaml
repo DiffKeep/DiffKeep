@@ -45,8 +45,7 @@
             </Button>
 
             <Separator Classes="vertical"
-                       Margin="4,0"
-                       Background="#c0c0c0" />
+                       Margin="4,0" />
 
             <!-- Zoom Controls -->
             <Button Name="ZoomInButton"
@@ -98,6 +97,17 @@
             </Button>
 
             <Separator Classes="vertical"
+                       Margin="4,0" />
+
+            <Button Name="InfoPanelButton"
+                    Width="32" Height="32"
+                    Command="{Binding ToggleInfoPanelCommand}"
+                    ToolTip.Tip="Toggle Info Panel (I)">
+                <PathIcon
+                    Data="M13,9H11V7H13M13,17H11V11H13M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2Z" />
+            </Button>
+
+            <Separator Classes="vertical"
                        Margin="4,0"
                        Background="#c0c0c0" />
 
@@ -107,9 +117,103 @@
                        Text="{Binding #ImageViewer.ZoomPercentage, StringFormat={}{0:F0}%}" />
         </StackPanel>
 
-        <!-- Image Viewer -->
-        <controls:ZoomableImage Grid.Row="1"
-                                Name="ImageViewer"
-                                Source="{Binding ImageSource}" />
+        <!-- Main Content with Overlay -->
+        <Grid Grid.Row="1">
+            <!-- Image Viewer -->
+            <controls:ZoomableImage Name="ImageViewer"
+                                    Source="{Binding ImageSource}" />
+
+            <!-- Floating Info Panel -->
+            <Grid HorizontalAlignment="Right"
+                  VerticalAlignment="Stretch"
+                  Width="{Binding InfoPanelWidth, Mode=TwoWay}"
+                  IsVisible="{Binding IsInfoPanelVisible}"
+                  Margin="0,0,8,8">
+
+                <!-- Info Panel Content -->
+                <Border CornerRadius="8"
+                        Background="#E6202020"
+                        ClipToBounds="True">
+                    <Grid RowDefinitions="Auto,*">
+                        <TextBlock Text="Image Information"
+                                   Grid.Row="0"
+                                   Margin="10"
+                                   Foreground="White"
+                                   FontWeight="Bold" />
+
+                        <ScrollViewer Grid.Row="1">
+                            <StackPanel Margin="10">
+                                <!-- Basic Info -->
+                                <TextBlock Text="Basic Information"
+                                           Foreground="White"
+                                           FontWeight="SemiBold" />
+                                <StackPanel Margin="0,5,0,15">
+                                    <TextBlock Text="{Binding ImageFilePath}"
+                                               Foreground="LightGray"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock Text="{Binding ImageDimensions}"
+                                               Foreground="LightGray" />
+                                    <TextBlock Text="{Binding FileSize}"
+                                               Foreground="LightGray" />
+                                </StackPanel>
+
+                                <!-- Generation Info -->
+                                <TextBlock Text="Generation Information"
+                                           Foreground="White"
+                                           FontWeight="SemiBold" />
+                                <StackPanel Margin="0,5,0,15">
+                                    <TextBlock Text="Image Generated With:"
+                                           Foreground="White"/>
+                                    <TextBlock Text="{Binding DetectedTool}"
+                                               Foreground="LightGray"
+                                               FontStyle="Italic" />
+                                    <TextBlock Text="Image Prompt:"
+                                           Foreground="White"/>
+                                    <TextBlock Text="{Binding GenerationPrompt}"
+                                               Foreground="LightGray"
+                                               TextWrapping="Wrap" />
+                                </StackPanel>
+
+                                <!-- Raw Metadata -->
+                                <Expander Header="Raw Metadata"
+                                          Foreground="White">
+                                    <ItemsControl ItemsSource="{Binding RawMetadata}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid ColumnDefinitions="Auto,*" Margin="0,2">
+                                                    <TextBlock Grid.Column="0"
+                                                               Text="{Binding Key}"
+                                                               Foreground="White"
+                                                               FontWeight="SemiBold"
+                                                               Margin="0,0,8,0" />
+                                                    <TextBox Grid.Column="1"
+                                                             Text="{Binding Value}"
+                                                             Foreground="LightGray"
+                                                             IsReadOnly="True"
+                                                             TextWrapping="Wrap"
+                                                             Background="Transparent"
+                                                             BorderThickness="0"
+                                                             Padding="0" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </Expander>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+
+                <!-- Resize Handle -->
+                <Rectangle Width="4"
+                           HorizontalAlignment="Left"
+                           VerticalAlignment="Stretch"
+                           Cursor="SizeWestEast"
+                           Fill="Transparent"
+                           PointerPressed="OnInfoPanelResizeStarted"
+                           PointerMoved="OnInfoPanelResizing"
+                           PointerReleased="OnInfoPanelResizeEnded" />
+            </Grid>
+        </Grid>
     </Grid>
 </Window>

@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using DiffKeep.ViewModels;
 using System.Collections.ObjectModel;
+using Avalonia;
 using Avalonia.Interactivity;
 
 namespace DiffKeep.Views;
@@ -11,6 +12,8 @@ public partial class ImageViewerWindow : Window
 {
     private bool _isFullScreen;
     private Avalonia.Controls.WindowState _previousWindowState;
+    private bool _isResizing;
+    private Point _lastPos;
 
     public ImageViewerWindow()
     {
@@ -86,5 +89,43 @@ public partial class ImageViewerWindow : Window
             ToggleFullScreen(null, new RoutedEventArgs());
             e.Handled = true;
         }
+        else if (e.Key == Key.I)
+        {
+            if (DataContext is ImageViewerViewModel vm)
+            {
+                vm.IsInfoPanelVisible = !vm.IsInfoPanelVisible;
+            }
+            e.Handled = true;
+        }
     }
+    
+    private void OnInfoPanelResizeStarted(object? sender, PointerPressedEventArgs e)
+    {
+        _isResizing = true;
+        _lastPos = e.GetPosition(this);
+        e.Pointer.Capture((IInputElement)sender!);
+    }
+
+    private void OnInfoPanelResizing(object? sender, PointerEventArgs e)
+    {
+        if (!_isResizing) return;
+    
+        var pos = e.GetPosition(this);
+        var delta = _lastPos.X - pos.X;
+    
+        if (DataContext is ImageViewerViewModel vm)
+        {
+            var newWidth = Math.Max(200, Math.Min(600, vm.InfoPanelWidth + delta));
+            vm.InfoPanelWidth = newWidth;
+        }
+    
+        _lastPos = pos;
+    }
+
+    private void OnInfoPanelResizeEnded(object? sender, PointerReleasedEventArgs e)
+    {
+        _isResizing = false;
+        e.Pointer.Capture(null);
+    }
+
 }
