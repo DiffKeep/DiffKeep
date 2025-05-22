@@ -7,7 +7,7 @@ This allows one to drag a generated image into the ComfyUI window and get the ex
 
 For PNG's, this is accomplished using [Chunks](http://www.libpng.org/pub/png/spec/1.2/PNG-Chunks.html), specifically `tEXt` Chunks. This allows arbitrary text to be saved inside the PNG file and easily read by other programs.
 
-ComfyUI adds two `iTXt` Chunks into files: `prompt` and `workflow`.
+ComfyUI adds two `tEXt` Chunks into files: `prompt` and `workflow`.
 
 ## `prompt`
 

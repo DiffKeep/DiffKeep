@@ -22,7 +22,7 @@
                                        MinItemHeight="220"
                                        MinColumnSpacing="10"
                                        MinRowSpacing="10"
-                                       ItemsJustification="SpaceAround"/>
+                                       ItemsJustification="Start"/>
                 </ItemsRepeater.Layout>
                 <ItemsRepeater.ItemTemplate>
                     <DataTemplate x:DataType="vm:ImageItemViewModel">
