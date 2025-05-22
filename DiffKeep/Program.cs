@@ -2,6 +2,7 @@
 using System;
 using System.IO;
 using System.CommandLine;
+using System.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using DiffKeep.Settings;
 using System.Text.Json;
@@ -14,6 +15,7 @@ sealed class Program
     public static AppSettings Settings { get; set; }
     public static string DataPath { get; private set; }
     public static string ConfigPath { get; private set; }
+
     private static string DefaultDataPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "DiffKeep"
@@ -33,34 +35,37 @@ sealed class Program
             dataPathOption
         };
 
+        DataPath = DefaultDataPath;
+
         rootCommand.SetHandler((dataPath) =>
         {
-            try
-            {
-                SetupConfiguration(dataPath);
-                BuildAvaloniaApp()
-                    .StartWithClassicDesktopLifetime(args);
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"Error: {ex.Message}");
-                Environment.Exit(1);
-            }
+            Debug.Print($"Data path: {dataPath}");
+            DataPath = dataPath;
         }, dataPathOption);
 
         rootCommand.Invoke(args);
+
+        try
+        {
+            SetupConfiguration();
+            BuildAvaloniaApp()
+                .StartWithClassicDesktopLifetime(args);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            Environment.Exit(1);
+        }
     }
 
-    private static void SetupConfiguration(string dataPath)
+    private static void SetupConfiguration()
     {
         // Ensure directory exists
-        Directory.CreateDirectory(dataPath);
-        
-        DataPath = dataPath;
+        Directory.CreateDirectory(DataPath);
 
         // Default config file path
-        string configPath = Path.Combine(dataPath, "appsettings.json");
-        
+        string configPath = Path.Combine(DataPath, "appsettings.json");
+
         ConfigPath = configPath;
 
         // Create default config file if it doesn't exist
@@ -71,20 +76,13 @@ sealed class Program
             File.WriteAllText(configPath, jsonString);
         }
 
-        Configuration = new ConfigurationBuilder()
-            .SetBasePath(dataPath)
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .Build();
-
-       ReloadConfiguration(dataPath);
+        ReloadConfiguration();
     }
-    
-    public static void ReloadConfiguration(string? dataPath = null)
+
+    public static void ReloadConfiguration()
     {
-        dataPath ??= DefaultDataPath;
-        
         Configuration = new ConfigurationBuilder()
-            .SetBasePath(dataPath)
+            .SetBasePath(DataPath)
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
             .Build();
 

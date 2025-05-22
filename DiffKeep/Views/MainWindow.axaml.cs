@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text.Json.Serialization;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
+using DiffKeep.ViewModels;
 
 namespace DiffKeep.Views;
 
@@ -120,10 +121,16 @@ public partial class MainWindow : Window
         await aboutWindow.ShowDialog(this);
     }
     
-    private void ShowSettingsDialog(object? sender, RoutedEventArgs e)
+    private async void ShowSettingsDialog(object? sender, RoutedEventArgs e)
     {
-        var settingsWindow = new SettingsWindow();
-        settingsWindow.ShowDialog(this);
+        var dialog = new SettingsWindow();
+        await dialog.ShowDialog(this);
+    
+        // After settings are updated, refresh the libraries
+        if (DataContext is MainWindowViewModel viewModel)
+        {
+            viewModel.RefreshLibraries();
+        }
     }
 }
 

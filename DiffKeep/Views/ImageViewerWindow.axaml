@@ -1,0 +1,115 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:DiffKeep.ViewModels"
+        xmlns:controls="using:DiffKeep.Controls"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        x:Class="DiffKeep.Views.ImageViewerWindow"
+        x:DataType="vm:ImageViewerViewModel"
+        Title="{Binding ImageName}"
+        WindowStartupLocation="CenterScreen"
+        WindowState="Maximized"
+        Width="800"
+        Height="600"
+        Focusable="True">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Toolbar -->
+        <StackPanel Grid.Row="0"
+                    HorizontalAlignment="Center"
+                    Orientation="Horizontal"
+                    Spacing="4"
+                    Margin="4">
+
+            <!-- Navigation Controls -->
+            <Button Name="PreviousButton"
+                    Width="32" Height="32"
+                    Command="{Binding NavigatePreviousCommand}"
+                    IsEnabled="{Binding HasPrevious}"
+                    ToolTip.Tip="Previous Image (Left Arrow)">
+                <PathIcon Data="M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z" />
+            </Button>
+
+            <Button Name="NextButton"
+                    Width="32" Height="32"
+                    Command="{Binding NavigateNextCommand}"
+                    IsEnabled="{Binding HasNext}"
+                    ToolTip.Tip="Next Image (Right Arrow)">
+                <PathIcon Data="M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z" />
+            </Button>
+
+            <Separator Classes="vertical"
+                       Margin="4,0"
+                       Background="#c0c0c0" />
+
+            <!-- Zoom Controls -->
+            <Button Name="ZoomInButton"
+                    Width="32" Height="32"
+                    ToolTip.Tip="Zoom In">
+                <PathIcon
+                    Data="M15.5,14H14.71L14.43,13.73C15.41,12.59 16,11.11 16,9.5A6.5,6.5 0 0,0 9.5,3A6.5,6.5 0 0,0 3,9.5A6.5,6.5 0 0,0 9.5,16C11.11,16 12.59,15.41 13.73,14.43L14,14.71V15.5L19,20.5L20.5,19L15.5,14M9.5,14C7,14 5,12 5,9.5C5,7 7,5 9.5,5C12,5 14,7 14,9.5C14,12 12,14 9.5,14M12,10H10V12H9V10H7V9H9V7H10V9H12V10Z" />
+            </Button>
+
+            <Button Name="ZoomOutButton"
+                    Width="32" Height="32"
+                    ToolTip.Tip="Zoom Out">
+                <PathIcon
+                    Data="M15.5,14H14.71L14.43,13.73C15.41,12.59 16,11.11 16,9.5A6.5,6.5 0 0,0 9.5,3A6.5,6.5 0 0,0 3,9.5A6.5,6.5 0 0,0 9.5,16C11.11,16 12.59,15.41 13.73,14.43L14,14.71V15.5L19,20.5L20.5,19L15.5,14M9.5,14C7,14 5,12 5,9.5C5,7 7,5 9.5,5C12,5 14,7 14,9.5C14,12 12,14 9.5,14M7,9H12V10H7V9Z" />
+            </Button>
+
+            <Separator Classes="vertical"
+                       Margin="4,0" />
+
+            <Button Name="FitToScreenButton"
+                    Width="32" Height="32"
+                    ToolTip.Tip="Fit to Screen">
+                <PathIcon
+                    Data="M19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5A2,2 0 0,0 19,3M19,19H5V5H19V19M17,17H7V7H17V17Z" />
+            </Button>
+
+            <Button Name="ActualSizeButton"
+                    Width="32" Height="32"
+                    ToolTip.Tip="Actual Size (100%)">
+                <PathIcon
+                    Data="M19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5A2,2 0 0,0 19,3M19,19H5V5H19V19M17,17H7V7H17V17M15,15H9V9H15V15Z" />
+            </Button>
+
+            <Button Name="CenterButton"
+                    Width="32" Height="32"
+                    ToolTip.Tip="Center Image">
+                <PathIcon
+                    Data="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M19,19H15V21H19A2,2 0 0,0 21,19V15H19M19,3H15V5H19V9H21V5A2,2 0 0,0 19,3M5,5H9V3H5A2,2 0 0,0 3,5V9H5M5,15H3V19A2,2 0 0,0 5,21H9V19H5V15Z" />
+            </Button>
+
+            <Separator Classes="vertical"
+                       Margin="4,0" />
+
+            <Button Name="FullScreenButton"
+                    Width="32" Height="32"
+                    Click="ToggleFullScreen"
+                    ToolTip.Tip="Toggle Full Screen (F11)">
+                <PathIcon Data="M5,5H10V7H7V10H5V5M14,5H19V10H17V7H14V5M17,14H19V19H14V17H17V14M10,17V19H5V14H7V17H10Z" />
+            </Button>
+
+            <Separator Classes="vertical"
+                       Margin="4,0"
+                       Background="#c0c0c0" />
+
+            <TextBlock Name="ZoomPercentage"
+                       VerticalAlignment="Center"
+                       MinWidth="60"
+                       Text="{Binding #ImageViewer.ZoomPercentage, StringFormat={}{0:F0}%}" />
+        </StackPanel>
+
+        <!-- Image Viewer -->
+        <controls:ZoomableImage Grid.Row="1"
+                                Name="ImageViewer"
+                                Source="{Binding ImageSource}" />
+    </Grid>
+</Window>

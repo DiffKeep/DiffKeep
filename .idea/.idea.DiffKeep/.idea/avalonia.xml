@@ -7,6 +7,7 @@
         <entry key="DiffKeep/Dialogs/MessageDialog.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/AboutWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/ImageGalleryView.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/ImageViewerWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/LeftPanel.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/MainWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/SettingsWindow.axaml" value="DiffKeep/DiffKeep.csproj" />

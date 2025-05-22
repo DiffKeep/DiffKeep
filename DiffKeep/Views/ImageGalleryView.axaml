@@ -6,7 +6,9 @@
              xmlns:vm="using:DiffKeep.ViewModels"
              mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
              x:Class="DiffKeep.Views.ImageGalleryView"
-             x:DataType="vm:ImageGalleryViewModel">
+             x:DataType="vm:ImageGalleryViewModel"
+             Focusable="True"
+             KeyDown="OnKeyDown">
     <Grid RowDefinitions="Auto,*">
         <!-- Directory path display -->
         <TextBlock Grid.Row="0" 
@@ -16,7 +18,8 @@
         
         <!-- Image gallery -->
         <ScrollViewer Grid.Row="1">
-            <ItemsRepeater ItemsSource="{Binding Images}">
+            <ItemsRepeater ItemsSource="{Binding Images}"
+                           Name="ItemsRepeater">
                 <ItemsRepeater.Layout>
                     <UniformGridLayout MinItemWidth="220" 
                                        MinItemHeight="220"
@@ -27,19 +30,36 @@
                 <ItemsRepeater.ItemTemplate>
                     <DataTemplate x:DataType="vm:ImageItemViewModel">
                         <Border Margin="5" 
-                                BorderBrush="Gray" 
-                                BorderThickness="1" 
-                                CornerRadius="3">
-                            <StackPanel>
-                                <Image Source="{Binding Thumbnail}"
-                                       Width="200"
-                                       Height="200"
-                                       Stretch="Uniform"/>
-                                <TextBlock Text="{Binding FileName}"
-                                           Margin="5 10"
-                                           TextAlignment="Center"
-                                           TextWrapping="Wrap"/>
-                            </StackPanel>
+                                CornerRadius="3"
+                                Tapped="Border_OnTapped"
+                                DoubleTapped="Border_OnDoubleTapped">
+                            <Border.Styles>
+                                <Style Selector="Border">
+                                    <Setter Property="BorderBrush" Value="Gray"/>
+                                    <Setter Property="BorderThickness" Value="1"/>
+                                </Style>
+                                <Style Selector="Border:pointerover">
+                                    <Setter Property="BorderBrush" Value="LightGray"/>
+                                </Style>
+                            </Border.Styles>
+                            <Grid>
+                                <!-- Selection border -->
+                                <Border BorderBrush="DarkRed"
+                                        BorderThickness="4"
+                                        IsVisible="{Binding IsSelected}"
+                                        Margin="-1"/>
+                                <!-- Content -->
+                                <StackPanel>
+                                    <Image Source="{Binding Thumbnail}"
+                                           Width="200"
+                                           Height="200"
+                                           Stretch="Uniform"/>
+                                    <TextBlock Text="{Binding FileName}"
+                                             Margin="5 10"
+                                             TextAlignment="Center"
+                                             TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </Grid>
                         </Border>
                     </DataTemplate>
                 </ItemsRepeater.ItemTemplate>

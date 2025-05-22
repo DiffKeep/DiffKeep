@@ -35,6 +35,11 @@ public partial class MainWindowViewModel : ViewModelBase
         };
 
     }
+    
+    public void RefreshLibraries()
+    {
+        LeftPanel.RefreshLibraries();
+    }
 
     partial void OnLeftPanelWidthChanged(GridLength value)
     {

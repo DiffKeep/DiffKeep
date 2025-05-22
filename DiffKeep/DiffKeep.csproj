@@ -55,6 +55,10 @@
         <DependentUpon>LeftPanel.axaml</DependentUpon>
         <SubType>Code</SubType>
       </Compile>
+      <Compile Update="Views\ImageViewerWindow.axaml.cs">
+        <DependentUpon>ImageViewerWindow.axaml</DependentUpon>
+        <SubType>Code</SubType>
+      </Compile>
     </ItemGroup>
 
     <ItemGroup>

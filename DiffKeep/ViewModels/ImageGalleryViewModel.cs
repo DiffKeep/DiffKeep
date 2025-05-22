@@ -142,6 +142,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
 public partial class ImageItemViewModel : ViewModelBase
 {
     [ObservableProperty]
+    private bool _isSelected;
+
+    [ObservableProperty]
     private string? _filePath;
 
     [ObservableProperty]

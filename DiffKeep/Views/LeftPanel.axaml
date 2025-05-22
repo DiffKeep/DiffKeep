@@ -6,7 +6,9 @@
     
     <TreeView ItemsSource="{Binding Items}"
               SelectedItem="{Binding SelectedItem}"
-              SelectionMode="Single">
+              SelectionMode="Single"
+              Name="TreeView"
+              KeyboardNavigation.IsTabStop="True">
         <TreeView.ItemTemplate>
             <TreeDataTemplate ItemsSource="{Binding Children}">
                 <TextBlock Text="{Binding Name}"/>

@@ -25,6 +25,12 @@ public class LeftPanelViewModel : ViewModelBase
         _items = new ObservableCollection<LibraryTreeItem>();
         InitializeTreeItems();
     }
+    
+    public void RefreshLibraries()
+    {
+        Items.Clear();
+        InitializeTreeItems();
+    }
 
     private void InitializeTreeItems()
     {
