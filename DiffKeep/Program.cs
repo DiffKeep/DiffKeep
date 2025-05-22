@@ -6,6 +6,7 @@ using System.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using DiffKeep.Settings;
 using System.Text.Json;
+using DiffKeep.Database;
 
 namespace DiffKeep;
 
@@ -15,6 +16,8 @@ sealed class Program
     public static AppSettings Settings { get; set; }
     public static string DataPath { get; private set; }
     public static string ConfigPath { get; private set; }
+    
+    public const string DbFilename = "diffkeep.db";
 
     private static string DefaultDataPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -65,6 +68,7 @@ sealed class Program
 
         // Default config file path
         string configPath = Path.Combine(DataPath, "appsettings.json");
+        string dbPath = Path.Combine(DataPath, DbFilename);
 
         ConfigPath = configPath;
 
@@ -77,6 +81,8 @@ sealed class Program
         }
 
         ReloadConfiguration();
+        
+        DatabaseInitializer.Initialize(dbPath);
     }
 
     public static void ReloadConfiguration()

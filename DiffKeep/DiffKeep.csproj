@@ -42,12 +42,15 @@
           <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
           <PrivateAssets>all</PrivateAssets>
         </PackageReference>
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.5" />
         <PackageReference Include="NetVips" Version="3.0.1" />
         <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" />
+        <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+        <RuntimeHostConfigurationOption Include="System.Data.SqliteEnableNotifications" Value="true" />
     </ItemGroup>
 
     <ItemGroup>
@@ -64,4 +67,32 @@
     <ItemGroup>
       <AdditionalFiles Include="Views\LeftPanel.axaml" />
     </ItemGroup>
+
+    <ItemGroup>
+        <!-- Linux x64 -->
+        <EmbeddedResource Include="$(NuGetPackageRoot)sqlite-vec/0.1.7-alpha.2.1/runtimes/linux-x64/native/vec0.so">
+            <LogicalName>DiffKeep.runtimes.linux-x64.native.vec0.so</LogicalName>
+        </EmbeddedResource>
+
+        <!-- Windows x64 -->
+        <EmbeddedResource Include="$(NuGetPackageRoot)sqlite-vec/0.1.7-alpha.2.1/runtimes/win-x64/native/vec0.dll">
+            <LogicalName>DiffKeep.runtimes.win-x64.native.vec0.dll</LogicalName>
+        </EmbeddedResource>
+
+        <!-- macOS x64 -->
+        <EmbeddedResource Include="$(NuGetPackageRoot)sqlite-vec/0.1.7-alpha.2.1/runtimes/osx-x64/native/vec0.dylib">
+            <LogicalName>DiffKeep.runtimes.osx-x64.native.vec0.dylib</LogicalName>
+        </EmbeddedResource>
+        
+        <!-- Linux ARM64 -->
+        <EmbeddedResource Include="$(NuGetPackageRoot)sqlite-vec/0.1.7-alpha.2.1/runtimes/linux-arm64/native/vec0.so">
+            <LogicalName>DiffKeep.runtimes.linux-arm64.native.vec0.so</LogicalName>
+        </EmbeddedResource>
+
+        <!-- macOS ARM64 -->
+        <EmbeddedResource Include="$(NuGetPackageRoot)sqlite-vec/0.1.7-alpha.2.1/runtimes/osx-arm64/native/vec0.dylib">
+            <LogicalName>DiffKeep.runtimes.osx-arm64.native.vec0.dylib</LogicalName>
+        </EmbeddedResource>
+    </ItemGroup>
+
 </Project>
