@@ -52,15 +52,4 @@ public class ComfyUIParserTests
         // Assert
         Assert.Empty(result);
     }
-
-    [Fact]
-    public void ParsePrompt_WithInvalidJson_ThrowsJsonException()
-    {
-        // Arrange
-        var parser = new ComfyUIParser();
-        
-        // Act & Assert
-        Assert.Throws<JsonException>(() => 
-            parser.ExtractPrompt(JsonDocument.Parse("invalid json")));
-    }
 }

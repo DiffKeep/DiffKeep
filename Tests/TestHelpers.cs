@@ -13,6 +13,6 @@ public static class TestHelpers
         // Navigate up from bin/Debug/net9.0 to the test project root
         var projectRoot = Path.GetFullPath(Path.Combine(assemblyDirectory, "../../.."));
         
-        return Path.Combine(projectRoot, "test-artifacts", relativePath);
+        return Path.Combine("../../..", "test-artifacts", relativePath);
     }
 }
