@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading.Tasks;
 
 namespace DiffKeep.Parsing
 {
@@ -30,6 +31,11 @@ namespace DiffKeep.Parsing
                 ".gif" => throw new NotImplementedException("GIF parsing not yet implemented"),
                 _ => throw new NotSupportedException($"Unsupported image format: {extension}")
             };
+        }
+
+        public async Task<ImageMetadata> ParseImageAsync(string filePath)
+        {
+            return await Task.Run(() => ParseImage(filePath));
         }
     }
 }

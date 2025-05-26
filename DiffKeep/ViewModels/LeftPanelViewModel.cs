@@ -2,16 +2,22 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using CommunityToolkit.Mvvm.ComponentModel;
+using DiffKeep.Database;
 using DiffKeep.Repositories;
 using DiffKeep.Extensions;
+using System.Threading;
+using System;
 
 namespace DiffKeep.ViewModels;
 
 public class LeftPanelViewModel : ViewModelBase
 {
     private readonly ILibraryRepository _libraryRepository;
+    private readonly ImageLibraryScanner _imageLibraryScanner;
     private ObservableCollection<LibraryTreeItem> _items;
     private LibraryTreeItem _selectedItem;
+    private readonly SemaphoreSlim _scanSemaphore = new(1, 1);
 
     public LibraryTreeItem SelectedItem
     {
@@ -25,9 +31,10 @@ public class LeftPanelViewModel : ViewModelBase
         set => SetProperty(ref _items, value);
     }
     
-    public LeftPanelViewModel(ILibraryRepository libraryRepository)
+    public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner)
     {
         _libraryRepository = libraryRepository;
+        _imageLibraryScanner = imageLibraryScanner;
         _items = new ObservableCollection<LibraryTreeItem>();
         InitializeTreeItemsAsync().FireAndForget();
     }
@@ -46,8 +53,8 @@ public class LeftPanelViewModel : ViewModelBase
         var librariesRoot = new LibraryTreeItem
         {
             Name = "Libraries",
-            Path = "", // Empty path for root
-            IsExpanded = true // Auto-expand the Libraries node
+            Path = "",
+            IsExpanded = true
         };
 
         foreach (var library in libraries)
@@ -62,6 +69,9 @@ public class LeftPanelViewModel : ViewModelBase
                 Path = library.Path,
             };
 
+            // Start background scan
+            StartLibraryScan(libraryItem);
+
             PopulateChildren(libraryItem);
             librariesRoot.Children.Add(libraryItem);
         }
@@ -70,6 +80,40 @@ public class LeftPanelViewModel : ViewModelBase
         
         // Auto-select the Libraries node
         SelectedItem = librariesRoot;
+    }
+
+    private void StartLibraryScan(LibraryTreeItem libraryItem)
+    {
+        Task.Run(async () =>
+        {
+            try
+            {
+                await _scanSemaphore.WaitAsync();
+                libraryItem.IsScanning = true;
+                libraryItem.ScanStatus = "Scanning...";
+
+                await _imageLibraryScanner.ScanLibraryAsync(libraryItem.Id);
+
+                libraryItem.ScanStatus = "Scan complete";
+            }
+            catch (Exception ex)
+            {
+                libraryItem.ScanStatus = $"Scan failed: {ex.Message}";
+            }
+            finally
+            {
+                libraryItem.IsScanning = false;
+                _scanSemaphore.Release();
+            }
+        });
+    }
+
+    public async Task RescanLibraryAsync(LibraryTreeItem libraryItem)
+    {
+        if (libraryItem.IsScanning || libraryItem.Id == 0)
+            return;
+
+        StartLibraryScan(libraryItem);
     }
 
     private void PopulateChildren(LibraryTreeItem item)
@@ -99,8 +143,13 @@ public class LeftPanelViewModel : ViewModelBase
     }
 }
 
-public class LibraryTreeItem : ViewModelBase
+public partial class LibraryTreeItem : ViewModelBase
 {
+    [ObservableProperty]
+    private bool _isScanning;
+    [ObservableProperty]
+    private string _scanStatus;
+
     public long Id { get; set; }
     public string Name { get; set; }
     public string Path { get; set; }

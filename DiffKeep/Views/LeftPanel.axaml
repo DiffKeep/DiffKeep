@@ -11,7 +11,17 @@
               KeyboardNavigation.IsTabStop="True">
         <TreeView.ItemTemplate>
             <TreeDataTemplate ItemsSource="{Binding Children}">
-                <TextBlock Text="{Binding Name}"/>
+                <StackPanel Orientation="Vertical">
+                    <TextBlock Text="{Binding Name}" />
+                    <ProgressBar IsVisible="{Binding IsScanning}"
+                                 IsIndeterminate="True"
+                                 Width="16"
+                                 Height="16"
+                                 Margin="4,0,0,0" />
+                    <TextBlock Text="{Binding ScanStatus}"
+                               IsVisible="{Binding IsScanning}"
+                               Margin="4,0,0,0" />
+                </StackPanel>
             </TreeDataTemplate>
         </TreeView.ItemTemplate>
     </TreeView>

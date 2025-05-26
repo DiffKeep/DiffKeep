@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using DiffKeep.Database;
 using DiffKeep.Extensions;
+using DiffKeep.Parsing;
 using DiffKeep.Repositories;
 using DiffKeep.ViewModels;
 using Microsoft.Data.Sqlite;
@@ -151,7 +152,11 @@ sealed class Program
             new ImageRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
         services.AddSingleton<IEmbeddingsRepository>(sp => 
             new EmbeddingsRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-
+        
+        // Register services
+        services.AddSingleton<ImageParser>();
+        services.AddSingleton<ImageLibraryScanner>();
+        services.AddSingleton<PngMetadataParser>();
         
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
@@ -161,7 +166,8 @@ sealed class Program
                 Settings
             ));
         services.AddSingleton<AboutWindowViewModel>();
-        services.AddSingleton<ImageGalleryViewModel>();
+        services.AddSingleton<ImageGalleryViewModel>(sp => 
+            new ImageGalleryViewModel(sp.GetRequiredService<IImageRepository>()));
         services.AddSingleton<ImageViewerViewModel>();
         services.AddSingleton<LeftPanelViewModel>();
 

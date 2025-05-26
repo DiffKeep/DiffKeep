@@ -100,14 +100,13 @@ public partial class ImageGalleryView : UserControl
 
     private void OpenImageViewer()
     {
-        var imageItem = new ImageItemViewModel();
         if (DataContext is ImageGalleryViewModel { SelectedImage: not null } vm)
         {
-            imageItem = vm.SelectedImage;
+            var imageItem = vm.SelectedImage;
         
-            if (string.IsNullOrEmpty(imageItem.FilePath)) return;
+            if (string.IsNullOrEmpty(imageItem.Path)) return;
             var window = new ImageViewerWindow(vm.Images, imageItem);
-        window.Show();
+            window.Show();
         }
     }
     

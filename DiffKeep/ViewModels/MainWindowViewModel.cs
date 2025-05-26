@@ -2,6 +2,7 @@
 using Avalonia.Controls;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Repositories;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,17 +25,19 @@ public partial class MainWindowViewModel : ViewModelBase
     public MainWindowViewModel()
     {
         var libraryRepository = Program.Services.GetRequiredService<ILibraryRepository>();
-        LeftPanel = new LeftPanelViewModel(libraryRepository);
-        ImageGallery = new ImageGalleryViewModel();
+        var imageRepository = Program.Services.GetRequiredService<IImageRepository>();
+        var imageLibraryScanner = Program.Services.GetRequiredService<ImageLibraryScanner>();
+        LeftPanel = new LeftPanelViewModel(libraryRepository, imageLibraryScanner);
+        ImageGallery = new ImageGalleryViewModel(imageRepository);
         _leftPanelWidth = new GridLength(250);
         
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
         {
             if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && 
-                LeftPanel.SelectedItem != null)
+                LeftPanel.SelectedItem?.Id > 0)
             {
-                await ImageGallery.LoadImagesFromDirectory(LeftPanel.SelectedItem.Path);
+                await ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id);
             }
         };
 

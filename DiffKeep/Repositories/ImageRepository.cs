@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
+using Avalonia.Media.Imaging;
 using DiffKeep.Database;
 using DiffKeep.Models;
 using Microsoft.Data.Sqlite;
@@ -19,8 +21,29 @@ public class ImageRepository : IImageRepository
     private SqliteConnection CreateConnection()
         => (SqliteConnection)_connectionFactory.CreateConnection();
 
+    private static byte[]? BitmapToBytes(Bitmap? bitmap)
+    {
+        if (bitmap == null) return null;
+        
+        using var memStream = new MemoryStream();
+        bitmap.Save(memStream);
+        return memStream.ToArray();
+    }
+
+    private static Bitmap? BytesToBitmap(byte[]? bytes)
+    {
+        if (bytes == null) return null;
+        
+        using var memStream = new MemoryStream(bytes);
+        return new Bitmap(memStream);
+    }
+
     private static Image ReadImage(SqliteDataReader reader)
     {
+        var thumbnailBytes = reader.IsDBNull(reader.GetOrdinal("Thumbnail")) 
+            ? null 
+            : reader.GetValue<byte[]>("Thumbnail");
+
         return new Image
         {
             Id = reader.GetValue<long>("Id"),
@@ -30,7 +53,10 @@ public class ImageRepository : IImageRepository
             PositivePrompt = reader.GetValue<string>("PositivePrompt"),
             NegativePrompt = reader.GetValue<string>("NegativePrompt"),
             Description = reader.GetValue<string>("Description"),
-            Created = reader.GetValue<DateTime>("Created")
+            Created = reader.GetValue<string>("Created") != null
+                ? DateTime.Parse(reader.GetValue<string>("Created"))
+                : DateTime.MinValue,
+            Thumbnail = BytesToBitmap(thumbnailBytes)
         };
     }
 
@@ -90,8 +116,8 @@ public class ImageRepository : IImageRepository
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
         command.CommandText = @"
-            INSERT INTO Images (LibraryId, Path, Hash, PositivePrompt, NegativePrompt, Description, Created)
-            VALUES (@LibraryId, @Path, @Hash, @PositivePrompt, @NegativePrompt, @Description, @Created)
+            INSERT INTO Images (LibraryId, Path, Hash, PositivePrompt, NegativePrompt, Description, Created, Thumbnail)
+            VALUES (@LibraryId, @Path, @Hash, @PositivePrompt, @NegativePrompt, @Description, @Created, @Thumbnail)
             RETURNING Id";
 
         command.CreateParameter("@LibraryId", image.LibraryId);
@@ -101,8 +127,19 @@ public class ImageRepository : IImageRepository
         command.CreateParameter("@NegativePrompt", (object?)image.NegativePrompt ?? DBNull.Value);
         command.CreateParameter("@Description", (object?)image.Description ?? DBNull.Value);
         command.CreateParameter("@Created", image.Created);
+        command.CreateParameter("@Thumbnail", (object?)BitmapToBytes(image.Thumbnail) ?? DBNull.Value);
 
         return await command.ExecuteScalarAsync<long>();
+    }
+    
+    public async Task DeleteAsync(long id)
+    {
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM Images WHERE Id = @Id";
+        command.CreateParameter("@Id", id);
+
+        await command.ExecuteNonQueryAsync();
     }
 
     public async Task UpdateAsync(Image image)
@@ -117,7 +154,8 @@ public class ImageRepository : IImageRepository
                 PositivePrompt = @PositivePrompt,
                 NegativePrompt = @NegativePrompt,
                 Description = @Description,
-                Created = @Created
+                Created = @Created,
+                Thumbnail = @Thumbnail,
             WHERE Id = @Id";
 
         command.CreateParameter("@Id", image.Id);
@@ -128,16 +166,23 @@ public class ImageRepository : IImageRepository
         command.CreateParameter("@NegativePrompt", (object?)image.NegativePrompt ?? DBNull.Value);
         command.CreateParameter("@Description", (object?)image.Description ?? DBNull.Value);
         command.CreateParameter("@Created", image.Created);
+        command.CreateParameter("@Thumbnail", (object?)BitmapToBytes(image.Thumbnail) ?? DBNull.Value);
 
         await command.ExecuteNonQueryAsync();
     }
 
-    public async Task DeleteAsync(long id)
+    // Add method to update just the thumbnail
+    public async Task UpdateThumbnailAsync(long imageId, Bitmap? thumbnail)
     {
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM Images WHERE Id = @Id";
-        command.CreateParameter("@Id", id);
+        command.CommandText = @"
+            UPDATE Images 
+            SET Thumbnail = @Thumbnail
+            WHERE Id = @Id";
+
+        command.CreateParameter("@Id", imageId);
+        command.CreateParameter("@Thumbnail", (object?)BitmapToBytes(thumbnail) ?? DBNull.Value);
 
         await command.ExecuteNonQueryAsync();
     }

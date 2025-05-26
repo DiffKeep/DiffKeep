@@ -1,4 +1,5 @@
 using System;
+using Avalonia.Media.Imaging;
 
 namespace DiffKeep.Models;
 
@@ -12,6 +13,7 @@ public class Image
     public string? NegativePrompt { get; set; }
     public string? Description { get; set; }
     public DateTime Created { get; set; }
+    public Bitmap? Thumbnail { get; set; }
     
     // Navigation property
     public Library? Library { get; set; }

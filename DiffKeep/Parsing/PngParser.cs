@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using NetVips;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace DiffKeep.Parsing;
 
@@ -115,6 +116,11 @@ public class PngMetadataParser : IImageParser
         }
 
         return result;
+    }
+
+    public async Task<ImageMetadata> ParseImageAsync(string filePath)
+    {
+        return await Task.Run(() => ParseImage(filePath));
     }
 
     private static GenerationTool DetectGenerationTool(List<KeyValuePair<string, string?>> metadata)

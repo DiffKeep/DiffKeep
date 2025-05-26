@@ -67,12 +67,13 @@ public partial class ImageViewerViewModel : ViewModelBase
         Debug.Print($"Loading image {_currentIndex}");
         var currentItem = _allImages[_currentIndex];
         ImageSource?.Dispose();
-        ImageSource = new Bitmap(currentItem.FilePath!);
-        ImageName = currentItem.FileName ?? string.Empty;
-        ImageFilePath = currentItem.FilePath ?? string.Empty;
+        ImageSource = new Bitmap(currentItem.Path);
+        // get the file name from the path
+        ImageName = Path.GetFileName(currentItem.Path);
+        ImageFilePath = currentItem.Path;
         
         // Add file info
-        var fileInfo = new FileInfo(currentItem.FilePath!);
+        var fileInfo = new FileInfo(currentItem.Path);
         FileSize = $"{fileInfo.Length / 1024:N0} KB";
         ImageDimensions = $"{ImageSource.PixelSize.Width} × {ImageSource.PixelSize.Height}";
         
@@ -84,11 +85,9 @@ public partial class ImageViewerViewModel : ViewModelBase
 
     private async Task LoadImageMetadataAsync()
     {
-        if (_allImages[_currentIndex].FilePath == null) return;
-
         try
         {
-            var result = await Task.Run(() => _imageParser.ParseImage(_allImages[_currentIndex].FilePath!));
+            var result = await Task.Run(() => _imageParser.ParseImage(_allImages[_currentIndex].Path));
         
             DetectedTool = result.Tool?.ToString() ?? "Unknown Tool";
             GenerationPrompt = result.Prompt ?? "No prompt found";
