@@ -4,14 +4,21 @@ using System.IO;
 using System.CommandLine;
 using System.Diagnostics;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using DiffKeep.Settings;
 using System.Text.Json;
+using System.Threading.Tasks;
 using DiffKeep.Database;
+using DiffKeep.Extensions;
+using DiffKeep.Repositories;
+using DiffKeep.ViewModels;
+using Microsoft.Data.Sqlite;
 
 namespace DiffKeep;
 
 sealed class Program
 {
+    public static IServiceProvider Services { get; private set; }
     public static IConfiguration Configuration { get; private set; }
     public static AppSettings Settings { get; set; }
     public static string DataPath { get; private set; }
@@ -32,19 +39,35 @@ sealed class Program
             () => DefaultDataPath,
             "Directory where application data and configuration will be stored"
         );
+        
+        var deleteDbOption = new Option<bool>(
+            new[] { "--delete-db" },
+            "Delete the existing database and create a new one on startup"
+        );
 
         var rootCommand = new RootCommand("DiffKeep - Manage AI generated assets")
         {
-            dataPathOption
+            dataPathOption,
+            deleteDbOption
         };
 
         DataPath = DefaultDataPath;
-
-        rootCommand.SetHandler((dataPath) =>
+        
+        rootCommand.SetHandler((dataPath, deleteDb) =>
         {
             Debug.Print($"Data path: {dataPath}");
             DataPath = dataPath;
-        }, dataPathOption);
+            
+            if (deleteDb)
+            {
+                var dbPath = Path.Combine(dataPath, DbFilename);
+                if (File.Exists(dbPath))
+                {
+                    File.Delete(dbPath);
+                    Debug.Print("Existing database deleted");
+                }
+            }
+        }, dataPathOption, deleteDbOption);
 
         rootCommand.Invoke(args);
 
@@ -82,7 +105,7 @@ sealed class Program
 
         ReloadConfiguration();
         
-        DatabaseInitializer.Initialize(dbPath);
+        ConfigureServices().FireAndForget();
     }
 
     public static void ReloadConfiguration()
@@ -103,4 +126,46 @@ sealed class Program
             .UsePlatformDetect()
             .WithInterFont()
             .LogToTrace();
+    
+    private static async Task ConfigureServices()
+    {
+        var services = new ServiceCollection();
+        
+        var dbPath = Path.Combine(DataPath, DbFilename);
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadWriteCreate
+        }.ToString();
+
+        var connectionFactory = new DatabaseConnectionFactory(connectionString);
+        await connectionFactory.InitializeAsync();
+
+        services.AddSingleton(connectionFactory);
+
+
+        // Register repositories with the connection factory
+        services.AddSingleton<ILibraryRepository>(sp => 
+            new LibraryRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
+        services.AddSingleton<IImageRepository>(sp => 
+            new ImageRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
+        services.AddSingleton<IEmbeddingsRepository>(sp => 
+            new EmbeddingsRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
+
+        
+        // Register view models
+        services.AddSingleton<MainWindowViewModel>();
+        services.AddTransient<SettingsViewModel>(sp => 
+            new SettingsViewModel(
+                sp.GetRequiredService<ILibraryRepository>(),
+                Settings
+            ));
+        services.AddSingleton<AboutWindowViewModel>();
+        services.AddSingleton<ImageGalleryViewModel>();
+        services.AddSingleton<ImageViewerViewModel>();
+        services.AddSingleton<LeftPanelViewModel>();
+
+        Services = services.BuildServiceProvider();
+    }
+
 }

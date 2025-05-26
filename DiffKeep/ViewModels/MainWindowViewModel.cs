@@ -2,6 +2,9 @@
 using Avalonia.Controls;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using DiffKeep.Extensions;
+using DiffKeep.Repositories;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace DiffKeep.ViewModels;
 
@@ -20,7 +23,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public MainWindowViewModel()
     {
-        LeftPanel = new LeftPanelViewModel();
+        var libraryRepository = Program.Services.GetRequiredService<ILibraryRepository>();
+        LeftPanel = new LeftPanelViewModel(libraryRepository);
         ImageGallery = new ImageGalleryViewModel();
         _leftPanelWidth = new GridLength(250);
         
@@ -38,7 +42,7 @@ public partial class MainWindowViewModel : ViewModelBase
     
     public void RefreshLibraries()
     {
-        LeftPanel.RefreshLibraries();
+        LeftPanel.RefreshLibrariesAsync().FireAndForget();
     }
 
     partial void OnLeftPanelWidthChanged(GridLength value)

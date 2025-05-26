@@ -20,7 +20,6 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Folder Include="Models\" />
         <AvaloniaResource Include="Assets\**" />
         <TrimmerRootDescriptor Include="Roots.xml" />
     </ItemGroup>
@@ -38,6 +37,7 @@
         </PackageReference>
         <PackageReference Include="Avalonia.Themes.Simple" Version="11.3.0" />
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.1" />
+        <PackageReference Include="Dapper" Version="2.1.66" />
         <PackageReference Include="GitInfo" Version="3.5.0">
           <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
           <PrivateAssets>all</PrivateAssets>
@@ -46,6 +46,7 @@
         <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.5" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.5" />
         <PackageReference Include="NetVips" Version="3.0.1" />
         <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" />
         <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
@@ -95,4 +96,7 @@
         </EmbeddedResource>
     </ItemGroup>
 
+    <ItemGroup>
+        <EmbeddedResource Include="Scripts/*.sql" />
+    </ItemGroup>
 </Project>

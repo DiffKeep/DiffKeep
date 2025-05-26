@@ -1,3 +1,4 @@
+using System;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
@@ -6,14 +7,19 @@ using System.Linq;
 using Avalonia.Markup.Xaml;
 using DiffKeep.ViewModels;
 using DiffKeep.Views;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace DiffKeep;
 
 public partial class App : Application
 {
+    public new static App Current => (App)Application.Current!;
+    public IServiceProvider Services { get; private set; }
+
     public override void Initialize()
     {
         AvaloniaXamlLoader.Load(this);
+        Services = Program.Services;
     }
 
     public override void OnFrameworkInitializationCompleted()
@@ -25,7 +31,7 @@ public partial class App : Application
             DisableAvaloniaDataAnnotationValidation();
             desktop.MainWindow = new MainWindow
             {
-                DataContext = new MainWindowViewModel(),
+                DataContext = Services.GetRequiredService<MainWindowViewModel>()
             };
         }
 
@@ -44,4 +50,8 @@ public partial class App : Application
             BindingPlugins.DataValidators.Remove(plugin);
         }
     }
+    
+    // Helper method to get services from anywhere in the app
+    public static T GetService<T>() where T : notnull
+        => Current.Services.GetRequiredService<T>();
 }

@@ -1,13 +1,18 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
+using DiffKeep.Repositories;
+using DiffKeep.Extensions;
 
 namespace DiffKeep.ViewModels;
 
 public class LeftPanelViewModel : ViewModelBase
 {
+    private readonly ILibraryRepository _libraryRepository;
     private ObservableCollection<LibraryTreeItem> _items;
     private LibraryTreeItem _selectedItem;
+
     public LibraryTreeItem SelectedItem
     {
         get => _selectedItem;
@@ -20,34 +25,51 @@ public class LeftPanelViewModel : ViewModelBase
         set => SetProperty(ref _items, value);
     }
     
-    public LeftPanelViewModel()
+    public LeftPanelViewModel(ILibraryRepository libraryRepository)
     {
+        _libraryRepository = libraryRepository;
         _items = new ObservableCollection<LibraryTreeItem>();
-        InitializeTreeItems();
+        InitializeTreeItemsAsync().FireAndForget();
     }
     
-    public void RefreshLibraries()
+    public async Task RefreshLibrariesAsync()
     {
         Items.Clear();
-        InitializeTreeItems();
+        await InitializeTreeItemsAsync();
     }
 
-    private void InitializeTreeItems()
+    private async Task InitializeTreeItemsAsync()
     {
-        foreach (var libraryPath in Program.Settings.Libraries)
+        var libraries = await _libraryRepository.GetAllAsync();
+        
+        // Create the top-level "Libraries" item
+        var librariesRoot = new LibraryTreeItem
         {
-            if (!Directory.Exists(libraryPath))
+            Name = "Libraries",
+            Path = "", // Empty path for root
+            IsExpanded = true // Auto-expand the Libraries node
+        };
+
+        foreach (var library in libraries)
+        {
+            if (!Directory.Exists(library.Path))
                 continue;
 
             var libraryItem = new LibraryTreeItem
             {
-                Name = Path.GetFileName(libraryPath) + (string.IsNullOrEmpty(libraryPath) ? "" : $" ({libraryPath})"),
-                Path = libraryPath,
+                Id = library.Id,
+                Name = Path.GetFileName(library.Path) + (string.IsNullOrEmpty(library.Path) ? "" : $" ({library.Path})"),
+                Path = library.Path,
             };
 
             PopulateChildren(libraryItem);
-            Items.Add(libraryItem);
+            librariesRoot.Children.Add(libraryItem);
         }
+
+        Items.Add(librariesRoot);
+        
+        // Auto-select the Libraries node
+        SelectedItem = librariesRoot;
     }
 
     private void PopulateChildren(LibraryTreeItem item)
@@ -79,6 +101,7 @@ public class LeftPanelViewModel : ViewModelBase
 
 public class LibraryTreeItem : ViewModelBase
 {
+    public long Id { get; set; }
     public string Name { get; set; }
     public string Path { get; set; }
     public ObservableCollection<LibraryTreeItem> Children { get; } = new();

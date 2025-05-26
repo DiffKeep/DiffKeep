@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
 using DiffKeep.ViewModels;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace DiffKeep.Views;
 
@@ -123,7 +124,12 @@ public partial class MainWindow : Window
     
     private async void ShowSettingsDialog(object? sender, RoutedEventArgs e)
     {
-        var dialog = new SettingsWindow();
+        var settingsVm = Program.Services.GetRequiredService<SettingsViewModel>();
+        var dialog = new SettingsWindow
+        {
+            DataContext = settingsVm
+        };
+
         await dialog.ShowDialog(this);
     
         // After settings are updated, refresh the libraries
