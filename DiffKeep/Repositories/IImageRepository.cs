@@ -7,6 +7,7 @@ namespace DiffKeep.Repositories;
 
 public interface IImageRepository
 {
+    Task<IEnumerable<Image>> GetAllAsync();
     Task<Image?> GetByIdAsync(long id);
     Task<Image?> GetByPathAsync(long libraryId, string path);
     Task<Image?> GetByHashAsync(string hash);

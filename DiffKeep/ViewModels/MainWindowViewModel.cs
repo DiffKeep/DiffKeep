@@ -34,13 +34,11 @@ public partial class MainWindowViewModel : ViewModelBase
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
         {
-            if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && 
-                LeftPanel.SelectedItem?.Id > 0)
+            if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem))
             {
                 await ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id);
             }
         };
-
     }
     
     public void RefreshLibraries()

@@ -61,6 +61,20 @@ public class ImageRepository : IImageRepository
         };
     }
 
+    public async Task<IEnumerable<Image>> GetAllAsync()
+    {
+        var images = new List<Image>();
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM Images";
+        using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            images.Add(ReadImage(reader));
+        }
+        return images;
+    }
+    
     public async Task<Image?> GetByIdAsync(long id)
     {
         using var connection = CreateConnection();

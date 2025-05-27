@@ -1,15 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
-using System.IO;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.ComponentModel;
-using DiffKeep.Models;
-using DiffKeep.Repositories;
-using NetVips;
-using System.Threading;
 using DiffKeep.Extensions;
+using DiffKeep.Repositories;
+using Image = DiffKeep.Models.Image;
 
 namespace DiffKeep.ViewModels;
 
@@ -36,15 +33,24 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _imageRepository = imageRepository;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "fixme";
+        LoadImagesForLibraryAsync(null).FireAndForget();
     }
 
-    public async Task LoadImagesForLibraryAsync(long libraryId)
+    public async Task LoadImagesForLibraryAsync(long? libraryId)
     {
         _currentLibraryId = libraryId;
         Images.Clear();
 
-        var dbImages = await _imageRepository.GetByLibraryIdAsync(libraryId);
-        
+        IEnumerable<Image> dbImages;
+        if (libraryId == null)
+        {
+            dbImages = await _imageRepository.GetAllAsync();
+        }
+        else
+        {
+            dbImages = await _imageRepository.GetByLibraryIdAsync((long)libraryId);
+        }
+
         foreach (var image in dbImages)
         {
             var viewModel = new ImageItemViewModel(image);

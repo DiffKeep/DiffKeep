@@ -11,19 +11,14 @@ using System;
 
 namespace DiffKeep.ViewModels;
 
-public class LeftPanelViewModel : ViewModelBase
+public partial class LeftPanelViewModel : ViewModelBase
 {
     private readonly ILibraryRepository _libraryRepository;
     private readonly ImageLibraryScanner _imageLibraryScanner;
     private ObservableCollection<LibraryTreeItem> _items;
+    [ObservableProperty]
     private LibraryTreeItem _selectedItem;
     private readonly SemaphoreSlim _scanSemaphore = new(1, 1);
-
-    public LibraryTreeItem SelectedItem
-    {
-        get => _selectedItem;
-        set => SetProperty(ref _selectedItem, value);
-    }
     
     public ObservableCollection<LibraryTreeItem> Items
     {
@@ -120,13 +115,15 @@ public class LeftPanelViewModel : ViewModelBase
     {
         Task.Run(async () =>
         {
+            if (libraryItem.Id == null)
+                return;
             try
             {
                 await _scanSemaphore.WaitAsync();
                 libraryItem.IsScanning = true;
                 libraryItem.ScanStatus = "Scanning...";
 
-                await _imageLibraryScanner.ScanLibraryAsync(libraryItem.Id);
+                await _imageLibraryScanner.ScanLibraryAsync((long)libraryItem.Id);
 
                 libraryItem.ScanStatus = "Scan complete";
             }
@@ -189,12 +186,14 @@ public partial class LibraryTreeItem : ViewModelBase
     private int _totalFiles;
     [ObservableProperty]
     private double _scanProgress;
+    [ObservableProperty]
+    private bool _isExpanded;
+    [ObservableProperty]
+    private bool _isSelected;
 
 
-    public long Id { get; set; }
+    public long? Id { get; set; }
     public string Name { get; set; }
     public string Path { get; set; }
     public ObservableCollection<LibraryTreeItem> Children { get; } = new();
-    public bool IsExpanded { get; set; }
-    public bool IsSelected { get; set; }
 }
