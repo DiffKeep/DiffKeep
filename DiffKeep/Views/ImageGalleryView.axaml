@@ -26,7 +26,7 @@
             <ComboBox Grid.Column="1"
                       Width="120"
                       SelectedItem="{Binding CurrentSortOption}"
-                      Margin="10,0,0,0">
+                      Margin="10,0,10,0">
                 <ComboBox.Items>
                     <repositories:ImageSortOption>NewestFirst</repositories:ImageSortOption>
                     <repositories:ImageSortOption>OldestFirst</repositories:ImageSortOption>

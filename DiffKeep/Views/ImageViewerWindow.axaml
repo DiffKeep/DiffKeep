@@ -167,11 +167,26 @@
                                     <TextBlock Text="{Binding DetectedTool}"
                                                Foreground="LightGray"
                                                FontStyle="Italic" />
-                                    <TextBlock Text="Image Prompt:"
-                                           Foreground="White"/>
-                                    <TextBlock Text="{Binding GenerationPrompt}"
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="Image Prompt:"
+                                                   Foreground="White"/>
+                                        <Button Grid.Column="1"
+                                                Width="24"
+                                                Height="24"
+                                                Margin="4,0,0,0"
+                                                Command="{Binding CopyPromptCommand}"
+                                                ToolTip.Tip="Copy prompt to clipboard">
+                                            <PathIcon Data="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/>
+                                        </Button>
+                                    </Grid>
+
+                                    <SelectableTextBlock Text="{Binding GenerationPrompt}"
                                                Foreground="LightGray"
-                                               TextWrapping="Wrap" />
+                                               TextWrapping="Wrap"/>
                                 </StackPanel>
 
                                 <!-- Raw Metadata -->
@@ -181,18 +196,16 @@
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate>
                                                 <Grid ColumnDefinitions="Auto,*" Margin="0,2">
-                                                    <TextBlock Grid.Column="0"
+                                                    <SelectableTextBlock Grid.Column="0"
                                                                Text="{Binding Key}"
                                                                Foreground="White"
                                                                FontWeight="SemiBold"
                                                                Margin="0,0,8,0" />
-                                                    <TextBox Grid.Column="1"
+                                                    <SelectableTextBlock Grid.Column="1"
                                                              Text="{Binding Value}"
                                                              Foreground="LightGray"
-                                                             IsReadOnly="True"
                                                              TextWrapping="Wrap"
                                                              Background="Transparent"
-                                                             BorderThickness="0"
                                                              Padding="0" />
                                                 </Grid>
                                             </DataTemplate>

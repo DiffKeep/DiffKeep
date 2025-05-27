@@ -9,6 +9,9 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using System.Linq;
+using System.Threading;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 
 namespace DiffKeep.ViewModels;
 
@@ -60,6 +63,51 @@ public partial class ImageViewerViewModel : ViewModelBase
         _currentIndex = images.IndexOf(currentImage);
         _imageParser = new ImageParser(); // Composite parser that handles all formats
         LoadCurrentImage();
+    }
+    
+    [RelayCommand]
+    private async Task CopyPrompt()
+    {
+        Debug.Print("Copying prompt to clipboard");
+        if (string.IsNullOrEmpty(GenerationPrompt)) return;
+
+        if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            Debug.Print("Got desktop lifetime");
+            var clipboard = TopLevel.GetTopLevel(desktop.MainWindow)?.Clipboard;
+            if (clipboard != null)
+            {
+                Debug.Print("Got clipboard");
+                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
+                try
+                {
+                    var clipboardTask = clipboard.SetTextAsync(GenerationPrompt);
+                    var timeoutTask = Task.Delay(-1, cts.Token);
+
+                    var completedTask = await Task.WhenAny(clipboardTask, timeoutTask);
+                    if (completedTask == clipboardTask)
+                    {
+                        Debug.Print($"Copied text: {GenerationPrompt}");
+                    }
+                    else
+                    {
+                        Debug.Print("Clipboard operation timed out, but may have succeeded");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Debug.Print("Clipboard operation timed out, but may have succeeded");
+                }
+                catch (Exception ex)
+                {
+                    Debug.Print($"Clipboard operation failed: {ex}");
+                }
+            }
+            else
+            {
+                Debug.Print("Clipboard was null");
+            }
+        }
     }
 
     private async void LoadCurrentImage()
