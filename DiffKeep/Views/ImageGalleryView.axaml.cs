@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Threading;
 using DiffKeep.ViewModels;
@@ -14,6 +17,7 @@ public partial class ImageGalleryView : UserControl
 {
     private ItemsRepeater? _itemsRepeater;
     private ImageGalleryViewModel? _currentViewModel;
+    private ScrollViewer? _scrollViewer;
 
     public ImageGalleryView()
     {
@@ -29,13 +33,42 @@ public partial class ImageGalleryView : UserControl
                 if (_currentViewModel != null)
                 {
                     _currentViewModel.ImagesCollectionChanged -= OnImagesCollectionChanged;
+                    _currentViewModel.ResetScrollRequested -= ResetScroll;
                 }
 
                 _currentViewModel = vm;
                 vm.ImagesCollectionChanged += OnImagesCollectionChanged;
+                vm.ResetScrollRequested += ResetScroll;
             }
         };
-
+    }
+    
+    private void ScrollViewer_OnLoaded(object? sender, RoutedEventArgs e)
+    {
+        Debug.WriteLine("ScrollViewer loaded");
+        _scrollViewer = sender as ScrollViewer;
+    }
+    
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(ImageGalleryViewModel.Images))
+        {
+            Debug.WriteLine("Images collection changed - updating scrollviewer");
+            // Use dispatcher to ensure this runs after the UI has updated
+            Dispatcher.UIThread.Post(() =>
+            {
+                _scrollViewer?.ScrollToHome();
+            }, DispatcherPriority.Background);
+        }
+    }
+    
+    private void ResetScroll()
+    {
+        if (this.GetControl<ScrollViewer>("ScrollViewer") is ScrollViewer scrollViewer)
+        {
+            Debug.WriteLine("Resetting scroll");
+            scrollViewer.ScrollToHome();
+        }
     }
     
     private void OnImagesCollectionChanged(object? sender, EventArgs e)
@@ -169,6 +202,7 @@ public partial class ImageGalleryView : UserControl
     private void ScrollDebounceTimer_Tick(object? sender, EventArgs e)
     {
         _scrollDebounceTimer?.Stop();
+        Debug.WriteLine("Scroll debounce timer fired");
         UpdateVisibleThumbnails();
     }
 

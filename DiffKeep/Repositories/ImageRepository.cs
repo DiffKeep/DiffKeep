@@ -61,12 +61,22 @@ public class ImageRepository : IImageRepository
         };
     }
 
-    public async Task<IEnumerable<Image>> GetAllAsync()
+    public async Task<IEnumerable<Image>> GetAllAsync(ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         var images = new List<Image>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM Images";
+        
+        var orderBy = sortOption switch
+        {
+            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
+            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
+            ImageSortOption.NameAscending => "ORDER BY Path ASC",
+            ImageSortOption.NameDescending => "ORDER BY Path DESC",
+            _ => "ORDER BY Created DESC"
+        };
+        
+        command.CommandText = $"SELECT * FROM Images {orderBy}";
         using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
@@ -86,11 +96,21 @@ public class ImageRepository : IImageRepository
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
-    public async Task<Image?> GetByPathAsync(long libraryId, string path)
+    public async Task<Image?> GetByPathAsync(long libraryId, string path, ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path = @Path";
+        
+        var orderBy = sortOption switch
+        {
+            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
+            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
+            ImageSortOption.NameAscending => "ORDER BY Path ASC",
+            ImageSortOption.NameDescending => "ORDER BY Path DESC",
+            _ => "ORDER BY Created DESC"
+        };
+        
+        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path = @Path {orderBy}";
         command.CreateParameter("@LibraryId", libraryId);
         command.CreateParameter("@Path", path);
 
@@ -109,12 +129,22 @@ public class ImageRepository : IImageRepository
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
-    public async Task<IEnumerable<Image>> GetByLibraryIdAsync(long libraryId)
+    public async Task<IEnumerable<Image>> GetByLibraryIdAsync(long libraryId, ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         var images = new List<Image>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM Images WHERE LibraryId = @LibraryId";
+        
+        var orderBy = sortOption switch
+        {
+            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
+            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
+            ImageSortOption.NameAscending => "ORDER BY Path ASC",
+            ImageSortOption.NameDescending => "ORDER BY Path DESC",
+            _ => "ORDER BY Created DESC"
+        };
+        
+        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId {orderBy}";
         command.CreateParameter("@LibraryId", libraryId);
 
         using var reader = await command.ExecuteReaderAsync();
@@ -126,12 +156,22 @@ public class ImageRepository : IImageRepository
         return images;
     }
     
-    public async Task<IEnumerable<Image>> GetByLibraryIdAndPathAsync(long libraryId, string path)
+    public async Task<IEnumerable<Image>> GetByLibraryIdAndPathAsync(long libraryId, string path, ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         var images = new List<Image>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%'";
+        
+        var orderBy = sortOption switch
+        {
+            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
+            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
+            ImageSortOption.NameAscending => "ORDER BY Path ASC",
+            ImageSortOption.NameDescending => "ORDER BY Path DESC",
+            _ => "ORDER BY Created DESC"
+        };
+
+        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%' {orderBy}";
         command.CreateParameter("@LibraryId", libraryId);
         command.CreateParameter("@Path", path);
         using var reader = await command.ExecuteReaderAsync();
