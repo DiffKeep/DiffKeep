@@ -36,7 +36,10 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem))
             {
-                await ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id);
+                if (LeftPanel.SelectedItem.IsLibrary)
+                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id).FireAndForget();
+                else
+                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id, LeftPanel.SelectedItem.Path).FireAndForget();
             }
         };
     }

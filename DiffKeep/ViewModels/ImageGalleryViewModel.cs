@@ -32,11 +32,11 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         _imageRepository = imageRepository;
         _images = new ObservableCollection<ImageItemViewModel>();
-        _currentDirectory = "fixme";
+        _currentDirectory = "";
         LoadImagesForLibraryAsync(null).FireAndForget();
     }
 
-    public async Task LoadImagesForLibraryAsync(long? libraryId)
+    public async Task LoadImagesForLibraryAsync(long? libraryId, string? path = null)
     {
         _currentLibraryId = libraryId;
         Images.Clear();
@@ -45,10 +45,17 @@ public partial class ImageGalleryViewModel : ViewModelBase
         if (libraryId == null)
         {
             dbImages = await _imageRepository.GetAllAsync();
+            CurrentDirectory = "All Libraries";
+        }
+        else if (path == null)
+        {
+            dbImages = await _imageRepository.GetByLibraryIdAsync((long)libraryId);
+            CurrentDirectory = "Library ID #" + libraryId;
         }
         else
         {
-            dbImages = await _imageRepository.GetByLibraryIdAsync((long)libraryId);
+            dbImages = await _imageRepository.GetByLibraryIdAndPathAsync((long)libraryId, path);
+            CurrentDirectory = path;
         }
 
         foreach (var image in dbImages)

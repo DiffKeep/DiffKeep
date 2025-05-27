@@ -125,6 +125,22 @@ public class ImageRepository : IImageRepository
 
         return images;
     }
+    
+    public async Task<IEnumerable<Image>> GetByLibraryIdAndPathAsync(long libraryId, string path)
+    {
+        var images = new List<Image>();
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%'";
+        command.CreateParameter("@LibraryId", libraryId);
+        command.CreateParameter("@Path", path);
+        using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            images.Add(ReadImage(reader));
+        }
+        return images;
+    }
 
     public async Task<long> AddAsync(Image image)
     {
