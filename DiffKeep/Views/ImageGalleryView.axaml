@@ -20,6 +20,7 @@
             <TextBlock Grid.Column="0"
                        Text="{Binding CurrentDirectory}"
                        VerticalAlignment="Center"
+                       Margin="15, 0, 0, 0"
                        IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}" />
 
             <!-- Sort dropdown -->
