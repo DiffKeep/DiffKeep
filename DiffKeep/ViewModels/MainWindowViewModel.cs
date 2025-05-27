@@ -34,12 +34,12 @@ public partial class MainWindowViewModel : ViewModelBase
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
         {
-            if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem))
+            if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && LeftPanel.SelectedItem != null)
             {
                 if (LeftPanel.SelectedItem.IsLibrary)
-                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id).FireAndForget();
+                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem).FireAndForget();
                 else
-                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem.Id, LeftPanel.SelectedItem.Path).FireAndForget();
+                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem).FireAndForget();
             }
         };
     }

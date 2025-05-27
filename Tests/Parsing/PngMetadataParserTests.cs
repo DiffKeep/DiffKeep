@@ -7,16 +7,17 @@ public class PngMetadataParserTests
     private const string ExpectedPrompt = "this is the prompt text! it has lots of cool stuff in it";
 
     [Theory]
-    [InlineData("comfyui-test.png", ImageGenerationTool.ComfyUI)]
-    [InlineData("automatic1111-test.png", ImageGenerationTool.Automatic1111)]
-    //[InlineData("fooocus-test.png", ImageGenerationTool.Fooocus)]
-    public void ParseImage_DetectsCorrectTool(string imageFile, ImageGenerationTool expectedTool)
+    [InlineData("comfyui-test.png", GenerationTool.ComfyUI)]
+    [InlineData("automatic1111-test.png", GenerationTool.Automatic1111)]
+    //[InlineData("fooocus-test.png", GenerationTool.Fooocus)]
+    public void ParseImage_DetectsCorrectTool(string imageFile, GenerationTool expectedTool)
     {
         // Arrange
         var imagePath = Path.Combine(GetArtifactDirectory(), imageFile);
+        var parser = new PngMetadataParser();
 
         // Act
-        var metadata = PngMetadataParser.ParseImage(imagePath);
+        var metadata = parser.ParseImage(imagePath);
 
         // Assert
         Assert.Equal(expectedTool, metadata.Tool);
@@ -33,9 +34,10 @@ public class PngMetadataParserTests
     {
         // Arrange
         var imagePath = Path.Combine(GetArtifactDirectory(), imageFile);
+        var parser = new PngMetadataParser();
 
         // Act
-        var metadata = PngMetadataParser.ParseImage(imagePath);
+        var metadata = parser.ParseImage(imagePath);
 
         // Assert
         Assert.StartsWith("A young anime-style woman stands at a castle", metadata.Prompt);
@@ -44,8 +46,9 @@ public class PngMetadataParserTests
     [Fact]
     public void ParseImage_WithNonexistentFile_ThrowsFileNotFoundException()
     {
+        var parser = new PngMetadataParser();
         Assert.Throws<NetVips.VipsException>(() => 
-            PngMetadataParser.ParseImage("nonexistent.png"));
+            parser.ParseImage("nonexistent.png"));
     }
 
     [Fact]
@@ -53,9 +56,10 @@ public class PngMetadataParserTests
     {
         var invalidPngPath = Path.GetTempFileName();
         File.WriteAllText(invalidPngPath, "not a png");
+        var parser = new PngMetadataParser();
         
         Assert.ThrowsAny<Exception>(() => 
-            PngMetadataParser.ParseImage(invalidPngPath));
+            parser.ParseImage(invalidPngPath));
         
         File.Delete(invalidPngPath);
     }

@@ -196,8 +196,8 @@ public partial class LibraryTreeItem : ViewModelBase
 
 
     public long? Id { get; set; }
-    public string Name { get; set; }
-    public string Path { get; set; }
+    public string? Name { get; set; }
+    public string? Path { get; set; }
     public bool IsLibrary { get; set; }
     public ObservableCollection<LibraryTreeItem> Children { get; } = new();
 }

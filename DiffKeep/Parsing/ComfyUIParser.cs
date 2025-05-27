@@ -121,9 +121,30 @@ public class ComfyUIParser : IPromptParser
             }
 
             // Check for CLIP/T5 inputs with widget values
-            if (HasInputOfType(currentNode, "CLIP") || HasInputOfType(currentNode, "T5"))
+            if (
+                (HasInputOfType(currentNode, "CLIP") || HasInputOfType(currentNode, "T5"))
+                && !HasInputOfType(currentNode, "CONDITIONING")
+                )
             {
-                if (currentNode.TryGetProperty("widgets_values", out var values) &&
+                if (HasInputOfType(currentNode, "STRING"))
+                {
+                    // clip encode but the text for it is coming from another node
+                    var nextNodeId = FollowInput(currentNode, "STRING");
+                    if (nextNodeId.HasValue)
+                    {
+                        var nextNode = FindNodeById(nextNodeId.Value);
+                        if (nextNode.HasValue)
+                        {
+                            if (nextNode.Value.TryGetProperty("widgets_values", out var vals)
+                                && vals.GetArrayLength() > 0)
+                            {
+                                return vals[0].GetString();
+                            }
+                            
+                        }
+                    }
+                }
+                else if (currentNode.TryGetProperty("widgets_values", out var values) &&
                     values.GetArrayLength() > 0)
                 {
                     return values[0].GetString();

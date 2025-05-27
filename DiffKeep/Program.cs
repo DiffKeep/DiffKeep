@@ -80,7 +80,7 @@ sealed class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Error: {ex.Message}");
+            Console.Error.WriteLine($"Error: {ex}");
             Environment.Exit(1);
         }
     }

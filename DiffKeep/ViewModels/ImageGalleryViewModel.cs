@@ -19,6 +19,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
     private string? _currentPath;
+    private string? _currentName;
     public event EventHandler? ImagesCollectionChanged;
     public event Action? ResetScrollRequested;
     
@@ -44,31 +45,37 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _imageRepository = imageRepository;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
-        LoadImagesForLibraryAsync(null).FireAndForget();
+        LoadImagesForLibraryAsync(new LibraryTreeItem
+        {
+            Id = _currentLibraryId,
+            Path = _currentPath,
+            Name = _currentName,
+        }).FireAndForget();
     }
 
-    public async Task LoadImagesForLibraryAsync(long? libraryId, string? path = null)
+    public async Task LoadImagesForLibraryAsync(LibraryTreeItem item)
     {
-        Debug.WriteLine($"Loading images for library {libraryId}, path: {path}");
-        _currentLibraryId = libraryId;
-        _currentPath = path;
+        Debug.WriteLine($"Loading images for library {item.Id}, path: {item.Path}");
+        _currentLibraryId = item.Id;
+        _currentPath = item.Path;
+        _currentName = item.Name;
         Images.Clear();
 
         IEnumerable<Image> dbImages;
-        if (libraryId == null)
+        if (item.Id == null)
         {
             dbImages = await _imageRepository.GetAllAsync(CurrentSortOption);
             CurrentDirectory = "All Libraries";
         }
-        else if (path == null)
+        else if (item.Path == null)
         {
-            dbImages = await _imageRepository.GetByLibraryIdAsync((long)libraryId, CurrentSortOption);
-            CurrentDirectory = "Library ID #" + libraryId;
+            dbImages = await _imageRepository.GetByLibraryIdAsync(item.Id ?? 0, CurrentSortOption);
+            CurrentDirectory = item.Name;
         }
         else
         {
-            dbImages = await _imageRepository.GetByLibraryIdAndPathAsync((long)libraryId, path, CurrentSortOption);
-            CurrentDirectory = path;
+            dbImages = await _imageRepository.GetByLibraryIdAndPathAsync(item.Id ?? 0, item.Path, CurrentSortOption);
+            CurrentDirectory = item.Path;
         }
 
         var enumerable = dbImages as Image[] ?? dbImages.ToArray();
@@ -95,14 +102,12 @@ public partial class ImageGalleryViewModel : ViewModelBase
         Debug.WriteLine($"Searching images for {SearchText}");
         if (string.IsNullOrWhiteSpace(SearchText))
         {
-            // If search is cleared, return to showing current library/folder
-            if (_currentLibraryId != 0)
+            LoadImagesForLibraryAsync(new LibraryTreeItem
             {
-                if (!string.IsNullOrEmpty(_currentPath))
-                    await LoadImagesForLibraryAsync(_currentLibraryId, _currentPath);
-                else
-                    await LoadImagesForLibraryAsync(_currentLibraryId);
-            }
+                Id = _currentLibraryId,
+                Path = _currentPath,
+                Name = _currentName,
+            }).FireAndForget();
             return;
         }
 
@@ -137,15 +142,23 @@ public partial class ImageGalleryViewModel : ViewModelBase
         if (CurrentSortOption == sortOption) return Task.CompletedTask;
         
         CurrentSortOption = sortOption;
-        return _currentLibraryId.HasValue 
-            ? LoadImagesForLibraryAsync(_currentLibraryId.Value) 
-            : Task.CompletedTask;
+        return LoadImagesForLibraryAsync(new LibraryTreeItem
+            {
+                Id = _currentLibraryId,
+                Path = _currentPath,
+                Name = _currentName,
+            });
     }
     
     partial void OnCurrentSortOptionChanged(ImageSortOption value)
     {
         Debug.WriteLine($"Current sort option changed to {value}");
-        LoadImagesForLibraryAsync(_currentLibraryId, _currentPath).FireAndForget();
+        LoadImagesForLibraryAsync(new LibraryTreeItem
+        {
+            Id = _currentLibraryId,
+            Path = _currentPath,
+            Name = _currentName,
+        }).FireAndForget();
     }
     
     public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
