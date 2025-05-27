@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Numerics;
-using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
@@ -14,7 +12,7 @@ namespace DiffKeep.Views;
 public partial class ImageGalleryView : UserControl
 {
     private ItemsRepeater? _itemsRepeater;
-    
+
     public ImageGalleryView()
     {
         InitializeComponent();
@@ -24,8 +22,8 @@ public partial class ImageGalleryView : UserControl
 
     private void Border_OnTapped(object? sender, TappedEventArgs e)
     {
-        if (DataContext is ImageGalleryViewModel vm && 
-            sender is Border border && 
+        if (DataContext is ImageGalleryViewModel vm &&
+            sender is Border border &&
             border.DataContext is ImageItemViewModel imageItem)
         {
             SelectImage(vm, imageItem);
@@ -101,6 +99,7 @@ public partial class ImageGalleryView : UserControl
             var itemWidth = gridLayout.MinItemWidth + gridLayout.MinColumnSpacing;
             return Math.Max(1, (int)(containerWidth / itemWidth));
         }
+
         return 1;
     }
 
@@ -109,13 +108,13 @@ public partial class ImageGalleryView : UserControl
         if (DataContext is ImageGalleryViewModel { SelectedImage: not null } vm)
         {
             var imageItem = vm.SelectedImage;
-        
+
             if (string.IsNullOrEmpty(imageItem.Path)) return;
             var window = new ImageViewerWindow(vm.Images, imageItem);
             window.Show();
         }
     }
-    
+
     private void InitializeScrollTracking()
     {
         var scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
@@ -157,34 +156,35 @@ public partial class ImageGalleryView : UserControl
             viewModel.UpdateVisibleThumbnails(visibleItems.Select(i => i.Id));
         }
     }
-    
+
     private IEnumerable<ImageItemViewModel> GetVisibleItems()
     {
         var scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
         var itemsRepeater = this.GetControl<ItemsRepeater>("ItemsRepeater");
-    
-        if (scrollViewer == null || itemsRepeater == null) 
+        
+        if (scrollViewer == null || itemsRepeater == null || itemsRepeater.ItemsSource == null) 
             return Enumerable.Empty<ImageItemViewModel>();
 
-        Point scrollOffset = new Point(scrollViewer.Offset.X, scrollViewer.Offset.Y);
-        Size viewportSize = new Size(new Vector2((float)scrollViewer.Viewport.Width, (float)scrollViewer.Viewport.Height * (float)1.5));
-        var viewport = new Rect(scrollOffset, viewportSize);
+        // Get the visible range with padding
+        var scrollOffset = scrollViewer.Offset.Y;
+        var viewportHeight = scrollViewer.Viewport.Height;
+        var padding = viewportHeight * 3; // Three viewport height padding for smoother scrolling
+        
+        var visibleRangeStart = Math.Max(0, scrollOffset - padding);
+        var visibleRangeEnd = scrollOffset + viewportHeight + padding;
 
         var visibleItems = new List<ImageItemViewModel>();
-        
         var itemCount = itemsRepeater.ItemsSource.Cast<object>().Count();
-    
+        
         for (var i = 0; i < itemCount; i++)
         {
             if (itemsRepeater.TryGetElement(i) is Control element)
             {
-                var bounds = element.Bounds;
-                // Transform the bounds to account for scroll position
-                var elementPosition = element.TranslatePoint(new Point(), scrollViewer)
-                                      ?? new Point();
-                var transformedBounds = new Rect(elementPosition, bounds.Size);
+                var elementBounds = element.Bounds;
+                var elementTop = elementBounds.Y;
+                var elementBottom = elementTop + elementBounds.Height;
 
-                if (viewport.Intersects(transformedBounds))
+                if (elementBottom >= visibleRangeStart && elementTop <= visibleRangeEnd)
                 {
                     if (element.DataContext is ImageItemViewModel item)
                     {
