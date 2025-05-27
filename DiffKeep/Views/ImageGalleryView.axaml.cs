@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -12,12 +13,35 @@ namespace DiffKeep.Views;
 public partial class ImageGalleryView : UserControl
 {
     private ItemsRepeater? _itemsRepeater;
+    private ImageGalleryViewModel? _currentViewModel;
 
     public ImageGalleryView()
     {
         InitializeComponent();
         _itemsRepeater = this.FindControl<ItemsRepeater>("ItemsRepeater");
         InitializeScrollTracking();
+        
+        DataContextChanged += (_, _) =>
+        {
+            if (DataContext is ImageGalleryViewModel vm)
+            {
+                // Unsubscribe from previous event (if any)
+                if (_currentViewModel != null)
+                {
+                    _currentViewModel.ImagesCollectionChanged -= OnImagesCollectionChanged;
+                }
+
+                _currentViewModel = vm;
+                vm.ImagesCollectionChanged += OnImagesCollectionChanged;
+            }
+        };
+
+    }
+    
+    private void OnImagesCollectionChanged(object? sender, EventArgs e)
+    {
+        Debug.WriteLine("Images collection changed - updating thumbnails");
+        Dispatcher.UIThread.Post(UpdateVisibleThumbnails, DispatcherPriority.Render);
     }
 
     private void Border_OnTapped(object? sender, TappedEventArgs e)
@@ -150,6 +174,7 @@ public partial class ImageGalleryView : UserControl
 
     private void UpdateVisibleThumbnails()
     {
+        Debug.WriteLine("Updating visible thumbnails");
         var visibleItems = GetVisibleItems();
         if (DataContext is ImageGalleryViewModel viewModel)
         {

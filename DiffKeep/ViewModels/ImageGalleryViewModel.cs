@@ -15,6 +15,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
     private readonly IImageRepository _imageRepository;
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
+    public event EventHandler? ImagesCollectionChanged;
     
     [ObservableProperty]
     private ImageItemViewModel? _selectedImage;
@@ -63,6 +64,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
             var viewModel = new ImageItemViewModel(image);
             Images.Add(viewModel);
         }
+        
+        // Raise the collection changed event after loading new images
+        ImagesCollectionChanged?.Invoke(this, EventArgs.Empty);
     }
     
     public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
