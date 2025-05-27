@@ -15,16 +15,49 @@
     </UserControl.Resources>
     <Grid RowDefinitions="Auto,*">
         <!-- Header -->
-        <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="10">
+        <Grid Grid.Row="0" Margin="10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/> <!-- Directory -->
+                <ColumnDefinition Width="*"/> <!-- Search (fills space) -->
+                <ColumnDefinition Width="Auto"/> <!-- Sort dropdown -->
+            </Grid.ColumnDefinitions>
+
             <!-- Directory path display -->
-            <TextBlock Grid.Column="0"
-                       Text="{Binding CurrentDirectory}"
-                       VerticalAlignment="Center"
-                       Margin="15, 0, 0, 0"
-                       IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}" />
+            <StackPanel Grid.Column="0" Orientation="Horizontal">
+                <TextBlock Text="{Binding CurrentDirectory}"
+                           VerticalAlignment="Center"
+                           Margin="15,0,0,0"
+                           IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                <TextBlock Text="{Binding ImagesCount}"
+                           VerticalAlignment="Center"
+                           Margin="5,0,0,0" />
+            </StackPanel>
+
+            <!-- Search -->
+            <TextBox Grid.Column="1"
+                     Width="300"
+                     HorizontalAlignment="Center"
+                     Text="{Binding SearchText}"
+                     Watermark="Search prompts..."
+                     VerticalAlignment="Center">
+                <TextBox.InnerRightContent>
+                    <Button Command="{Binding ClearSearchCommand}"
+                            IsVisible="{Binding SearchText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                            Background="Transparent"
+                            Width="20" Height="20"
+                            Padding="0"
+                            VerticalAlignment="Center">
+                        <PathIcon Data="M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z"/>
+                    </Button>
+                </TextBox.InnerRightContent>
+                <TextBox.KeyBindings>
+                    <KeyBinding Gesture="Enter" 
+                       Command="{Binding SearchPromptsCommand}"/>
+                </TextBox.KeyBindings>
+            </TextBox>
 
             <!-- Sort dropdown -->
-            <ComboBox Grid.Column="1"
+            <ComboBox Grid.Column="2"
                       Width="120"
                       SelectedItem="{Binding CurrentSortOption}"
                       Margin="10,0,10,0">

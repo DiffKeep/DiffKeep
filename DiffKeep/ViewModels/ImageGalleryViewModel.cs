@@ -24,12 +24,14 @@ public partial class ImageGalleryViewModel : ViewModelBase
     
     [ObservableProperty]
     private ImageItemViewModel? _selectedImage;
-    
     [ObservableProperty]
     private string? _currentDirectory;
-    
     [ObservableProperty]
     private ImageSortOption _currentSortOption = ImageSortOption.NewestFirst;
+    [ObservableProperty]
+    private string _searchText = string.Empty;
+    [ObservableProperty]
+    private string _imagesCount;
 
     public ObservableCollection<ImageItemViewModel> Images
     {
@@ -68,13 +70,15 @@ public partial class ImageGalleryViewModel : ViewModelBase
             dbImages = await _imageRepository.GetByLibraryIdAndPathAsync((long)libraryId, path, CurrentSortOption);
             CurrentDirectory = path;
         }
-        
-        Debug.WriteLine($"Loaded {dbImages.Count()} images");
+
+        var enumerable = dbImages as Image[] ?? dbImages.ToArray();
+        Debug.WriteLine($"Loaded {enumerable.Count()} images");
+        ImagesCount = $"({enumerable.Count()} images)";
         
         // Request scroll reset before updating images
         ResetScrollRequested?.Invoke();
 
-        foreach (var image in dbImages)
+        foreach (var image in enumerable)
         {
             var viewModel = new ImageItemViewModel(image);
             Images.Add(viewModel);
@@ -83,6 +87,47 @@ public partial class ImageGalleryViewModel : ViewModelBase
         
         // Raise the collection changed event after loading new images
         ImagesCollectionChanged?.Invoke(this, EventArgs.Empty);
+    }
+    
+    [RelayCommand]
+    private async Task SearchPrompts()
+    {
+        Debug.WriteLine($"Searching images for {SearchText}");
+        if (string.IsNullOrWhiteSpace(SearchText))
+        {
+            // If search is cleared, return to showing current library/folder
+            if (_currentLibraryId != 0)
+            {
+                if (!string.IsNullOrEmpty(_currentPath))
+                    await LoadImagesForLibraryAsync(_currentLibraryId, _currentPath);
+                else
+                    await LoadImagesForLibraryAsync(_currentLibraryId);
+            }
+            return;
+        }
+
+        Images.Clear();
+        var images = await _imageRepository.SearchByPromptAsync(SearchText, _currentLibraryId, _currentPath);
+        var enumerable = images as Image[] ?? images.ToArray();
+        Debug.WriteLine($"Found {enumerable.Count()} images");
+        ImagesCount = $"({enumerable.Count()} images)";
+        
+        foreach (var image in enumerable)
+        {
+            var viewModel = new ImageItemViewModel(image);
+            Images.Add(viewModel);
+        }
+        Debug.WriteLine($"Created {Images.Count} view models");
+        
+        // Raise the collection changed event after loading new images
+        ImagesCollectionChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private async Task ClearSearch()
+    {
+        SearchText = string.Empty;
+        await SearchPrompts();
     }
     
     [RelayCommand]
