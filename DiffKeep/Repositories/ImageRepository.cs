@@ -211,6 +211,15 @@ public class ImageRepository : IImageRepository
 
         await command.ExecuteNonQueryAsync();
     }
+    
+    public async Task DeleteByLibraryIdAsync(long libraryId)
+    {
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM Images WHERE LibraryId = @LibraryId";
+        command.CreateParameter("@LibraryId", libraryId);
+        await command.ExecuteNonQueryAsync();
+    }
 
     public async Task UpdateAsync(Image image)
     {

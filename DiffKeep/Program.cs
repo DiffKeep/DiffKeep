@@ -163,6 +163,7 @@ sealed class Program
         services.AddTransient<SettingsViewModel>(sp => 
             new SettingsViewModel(
                 sp.GetRequiredService<ILibraryRepository>(),
+                sp.GetRequiredService<IImageRepository>(),
                 Settings
             ));
         services.AddSingleton<AboutWindowViewModel>();

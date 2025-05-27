@@ -18,6 +18,7 @@ namespace DiffKeep.ViewModels;
 public partial class SettingsViewModel : ViewModelBase
 {
     private readonly ILibraryRepository _libraryRepository;
+    private readonly IImageRepository _imageRepository;
 
     [ObservableProperty]
     private string _theme;
@@ -35,9 +36,10 @@ public partial class SettingsViewModel : ViewModelBase
 
     public ObservableCollection<LibraryItem> Libraries { get; }
 
-    public SettingsViewModel(ILibraryRepository libraryRepository, AppSettings settings)
+    public SettingsViewModel(ILibraryRepository libraryRepository, IImageRepository imageRepository, AppSettings settings)
     {
         _libraryRepository = libraryRepository;
+        _imageRepository = imageRepository;
         _theme = settings.Theme;
         _language = settings.Language;
         Libraries = new ObservableCollection<LibraryItem>();
@@ -147,6 +149,8 @@ public partial class SettingsViewModel : ViewModelBase
             var window = desktop.Windows.FirstOrDefault(w => w.IsActive);
             if (window != null)
             {
+                if (item.Id == null)
+                    return;
                 var dialog = new MessageDialog
                 {
                     Title = "Confirm Delete",
@@ -155,6 +159,8 @@ public partial class SettingsViewModel : ViewModelBase
 
                 if (await dialog.ShowAsync(window) == MessageDialogResult.Ok)
                 {
+                    // delete all the images associated with this library
+                    _imageRepository.DeleteByLibraryIdAsync(item.Id.Value).FireAndForget();
                     Libraries.Remove(item);
                 }
             }

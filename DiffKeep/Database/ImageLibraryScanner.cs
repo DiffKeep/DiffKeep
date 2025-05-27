@@ -94,8 +94,7 @@ public class ImageLibraryScanner
 
             try
             {
-                var relativePath = Path.GetRelativePath(library.Path, file);
-                if (!await _imageRepository.ExistsAsync(library.Id, relativePath))
+                if (!await _imageRepository.ExistsAsync(library.Id, file))
                 {
                     await semaphore.WaitAsync(cancellationToken);
                     
@@ -130,7 +129,7 @@ public class ImageLibraryScanner
                             var image = new Image
                             {
                                 LibraryId = library.Id,
-                                Path = relativePath,
+                                Path = file,
                                 Hash = hash,
                                 PositivePrompt = metadata?.Prompt,
                                 Created = fileInfo.CreationTime,
