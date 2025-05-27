@@ -98,13 +98,14 @@
                                     <Setter Property="BorderThickness" Value="1" />
                                 </Style>
                                 <Style Selector="Border:pointerover">
-                                    <Setter Property="BorderBrush" Value="LightGray" />
+                                    <Setter Property="BorderBrush" Value="Gray" />
                                 </Style>
                             </Border.Styles>
                             <Grid>
                                 <!-- Selection border -->
                                 <Border BorderBrush="DarkRed"
-                                        BorderThickness="4"
+                                        Background="DarkSlateGray"
+                                        BorderThickness="2"
                                         IsVisible="{Binding IsSelected}"
                                         Margin="-1" />
                                 <!-- Content -->

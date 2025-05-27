@@ -18,6 +18,8 @@ public partial class ImageGalleryView : UserControl
     private ItemsRepeater? _itemsRepeater;
     private ImageGalleryViewModel? _currentViewModel;
     private ScrollViewer? _scrollViewer;
+    private int _columnCount = 1;
+    private double _effectiveItemHeight = 240; // Default value
 
     public ImageGalleryView()
     {
@@ -41,12 +43,6 @@ public partial class ImageGalleryView : UserControl
                 vm.ResetScrollRequested += ResetScroll;
             }
         };
-    }
-    
-    private void ScrollViewer_OnLoaded(object? sender, RoutedEventArgs e)
-    {
-        Debug.WriteLine("ScrollViewer loaded");
-        _scrollViewer = sender as ScrollViewer;
     }
     
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -102,6 +98,7 @@ public partial class ImageGalleryView : UserControl
 
         imageItem.IsSelected = true;
         vm.SelectedImage = imageItem;
+        ScrollSelectedItemIntoView();
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
@@ -134,7 +131,24 @@ public partial class ImageGalleryView : UserControl
                 break;
             case Key.Down:
                 newIndex = currentIndex + columns;
+                Debug.WriteLine($"New index: {newIndex}, count: {vm.Images.Count}");
                 if (newIndex >= vm.Images.Count) newIndex = currentIndex;
+                break;
+            case Key.PageUp:
+                if (_scrollViewer != null)
+                {
+                    var visibleRows = (int)(_scrollViewer.Viewport.Height / _effectiveItemHeight);
+                    newIndex = currentIndex - (visibleRows * columns);
+                    if (newIndex < 0) newIndex = 0;
+                }
+                break;
+            case Key.PageDown:
+                if (_scrollViewer != null)
+                {
+                    var visibleRows = (int)(_scrollViewer.Viewport.Height / _effectiveItemHeight);
+                    newIndex = currentIndex + (visibleRows * columns);
+                    if (newIndex >= vm.Images.Count) newIndex = vm.Images.Count - 1;
+                }
                 break;
             default:
                 return;
@@ -146,26 +160,91 @@ public partial class ImageGalleryView : UserControl
             e.Handled = true;
         }
     }
+    
+    private void ScrollSelectedItemIntoView()
+    {
+        if (_scrollViewer == null || _itemsRepeater == null) return;
+        
+        var viewModel = DataContext as ImageGalleryViewModel;
+        if (viewModel?.SelectedImage == null) return;
+
+        var selectedIndex = viewModel.Images.IndexOf(viewModel.SelectedImage);
+        if (selectedIndex == -1) return;
+
+        // Calculate the position of the item
+        var columns = GetColumnCount();
+        var row = selectedIndex / columns;
+        var targetScrollPosition = row * _effectiveItemHeight;
+
+        // Determine if we need to scroll up or down
+        var currentOffset = _scrollViewer.Offset.Y;
+        var viewportHeight = _scrollViewer.Viewport.Height;
+        
+        // If the target is above the current viewport
+        if (targetScrollPosition < currentOffset)
+        {
+            _scrollViewer.Offset = new Vector(0, targetScrollPosition);
+        }
+        // If the target is below the current viewport
+        else if (targetScrollPosition + _effectiveItemHeight > currentOffset + viewportHeight)
+        {
+            var newOffset = targetScrollPosition + _effectiveItemHeight - viewportHeight;
+            _scrollViewer.Offset = new Vector(0, newOffset);
+        }
+    }
+
+    protected override void OnLoaded(RoutedEventArgs e)
+    {
+        base.OnLoaded(e);
+        
+        _scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
+        if (_itemsRepeater != null)
+        {
+            _itemsRepeater.LayoutUpdated += ItemsRepeater_LayoutUpdated;
+        }
+    }
+
+    protected override void OnUnloaded(RoutedEventArgs e)
+    {
+        base.OnUnloaded(e);
+        if (_itemsRepeater != null)
+        {
+            _itemsRepeater.LayoutUpdated -= ItemsRepeater_LayoutUpdated;
+        }
+    }
+
+    private void ItemsRepeater_LayoutUpdated(object? sender, EventArgs e)
+    {
+        if (_itemsRepeater?.ItemsSource == null || !_itemsRepeater.ItemsSource.Cast<object>().Any())
+            return;
+
+        // Get any realized element to calculate measurements
+        var anyElement = _itemsRepeater.TryGetElement(0) as Control;
+        if (anyElement != null)
+        {
+            var containerWidth = _itemsRepeater.Bounds.Width;
+            var itemWidth = anyElement.Bounds.Width;
+            var itemHeight = anyElement.Bounds.Height;
+            var horizontalSpacing = (_itemsRepeater.Layout as WrapLayout)?.HorizontalSpacing ?? 0;
+            var verticalSpacing = (_itemsRepeater.Layout as WrapLayout)?.VerticalSpacing ?? 0;
+        
+            var effectiveItemWidth = itemWidth + horizontalSpacing;
+            var newColumnCount = Math.Max(1, (int)(containerWidth / effectiveItemWidth));
+        
+            if (newColumnCount != _columnCount)
+            {
+                _columnCount = newColumnCount;
+                Debug.WriteLine($"Column count updated to: {_columnCount}");
+            }
+
+            _effectiveItemHeight = itemHeight + verticalSpacing;
+            Debug.WriteLine($"Effective item height updated to: {_effectiveItemHeight}");
+        }
+    }
 
     private int GetColumnCount()
     {
-        if (_itemsRepeater == null || !_itemsRepeater.ItemsSource.Cast<object>().Any())
-            return 1;
-
-        // Try to get the first item's container to determine actual item width
-        if (_itemsRepeater.TryGetElement(0) is Control firstElement)
-        {
-            var containerWidth = _itemsRepeater.Bounds.Width;
-            var itemWidth = firstElement.Bounds.Width;
-            var horizontalSpacing = (_itemsRepeater.Layout as WrapLayout)?.HorizontalSpacing ?? 0;
-            Debug.WriteLine($"Container width: {containerWidth}, item width: {itemWidth}, horizontal spacing: {horizontalSpacing}");
-        
-            // Account for the item width plus spacing
-            var effectiveItemWidth = itemWidth + horizontalSpacing;
-            return Math.Max(1, (int)(containerWidth / effectiveItemWidth));
-        }
-
-        return 1;
+        return _columnCount;
     }
 
     private void OpenImageViewer()
