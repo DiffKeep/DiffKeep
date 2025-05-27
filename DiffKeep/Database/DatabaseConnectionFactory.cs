@@ -45,6 +45,23 @@ public class DatabaseConnectionFactory
                     command.CommandText = $"SELECT load_extension('{_extensionPath}');";
                     command.ExecuteNonQuery();
                 }
+                
+                // Apply PRAGMA settings
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+                        PRAGMA journal_mode = WAL;
+                        PRAGMA synchronous = NORMAL;
+                        PRAGMA cache_size = -64000;
+                        PRAGMA page_size = 4096;
+                        PRAGMA mmap_size = 1073741824;
+                        PRAGMA temp_store = MEMORY;
+                        PRAGMA busy_timeout = 5000;
+                        PRAGMA foreign_keys = ON;
+                        PRAGMA journal_size_limit = 67108864;
+                        PRAGMA threads = 4;";
+                    command.ExecuteNonQuery();
+                }
             }
 
             return connection;

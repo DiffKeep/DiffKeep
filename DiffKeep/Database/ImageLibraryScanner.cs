@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,6 +22,7 @@ public class ImageLibraryScanner
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _scanCancellations = new();
     private const int ThumbnailSize = 200;
     private const int MaxConcurrentThumbnails = 16;
+    private const int BatchSize = 500; // Size of batches for database inserts
 
     public event EventHandler<ScanProgressEventArgs>? ScanProgress;
     public event EventHandler<ScanCompletedEventArgs>? ScanCompleted;
@@ -70,7 +73,19 @@ public class ImageLibraryScanner
         Debug.Print($"Found {totalFiles} files");
 
         using var semaphore = new SemaphoreSlim(MaxConcurrentThumbnails);
-        var tasks = new ConcurrentBag<Task>();
+        var imageBatch = new ConcurrentBag<Image>();
+        var processingTasks = new List<Task>();
+
+        async Task ProcessBatchAsync()
+        {
+            var batchToProcess = imageBatch.Where(img => img != null).ToList();
+            if (batchToProcess.Count > 0)
+            {
+                imageBatch = new ConcurrentBag<Image>();
+                await _imageRepository.AddBatchAsync(batchToProcess);
+                Debug.Print($"Inserted batch of {batchToProcess.Count} images");
+            }
+        }
 
         foreach (var file in files)
         {
@@ -82,32 +97,53 @@ public class ImageLibraryScanner
                 var relativePath = Path.GetRelativePath(library.Path, file);
                 if (!await _imageRepository.ExistsAsync(library.Id, relativePath))
                 {
-                    var hash = await Hash(file);
-                    var metadata = await _imageParser.ParseImageAsync(file);
-                    var fileInfo = new FileInfo(file);
-                    var image = new Image
-                    {
-                        LibraryId = library.Id,
-                        Path = relativePath,
-                        Hash = hash,
-                        PositivePrompt = metadata.Prompt,
-                        Created = fileInfo.CreationTime
-                    };
-
-                    // Generate thumbnail
                     await semaphore.WaitAsync(cancellationToken);
+                    
                     var task = Task.Run(async () =>
                     {
                         try
                         {
-                            using var vipsThumbnail = NetVips.Image.Thumbnail(file, ThumbnailSize);
-                            var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
-                            using var stream = new MemoryStream(buffer);
-                            using var bitmap = new Bitmap(stream);
-                            image.Thumbnail = bitmap;
+                            var hash = await Hash(file);
+                            if (string.IsNullOrEmpty(hash))
+                            {
+                                Debug.Print($"Failed to generate hash for file: {file}");
+                                return;
+                            }
 
-                            Debug.Print($"Generated thumbnail for {file}, size {bitmap.Size}");
-                            await _imageRepository.AddAsync(image);
+                            var metadata = await _imageParser.ParseImageAsync(file);
+                            var fileInfo = new FileInfo(file);
+                            
+                            Bitmap? thumbnail = null;
+                            try
+                            {
+                                using var vipsThumbnail = NetVips.Image.Thumbnail(file, ThumbnailSize);
+                                var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
+                                using var stream = new MemoryStream(buffer);
+                                thumbnail = new Bitmap(stream);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
+                                return;
+                            }
+
+                            var image = new Image
+                            {
+                                LibraryId = library.Id,
+                                Path = relativePath,
+                                Hash = hash,
+                                PositivePrompt = metadata?.Prompt,
+                                Created = fileInfo.CreationTime,
+                                Thumbnail = thumbnail
+                            };
+
+                            imageBatch.Add(image);
+                            Debug.Print($"Processed {file}");
+
+                            if (imageBatch.Count >= BatchSize)
+                            {
+                                await ProcessBatchAsync();
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -119,22 +155,35 @@ public class ImageLibraryScanner
                         }
                     }, cancellationToken);
 
-                    tasks.Add(task);
-                }
+                processingTasks.Add(task);
             }
-            catch (Exception ex)
-            {
-                Debug.Print($"Error processing file {file}: {ex.Message}");
-            }
-
-            processedFiles++;
-            OnScanProgress(library.Id, processedFiles, totalFiles);
+        }
+        catch (Exception ex)
+        {
+            Debug.Print($"Error processing file {file}: {ex.Message}");
         }
 
-        await Task.WhenAll(tasks);
-        OnScanCompleted(library.Id, processedFiles);
+        processedFiles++;
+        OnScanProgress(library.Id, processedFiles, totalFiles);
     }
 
+    try
+    {
+        // Wait for all processing tasks to complete
+        await Task.WhenAll(processingTasks);
+
+        // Process any remaining images in the final batch
+        await ProcessBatchAsync();
+    }
+    catch (Exception ex)
+    {
+        Debug.Print($"Error during batch processing: {ex}");
+        throw;
+    }
+
+    OnScanCompleted(library.Id, processedFiles);
+}
+    
     private void OnScanProgress(long libraryId, int processedFiles, int totalFiles)
     {
         ScanProgress?.Invoke(this, new ScanProgressEventArgs(libraryId, processedFiles, totalFiles));

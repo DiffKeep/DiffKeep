@@ -5,25 +5,29 @@
              x:DataType="vm:LeftPanelViewModel">
     
     <TreeView ItemsSource="{Binding Items}"
-              SelectedItem="{Binding SelectedItem}"
-              SelectionMode="Single"
-              Name="TreeView"
-              KeyboardNavigation.IsTabStop="True">
+          SelectedItem="{Binding SelectedItem}"
+          SelectionMode="Single"
+          Name="TreeView"
+          KeyboardNavigation.IsTabStop="True">
         <TreeView.ItemTemplate>
             <TreeDataTemplate ItemsSource="{Binding Children}">
-                <StackPanel Orientation="Vertical">
-                    <TextBlock Text="{Binding Name}" />
-                    <ProgressBar IsVisible="{Binding IsScanning}"
-                                 IsIndeterminate="True"
-                                 Width="16"
-                                 Height="16"
-                                 Margin="4,0,0,0" />
+            <StackPanel Orientation="Vertical" Spacing="4">
+                <TextBlock Text="{Binding Name}" />
+                <StackPanel IsVisible="{Binding IsScanning}"
+                          Orientation="Vertical"
+                          Margin="4,0,0,0"
+                          Spacing="2">
+                    <ProgressBar Value="{Binding ScanProgress}"
+                               Maximum="1.0"
+                               Height="2"
+                               MinWidth="100" />
                     <TextBlock Text="{Binding ScanStatus}"
-                               IsVisible="{Binding IsScanning}"
-                               Margin="4,0,0,0" />
+                             FontSize="11"
+                             Foreground="#666666" />
                 </StackPanel>
-            </TreeDataTemplate>
-        </TreeView.ItemTemplate>
-    </TreeView>
+            </StackPanel>
+        </TreeDataTemplate>
+    </TreeView.ItemTemplate>
+</TreeView>
     
 </UserControl>

@@ -6,6 +6,7 @@ using Avalonia.Media.Imaging;
 using DiffKeep.Database;
 using DiffKeep.Models;
 using Microsoft.Data.Sqlite;
+using System.Diagnostics;
 
 namespace DiffKeep.Repositories;
 
@@ -24,7 +25,7 @@ public class ImageRepository : IImageRepository
     private static byte[]? BitmapToBytes(Bitmap? bitmap)
     {
         if (bitmap == null) return null;
-        
+
         using var memStream = new MemoryStream();
         bitmap.Save(memStream);
         return memStream.ToArray();
@@ -33,15 +34,15 @@ public class ImageRepository : IImageRepository
     private static Bitmap? BytesToBitmap(byte[]? bytes)
     {
         if (bytes == null) return null;
-        
+
         using var memStream = new MemoryStream(bytes);
         return new Bitmap(memStream);
     }
 
     private static Image ReadImage(SqliteDataReader reader)
     {
-        var thumbnailBytes = reader.IsDBNull(reader.GetOrdinal("Thumbnail")) 
-            ? null 
+        var thumbnailBytes = reader.IsDBNull(reader.GetOrdinal("Thumbnail"))
+            ? null
             : reader.GetValue<byte[]>("Thumbnail");
 
         return new Image
@@ -131,7 +132,76 @@ public class ImageRepository : IImageRepository
 
         return await command.ExecuteScalarAsync<long>();
     }
-    
+
+    public async Task AddBatchAsync(IEnumerable<Image> images)
+    {
+        using var connection = CreateConnection();
+        using var transaction = connection.BeginTransaction();
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+            INSERT INTO Images (LibraryId, Path, Hash, PositivePrompt, NegativePrompt, Description, Created, Thumbnail)
+            VALUES (@LibraryId, @Path, @Hash, @PositivePrompt, @NegativePrompt, @Description, @Created, @Thumbnail)";
+
+            var libIdParam = command.CreateParameter();
+            libIdParam.ParameterName = "@LibraryId";
+
+            var pathParam = command.CreateParameter();
+            pathParam.ParameterName = "@Path";
+
+            var hashParam = command.CreateParameter();
+            hashParam.ParameterName = "@Hash";
+
+            var posPromptParam = command.CreateParameter();
+            posPromptParam.ParameterName = "@PositivePrompt";
+
+            var negPromptParam = command.CreateParameter();
+            negPromptParam.ParameterName = "@NegativePrompt";
+
+            var descParam = command.CreateParameter();
+            descParam.ParameterName = "@Description";
+
+            var createdParam = command.CreateParameter();
+            createdParam.ParameterName = "@Created";
+
+            var thumbParam = command.CreateParameter();
+            thumbParam.ParameterName = "@Thumbnail";
+
+            command.Parameters.Add(libIdParam);
+            command.Parameters.Add(pathParam);
+            command.Parameters.Add(hashParam);
+            command.Parameters.Add(posPromptParam);
+            command.Parameters.Add(negPromptParam);
+            command.Parameters.Add(descParam);
+            command.Parameters.Add(createdParam);
+            command.Parameters.Add(thumbParam);
+
+            foreach (var image in images)
+            {
+                libIdParam.Value = image.LibraryId;
+                pathParam.Value = image.Path;
+                hashParam.Value = image.Hash;
+                posPromptParam.Value = (object?)image.PositivePrompt ?? DBNull.Value;
+                negPromptParam.Value = (object?)image.NegativePrompt ?? DBNull.Value;
+                descParam.Value = (object?)image.Description ?? DBNull.Value;
+                createdParam.Value = image.Created;
+                thumbParam.Value = (object?)BitmapToBytes(image.Thumbnail) ?? DBNull.Value;
+
+                await command.ExecuteNonQueryAsync();
+            }
+
+            transaction.Commit();
+        }
+        catch (Exception ex)
+        {
+            Debug.Print($"Error in batch insert: {ex}");
+            transaction.Rollback();
+            throw;
+        }
+    }
+
     public async Task DeleteAsync(long id)
     {
         using var connection = CreateConnection();

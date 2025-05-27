@@ -38,7 +38,7 @@ public class PngMetadataParser : IImageParser
         // Get all fields that start with "png-" as these contain the PNG chunks
         foreach (var field in image.GetFields())
         {
-            Debug.Print($"Found field: {field} with value: {image.Get(field)}");
+            //Debug.Print($"Found field: {field} with value: {image.Get(field)}");
             if (field.StartsWith("png-comment-"))
             {
                 // Format is "png-comment-0-{chunk name}" where the 0 will be incremented for each chunk

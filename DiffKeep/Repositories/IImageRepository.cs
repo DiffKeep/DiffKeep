@@ -12,6 +12,7 @@ public interface IImageRepository
     Task<Image?> GetByHashAsync(string hash);
     Task<IEnumerable<Image>> GetByLibraryIdAsync(long libraryId);
     Task<long> AddAsync(Image image);
+    Task AddBatchAsync(IEnumerable<Image> images);
     Task UpdateAsync(Image image);
     Task UpdateThumbnailAsync(long imageId, Bitmap? thumbnail);
     Task DeleteAsync(long id);

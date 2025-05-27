@@ -36,7 +36,41 @@ public class LeftPanelViewModel : ViewModelBase
         _libraryRepository = libraryRepository;
         _imageLibraryScanner = imageLibraryScanner;
         _items = new ObservableCollection<LibraryTreeItem>();
+        
+        // Subscribe to scanner events
+        _imageLibraryScanner.ScanProgress += OnScanProgress;
+        _imageLibraryScanner.ScanCompleted += OnScanCompleted;
+        
         InitializeTreeItemsAsync().FireAndForget();
+    }
+
+    private void OnScanProgress(object? sender, ScanProgressEventArgs e)
+    {
+        var libraryItem = FindLibraryItem(e.LibraryId);
+        if (libraryItem != null)
+        {
+            libraryItem.ProcessedFiles = e.ProcessedFiles;
+            libraryItem.TotalFiles = e.TotalFiles;
+            libraryItem.ScanProgress = e.TotalFiles > 0 ? (double)e.ProcessedFiles / e.TotalFiles : 0;
+            libraryItem.ScanStatus = $"Scanning: {e.ProcessedFiles}/{e.TotalFiles} files";
+        }
+    }
+
+    private void OnScanCompleted(object? sender, ScanCompletedEventArgs e)
+    {
+        var libraryItem = FindLibraryItem(e.LibraryId);
+        if (libraryItem != null)
+        {
+            libraryItem.IsScanning = false;
+            libraryItem.ScanStatus = $"Scan complete: {e.ProcessedFiles} files processed";
+            libraryItem.ScanProgress = 1.0;
+        }
+    }
+
+    private LibraryTreeItem? FindLibraryItem(long libraryId)
+    {
+        if (Items.Count == 0) return null;
+        return Items[0].Children.FirstOrDefault(item => item.Id == libraryId);
     }
     
     public async Task RefreshLibrariesAsync()
@@ -149,6 +183,13 @@ public partial class LibraryTreeItem : ViewModelBase
     private bool _isScanning;
     [ObservableProperty]
     private string _scanStatus;
+    [ObservableProperty]
+    private int _processedFiles;
+    [ObservableProperty]
+    private int _totalFiles;
+    [ObservableProperty]
+    private double _scanProgress;
+
 
     public long Id { get; set; }
     public string Name { get; set; }
