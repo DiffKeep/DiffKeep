@@ -7,6 +7,7 @@ using DiffKeep.Database;
 using DiffKeep.Models;
 using Microsoft.Data.Sqlite;
 using System.Diagnostics;
+using System.Linq;
 
 namespace DiffKeep.Repositories;
 
@@ -56,8 +57,7 @@ public class ImageRepository : IImageRepository
             Description = reader.GetValue<string>("Description"),
             Created = reader.GetValue<string>("Created") != null
                 ? DateTime.Parse(reader.GetValue<string>("Created"))
-                : DateTime.MinValue,
-            Thumbnail = BytesToBitmap(thumbnailBytes)
+                : DateTime.MinValue
         };
     }
 
@@ -140,6 +140,38 @@ public class ImageRepository : IImageRepository
             images.Add(ReadImage(reader));
         }
         return images;
+    }
+    
+    public async Task<Dictionary<long, Bitmap?>> GetThumbnailsByIdsAsync(IEnumerable<long> ids)
+    {
+        var thumbnails = new Dictionary<long, Bitmap?>();
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+    
+        // Create a parameter string with the correct number of parameters
+        var parameters = string.Join(",", ids.Select((_, index) => $"@Id{index}"));
+        command.CommandText = $"SELECT Id, Thumbnail FROM Images WHERE Id IN ({parameters})";
+    
+        // Add parameters
+        var index = 0;
+        foreach (var id in ids)
+        {
+            command.CreateParameter($"@Id{index}", id);
+            index++;
+        }
+
+        using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var id = reader.GetValue<long>("Id");
+            var thumbnailBytes = reader.IsDBNull(reader.GetOrdinal("Thumbnail"))
+                ? null
+                : reader.GetValue<byte[]>("Thumbnail");
+            
+            thumbnails[id] = BytesToBitmap(thumbnailBytes);
+        }
+
+        return thumbnails;
     }
 
     public async Task<long> AddAsync(Image image)

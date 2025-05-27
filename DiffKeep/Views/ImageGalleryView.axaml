@@ -17,7 +17,7 @@
                    IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}"/>
         
         <!-- Image gallery -->
-        <ScrollViewer Grid.Row="1">
+        <ScrollViewer Grid.Row="1" Name="ScrollViewer">
             <ItemsRepeater ItemsSource="{Binding Images}"
                            Name="ItemsRepeater">
                 <ItemsRepeater.Layout>

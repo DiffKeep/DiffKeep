@@ -64,11 +64,29 @@ public partial class ImageGalleryViewModel : ViewModelBase
             Images.Add(viewModel);
         }
     }
+    
+    public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
+    {
+        // Get thumbnails for visible items and some items ahead/behind
+        var thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
+    
+        foreach (var image in Images)
+        {
+            if (thumbnails.TryGetValue(image.Id, out var thumbnail))
+            {
+                image.Thumbnail = thumbnail;
+            } else
+            {
+                image.Thumbnail = null;
+            }
+        }
+    }
 }
 
 public partial class ImageItemViewModel : ViewModelBase
 {
     private readonly Models.Image _image;
+    private Bitmap? _thumbnail;
 
     public long Id => _image.Id;
     public string Path => _image.Path;
@@ -77,7 +95,11 @@ public partial class ImageItemViewModel : ViewModelBase
     public string? PositivePrompt => _image.PositivePrompt;
     public string? NegativePrompt => _image.NegativePrompt;
     public DateTime Created => _image.Created;
-    public Bitmap? Thumbnail => _image.Thumbnail;
+    public Bitmap? Thumbnail
+    {
+        get => _thumbnail ?? _image.Thumbnail;
+        set => SetProperty(ref _thumbnail, value);
+    }
     
     [ObservableProperty]
     private bool _isSelected;
