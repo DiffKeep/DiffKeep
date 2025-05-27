@@ -11,17 +11,17 @@
              Focusable="True"
              KeyDown="OnKeyDown">
     <UserControl.Resources>
-        <converters:EnumToDisplayNameConverter x:Key="EnumToDisplayNameConverter"/>
+        <converters:EnumToDisplayNameConverter x:Key="EnumToDisplayNameConverter" />
     </UserControl.Resources>
     <Grid RowDefinitions="Auto,*">
         <!-- Header -->
         <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="10">
             <!-- Directory path display -->
-            <TextBlock Grid.Column="0" 
-                       Text="{Binding CurrentDirectory}" 
+            <TextBlock Grid.Column="0"
+                       Text="{Binding CurrentDirectory}"
                        VerticalAlignment="Center"
-                       IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}"/>
-        
+                       IsVisible="{Binding CurrentDirectory, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
             <!-- Sort dropdown -->
             <ComboBox Grid.Column="1"
                       Width="120"
@@ -35,37 +35,37 @@
                 </ComboBox.Items>
                 <ComboBox.ItemTemplate>
                     <DataTemplate>
-                        <TextBlock Text="{Binding Converter={StaticResource EnumToDisplayNameConverter}}"/>
+                        <TextBlock Text="{Binding Converter={StaticResource EnumToDisplayNameConverter}}" />
                     </DataTemplate>
                 </ComboBox.ItemTemplate>
             </ComboBox>
         </Grid>
 
-        
+
         <!-- Image gallery -->
-        <ScrollViewer Grid.Row="1" Name="ScrollViewer" Loaded="ScrollViewer_OnLoaded">
+        <ScrollViewer Grid.Row="1" Name="ScrollViewer" Margin="0,0,10,0">
             <ItemsRepeater ItemsSource="{Binding Images}"
                            Name="ItemsRepeater">
                 <ItemsRepeater.Layout>
-                    <UniformGridLayout MinItemWidth="220" 
-                                       MinItemHeight="220"
-                                       MinColumnSpacing="10"
-                                       MinRowSpacing="10"
-                                       ItemsJustification="Start"/>
+                    <WrapLayout Orientation="Horizontal"
+                                HorizontalSpacing="3"
+                                VerticalSpacing="3" />
                 </ItemsRepeater.Layout>
                 <ItemsRepeater.ItemTemplate>
                     <DataTemplate x:DataType="vm:ImageItemViewModel">
-                        <Border Margin="5" 
+                        <Border Margin="5"
+                                Width="220"
+                                Height="240"
                                 CornerRadius="3"
                                 Tapped="Border_OnTapped"
                                 DoubleTapped="Border_OnDoubleTapped">
                             <Border.Styles>
                                 <Style Selector="Border">
-                                    <Setter Property="BorderBrush" Value="Gray"/>
-                                    <Setter Property="BorderThickness" Value="1"/>
+                                    <Setter Property="BorderBrush" Value="Gray" />
+                                    <Setter Property="BorderThickness" Value="1" />
                                 </Style>
                                 <Style Selector="Border:pointerover">
-                                    <Setter Property="BorderBrush" Value="LightGray"/>
+                                    <Setter Property="BorderBrush" Value="LightGray" />
                                 </Style>
                             </Border.Styles>
                             <Grid>
@@ -73,17 +73,17 @@
                                 <Border BorderBrush="DarkRed"
                                         BorderThickness="4"
                                         IsVisible="{Binding IsSelected}"
-                                        Margin="-1"/>
+                                        Margin="-1" />
                                 <!-- Content -->
                                 <StackPanel>
                                     <Image Source="{Binding Thumbnail}"
                                            Width="200"
                                            Height="200"
-                                           Stretch="Uniform"/>
+                                           Stretch="Uniform" />
                                     <TextBlock Text="{Binding FileName}"
-                                             Margin="5 10"
-                                             TextAlignment="Center"
-                                             TextWrapping="Wrap"/>
+                                               Margin="5 10"
+                                               TextAlignment="Center"
+                                               TextWrapping="Wrap" />
                                 </StackPanel>
                             </Grid>
                         </Border>
