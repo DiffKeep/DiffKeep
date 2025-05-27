@@ -149,12 +149,20 @@ public partial class ImageGalleryView : UserControl
 
     private int GetColumnCount()
     {
-        if (_itemsRepeater?.Layout is UniformGridLayout gridLayout)
+        if (_itemsRepeater == null || !_itemsRepeater.ItemsSource.Cast<object>().Any())
+            return 1;
+
+        // Try to get the first item's container to determine actual item width
+        if (_itemsRepeater.TryGetElement(0) is Control firstElement)
         {
-            // Calculate approximate number of columns based on container width and minimum item width
             var containerWidth = _itemsRepeater.Bounds.Width;
-            var itemWidth = gridLayout.MinItemWidth + gridLayout.MinColumnSpacing;
-            return Math.Max(1, (int)(containerWidth / itemWidth));
+            var itemWidth = firstElement.Bounds.Width;
+            var horizontalSpacing = (_itemsRepeater.Layout as WrapLayout)?.HorizontalSpacing ?? 0;
+            Debug.WriteLine($"Container width: {containerWidth}, item width: {itemWidth}, horizontal spacing: {horizontalSpacing}");
+        
+            // Account for the item width plus spacing
+            var effectiveItemWidth = itemWidth + horizontalSpacing;
+            return Math.Max(1, (int)(containerWidth / effectiveItemWidth));
         }
 
         return 1;
