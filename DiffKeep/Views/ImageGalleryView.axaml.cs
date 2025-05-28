@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
@@ -20,6 +23,9 @@ public partial class ImageGalleryView : UserControl
     private ScrollViewer? _scrollViewer;
     private int _columnCount = 1;
     private double _effectiveItemHeight = 240; // Default value
+    private Point _pointerPressPosition;
+    private bool _isDragging;
+    private const double DragThreshold = 5.0;
 
     public ImageGalleryView()
     {
@@ -341,5 +347,84 @@ public partial class ImageGalleryView : UserControl
         }
 
         return visibleItems;
+    }
+
+    private void Image_OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        Debug.WriteLine("Image pressed");
+        _pointerPressPosition = e.GetPosition(null);
+        _isDragging = false;
+        e.Handled = true;
+    }
+
+    private async void Image_OnPointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (!e.GetCurrentPoint(null).Properties.IsLeftButtonPressed) return;
+        
+        var currentPosition = e.GetPosition(null);
+        var dx = currentPosition.X - _pointerPressPosition.X;
+        var dy = currentPosition.Y - _pointerPressPosition.Y;
+        var distance = Math.Sqrt(dx * dx + dy * dy);
+        
+        if (!_isDragging && distance > DragThreshold)
+        {
+            _isDragging = true;
+            Debug.WriteLine("Image drag started");
+        
+            if (sender is IDataContextProvider contextProvider && 
+                contextProvider.DataContext is ImageItemViewModel imageItem && 
+                !string.IsNullOrEmpty(imageItem.Path))
+            {
+                Debug.WriteLine($"Dragging file {imageItem.Path} to clipboard...");
+                var dataObject = new DataObject();
+                dataObject.Set(DataFormats.Files, new[] { imageItem.Path });
+            
+                try
+                {
+                    if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+                    {
+                        var clipboard = TopLevel.GetTopLevel(desktop.MainWindow)?.Clipboard;
+                        if (clipboard != null)
+                        {
+                            Debug.Print("Got clipboard");
+                            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
+                            try
+                            {
+                                var clipboardTask = clipboard.SetDataObjectAsync(dataObject);
+                                var timeoutTask = Task.Delay(-1, cts.Token);
+
+                                var completedTask = await Task.WhenAny(clipboardTask, timeoutTask);
+                                if (completedTask == clipboardTask)
+                                {
+                                    Debug.Print($"Copied file: {imageItem.Path}");
+                                }
+                                else
+                                {
+                                    Debug.Print("Clipboard operation timed out, but may have succeeded");
+                                }
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                Debug.Print("Clipboard operation timed out, but may have succeeded");
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.Print($"Clipboard operation failed: {ex}");
+                            }
+                        }
+                        else
+                        {
+                            Debug.Print("Clipboard was null");
+                        }
+
+                        await DragDrop.DoDragDrop(e, dataObject, DragDropEffects.Copy);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Drag and drop operation failed: {ex}");
+                }
+            }
+        }
     }
 }

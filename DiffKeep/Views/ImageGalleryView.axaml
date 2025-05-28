@@ -101,7 +101,7 @@
                                     <Setter Property="BorderBrush" Value="Gray" />
                                 </Style>
                             </Border.Styles>
-                            <Grid>
+                            <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
                                 <!-- Selection border -->
                                 <Border BorderBrush="DarkRed"
                                         Background="DarkSlateGray"
