@@ -6,7 +6,7 @@ Manage your AI-generated images with ease. Sort, filter, search, delete, and org
 
 ## Feature Roadmap
 
-- [ ] Display images by folder or date
+- [x] Display images by folder or date
 - [ ] View raw and parsed generation metadata
 - [ ] Vector search image prompts. Prompt detection support for:
     - [ ] Comfyui
@@ -15,6 +15,12 @@ Manage your AI-generated images with ease. Sort, filter, search, delete, and org
     - [ ] CivitAI
     - _More to come_
 - [ ] AI-generated image descriptions (also exposed in vector search)
+- [ ] Drag and drop support, cross-platform
+    - [x] Windows ("completed" but unverified)
+    - [ ] Mac
+    - [ ] Linux
+        - [ ] X11
+        - [ ] Wayland
 - [ ] Integration with image generation tools:
     - [ ] ComfyUI
     - [ ] Internal image generation
