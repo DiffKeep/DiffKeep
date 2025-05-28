@@ -15,7 +15,7 @@ Manage your AI-generated images with ease. Sort, filter, search, delete, and org
     - [ ] CivitAI
     - _More to come_
 - [ ] AI-generated image descriptions (also exposed in vector search)
-- [ ] Drag and drop support, cross-platform
+- [ ] File drag and drop out support (DnD source), cross-platform
     - [x] Windows ("completed" but unverified)
     - [ ] Mac
     - [ ] Linux
