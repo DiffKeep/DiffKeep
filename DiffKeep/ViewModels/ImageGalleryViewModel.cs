@@ -17,16 +17,12 @@ namespace DiffKeep.ViewModels;
 
 public partial class ImageGalleryViewModel : ViewModelBase
 {
-    private const int PAGE_SIZE = 300;
-    private int _currentOffset;
-    private bool _isLoadingMore;
-    private CancellationTokenSource? _loadingCts;
-
     private readonly IImageRepository _imageRepository;
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
     private string? _currentPath;
     private string? _currentName;
+    public Dictionary<long, Bitmap> Thumbnails;
     public event EventHandler? ImagesCollectionChanged;
     public event Action? ResetScrollRequested;
     
@@ -43,12 +39,6 @@ public partial class ImageGalleryViewModel : ViewModelBase
     [ObservableProperty]
     private bool _isLoading;
     [ObservableProperty]
-    private double _scrollOffset;
-    [ObservableProperty]
-    private double _viewportHeight;
-    [ObservableProperty]
-    private double _extentHeight;
-    [ObservableProperty]
     private int _totalCount;
 
     public ObservableCollection<ImageItemViewModel> Images
@@ -64,223 +54,56 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _currentDirectory = "";
     }
 
-    public void UpdateVirtualHeight(int columnCount, double itemHeight)
+    public async Task LoadImagesAsync(LibraryTreeItem? item)
     {
-        if (columnCount <= 0) return;
+        if (item != null)
+        {
+            _currentLibraryId = item.Id;
+            _currentPath = item.Path;
+            _currentName = item.Name;
+        }
         
-        // Calculate how many rows we'll need for all images
-        var totalRows = Math.Ceiling((double)_totalCount / columnCount);
-        ExtentHeight = totalRows * itemHeight;
-        Debug.WriteLine($"Updated virtual height to {ExtentHeight} for {_totalCount} items in {columnCount} columns");
-    }
-
-    public async Task LoadImagesAsync(LibraryTreeItem item)
-    {
-        // Cancel any ongoing loading
-        _loadingCts?.Cancel();
-        _loadingCts = new CancellationTokenSource();
-        
-        Debug.WriteLine($"Loading images for library {item.Id}, path: {item.Path}");
+        Debug.WriteLine($"Loading images for library {_currentLibraryId}, path: {_currentPath}");
         IsLoading = true;
-        _currentOffset = 0;
-        _currentLibraryId = item.Id;
-        _currentPath = item.Path;
-        _currentName = item.Name;
 
         try
         {
-            // First, get only the total count
-            if (!String.IsNullOrWhiteSpace(SearchText))
+            IEnumerable<Image> dbImages;
+            if (!string.IsNullOrWhiteSpace(SearchText))
             {
-                TotalCount = await _imageRepository.GetSearchCountAsync(SearchText, _currentLibraryId, _currentPath);
+                dbImages = await _imageRepository.SearchByPromptAsync(SearchText, 0, null, _currentLibraryId, _currentPath);
+            }
+            else if (_currentLibraryId == null)
+            {
+                dbImages = await _imageRepository.GetPagedAllAsync(0, null, CurrentSortOption);
+            }
+            else if (_currentPath == null)
+            {
+                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, 0, null, CurrentSortOption);
             }
             else
             {
-                TotalCount = await _imageRepository.GetCountAsync(item.Id, item.Path);
+                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath, 0, null, CurrentSortOption);
             }
+            
+            TotalCount = dbImages.Count();
 
             ImagesCount = $"({TotalCount} images)";
         
             // Clear existing images
             Images.Clear();
 
-            // Load initial page
-            await LoadMoreImagesAsync(_loadingCts.Token);
-        
-            // Note: Initial ExtentHeight will be set when ItemsRepeater_LayoutUpdated is called
+            var viewModels = await Task.Run(() => 
+                dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
+
+            await Task.Run(() =>
+            {
+                Images = new ObservableCollection<ImageItemViewModel>(viewModels);
+            });
         }
         finally
         {
             IsLoading = false;
-        }
-    }
-
-    private async Task LoadMoreImagesAsync(CancellationToken ct)
-    {
-        if (_isLoadingMore || _currentOffset >= TotalCount) return;
-        Debug.WriteLine($"Loading more images for library {_currentLibraryId}, path: {_currentPath}");
-        
-        _isLoadingMore = true;
-        try
-        {
-            IEnumerable<Image> dbImages;
-            if (!string.IsNullOrWhiteSpace(SearchText))
-            {
-                dbImages = await _imageRepository.SearchByPromptAsync(SearchText, _currentOffset, PAGE_SIZE, _currentLibraryId, _currentPath);
-            }
-            else if (_currentLibraryId == null)
-            {
-                dbImages = await _imageRepository.GetPagedAllAsync(_currentOffset, PAGE_SIZE, CurrentSortOption);
-            }
-            else if (_currentPath == null)
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, _currentOffset, PAGE_SIZE, CurrentSortOption);
-            }
-            else
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath, _currentOffset, PAGE_SIZE, CurrentSortOption);
-            }
-
-            if (ct.IsCancellationRequested) return;
-
-            var viewModels = await Task.Run(() => 
-                dbImages.Select(image => new ImageItemViewModel(image)).ToList(), ct);
-
-            if (ct.IsCancellationRequested) return;
-
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                foreach (var vm in viewModels)
-                {
-                    Images.Add(vm);
-                }
-            }, DispatcherPriority.Background);
-
-            _currentOffset += viewModels.Count;
-        }
-        finally
-        {
-            _isLoadingMore = false;
-        }
-    }
-
-    // Call this when scroll position changes
-    [RelayCommand]
-    public async Task OnScrollChanged()
-    {
-        Debug.WriteLine($"ScrollOffset: {ScrollOffset} Viewport Height: {ViewportHeight} ExtentHeight: {ExtentHeight}");
-        
-        // Calculate which range of items should be visible based on scroll position
-        var itemsPerViewport = (int)(ViewportHeight / (ExtentHeight / TotalCount));
-        var buffer = itemsPerViewport * 2; // Buffer of 2 viewport heights worth of items
-        
-        // Calculate the target offset based on scroll position
-        var scrollProgress = ScrollOffset / ExtentHeight;
-        var targetOffset = (int)(scrollProgress * TotalCount);
-        
-        // Adjust target offset to ensure we load items before and after the visible area
-        var startOffset = Math.Max(0, targetOffset - buffer);
-        var endOffset = Math.Min(TotalCount, targetOffset + itemsPerViewport + buffer);
-        
-        // Check if we need to load this range
-        if (!IsRangeLoaded(startOffset, endOffset))
-        {
-            Debug.WriteLine($"Loading images for range {startOffset} to {endOffset}");
-            await LoadImagesForRangeAsync(startOffset, endOffset, _loadingCts?.Token ?? CancellationToken.None);
-        }
-    }
-
-    private bool IsRangeLoaded(int startOffset, int endOffset)
-    {
-        // Check if we have items in this range
-        return Images.Any(img => img.Index >= startOffset && img.Index < endOffset);
-    }
-
-    private async Task LoadImagesForRangeAsync(int startOffset, int endOffset, CancellationToken ct)
-    {
-        if (_isLoadingMore) return;
-        
-        _isLoadingMore = true;
-        try
-        {
-            // First, ensure we have placeholder items for the entire range
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                // Fill any gaps before our range
-                if (Images.Count == 0 || Images[0].Index > 0)
-                {
-                    for (int i = 0; i < startOffset; i++)
-                    {
-                        if (!Images.Any(img => img.Index == i))
-                        {
-                            Images.Add(new PlaceholderImageItem(i));
-                        }
-                    }
-                }
-
-                // Fill any gaps in and after our range up to endOffset
-                for (int i = startOffset; i < endOffset; i++)
-                {
-                    if (!Images.Any(img => img.Index == i))
-                    {
-                        Images.Add(new PlaceholderImageItem(i));
-                    }
-                }
-
-                // Sort the collection by index
-                var sorted = Images.OrderBy(x => x.Index).ToList();
-                Images.Clear();
-                foreach (var item in sorted)
-                {
-                    Images.Add(item);
-                }
-            });
-
-            // Load actual images
-            IEnumerable<Image> dbImages;
-            // ... your existing database loading code ...
-
-            if (!string.IsNullOrWhiteSpace(SearchText))
-            {
-                dbImages = await _imageRepository.SearchByPromptAsync(SearchText, startOffset, endOffset - startOffset, _currentLibraryId, _currentPath);
-            }
-            else if (_currentLibraryId == null)
-            {
-                dbImages = await _imageRepository.GetPagedAllAsync(startOffset, endOffset - startOffset, CurrentSortOption);
-            }
-            else if (_currentPath == null)
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, startOffset, endOffset - startOffset, CurrentSortOption);
-            }
-            else
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath, startOffset, endOffset - startOffset, CurrentSortOption);
-            }
-
-            if (ct.IsCancellationRequested) return;
-
-            var viewModels = await Task.Run(() => 
-                dbImages.Select((image, idx) => new ImageItemViewModel(image) { Index = startOffset + idx }).ToList(), ct);
-
-            if (ct.IsCancellationRequested) return;
-
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                // Replace placeholders with actual items
-                foreach (var vm in viewModels)
-                {
-                    var placeholder = Images.FirstOrDefault(x => x.Index == vm.Index);
-                    if (placeholder != null)
-                    {
-                        var index = Images.IndexOf(placeholder);
-                        Images[index] = vm;
-                    }
-                }
-            }, DispatcherPriority.Background);
-        }
-        finally
-        {
-            _isLoadingMore = false;
         }
     }
     
@@ -289,12 +112,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         Debug.WriteLine($"Searching images for {SearchText}");
         ResetScrollRequested?.Invoke();
-        await LoadImagesAsync(new LibraryTreeItem
-        {
-            Name = _currentName,
-            Id = _currentLibraryId,
-            Path = _currentPath,
-        });
+        await LoadImagesAsync(null);
     }
 
     [RelayCommand]
@@ -311,81 +129,53 @@ public partial class ImageGalleryViewModel : ViewModelBase
         if (CurrentSortOption == sortOption) return Task.CompletedTask;
         
         CurrentSortOption = sortOption;
-        return LoadImagesAsync(new LibraryTreeItem
-            {
-                Id = _currentLibraryId,
-                Path = _currentPath,
-                Name = _currentName,
-            });
+        return LoadImagesAsync(null);
     }
     
     partial void OnCurrentSortOptionChanged(ImageSortOption value)
     {
         Debug.WriteLine($"Current sort option changed to {value}");
-        LoadImagesAsync(new LibraryTreeItem
-        {
-            Id = _currentLibraryId,
-            Path = _currentPath,
-            Name = _currentName,
-        }).FireAndForget();
+        LoadImagesAsync(null).FireAndForget();
     }
     
     public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
     {
         Debug.WriteLine($"Updating visible thumbnails for {visibleIds.Count()} images");
         // Get thumbnails for visible items and some items ahead/behind
-        var thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
-    
+        Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
+        
+        // Update the view models
         foreach (var image in Images)
         {
-            if (thumbnails.TryGetValue(image.Id, out var thumbnail))
-            {
-                image.Thumbnail = thumbnail;
-            } else
-            {
-                image.Thumbnail = null;
-            }
+            image.UpdateThumbnail();
         }
     }
 }
 
 public partial class ImageItemViewModel : ViewModelBase
 {
-    private readonly Models.Image _image;
-    private Bitmap? _thumbnail;
-
-    public long Id => _image.Id;
-    public string Path => _image.Path;
-    public string FileName => System.IO.Path.GetFileName(Path);
-    public string Hash => _image.Hash;
-    public string? PositivePrompt => _image.PositivePrompt;
-    public string? NegativePrompt => _image.NegativePrompt;
-    public DateTime Created => _image.Created;
-    public Bitmap? Thumbnail
-    {
-        get => _thumbnail ?? _image.Thumbnail;
-        set => SetProperty(ref _thumbnail, value);
-    }
-    public int Index {get; set;}
-    public virtual bool IsPlaceholder => false;
-    public virtual bool IsRealImage => true;
+    private readonly WeakReference<ImageGalleryViewModel> _galleryViewModel;
     
+    [ObservableProperty]
+    private Bitmap? _thumbnail;
     [ObservableProperty]
     private bool _isSelected;
 
-    public ImageItemViewModel(Models.Image image)
+    public long Id { get; }
+    public string? Path { get; }
+    public string? FileName { get; }
+
+    public void UpdateThumbnail()
     {
-        _image = image;
+        Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails.GetValueOrDefault(Id) : null;
     }
-}
 
-public class PlaceholderImageItem : ImageItemViewModel
-{
-    public override bool IsPlaceholder => true;
-    public override bool IsRealImage => false;
-
-    public PlaceholderImageItem(int index) : base(null!)
+    public ImageItemViewModel(Image image, ImageGalleryViewModel galleryViewModel)
     {
-        Index = index;
+        Id = image.Id;
+        Path = image.Path;
+        FileName = System.IO.Path.GetFileName(image.Path);
+        _galleryViewModel = new WeakReference<ImageGalleryViewModel>(galleryViewModel);
+        UpdateThumbnail(); // Initial thumbnail value
     }
 }

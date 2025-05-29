@@ -83,7 +83,7 @@
                 Margin="0,0,0,-1" />
 
         <!-- Image gallery -->
-        <ScrollViewer Grid.Row="1" Name="ScrollViewer" ScrollChanged="OnScrollChanged">
+        <ScrollViewer Grid.Row="1" Name="ScrollViewer" ScrollChanged="ScrollViewer_ScrollChanged">
             <Grid>
                 <!-- Dummy border to fake height -->
                 <Border Name="VirtualHeightEnforcer" 
@@ -122,23 +122,14 @@
                                             Margin="-1" />
                                     <!-- Content -->
                                     <StackPanel>
-                                        <!-- Regular image content -->
-                                        <Panel Name="ImageContent" IsVisible="{Binding IsRealImage}">
-                                            <Image Source="{Binding Thumbnail}"
-                                                   Width="200"
-                                                   Height="200"
-                                                   Stretch="Uniform"/>
-                                            <TextBlock Text="{Binding FileName}"
-                                                       Margin="5 10"
-                                                       TextAlignment="Center"
-                                                       TextWrapping="Wrap" />
-                                        </Panel>
-                
-                                        <!-- Placeholder -->
-                                        <Panel Name="PlaceholderContent" IsVisible="{Binding IsPlaceholder}"
+                                        <Image Source="{Binding Thumbnail}"
                                                Width="200"
-                                               Height="200">
-                                        </Panel>
+                                               Height="200"
+                                               Stretch="Uniform"/>
+                                        <TextBlock Text="{Binding FileName}"
+                                                   Margin="5 10"
+                                                   TextAlignment="Center"
+                                                   TextWrapping="Wrap" />
                                     </StackPanel>
                                 </Grid>
                             </Border>

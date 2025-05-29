@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.IO;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
@@ -42,9 +43,15 @@ public class ImageRepository : IImageRepository
 
     private static Image ReadImage(SqliteDataReader reader)
     {
-        var thumbnailBytes = reader.IsDBNull(reader.GetOrdinal("Thumbnail"))
-            ? null
-            : reader.GetValue<byte[]>("Thumbnail");
+        byte[]? thumbnailBytes = null;
+        if (SqliteHelper.HasColumn(reader, "thumbnail")) 
+        {
+            var ordinal = reader.GetOrdinal("Thumbnail");
+            if (!reader.IsDBNull(ordinal))
+            {
+                thumbnailBytes = reader.GetValue<byte[]>("Thumbnail");
+            }
+        }
 
         return new Image
         {
@@ -52,6 +59,7 @@ public class ImageRepository : IImageRepository
             LibraryId = reader.GetValue<long>("LibraryId"),
             Path = reader.GetValue<string>("Path"),
             Hash = reader.GetValue<string>("Hash"),
+            Thumbnail = BytesToBitmap(thumbnailBytes),
             PositivePrompt = reader.GetValue<string>("PositivePrompt"),
             NegativePrompt = reader.GetValue<string>("NegativePrompt"),
             Description = reader.GetValue<string>("Description"),
@@ -130,7 +138,7 @@ public class ImageRepository : IImageRepository
 
         // Base query using FTS5 virtual table for full-text search
         var baseQuery = @"
-        SELECT i.*
+        SELECT i.Id, i.Path
         FROM Images i
         INNER JOIN ImagePromptIndex fts ON i.Id = fts.rowid
         WHERE fts.PositivePrompt MATCH @SearchText";
@@ -145,7 +153,7 @@ public class ImageRepository : IImageRepository
             baseQuery += " AND i.Path LIKE @DirectoryPath || '%'";
         }
 
-        baseQuery += " ORDER BY rank"; // FTS5 automatically provides the rank column
+        baseQuery += " ORDER BY rank, created desc"; // FTS5 automatically provides the rank column
 
         command.CommandText = baseQuery;
         command.CreateParameter("@SearchText", searchText);
@@ -177,7 +185,8 @@ public class ImageRepository : IImageRepository
         using var command = connection.CreateCommand();
 
         var limitClause = limit.HasValue ? "LIMIT @Limit" : "";
-        command.CommandText = $"{baseQuery} {GetSortClause(sortOption)} {limitClause} OFFSET @Offset";
+        var offsetClause = limit.HasValue ? "OFFSET @Offset" : "";
+        command.CommandText = $"{baseQuery} {GetSortClause(sortOption)} {limitClause} {offsetClause}";
         
         foreach (var param in parameters)
         {
@@ -186,8 +195,8 @@ public class ImageRepository : IImageRepository
         if (limit.HasValue)
         {
             command.CreateParameter("@Limit", limit.Value);
+            command.CreateParameter("@Offset", offset);
         }
-        command.CreateParameter("@Offset", offset);
 
         using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -201,7 +210,7 @@ public class ImageRepository : IImageRepository
     public async Task<IEnumerable<Image>> GetPagedAllAsync(int offset, int? limit, ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         return await ExecutePagedQueryAsync(
-            "SELECT * FROM Images",
+            "SELECT Id, Path FROM Images",
             new Dictionary<string, object>(),
             offset, limit, sortOption);
     }
@@ -210,7 +219,7 @@ public class ImageRepository : IImageRepository
         ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         return await ExecutePagedQueryAsync(
-            "SELECT * FROM Images WHERE LibraryId = @LibraryId",
+            "SELECT Id, Path FROM Images WHERE LibraryId = @LibraryId",
             new Dictionary<string, object> { ["@LibraryId"] = libraryId },
             offset, limit, sortOption);
     }
@@ -219,7 +228,7 @@ public class ImageRepository : IImageRepository
         ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
         return await ExecutePagedQueryAsync(
-            "SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%'",
+            "SELECT Id, Path FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%'",
             new Dictionary<string, object> 
             { 
                 ["@LibraryId"] = libraryId,
@@ -275,16 +284,9 @@ public class ImageRepository : IImageRepository
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
 
-        var orderBy = sortOption switch
-        {
-            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
-            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
-            ImageSortOption.NameAscending => "ORDER BY Path ASC",
-            ImageSortOption.NameDescending => "ORDER BY Path DESC",
-            _ => "ORDER BY Created DESC"
-        };
+        var orderBy = GetSortClause(sortOption);
 
-        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path = @Path {orderBy}";
+        command.CommandText = $"SELECT Id, Path FROM Images WHERE LibraryId = @LibraryId AND Path = @Path {orderBy}";
         command.CreateParameter("@LibraryId", libraryId);
         command.CreateParameter("@Path", path);
 
