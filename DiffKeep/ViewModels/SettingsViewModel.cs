@@ -8,10 +8,11 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
-using DiffKeep.Dialogs;
 using DiffKeep.Models;
 using DiffKeep.Repositories;
 using DiffKeep.Extensions;
+using MsBox.Avalonia;
+using MsBox.Avalonia.Enums;
 
 namespace DiffKeep.ViewModels;
 
@@ -151,13 +152,10 @@ public partial class SettingsViewModel : ViewModelBase
             {
                 if (item.Id == null)
                     return;
-                var dialog = new MessageDialog
-                {
-                    Title = "Confirm Delete",
-                    Message = $"Are you sure you want to remove this library?\n{item.Path}"
-                };
+                var dialog = MessageBoxManager.GetMessageBoxStandard(
+                    "Confirm Delete", $"Are you sure you want to remove this library?\n{item.Path}", ButtonEnum.OkCancel);
 
-                if (await dialog.ShowAsync(window) == MessageDialogResult.Ok)
+                if (await dialog.ShowAsync() == ButtonResult.Ok)
                 {
                     // delete all the images associated with this library
                     _imageRepository.DeleteByLibraryIdAsync(item.Id.Value).FireAndForget();

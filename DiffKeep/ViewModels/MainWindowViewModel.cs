@@ -25,11 +25,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public MainWindowViewModel()
     {
-        var libraryRepository = Program.Services.GetRequiredService<ILibraryRepository>();
-        var imageRepository = Program.Services.GetRequiredService<IImageRepository>();
-        var imageLibraryScanner = Program.Services.GetRequiredService<ImageLibraryScanner>();
-        LeftPanel = new LeftPanelViewModel(libraryRepository, imageLibraryScanner);
-        ImageGallery = new ImageGalleryViewModel(imageRepository);
+        LeftPanel = Program.Services.GetRequiredService<LeftPanelViewModel>();
+        ImageGallery = Program.Services.GetRequiredService<ImageGalleryViewModel>();
         _leftPanelWidth = new GridLength(250);
         
         // Subscribe to selection changes

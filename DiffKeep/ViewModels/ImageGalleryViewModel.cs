@@ -3,14 +3,14 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
+using Avalonia.Controls;
 using Avalonia.Media.Imaging;
-using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using DiffKeep.Extensions;
 using DiffKeep.Repositories;
+using DiffKeep.Services;
 using Image = DiffKeep.Models.Image;
 
 namespace DiffKeep.ViewModels;
@@ -18,6 +18,7 @@ namespace DiffKeep.ViewModels;
 public partial class ImageGalleryViewModel : ViewModelBase
 {
     private readonly IImageRepository _imageRepository;
+    private readonly IImageService _imageService;
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
     private string? _currentPath;
@@ -47,9 +48,10 @@ public partial class ImageGalleryViewModel : ViewModelBase
         set => SetProperty(ref _images, value);
     }
 
-    public ImageGalleryViewModel(IImageRepository imageRepository)
+    public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService)
     {
         _imageRepository = imageRepository;
+        _imageService = imageService;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
     }
@@ -148,6 +150,28 @@ public partial class ImageGalleryViewModel : ViewModelBase
         foreach (var image in Images)
         {
             image.UpdateThumbnail();
+        }
+    }
+    
+    public async Task DeleteImage(ImageItemViewModel image, Window parentWindow)
+    {
+        if (await _imageService.DeleteImageAsync(image, parentWindow))
+        {
+            var index = Images.IndexOf(image);
+            Images.Remove(image);
+            // If there are any images left, select one
+            if (Images.Count > 0)
+            {
+                // If we deleted the last image, select the new last image
+                // Otherwise, select the image at the same index (which will be the next image)
+                var newIndex = Math.Min(index, Images.Count - 1);
+                SelectedImage = Images[newIndex];
+                SelectedImage.IsSelected = true;
+            }
+            else
+            {
+                SelectedImage = null;
+            }
         }
     }
 }

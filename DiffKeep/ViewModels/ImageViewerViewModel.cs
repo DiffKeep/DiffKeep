@@ -12,6 +12,7 @@ using System.Linq;
 using System.Threading;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
+using DiffKeep.Services;
 
 namespace DiffKeep.ViewModels;
 
@@ -19,6 +20,7 @@ public partial class ImageViewerViewModel : ViewModelBase
 {
     private readonly ObservableCollection<ImageItemViewModel> _allImages;
     private readonly IImageParser _imageParser;
+    private readonly IImageService _imageService;
     private int _currentIndex;
 
     [ObservableProperty]
@@ -57,10 +59,11 @@ public partial class ImageViewerViewModel : ViewModelBase
     [ObservableProperty]
     private string _fileSize = string.Empty;
 
-    public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage)
+    public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage, IImageService imageService)
     {
         _allImages = images;
         _currentIndex = images.IndexOf(currentImage);
+        _imageService = imageService;
         _imageParser = new ImageParser(); // Composite parser that handles all formats
         LoadCurrentImage();
     }
@@ -110,9 +113,13 @@ public partial class ImageViewerViewModel : ViewModelBase
         }
     }
 
-    private async void LoadCurrentImage()
+    public async void LoadCurrentImage()
     {
         Debug.Print($"Loading image {_currentIndex}");
+        if (_currentIndex < 0 || _currentIndex >= _allImages.Count)
+        {
+            return;
+        }
         var currentItem = _allImages[_currentIndex];
         ImageSource?.Dispose();
         ImageSource = new Bitmap(currentItem.Path);
@@ -129,6 +136,19 @@ public partial class ImageViewerViewModel : ViewModelBase
         HasNext = _currentIndex < _allImages.Count - 1;
 
         await LoadImageMetadataAsync();
+    }
+    
+    public async Task<bool> DeleteCurrentImage(Window parentWindow)
+    {
+        var currentImage = _allImages[_currentIndex];
+
+        var result = await _imageService.DeleteImageAsync(currentImage, parentWindow);
+        if (result)
+        {
+            // Remove from gallery
+            _allImages.Remove(currentImage);
+        }
+        return result;
     }
 
     private async Task LoadImageMetadataAsync()
@@ -163,6 +183,25 @@ public partial class ImageViewerViewModel : ViewModelBase
     private void NavigateNext()
     {
         if (_currentIndex < _allImages.Count - 1)
+        {
+            _currentIndex++;
+            LoadCurrentImage();
+        }
+    }
+
+    /// <summary>
+    /// Attempts to navigate to the next image. If not available, navigates to the previous.
+    /// If that is not available, don't navigate.
+    /// </summary>
+    [RelayCommand]
+    private void NavigateNextOrPrevious()
+    {
+        if (_currentIndex > 0)
+        {
+            _currentIndex--;
+            LoadCurrentImage();
+        }
+        else if (_currentIndex < _allImages.Count - 1)
         {
             _currentIndex++;
             LoadCurrentImage();

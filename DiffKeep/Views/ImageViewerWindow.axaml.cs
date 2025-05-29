@@ -5,6 +5,7 @@ using DiffKeep.ViewModels;
 using System.Collections.ObjectModel;
 using Avalonia;
 using Avalonia.Interactivity;
+using DiffKeep.Services;
 
 namespace DiffKeep.Views;
 
@@ -18,7 +19,7 @@ public partial class ImageViewerWindow : Window
     public ImageViewerWindow()
     {
         InitializeComponent();
-        
+
         ZoomInButton.Click += (_, _) => ImageViewer.ZoomIn();
         ZoomOutButton.Click += (_, _) => ImageViewer.ZoomOut();
         FitToScreenButton.Click += (_, _) => ImageViewer.ZoomToFit();
@@ -28,15 +29,15 @@ public partial class ImageViewerWindow : Window
 
     public ImageViewerWindow(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage) : this()
     {
-        DataContext = new ImageViewerViewModel(images, currentImage);
-        
+        DataContext = new ImageViewerViewModel(images, currentImage, App.GetService<IImageService>());
+
         KeyDown += ImageViewerWindow_KeyDown;
-        
+
         // Handle window opened event
         Opened += (s, e) => Focus();
     }
 
-    private void ImageViewerWindow_KeyDown(object? sender, KeyEventArgs e)
+    private async void ImageViewerWindow_KeyDown(object? sender, KeyEventArgs e)
     {
         if (DataContext is ImageViewerViewModel vm)
         {
@@ -54,6 +55,30 @@ public partial class ImageViewerWindow : Window
                     break;
                 case Key.Escape:
                     Close();
+                    e.Handled = true;
+                    break;
+                case Key.F11:
+                    ToggleFullScreen(null, new RoutedEventArgs());
+                    e.Handled = true;
+                    break;
+                case Key.I:
+                    if (DataContext is ImageViewerViewModel vm1)
+                    {
+                        vm1.IsInfoPanelVisible = !vm1.IsInfoPanelVisible;
+                    }
+
+                    e.Handled = true;
+                    break;
+                case Key.Delete:
+                    if (DataContext is ImageViewerViewModel vm2)
+                    {
+                        var result = await vm2.DeleteCurrentImage(this);
+                        if (result)
+                        {
+                            vm2.LoadCurrentImage();
+                        }
+                    }
+
                     e.Handled = true;
                     break;
             }
@@ -80,25 +105,6 @@ public partial class ImageViewerWindow : Window
         WindowState = _isFullScreen ? Avalonia.Controls.WindowState.FullScreen : _previousWindowState;
     }
 
-    protected override void OnKeyUp(KeyEventArgs e)
-    {
-        base.OnKeyUp(e);
-        
-        if (e.Key == Key.F11)
-        {
-            ToggleFullScreen(null, new RoutedEventArgs());
-            e.Handled = true;
-        }
-        else if (e.Key == Key.I)
-        {
-            if (DataContext is ImageViewerViewModel vm)
-            {
-                vm.IsInfoPanelVisible = !vm.IsInfoPanelVisible;
-            }
-            e.Handled = true;
-        }
-    }
-    
     private void OnInfoPanelResizeStarted(object? sender, PointerPressedEventArgs e)
     {
         _isResizing = true;
@@ -109,16 +115,16 @@ public partial class ImageViewerWindow : Window
     private void OnInfoPanelResizing(object? sender, PointerEventArgs e)
     {
         if (!_isResizing) return;
-    
+
         var pos = e.GetPosition(this);
         var delta = _lastPos.X - pos.X;
-    
+
         if (DataContext is ImageViewerViewModel vm)
         {
             var newWidth = Math.Max(200, Math.Min(600, vm.InfoPanelWidth + delta));
             vm.InfoPanelWidth = newWidth;
         }
-    
+
         _lastPos = pos;
     }
 
@@ -127,5 +133,4 @@ public partial class ImageViewerWindow : Window
         _isResizing = false;
         e.Pointer.Capture(null);
     }
-
 }

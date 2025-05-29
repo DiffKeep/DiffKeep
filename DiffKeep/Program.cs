@@ -12,6 +12,7 @@ using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Parsing;
 using DiffKeep.Repositories;
+using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Data.Sqlite;
 
@@ -24,7 +25,7 @@ sealed class Program
     public static AppSettings Settings { get; set; }
     public static string DataPath { get; private set; }
     public static string ConfigPath { get; private set; }
-    
+
     public const string DbFilename = "diffkeep.db";
 
     private static string DefaultDataPath => Path.Combine(
@@ -40,7 +41,7 @@ sealed class Program
             () => DefaultDataPath,
             "Directory where application data and configuration will be stored"
         );
-        
+
         var deleteDbOption = new Option<bool>(
             new[] { "--delete-db" },
             "Delete the existing database and create a new one on startup"
@@ -53,12 +54,12 @@ sealed class Program
         };
 
         DataPath = DefaultDataPath;
-        
+
         rootCommand.SetHandler((dataPath, deleteDb) =>
         {
             Debug.Print($"Data path: {dataPath}");
             DataPath = dataPath;
-            
+
             if (deleteDb)
             {
                 var dbPath = Path.Combine(dataPath, DbFilename);
@@ -105,7 +106,7 @@ sealed class Program
         }
 
         ReloadConfiguration();
-        
+
         ConfigureServices().FireAndForget();
     }
 
@@ -127,11 +128,11 @@ sealed class Program
             .UsePlatformDetect()
             .WithInterFont()
             .LogToTrace();
-    
+
     private static async Task ConfigureServices()
     {
         var services = new ServiceCollection();
-        
+
         var dbPath = Path.Combine(DataPath, DbFilename);
         var connectionString = new SqliteConnectionStringBuilder
         {
@@ -146,33 +147,38 @@ sealed class Program
 
 
         // Register repositories with the connection factory
-        services.AddSingleton<ILibraryRepository>(sp => 
+        services.AddSingleton<ILibraryRepository>(sp =>
             new LibraryRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-        services.AddSingleton<IImageRepository>(sp => 
+        services.AddSingleton<IImageRepository>(sp =>
             new ImageRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-        services.AddSingleton<IEmbeddingsRepository>(sp => 
+        services.AddSingleton<IEmbeddingsRepository>(sp =>
             new EmbeddingsRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-        
+
         // Register services
         services.AddSingleton<ImageParser>();
         services.AddSingleton<ImageLibraryScanner>();
         services.AddSingleton<PngMetadataParser>();
-        
+        services.AddSingleton<IImageService>(sp =>
+            new ImageService(sp.GetRequiredService<IImageRepository>())
+        );
+
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
-        services.AddTransient<SettingsViewModel>(sp => 
+        services.AddTransient<SettingsViewModel>(sp =>
             new SettingsViewModel(
                 sp.GetRequiredService<ILibraryRepository>(),
                 sp.GetRequiredService<IImageRepository>(),
                 Settings
             ));
         services.AddSingleton<AboutWindowViewModel>();
-        services.AddSingleton<ImageGalleryViewModel>(sp => 
-            new ImageGalleryViewModel(sp.GetRequiredService<IImageRepository>()));
+        services.AddSingleton<ImageGalleryViewModel>(sp =>
+            new ImageGalleryViewModel(
+                sp.GetRequiredService<IImageRepository>(),
+                sp.GetRequiredService<IImageService>()
+            ));
         services.AddSingleton<ImageViewerViewModel>();
         services.AddSingleton<LeftPanelViewModel>();
 
         Services = services.BuildServiceProvider();
     }
-
 }

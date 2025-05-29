@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -119,10 +120,18 @@ public partial class ImageGalleryView : UserControl
             return;
         }
 
+        if (e.Key == Key.Delete && vm.SelectedImage != null)
+        {
+            DeleteSelectedImage();
+            e.Handled = true;
+            return;
+        }
+
         int currentIndex = vm.SelectedImage != null ? vm.Images.IndexOf(vm.SelectedImage) : -1;
         int columns = GetColumnCount();
         int newIndex = currentIndex;
 
+        // navigation keys
         switch (e.Key)
         {
             case Key.Left:
@@ -166,6 +175,18 @@ public partial class ImageGalleryView : UserControl
             e.Handled = true;
         }
     }
+    
+    private async void DeleteSelectedImage()
+    {
+        if (DataContext is not ImageGalleryViewModel vm || vm.SelectedImage == null)
+            return;
+
+        if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime { MainWindow: not null } desktop)
+        {
+            await vm.DeleteImage(vm.SelectedImage, desktop.MainWindow);
+        }
+    }
+
     
     private void ScrollSelectedItemIntoView()
     {
