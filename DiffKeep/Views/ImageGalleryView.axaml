@@ -17,9 +17,9 @@
         <!-- Header -->
         <Grid Grid.Row="0" Margin="10">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/> <!-- Directory -->
-                <ColumnDefinition Width="*"/> <!-- Search (fills space) -->
-                <ColumnDefinition Width="Auto"/> <!-- Sort dropdown -->
+                <ColumnDefinition Width="Auto" /> <!-- Directory -->
+                <ColumnDefinition Width="*" /> <!-- Search (fills space) -->
+                <ColumnDefinition Width="Auto" /> <!-- Sort dropdown -->
             </Grid.ColumnDefinitions>
 
             <!-- Directory path display -->
@@ -47,12 +47,13 @@
                             Width="20" Height="20"
                             Padding="0"
                             VerticalAlignment="Center">
-                        <PathIcon Data="M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z"/>
+                        <PathIcon
+                            Data="M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z" />
                     </Button>
                 </TextBox.InnerRightContent>
                 <TextBox.KeyBindings>
-                    <KeyBinding Gesture="Enter" 
-                       Command="{Binding SearchPromptsCommand}"/>
+                    <KeyBinding Gesture="Enter"
+                                Command="{Binding SearchPromptsCommand}" />
                 </TextBox.KeyBindings>
             </TextBox>
 
@@ -75,55 +76,105 @@
             </ComboBox>
         </Grid>
 
+        <!-- Separator -->
+        <Border Grid.Row="0"
+                BorderThickness="0,0,0,1"
+                BorderBrush="Gray"
+                Margin="0,0,0,-1" />
 
         <!-- Image gallery -->
-        <ScrollViewer Grid.Row="1" Name="ScrollViewer">
-            <ItemsRepeater ItemsSource="{Binding Images}"
-                           Name="ItemsRepeater">
-                <ItemsRepeater.Layout>
-                    <WrapLayout Orientation="Horizontal"
-                                HorizontalSpacing="3"
-                                VerticalSpacing="3" />
-                </ItemsRepeater.Layout>
-                <ItemsRepeater.ItemTemplate>
-                    <DataTemplate x:DataType="vm:ImageItemViewModel">
-                        <Border Width="220"
-                                Height="240"
-                                CornerRadius="3"
-                                Tapped="Border_OnTapped"
-                                DoubleTapped="Border_OnDoubleTapped">
-                            <Border.Styles>
-                                <Style Selector="Border">
-                                    <Setter Property="BorderBrush" Value="Gray" />
-                                    <Setter Property="BorderThickness" Value="1" />
+        <ScrollViewer Grid.Row="1" Name="ScrollViewer" ScrollChanged="OnScrollChanged">
+            <Grid>
+                <!-- Dummy border to fake height -->
+                <Border Name="VirtualHeightEnforcer" 
+                        Background="Transparent" 
+                        IsHitTestVisible="False"/>
+
+                <ItemsRepeater ItemsSource="{Binding Images}"
+                               Name="ItemsRepeater">
+                    <ItemsRepeater.Layout>
+                        <WrapLayout Orientation="Horizontal"
+                                    HorizontalSpacing="3"
+                                    VerticalSpacing="3" />
+                    </ItemsRepeater.Layout>
+                    <ItemsRepeater.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ImageItemViewModel">
+                            <Border Width="220"
+                                    Height="240"
+                                    CornerRadius="3"
+                                    Tapped="Border_OnTapped"
+                                    DoubleTapped="Border_OnDoubleTapped">
+                                <Border.Styles>
+                                    <Style Selector="Border">
+                                        <Setter Property="BorderBrush" Value="Gray" />
+                                        <Setter Property="BorderThickness" Value="1" />
+                                    </Style>
+                                    <Style Selector="Border:pointerover">
+                                        <Setter Property="BorderBrush" Value="Gray" />
+                                    </Style>
+                                </Border.Styles>
+                                <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
+                                    <!-- Selection border -->
+                                    <Border BorderBrush="DarkRed"
+                                            Background="DarkSlateGray"
+                                            BorderThickness="2"
+                                            IsVisible="{Binding IsSelected}"
+                                            Margin="-1" />
+                                    <!-- Content -->
+                                    <StackPanel>
+                                        <!-- Regular image content -->
+                                        <Panel Name="ImageContent" IsVisible="{Binding IsRealImage}">
+                                            <Image Source="{Binding Thumbnail}"
+                                                   Width="200"
+                                                   Height="200"
+                                                   Stretch="Uniform"/>
+                                            <TextBlock Text="{Binding FileName}"
+                                                       Margin="5 10"
+                                                       TextAlignment="Center"
+                                                       TextWrapping="Wrap" />
+                                        </Panel>
+                
+                                        <!-- Placeholder -->
+                                        <Panel Name="PlaceholderContent" IsVisible="{Binding IsPlaceholder}"
+                                               Width="200"
+                                               Height="200">
+                                        </Panel>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsRepeater.ItemTemplate>
+                </ItemsRepeater>
+                <!-- Loader Overlay -->
+                <Panel IsVisible="{Binding IsLoading}">
+                    <Border Background="Transparent"
+                            Width="40"
+                            Height="40"
+                            CornerRadius="20"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Bottom"
+                            Margin="0,0,20,20">
+                        <PathIcon Data="M12,4V2A10,10 0 0,0 2,12H4A8,8 0 0,1 12,4Z">
+                            <PathIcon.Styles>
+                                <Style Selector="PathIcon">
+                                    <Style.Animations>
+                                        <Animation Duration="0:0:1"
+                                                   IterationCount="Infinite">
+                                            <KeyFrame Cue="0%">
+                                                <Setter Property="RotateTransform.Angle" Value="0.0" />
+                                            </KeyFrame>
+                                            <KeyFrame Cue="100%">
+                                                <Setter Property="RotateTransform.Angle" Value="360.0" />
+                                            </KeyFrame>
+                                        </Animation>
+                                    </Style.Animations>
                                 </Style>
-                                <Style Selector="Border:pointerover">
-                                    <Setter Property="BorderBrush" Value="Gray" />
-                                </Style>
-                            </Border.Styles>
-                            <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
-                                <!-- Selection border -->
-                                <Border BorderBrush="DarkRed"
-                                        Background="DarkSlateGray"
-                                        BorderThickness="2"
-                                        IsVisible="{Binding IsSelected}"
-                                        Margin="-1" />
-                                <!-- Content -->
-                                <StackPanel>
-                                    <Image Source="{Binding Thumbnail}"
-                                           Width="200"
-                                           Height="200"
-                                           Stretch="Uniform" />
-                                    <TextBlock Text="{Binding FileName}"
-                                               Margin="5 10"
-                                               TextAlignment="Center"
-                                               TextWrapping="Wrap" />
-                                </StackPanel>
-                            </Grid>
-                        </Border>
-                    </DataTemplate>
-                </ItemsRepeater.ItemTemplate>
-            </ItemsRepeater>
+                            </PathIcon.Styles>
+                        </PathIcon>
+                    </Border>
+                </Panel>
+            </Grid>
         </ScrollViewer>
+
     </Grid>
 </UserControl>

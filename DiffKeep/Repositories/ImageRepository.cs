@@ -60,8 +60,69 @@ public class ImageRepository : IImageRepository
                 : DateTime.MinValue
         };
     }
+    
+    public async Task<int> GetCountAsync(long? libraryId = null, string? path = null)
+    {
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+    
+        var sql = "SELECT COUNT(*) FROM Images WHERE 1=1";
+        if (libraryId.HasValue)
+        {
+            sql += " AND LibraryId = @LibraryId";
+            command.CreateParameter("@LibraryId", libraryId.Value);
+        }
+        if (!string.IsNullOrEmpty(path))
+        {
+            sql += " AND Path LIKE @Path || '%'";
+            command.CreateParameter("@Path", path);
+        }
+    
+        command.CommandText = sql;
+        return await command.ExecuteScalarAsync<int>();
+    }
 
-    public async Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, long? libraryId = null, string? directoryPath = null)
+    public async Task<int> GetSearchCountAsync(string searchText, long? libraryId = null, string? directoryPath = null)
+    {
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+
+        // Base query using FTS5 virtual table for full-text search
+        var baseQuery = @"
+        SELECT COUNT(*)
+        FROM Images i
+        INNER JOIN ImagePromptIndex fts ON i.Id = fts.rowid
+        WHERE fts.PositivePrompt MATCH @SearchText";
+
+        if (libraryId.HasValue)
+        {
+            baseQuery += " AND i.LibraryId = @LibraryId";
+        }
+
+        if (!string.IsNullOrEmpty(directoryPath))
+        {
+            baseQuery += " AND i.Path LIKE @DirectoryPath || '%'";
+        }
+
+        baseQuery += " ORDER BY rank"; // FTS5 automatically provides the rank column
+
+        command.CommandText = baseQuery;
+        command.CreateParameter("@SearchText", searchText);
+
+        if (libraryId.HasValue)
+        {
+            command.CreateParameter("@LibraryId", libraryId.Value);
+        }
+
+        if (!string.IsNullOrEmpty(directoryPath))
+        {
+            command.CreateParameter("@DirectoryPath", directoryPath);
+        }
+
+        return await command.ExecuteScalarAsync<int>();
+    }
+
+    public async Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, int offset, int? limit, long? libraryId = null, string? directoryPath = null)
     {
         var images = new List<Image>();
         using var connection = CreateConnection();
@@ -108,22 +169,26 @@ public class ImageRepository : IImageRepository
         return images;
     }
 
-    public async Task<IEnumerable<Image>> GetAllAsync(ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    private async Task<IEnumerable<Image>> ExecutePagedQueryAsync(string baseQuery, Dictionary<string, object> parameters, 
+        int offset, int? limit, ImageSortOption sortOption)
     {
         var images = new List<Image>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
 
-        var orderBy = sortOption switch
+        var limitClause = limit.HasValue ? "LIMIT @Limit" : "";
+        command.CommandText = $"{baseQuery} {GetSortClause(sortOption)} {limitClause} OFFSET @Offset";
+        
+        foreach (var param in parameters)
         {
-            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
-            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
-            ImageSortOption.NameAscending => "ORDER BY Path ASC",
-            ImageSortOption.NameDescending => "ORDER BY Path DESC",
-            _ => "ORDER BY Created DESC"
-        };
+            command.CreateParameter(param.Key, param.Value);
+        }
+        if (limit.HasValue)
+        {
+            command.CreateParameter("@Limit", limit.Value);
+        }
+        command.CreateParameter("@Offset", offset);
 
-        command.CommandText = $"SELECT * FROM Images {orderBy}";
         using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
@@ -131,6 +196,66 @@ public class ImageRepository : IImageRepository
         }
 
         return images;
+    }
+
+    public async Task<IEnumerable<Image>> GetPagedAllAsync(int offset, int? limit, ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await ExecutePagedQueryAsync(
+            "SELECT * FROM Images",
+            new Dictionary<string, object>(),
+            offset, limit, sortOption);
+    }
+
+    public async Task<IEnumerable<Image>> GetPagedByLibraryIdAsync(long libraryId, int offset, int? limit, 
+        ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await ExecutePagedQueryAsync(
+            "SELECT * FROM Images WHERE LibraryId = @LibraryId",
+            new Dictionary<string, object> { ["@LibraryId"] = libraryId },
+            offset, limit, sortOption);
+    }
+
+    public async Task<IEnumerable<Image>> GetPagedByLibraryIdAndPathAsync(long libraryId, string path, int offset, int? limit,
+        ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await ExecutePagedQueryAsync(
+            "SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%'",
+            new Dictionary<string, object> 
+            { 
+                ["@LibraryId"] = libraryId,
+                ["@Path"] = path
+            },
+            offset, limit, sortOption);
+    }
+
+    // Update existing methods to use the paged versions without limit
+    public async Task<IEnumerable<Image>> GetAllAsync(ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await GetPagedAllAsync(0, null, sortOption);
+    }
+
+    public async Task<IEnumerable<Image>> GetByLibraryIdAsync(long libraryId, 
+        ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await GetPagedByLibraryIdAsync(libraryId, 0, null, sortOption);
+    }
+
+    public async Task<IEnumerable<Image>> GetByLibraryIdAndPathAsync(long libraryId, string path,
+        ImageSortOption sortOption = ImageSortOption.NewestFirst)
+    {
+        return await GetPagedByLibraryIdAndPathAsync(libraryId, path, 0, null, sortOption);
+    }
+
+    private string GetSortClause(ImageSortOption sortOption)
+    {
+        return sortOption switch
+        {
+            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
+            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
+            ImageSortOption.NameAscending => "ORDER BY Path ASC",
+            ImageSortOption.NameDescending => "ORDER BY Path DESC",
+            _ => "ORDER BY Created DESC"
+        };
     }
 
     public async Task<Image?> GetByIdAsync(long id)
@@ -178,61 +303,6 @@ public class ImageRepository : IImageRepository
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
-    public async Task<IEnumerable<Image>> GetByLibraryIdAsync(long libraryId,
-        ImageSortOption sortOption = ImageSortOption.NewestFirst)
-    {
-        var images = new List<Image>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
-
-        var orderBy = sortOption switch
-        {
-            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
-            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
-            ImageSortOption.NameAscending => "ORDER BY Path ASC",
-            ImageSortOption.NameDescending => "ORDER BY Path DESC",
-            _ => "ORDER BY Created DESC"
-        };
-
-        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId {orderBy}";
-        command.CreateParameter("@LibraryId", libraryId);
-
-        using var reader = await command.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            images.Add(ReadImage(reader));
-        }
-
-        return images;
-    }
-
-    public async Task<IEnumerable<Image>> GetByLibraryIdAndPathAsync(long libraryId, string path,
-        ImageSortOption sortOption = ImageSortOption.NewestFirst)
-    {
-        var images = new List<Image>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
-
-        var orderBy = sortOption switch
-        {
-            ImageSortOption.NewestFirst => "ORDER BY Created DESC",
-            ImageSortOption.OldestFirst => "ORDER BY Created ASC",
-            ImageSortOption.NameAscending => "ORDER BY Path ASC",
-            ImageSortOption.NameDescending => "ORDER BY Path DESC",
-            _ => "ORDER BY Created DESC"
-        };
-
-        command.CommandText = $"SELECT * FROM Images WHERE LibraryId = @LibraryId AND Path LIKE @Path || '%' {orderBy}";
-        command.CreateParameter("@LibraryId", libraryId);
-        command.CreateParameter("@Path", path);
-        using var reader = await command.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            images.Add(ReadImage(reader));
-        }
-
-        return images;
-    }
 
     public async Task<Dictionary<long, Bitmap?>> GetThumbnailsByIdsAsync(IEnumerable<long> ids)
     {

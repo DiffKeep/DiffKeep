@@ -26,6 +26,7 @@ public partial class ImageGalleryView : UserControl
     private Point _pointerPressPosition;
     private bool _isDragging;
     private const double DragThreshold = 5.0;
+    private Border? _virtualHeightEnforcer;
 
     public ImageGalleryView()
     {
@@ -49,6 +50,19 @@ public partial class ImageGalleryView : UserControl
                 vm.ResetScrollRequested += ResetScroll;
             }
         };
+    }
+    
+    private void OnScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        if (DataContext is ImageGalleryViewModel vm && 
+            sender is ScrollViewer scrollViewer)
+        {
+            vm.ScrollOffset = scrollViewer.Offset.Y;
+            vm.ViewportHeight = scrollViewer.Viewport.Height;
+            vm.ExtentHeight = scrollViewer.Extent.Height;
+        
+            vm.ScrollChangedCommand.Execute(null);
+        }
     }
     
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -202,6 +216,7 @@ public partial class ImageGalleryView : UserControl
     protected override void OnLoaded(RoutedEventArgs e)
     {
         base.OnLoaded(e);
+        _virtualHeightEnforcer = this.GetControl<Border>("VirtualHeightEnforcer");
         
         _scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
         if (_itemsRepeater != null)
@@ -233,10 +248,10 @@ public partial class ImageGalleryView : UserControl
             var itemHeight = anyElement.Bounds.Height;
             var horizontalSpacing = (_itemsRepeater.Layout as WrapLayout)?.HorizontalSpacing ?? 0;
             var verticalSpacing = (_itemsRepeater.Layout as WrapLayout)?.VerticalSpacing ?? 0;
-        
+    
             var effectiveItemWidth = itemWidth + horizontalSpacing;
             var newColumnCount = Math.Max(1, (int)(containerWidth / effectiveItemWidth));
-        
+    
             if (newColumnCount != _columnCount)
             {
                 _columnCount = newColumnCount;
@@ -245,7 +260,23 @@ public partial class ImageGalleryView : UserControl
 
             _effectiveItemHeight = itemHeight + verticalSpacing;
             Debug.WriteLine($"Effective item height updated to: {_effectiveItemHeight}");
+        
+            // Update virtual height when effective item height changes
+            if (DataContext is ImageGalleryViewModel vm)
+            {
+                UpdateVirtualHeight(vm.TotalCount, _columnCount, _effectiveItemHeight);
+            }
         }
+    }
+    
+    private void UpdateVirtualHeight(int totalCount, int columnCount, double itemHeight)
+    {
+        if (_virtualHeightEnforcer == null || columnCount <= 0) return;
+    
+        var totalRows = Math.Ceiling((double)totalCount / columnCount);
+        var virtualHeight = totalRows * itemHeight;
+        _virtualHeightEnforcer.Height = virtualHeight;
+        Debug.WriteLine($"Set virtual height enforcer to {virtualHeight}");
     }
 
     private int GetColumnCount()

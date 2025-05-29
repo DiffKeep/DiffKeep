@@ -8,6 +8,9 @@ using DiffKeep.Repositories;
 using DiffKeep.Extensions;
 using System.Threading;
 using System;
+using System.Diagnostics;
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
 
 namespace DiffKeep.ViewModels;
 
@@ -25,18 +28,35 @@ public partial class LeftPanelViewModel : ViewModelBase
         get => _items;
         set => SetProperty(ref _items, value);
     }
-    
+
     public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner)
     {
         _libraryRepository = libraryRepository;
         _imageLibraryScanner = imageLibraryScanner;
         _items = new ObservableCollection<LibraryTreeItem>();
-        
+
         // Subscribe to scanner events
         _imageLibraryScanner.ScanProgress += OnScanProgress;
         _imageLibraryScanner.ScanCompleted += OnScanCompleted;
         
-        InitializeTreeItemsAsync().FireAndForget();
+        WaitInitializeAsync().FireAndForget();
+    }
+
+    public async Task WaitInitializeAsync()
+    {
+        if (Application.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            while (desktop.MainWindow is not { IsVisible: true })
+            {
+                // async sleep
+                await Task.Delay(100);
+            }
+            // give the window some time to set up
+            Debug.WriteLine("Application Initialized, pausing for paint");
+            await Task.Delay(500);
+            Debug.WriteLine("Main window is visible, initializing tree items");
+            await InitializeTreeItemsAsync();
+        }
     }
 
     private void OnScanProgress(object? sender, ScanProgressEventArgs e)
@@ -70,6 +90,7 @@ public partial class LeftPanelViewModel : ViewModelBase
     
     public async Task RefreshLibrariesAsync()
     {
+        Debug.WriteLine("Refreshing libraries");
         Items.Clear();
         await InitializeTreeItemsAsync();
     }
@@ -118,6 +139,10 @@ public partial class LeftPanelViewModel : ViewModelBase
         {
             if (libraryItem.Id == null)
                 return;
+            Debug.WriteLine($"Delaying start of scan for library {libraryItem.Name}");
+            await Task.Delay(1000);
+            Debug.WriteLine($"Starting library scan for library {libraryItem.Name}");
+            
             try
             {
                 await _scanSemaphore.WaitAsync();
@@ -142,9 +167,11 @@ public partial class LeftPanelViewModel : ViewModelBase
 
     public async Task RescanLibraryAsync(LibraryTreeItem libraryItem)
     {
+        Debug.WriteLine("Rescan library called");
         if (libraryItem.IsScanning || libraryItem.Id == 0)
             return;
 
+        Debug.WriteLine("Rescaning library");
         StartLibraryScan(libraryItem);
     }
 

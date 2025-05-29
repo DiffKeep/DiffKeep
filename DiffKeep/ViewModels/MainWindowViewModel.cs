@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Threading.Tasks;
 using Avalonia.Controls;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -36,10 +37,9 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && LeftPanel.SelectedItem != null)
             {
-                if (LeftPanel.SelectedItem.IsLibrary)
-                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem).FireAndForget();
-                else
-                    ImageGallery.LoadImagesForLibraryAsync(LeftPanel.SelectedItem).FireAndForget();
+                Debug.WriteLine("Loading images for library called from main window");
+                await Task.Delay(100);
+                ImageGallery.LoadImagesAsync(LeftPanel.SelectedItem).FireAndForget();
             }
         };
     }
