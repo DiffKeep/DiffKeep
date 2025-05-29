@@ -367,44 +367,7 @@ public partial class ImageGalleryView : UserControl
             
                 try
                 {
-                    if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
-                    {
-                        var clipboard = TopLevel.GetTopLevel(desktop.MainWindow)?.Clipboard;
-                        if (clipboard != null)
-                        {
-                            Debug.Print("Got clipboard");
-                            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
-                            try
-                            {
-                                var clipboardTask = clipboard.SetDataObjectAsync(dataObject);
-                                var timeoutTask = Task.Delay(-1, cts.Token);
-
-                                var completedTask = await Task.WhenAny(clipboardTask, timeoutTask);
-                                if (completedTask == clipboardTask)
-                                {
-                                    Debug.Print($"Copied file: {imageItem.Path}");
-                                }
-                                else
-                                {
-                                    Debug.Print("Clipboard operation timed out, but may have succeeded");
-                                }
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                Debug.Print("Clipboard operation timed out, but may have succeeded");
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.Print($"Clipboard operation failed: {ex}");
-                            }
-                        }
-                        else
-                        {
-                            Debug.Print("Clipboard was null");
-                        }
-
-                        await DragDrop.DoDragDrop(e, dataObject, DragDropEffects.Copy);
-                    }
+                    await DragDrop.DoDragDrop(e, dataObject, DragDropEffects.Copy);
                 }
                 catch (Exception ex)
                 {
