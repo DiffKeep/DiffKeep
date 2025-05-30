@@ -20,6 +20,7 @@ public partial class SettingsViewModel : ViewModelBase
 {
     private readonly ILibraryRepository _libraryRepository;
     private readonly IImageRepository _imageRepository;
+    private readonly IEmbeddingsRepository _embeddingsRepository;
 
     [ObservableProperty]
     private string _theme;
@@ -37,10 +38,11 @@ public partial class SettingsViewModel : ViewModelBase
 
     public ObservableCollection<LibraryItem> Libraries { get; }
 
-    public SettingsViewModel(ILibraryRepository libraryRepository, IImageRepository imageRepository, AppSettings settings)
+    public SettingsViewModel(ILibraryRepository libraryRepository, IImageRepository imageRepository, IEmbeddingsRepository embeddingsRepository, AppSettings settings)
     {
         _libraryRepository = libraryRepository;
         _imageRepository = imageRepository;
+        _embeddingsRepository = embeddingsRepository;
         _theme = settings.Theme;
         _language = settings.Language;
         Libraries = new ObservableCollection<LibraryItem>();
@@ -101,7 +103,11 @@ public partial class SettingsViewModel : ViewModelBase
         {
             if (!Libraries.Any(l => l.Id == existing.Id))
             {
-                await _libraryRepository.DeleteAsync(existing.Id);
+                await DeleteLibrary(new LibraryItem
+                {
+                    Id = existing.Id,
+                    Path = existing.Path
+                });
             }
         }
         
@@ -157,8 +163,12 @@ public partial class SettingsViewModel : ViewModelBase
 
                 if (await dialog.ShowAsync() == ButtonResult.Ok)
                 {
+                    // delete all the embeddings associated with images associated with this library
+                    await _embeddingsRepository.DeleteEmbeddingsForLibraryAsync(item.Id.Value);
                     // delete all the images associated with this library
-                    _imageRepository.DeleteByLibraryIdAsync(item.Id.Value).FireAndForget();
+                    await _imageRepository.DeleteByLibraryIdAsync(item.Id.Value);
+                    // delete the library itself
+                    await _libraryRepository.DeleteAsync(item.Id.Value);
                     Libraries.Remove(item);
                 }
             }

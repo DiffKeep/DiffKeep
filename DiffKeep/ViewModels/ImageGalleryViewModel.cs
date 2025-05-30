@@ -22,6 +22,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 {
     private readonly IImageRepository _imageRepository;
     private readonly IImageService _imageService;
+    private readonly SearchService _searchService;
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
     private string? _currentPath;
@@ -54,10 +55,11 @@ public partial class ImageGalleryViewModel : ViewModelBase
         set => SetProperty(ref _images, value);
     }
 
-    public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService)
+    public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService, SearchService searchService)
     {
         _imageRepository = imageRepository;
         _imageService = imageService;
+        _searchService = searchService;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
         
@@ -90,7 +92,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             IEnumerable<Image> dbImages;
             if (!string.IsNullOrWhiteSpace(SearchText))
             {
-                dbImages = await _imageRepository.SearchByPromptAsync(SearchText, 0, null, _currentLibraryId, _currentPath);
+                dbImages = await _searchService.SearchByTextAndGetImagesAsync(SearchText);
             }
             else if (_currentLibraryId == null)
             {

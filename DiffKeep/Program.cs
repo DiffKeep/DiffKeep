@@ -164,6 +164,7 @@ sealed class Program
         services.AddSingleton<IImageService>(sp =>
             new ImageService(sp.GetRequiredService<IImageRepository>())
         );
+        services.AddSingleton<SearchService>();
 
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
@@ -171,13 +172,15 @@ sealed class Program
             new SettingsViewModel(
                 sp.GetRequiredService<ILibraryRepository>(),
                 sp.GetRequiredService<IImageRepository>(),
+                sp.GetRequiredService<IEmbeddingsRepository>(),
                 Settings
             ));
         services.AddSingleton<AboutWindowViewModel>();
         services.AddSingleton<ImageGalleryViewModel>(sp =>
             new ImageGalleryViewModel(
                 sp.GetRequiredService<IImageRepository>(),
-                sp.GetRequiredService<IImageService>()
+                sp.GetRequiredService<IImageService>(),
+                sp.GetRequiredService<SearchService>()
             ));
         services.AddSingleton<ImageViewerViewModel>();
         services.AddSingleton<LeftPanelViewModel>();

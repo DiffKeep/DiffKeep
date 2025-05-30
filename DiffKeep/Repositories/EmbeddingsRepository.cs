@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using DiffKeep.Database;
@@ -25,7 +26,7 @@ public class EmbeddingsRepository : IEmbeddingsRepository
     {
         if (vector.Length != VectorDimension)
             throw new ArgumentException($"Vector must have exactly {VectorDimension} dimensions");
-        
+
         return vector.SelectMany(BitConverter.GetBytes).ToArray();
     }
 
@@ -44,29 +45,32 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         await command.ExecuteNonQueryAsync();
     }
 
-    public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(float[] embedding)
+    public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(
+        float[] embedding, int limit = 100)
     {
         var results = new List<(long ImageId, string Path, float Score)>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
+
+        // it's a little funky, but because we are querying inside a query and vec0 queries require a limit but
+        // the limit the yser expects is for the outer query, and we want to get good results from all embeddings an image might have,
+        // we use a tripled limit clause in the inner vec0 query
+        var innerLimit = limit * 3;
+
         command.CommandText = @"
-        WITH BestMatches AS (
             SELECT 
                 e.ImageId,
-                MIN(e.distance) as best_score  -- Get the best (lowest) distance score for each image
+                i.Path,
+                e.distance
             FROM Embeddings e
+            INNER JOIN Images i ON e.ImageId = i.Id
             WHERE e.Embedding MATCH @Embedding
-            GROUP BY e.ImageId
-        )
-        SELECT 
-            bm.ImageId,
-            i.Path,
-            bm.best_score as score
-        FROM BestMatches bm
-        INNER JOIN Images i ON bm.ImageId = i.Id
-        ORDER BY score ASC";
+            AND k = @Limit
+            ORDER BY e.distance ASC";
+
 
         command.CreateParameter("@Embedding", $"[{string.Join(",", embedding)}]");
+        command.CreateParameter("@Limit", limit);
 
         using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -77,6 +81,8 @@ public class EmbeddingsRepository : IEmbeddingsRepository
             results.Add((imageId, path, score));
         }
 
+        Debug.WriteLine($"Search returned {results.Count} results with a limit of {limit}");
+
         return results;
     }
 
@@ -86,6 +92,21 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM Embeddings WHERE ImageId = @ImageId";
         command.CreateParameter("@ImageId", imageId);
+        await command.ExecuteNonQueryAsync();
+    }
+    
+    public async Task DeleteEmbeddingsForLibraryAsync(long libraryId)
+    {
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = @"
+        DELETE FROM Embeddings 
+        WHERE ImageId IN (
+            SELECT Id 
+            FROM Images 
+            WHERE LibraryId = @LibraryId
+        )";
+        command.CreateParameter("@LibraryId", libraryId);
         await command.ExecuteNonQueryAsync();
     }
 }
