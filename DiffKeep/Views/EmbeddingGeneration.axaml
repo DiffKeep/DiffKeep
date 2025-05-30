@@ -1,0 +1,27 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:DiffKeep.ViewModels"
+             x:DataType="vm:EmbeddingsGenerationViewModel"
+             x:Class="DiffKeep.Views.EmbeddingGeneration">
+    <Grid RowDefinitions="Auto,*" IsVisible="{Binding IsProcessing}">
+        <StackPanel>
+            <TextBlock HorizontalAlignment="Center"
+            VerticalAlignment="Center" Text="Preparing Semantic Search" />
+
+            <ProgressBar Value="{Binding Progress}"
+                         Maximum="1.0"
+                         Height="20"
+                         Margin="10" />
+
+            <TextBlock HorizontalAlignment="Center"
+            VerticalAlignment="Center">
+            <TextBlock.Text>
+                <MultiBinding StringFormat="Processed {0} of {1} items">
+                    <Binding Path="ProcessedItems" />
+                    <Binding Path="TotalItems" />
+                </MultiBinding>
+            </TextBlock.Text>
+            </TextBlock>
+        </StackPanel>
+    </Grid>
+</UserControl>

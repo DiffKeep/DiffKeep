@@ -1,7 +1,6 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Threading.Tasks;
 using LLama;
 using LLama.Common;
@@ -29,6 +28,10 @@ public class LlamaSharpEmbeddingGenerateService: IEmbeddingGenerationService
         
         var parameters = new ModelParams(fullModelPath)
         {
+            Embeddings = true,
+            GpuLayerCount = 999,
+            Threads = 16,
+            BatchThreads = 16,
             // add model params as needed
         };
         loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);

@@ -1,11 +1,6 @@
 namespace DiffKeep.Messages;
 
-public class LibraryUpdatedMessage
+public class LibraryUpdatedMessage(long libraryId)
 {
-    public long LibraryId { get; }
-
-    public LibraryUpdatedMessage(long libraryId)
-    {
-        LibraryId = libraryId;
-    }
+    public long LibraryId { get; } = libraryId;
 }

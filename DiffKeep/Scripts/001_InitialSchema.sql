@@ -27,7 +27,8 @@ CREATE INDEX IF NOT EXISTS idx_images_path ON Images (Path);
 -- Create vector table for embeddings
 CREATE VIRTUAL TABLE IF NOT EXISTS Embeddings USING vec0
 (
-    ImageId   INTEGER PRIMARY KEY,
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ImageId INTEGER,
     EmbeddingType TEXT NOT NULL,
     Embedding float[1024]
 );

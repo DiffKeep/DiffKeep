@@ -1,13 +1,12 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using DiffKeep.Models;
 
 namespace DiffKeep.Repositories;
 
 public interface IEmbeddingsRepository
 {
-    Task StorePromptEmbeddingAsync(long imageId, float[] embedding);
-    Task StoreDescriptionEmbeddingAsync(long imageId, float[] embedding);
-    Task<IEnumerable<(long ImageId, float Score)>> SearchSimilarPromptsByVectorAsync(float[] embedding, int limit = 10);
-    Task<IEnumerable<(long ImageId, float Score)>> SearchSimilarDescriptionsByVectorAsync(float[] embedding, int limit = 10);
     Task DeleteEmbeddingsForImageAsync(long imageId);
+    Task StoreEmbeddingAsync(long imageId, EmbeddingType embeddingType, float[] embedding);
+    Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(float[] embedding);
 }

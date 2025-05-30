@@ -42,6 +42,7 @@ public interface IImageRepository
     Task UpdateThumbnailAsync(long imageId, Bitmap? thumbnail);
     Task DeleteAsync(long id);
     Task<bool> ExistsAsync(long libraryId, string path);
+    Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null);
 }
 
 public enum ImageSortOption

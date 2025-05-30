@@ -181,6 +181,7 @@ sealed class Program
             ));
         services.AddSingleton<ImageViewerViewModel>();
         services.AddSingleton<LeftPanelViewModel>();
+        services.AddSingleton<EmbeddingsGenerationViewModel>();
 
         Services = services.BuildServiceProvider();
     }

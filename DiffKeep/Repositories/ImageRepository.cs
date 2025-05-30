@@ -502,4 +502,33 @@ public class ImageRepository : IImageRepository
 
         return await command.ExecuteScalarAsync<bool>();
     }
+
+    public async Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null)
+    {
+        var images = new List<Image>();
+        using var connection = CreateConnection();
+        using var command = connection.CreateCommand();
+        
+        command.CommandText = @"
+            SELECT i.Id, i.PositivePrompt 
+            FROM Images i 
+            LEFT JOIN Embeddings e ON i.Id = e.ImageId
+            WHERE i.PositivePrompt IS NOT NULL 
+            AND i.PositivePrompt != ''
+            AND e.ImageId IS NULL";
+
+        if (libraryId.HasValue)
+        {
+            command.CommandText += " AND i.LibraryId = @LibraryId";
+            command.CreateParameter("@LibraryId", libraryId.Value);
+        }
+
+        using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            images.Add(ReadImage(reader));
+        }
+
+        return images;
+    }
 }

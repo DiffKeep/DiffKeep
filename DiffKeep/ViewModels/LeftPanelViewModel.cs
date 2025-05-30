@@ -20,6 +20,7 @@ public partial class LeftPanelViewModel : ViewModelBase
     private readonly ILibraryRepository _libraryRepository;
     private readonly ImageLibraryScanner _imageLibraryScanner;
     private readonly LibraryWatcherService _libraryWatcherService;
+    public EmbeddingsGenerationViewModel EmbeddingsGenerationViewModel { get; }
     private ObservableCollection<LibraryTreeItem> _items;
     [ObservableProperty]
     private LibraryTreeItem _selectedItem;
@@ -37,6 +38,7 @@ public partial class LeftPanelViewModel : ViewModelBase
         _imageLibraryScanner = imageLibraryScanner;
         _libraryWatcherService = libraryWatcherService;
         _items = new ObservableCollection<LibraryTreeItem>();
+        EmbeddingsGenerationViewModel = App.GetService<EmbeddingsGenerationViewModel>();
 
         // Subscribe to scanner events
         _imageLibraryScanner.ScanProgress += OnScanProgress;

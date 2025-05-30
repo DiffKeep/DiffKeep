@@ -182,6 +182,34 @@ public class ImageLibraryScanner
     private void OnScanCompleted(long libraryId, int processedFiles)
     {
         ScanCompleted?.Invoke(this, new ScanCompletedEventArgs(libraryId, processedFiles));
+        
+        Debug.WriteLine($"Finished scanning library {libraryId}, checking for images without embeddings");
+        // find and queue all images in the library that don't have embeddings
+        Task.Run(async () =>
+        {
+            try
+            {
+                // Get all images from this library
+                var images = await _imageRepository.GetImagesWithoutEmbeddingsAsync(libraryId);
+                Debug.WriteLine($"Found {images.Count()} images in library {libraryId} without embeddings");
+            
+                // Filter for images that have a positive prompt but no embedding
+                foreach (var image in images)
+                {
+                    if (!string.IsNullOrWhiteSpace(image.PositivePrompt))
+                    {
+                        // Send message to generate embedding for this image
+                        WeakReferenceMessenger.Default.Send(
+                            new GenerateEmbeddingMessage(image.Id, EmbeddingType.PositivePrompt, image.PositivePrompt)
+                            );
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Print($"Error queuing embeddings generation: {ex}");
+            }
+        });
     }
 
     private async Task<Image?> CreateImageFromFile(string file, long libraryId)

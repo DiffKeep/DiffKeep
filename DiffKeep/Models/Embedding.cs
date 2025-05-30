@@ -10,6 +10,8 @@ public class Embedding
 
 public enum EmbeddingType
 {
-    Prompt,
-    Description
+    PositivePrompt,
+    NegativePrompt,
+    Description,
+    Image,
 }
