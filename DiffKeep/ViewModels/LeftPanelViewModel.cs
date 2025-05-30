@@ -11,6 +11,7 @@ using System;
 using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
+using DiffKeep.Services;
 
 namespace DiffKeep.ViewModels;
 
@@ -18,6 +19,7 @@ public partial class LeftPanelViewModel : ViewModelBase
 {
     private readonly ILibraryRepository _libraryRepository;
     private readonly ImageLibraryScanner _imageLibraryScanner;
+    private readonly LibraryWatcherService _libraryWatcherService;
     private ObservableCollection<LibraryTreeItem> _items;
     [ObservableProperty]
     private LibraryTreeItem _selectedItem;
@@ -29,10 +31,11 @@ public partial class LeftPanelViewModel : ViewModelBase
         set => SetProperty(ref _items, value);
     }
 
-    public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner)
+    public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner, LibraryWatcherService libraryWatcherService)
     {
         _libraryRepository = libraryRepository;
         _imageLibraryScanner = imageLibraryScanner;
+        _libraryWatcherService = libraryWatcherService;
         _items = new ObservableCollection<LibraryTreeItem>();
 
         // Subscribe to scanner events
@@ -150,6 +153,7 @@ public partial class LeftPanelViewModel : ViewModelBase
                 libraryItem.ScanStatus = "Scanning...";
 
                 await _imageLibraryScanner.ScanLibraryAsync((long)libraryItem.Id);
+                _libraryWatcherService.AddWatcher(libraryItem.Path, (long)libraryItem.Id).FireAndForget();
 
                 libraryItem.ScanStatus = "Scan complete";
             }

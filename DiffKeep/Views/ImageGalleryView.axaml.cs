@@ -28,6 +28,10 @@ public partial class ImageGalleryView : UserControl
     private Point _pointerPressPosition;
     private bool _isDragging;
     private const double DragThreshold = 5.0;
+    private double _currentScrollPosition;
+    private double? _lastThumbnailUpdatePosition;
+    private const double SCROLL_UPDATE_THRESHOLD = 800;
+    private DispatcherTimer? _layoutDebounceTimer;
 
     public ImageGalleryView()
     {
@@ -43,15 +47,33 @@ public partial class ImageGalleryView : UserControl
                 {
                     _currentViewModel.ImagesCollectionChanged -= OnImagesCollectionChanged;
                     _currentViewModel.ResetScrollRequested -= ResetScroll;
+                    _currentViewModel.SaveScrollPositionRequested -= SaveScrollPosition;
+                    _currentViewModel.RestoreScrollPositionRequested -= RestoreScrollPosition;
                 }
 
                 _currentViewModel = vm;
                 vm.ImagesCollectionChanged += OnImagesCollectionChanged;
                 vm.ResetScrollRequested += ResetScroll;
+                vm.SaveScrollPositionRequested += SaveScrollPosition;
+                vm.RestoreScrollPositionRequested += RestoreScrollPosition;
             }
         };
     }
-    
+
+    private void SaveScrollPosition()
+    {
+        Debug.WriteLine("SaveScrollPosition called");
+        if (_scrollViewer != null && _scrollViewer.Offset != null)
+            _currentScrollPosition = _scrollViewer.Offset.Y;
+    }
+
+    private void RestoreScrollPosition()
+    {
+        Debug.WriteLine("RestoreScrollPosition called");
+        if (_scrollViewer != null && _scrollViewer.Offset != null)
+            _scrollViewer.Offset = new Vector(0, _currentScrollPosition);
+    }
+
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(ImageGalleryViewModel.Images))
@@ -86,7 +108,7 @@ public partial class ImageGalleryView : UserControl
             sender is Border border &&
             border.DataContext is ImageItemViewModel imageItem)
         {
-            SelectImage(vm, imageItem);
+            SelectImage(vm, imageItem, false);
             border.Focus();
         }
     }
@@ -96,7 +118,7 @@ public partial class ImageGalleryView : UserControl
         OpenImageViewer();
     }
 
-    private void SelectImage(ImageGalleryViewModel vm, ImageItemViewModel imageItem)
+    private void SelectImage(ImageGalleryViewModel vm, ImageItemViewModel imageItem, bool scrollToView)
     {
         if (vm.SelectedImage != null)
         {
@@ -105,7 +127,8 @@ public partial class ImageGalleryView : UserControl
 
         imageItem.IsSelected = true;
         vm.SelectedImage = imageItem;
-        ScrollSelectedItemIntoView();
+        if (scrollToView)
+            ScrollSelectedItemIntoView();
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
@@ -171,7 +194,7 @@ public partial class ImageGalleryView : UserControl
 
         if (newIndex != currentIndex && newIndex >= 0 && newIndex < vm.Images.Count)
         {
-            SelectImage(vm, vm.Images[newIndex]);
+            SelectImage(vm, vm.Images[newIndex], true);
             e.Handled = true;
         }
     }
@@ -244,22 +267,52 @@ public partial class ImageGalleryView : UserControl
     {
         if (_itemsRepeater?.ItemsSource == null || !_itemsRepeater.ItemsSource.Cast<object>().Any())
             return;
+        
+        if (_layoutDebounceTimer == null)
+        {
+            _layoutDebounceTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(300)
+            };
+            _layoutDebounceTimer.Tick += LayoutDebounceTimer_Tick;
+        }
 
-        // Get any realized element to calculate measurements
-        var anyElement = _itemsRepeater.TryGetElement(0) as Control;
+        _layoutDebounceTimer.Stop();
+        _layoutDebounceTimer.Start();
+    }
+
+    private void LayoutDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        Debug.WriteLine("LayoutDebounceTimer_Tick called");
+        // Try to find any realized element
+        Control? anyElement = null;
+        var itemsCount = _itemsRepeater.ItemsSource.Cast<object>().Count();
+    
+        for (int i = 0; i < itemsCount && anyElement == null; i++)
+        {
+            anyElement = _itemsRepeater.TryGetElement(i);
+        }
         if (anyElement != null)
         {
+            Debug.WriteLine("got an element, calculating");
             var containerWidth = _itemsRepeater.Bounds.Width;
             var itemWidth = anyElement.Bounds.Width;
-            var horizontalSpacing = (_itemsRepeater.Layout as WrapLayout)?.HorizontalSpacing ?? 0;
-    
+            var itemHeight = anyElement.Bounds.Height;
+            var wrapLayout = _itemsRepeater.Layout as WrapLayout;
+            var horizontalSpacing = wrapLayout?.HorizontalSpacing ?? 0;
+            var verticalSpacing = wrapLayout?.VerticalSpacing ?? 0;
+
             var effectiveItemWidth = itemWidth + horizontalSpacing;
+            var newEffectiveItemHeight = itemHeight + verticalSpacing;
             var newColumnCount = Math.Max(1, (int)(containerWidth / effectiveItemWidth));
-    
-            if (newColumnCount != _columnCount)
+
+            if (newColumnCount != _columnCount || Math.Abs(_effectiveItemHeight - newEffectiveItemHeight) > 0.1)
             {
                 _columnCount = newColumnCount;
-                Debug.WriteLine($"Column count updated to: {_columnCount}");
+                _effectiveItemHeight = newEffectiveItemHeight;
+                Debug.WriteLine($"Layout updated - Columns: {_columnCount}, Item height: {_effectiveItemHeight}");
+                // update thumbnails
+                UpdateVisibleThumbnails();
             }
         }
     }
@@ -283,19 +336,28 @@ public partial class ImageGalleryView : UserControl
 
     private void ScrollViewer_ScrollChanged(object? sender, ScrollChangedEventArgs e)
     {
-        // Debounce the scroll events to avoid too frequent updates
-        if (_scrollDebounceTimer == null)
+        if (_scrollViewer == null) return;
+    
+        var currentPosition = _scrollViewer.Offset.Y;
+        var scrollDelta = Math.Abs(currentPosition - _lastThumbnailUpdatePosition ?? 0);
+    
+        // Only update if we've scrolled more than the threshold
+        if (scrollDelta >= SCROLL_UPDATE_THRESHOLD || _lastThumbnailUpdatePosition == null)
         {
-            _scrollDebounceTimer = new DispatcherTimer
+            if (_scrollDebounceTimer == null)
             {
-                Interval = TimeSpan.FromMilliseconds(150)
-            };
-            _scrollDebounceTimer.Tick += ScrollDebounceTimer_Tick;
-        }
+                _scrollDebounceTimer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(150)
+                };
+                _scrollDebounceTimer.Tick += ScrollDebounceTimer_Tick;
+            }
 
-        _scrollDebounceTimer.Stop();
-        _scrollDebounceTimer.Start();
+            _scrollDebounceTimer.Stop();
+            _scrollDebounceTimer.Start();
+        }
     }
+
 
     private DispatcherTimer? _scrollDebounceTimer;
 
@@ -303,6 +365,7 @@ public partial class ImageGalleryView : UserControl
     {
         _scrollDebounceTimer?.Stop();
         Debug.WriteLine("Scroll debounce timer fired");
+        _lastThumbnailUpdatePosition = _scrollViewer?.Offset.Y ?? 0;
         UpdateVisibleThumbnails();
     }
 

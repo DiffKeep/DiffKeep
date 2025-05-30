@@ -8,9 +8,13 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
+using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Extensions;
+using DiffKeep.Messages;
 using DiffKeep.Models;
 using DiffKeep.Parsing;
 using DiffKeep.Repositories;
+using DiffKeep.Services;
 
 namespace DiffKeep.Database;
 
@@ -97,44 +101,12 @@ public class ImageLibraryScanner
                 if (!await _imageRepository.ExistsAsync(library.Id, file))
                 {
                     await semaphore.WaitAsync(cancellationToken);
-                    
+
                     var task = Task.Run(async () =>
                     {
                         try
                         {
-                            var hash = await Hash(file);
-                            if (string.IsNullOrEmpty(hash))
-                            {
-                                Debug.Print($"Failed to generate hash for file: {file}");
-                                return;
-                            }
-
-                            var metadata = await _imageParser.ParseImageAsync(file);
-                            var fileInfo = new FileInfo(file);
-                            
-                            Bitmap? thumbnail = null;
-                            try
-                            {
-                                using var vipsThumbnail = NetVips.Image.Thumbnail(file, ThumbnailSize);
-                                var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
-                                using var stream = new MemoryStream(buffer);
-                                thumbnail = new Bitmap(stream);
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
-                                return;
-                            }
-
-                            var image = new Image
-                            {
-                                LibraryId = library.Id,
-                                Path = file,
-                                Hash = hash,
-                                PositivePrompt = metadata?.Prompt,
-                                Created = fileInfo.CreationTime,
-                                Thumbnail = thumbnail
-                            };
+                            var image = await CreateImageFromFile(file, library.Id);
 
                             imageBatch.Add(image);
                             Debug.Print($"Processed {file}");
@@ -154,35 +126,54 @@ public class ImageLibraryScanner
                         }
                     }, cancellationToken);
 
-                processingTasks.Add(task);
+                    processingTasks.Add(task);
+                }
             }
+            catch (Exception ex)
+            {
+                Debug.Print($"Error processing file {file}: {ex.Message}");
+            }
+
+            processedFiles++;
+            OnScanProgress(library.Id, processedFiles, totalFiles);
+        }
+
+        try
+        {
+            // Wait for all processing tasks to complete
+            await Task.WhenAll(processingTasks);
+
+            // Process any remaining images in the final batch
+            await ProcessBatchAsync();
         }
         catch (Exception ex)
         {
-            Debug.Print($"Error processing file {file}: {ex.Message}");
+            Debug.Print($"Error during batch processing: {ex}");
+            throw;
         }
 
-        processedFiles++;
-        OnScanProgress(library.Id, processedFiles, totalFiles);
+        OnScanCompleted(library.Id, processedFiles);
+        WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(library.Id));
     }
 
-    try
+    public async Task CreateOrUpdateSingleFile(long libraryId, string filePath)
     {
-        // Wait for all processing tasks to complete
-        await Task.WhenAll(processingTasks);
-
-        // Process any remaining images in the final batch
-        await ProcessBatchAsync();
+        var dbImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
+        var image = await CreateImageFromFile(filePath, libraryId);
+        if (dbImage.Count() == 1)
+        {
+            Debug.WriteLine($"Existing image found for {image.Path}, updating image");
+            var i = dbImage.First();
+            image.Id = i.Id;
+            await _imageRepository.UpdateAsync(image);
+        }
+        else
+        {
+            Debug.WriteLine($"No previous image found for {image.Path}, inserting image");
+            await _imageRepository.AddAsync(image);
+        }
     }
-    catch (Exception ex)
-    {
-        Debug.Print($"Error during batch processing: {ex}");
-        throw;
-    }
 
-    OnScanCompleted(library.Id, processedFiles);
-}
-    
     private void OnScanProgress(long libraryId, int processedFiles, int totalFiles)
     {
         ScanProgress?.Invoke(this, new ScanProgressEventArgs(libraryId, processedFiles, totalFiles));
@@ -192,7 +183,44 @@ public class ImageLibraryScanner
     {
         ScanCompleted?.Invoke(this, new ScanCompletedEventArgs(libraryId, processedFiles));
     }
-    
+
+    private async Task<Image?> CreateImageFromFile(string file, long libraryId)
+    {
+        var hash = await Hash(file);
+        if (string.IsNullOrEmpty(hash))
+        {
+            Debug.Print($"Failed to generate hash for file: {file}");
+            return null;
+        }
+
+        var metadata = await _imageParser.ParseImageAsync(file);
+        var fileInfo = new FileInfo(file);
+
+        Bitmap? thumbnail = null;
+        try
+        {
+            using var vipsThumbnail = NetVips.Image.Thumbnail(file, ThumbnailSize);
+            var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
+            using var stream = new MemoryStream(buffer);
+            thumbnail = new Bitmap(stream);
+        }
+        catch (Exception ex)
+        {
+            Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
+            return null;
+        }
+
+        return new Image
+        {
+            LibraryId = libraryId,
+            Path = file,
+            Hash = hash,
+            PositivePrompt = metadata?.Prompt,
+            Created = fileInfo.CreationTime,
+            Thumbnail = thumbnail
+        };
+    }
+
     private static async Task<string> Hash(string imagePath)
     {
         // Calculate file hash

@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using DiffKeep.Settings;
 using System.Text.Json;
 using System.Threading.Tasks;
+using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Parsing;
@@ -156,6 +157,7 @@ sealed class Program
 
         // Register services
         services.AddSingleton<ImageParser>();
+        services.AddSingleton<LibraryWatcherService>();
         services.AddSingleton<ImageLibraryScanner>();
         services.AddSingleton<PngMetadataParser>();
         services.AddSingleton<IImageService>(sp =>

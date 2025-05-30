@@ -6,9 +6,12 @@ using System.Linq;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Media.Imaging;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Extensions;
+using DiffKeep.Messages;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Image = DiffKeep.Models.Image;
@@ -26,6 +29,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
     public Dictionary<long, Bitmap> Thumbnails;
     public event EventHandler? ImagesCollectionChanged;
     public event Action? ResetScrollRequested;
+    public event Action? SaveScrollPositionRequested;
+    public event Action? RestoreScrollPositionRequested;
+
     
     [ObservableProperty]
     private ImageItemViewModel? _selectedImage;
@@ -54,6 +60,17 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _imageService = imageService;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
+        
+        // Subscribe to library updated messages
+        WeakReferenceMessenger.Default.Register<LibraryUpdatedMessage>(this, (r, m) =>
+        {
+            Debug.WriteLine($"Received message for library updated for library ID {m.LibraryId}");
+            if (_currentLibraryId == m.LibraryId || _currentLibraryId == null)
+            {
+                LoadImagesAsync(null).FireAndForget();
+            }
+        });
+
     }
 
     public async Task LoadImagesAsync(LibraryTreeItem? item)
@@ -91,16 +108,40 @@ public partial class ImageGalleryViewModel : ViewModelBase
             TotalCount = dbImages.Count();
 
             ImagesCount = $"({TotalCount} images)";
-        
-            // Clear existing images
-            Images.Clear();
 
             var viewModels = await Task.Run(() => 
                 dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
 
-            await Task.Run(() =>
+            await Task.Run(async () =>
             {
-                Images = new ObservableCollection<ImageItemViewModel>(viewModels);
+                if (Images != null && Images.Count > 0)
+                {
+                    var selectedId = SelectedImage?.Id;
+                    await Dispatcher.UIThread.InvokeAsync(() => SaveScrollPositionRequested?.Invoke());
+            
+                    await Task.Run(() =>
+                    {
+                        Images.Clear();
+                        Images = new ObservableCollection<ImageItemViewModel>(viewModels);
+                    });
+            
+                    await Dispatcher.UIThread.InvokeAsync(() => RestoreScrollPositionRequested?.Invoke());
+                    if (selectedId != null)
+                    {
+                        SelectedImage = Images.FirstOrDefault(image => image.Id == selectedId);
+                        if (SelectedImage != null)
+                            SelectedImage.IsSelected = true;
+                    }
+                }
+                else
+                {
+                    Images.Clear();
+                    Images = new ObservableCollection<ImageItemViewModel>(viewModels);
+                }
+                
+                if (ImagesCollectionChanged != null)
+                    ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
+                
             });
         }
         finally
@@ -191,7 +232,7 @@ public partial class ImageItemViewModel : ViewModelBase
 
     public void UpdateThumbnail()
     {
-        Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails.GetValueOrDefault(Id) : null;
+        Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails?.GetValueOrDefault(Id) : null;
     }
 
     public ImageItemViewModel(Image image, ImageGalleryViewModel galleryViewModel)
