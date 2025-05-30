@@ -140,7 +140,17 @@ public partial class ImageViewerViewModel : ViewModelBase
     
     public async Task<bool> DeleteCurrentImage(Window parentWindow)
     {
-        var currentImage = _allImages[_currentIndex];
+        ImageItemViewModel currentImage;
+        try
+        {
+            currentImage = _allImages[_currentIndex];
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            Debug.WriteLine($"Failed finding image index {_currentIndex}, trying again after pause");
+            await Task.Delay(100);
+            currentImage = _allImages[_currentIndex];
+        }
 
         var result = await _imageService.DeleteImageAsync(currentImage, parentWindow);
         if (result)

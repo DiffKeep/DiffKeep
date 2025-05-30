@@ -184,14 +184,18 @@ public partial class ImageGalleryViewModel : ViewModelBase
     public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
     {
         Debug.WriteLine($"Updating visible thumbnails for {visibleIds.Count()} images");
-        // Get thumbnails for visible items and some items ahead/behind
-        Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
-        
-        // Update the view models
-        foreach (var image in Images)
+
+        await Task.Run(async () =>
         {
-            image.UpdateThumbnail();
-        }
+            // Get thumbnails for visible items and some items ahead/behind
+            Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
+
+            // Update the view models
+            foreach (var image in Images)
+            {
+                image.UpdateThumbnail();
+            }
+        });
     }
     
     public async Task DeleteImage(ImageItemViewModel image, Window parentWindow)
