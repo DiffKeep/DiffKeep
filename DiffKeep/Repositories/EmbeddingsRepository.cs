@@ -30,53 +30,56 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         return vector.SelectMany(BitConverter.GetBytes).ToArray();
     }
 
-    public async Task StoreEmbeddingAsync(long imageId, EmbeddingType type, float[] embedding)
+    public async Task StoreEmbeddingAsync(long imageId, EmbeddingSource source, string embeddingModel, float[] embedding)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = @"
-        INSERT INTO Embeddings (ImageId, EmbeddingType, Embedding) 
-        VALUES (@ImageId, @EmbeddingType, @Embedding)";
-
-        command.CreateParameter("@ImageId", imageId);
-        command.CreateParameter("@EmbeddingType", type.ToString());
-        command.CreateParameter("@Embedding", $"[{string.Join(",", embedding)}]");
-
-        await command.ExecuteNonQueryAsync();
+        await StoreBatchEmbeddingsAsync([
+            (imageId, source, embeddingModel, embedding)
+        ]);
     }
 
     public async Task StoreBatchEmbeddingsAsync(
-        IEnumerable<(long ImageId, EmbeddingType Type, float[] Embedding)> embeddings)
+        IEnumerable<(long ImageId, EmbeddingSource Source, string Model, float[] Embedding)> embeddings)
     {
         using var connection = CreateConnection();
         using var transaction = connection.BeginTransaction();
         try
         {
             using var command = connection.CreateCommand();
+            var embeddingSize = embeddings.First().Embedding.Length;
             command.Transaction = transaction;
             command.CommandText = @"
-            INSERT INTO Embeddings (ImageId, EmbeddingType, Embedding) 
-            VALUES (@ImageId, @EmbeddingType, @Embedding)";
+            INSERT INTO Embeddings (ImageId, Source, Size, Model, Embedding) 
+            VALUES (@ImageId, @Source, @Size, @Model, @Embedding)";
 
             var imageIdParam = command.CreateParameter();
             imageIdParam.ParameterName = "@ImageId";
             command.Parameters.Add(imageIdParam);
 
-            var typeParam = command.CreateParameter();
-            typeParam.ParameterName = "@EmbeddingType";
-            command.Parameters.Add(typeParam);
+            var sourceParam = command.CreateParameter();
+            sourceParam.ParameterName = "@Source";
+            command.Parameters.Add(sourceParam);
+
+            var modelParam = command.CreateParameter();
+            modelParam.ParameterName = "@Model";
+            command.Parameters.Add(modelParam);
+
+            var sizeParam = command.CreateParameter();
+            sizeParam.ParameterName = "@Size";
+            command.Parameters.Add(sizeParam);
 
             var embeddingParam = command.CreateParameter();
             embeddingParam.ParameterName = "@Embedding";
             command.Parameters.Add(embeddingParam);
 
-            foreach (var (imageId, type, embedding) in embeddings)
+            foreach (var (imageId, source, model, embedding) in embeddings)
             {
-                if (embedding.Length != VectorDimension)
-                    throw new ArgumentException($"Vector must have exactly {VectorDimension} dimensions");
+                if (embedding.Length != embeddingSize)
+                    throw new ArgumentException($"Vectors must have equal dimensions");
 
                 imageIdParam.Value = imageId;
-                typeParam.Value = type.ToString();
+                sourceParam.Value = source.ToString();
+                modelParam.Value = model;
+                sizeParam.Value = embeddingSize;
                 embeddingParam.Value = $"[{string.Join(",", embedding)}]";
 
                 await command.ExecuteNonQueryAsync();
@@ -102,15 +105,14 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         SELECT 
             e.ImageId,
             i.Path,
-            e.distance
+            vec_distance_L2(e.Embedding, @Embedding) as distance
         FROM Embeddings e
         INNER JOIN Images i ON e.ImageId = i.Id
-        WHERE e.Embedding MATCH @Embedding
-        AND k = @Limit
-        ORDER BY e.distance ASC";
+        ORDER BY distance ASC
+        LIMIT @Limit";
 
-        command.CreateParameter("@Embedding", $"[{string.Join(",", embedding)}]");
-        command.CreateParameter("@Limit", limit);
+        command.Parameters.AddWithValue("@Embedding", VectorToBlob(embedding));
+        command.Parameters.AddWithValue("@Limit", limit);
 
         using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())

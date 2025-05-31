@@ -24,11 +24,13 @@ CREATE TABLE IF NOT EXISTS Images
 CREATE INDEX IF NOT EXISTS idx_images_library_id ON Images (LibraryId);
 CREATE INDEX IF NOT EXISTS idx_images_path ON Images (Path);
 
--- Create vector table for embeddings
-CREATE VIRTUAL TABLE IF NOT EXISTS Embeddings USING vec0
+-- Create embeddings table
+CREATE TABLE IF NOT EXISTS Embeddings
 (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     ImageId INTEGER,
-    EmbeddingType TEXT NOT NULL,
-    Embedding float[1024]
+    Source TEXT NOT NULL,
+    Size INTEGER,
+    Model TEXT,
+    Embedding blob
 );

@@ -21,6 +21,7 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
     private ModelParams? _modelParams;
     private readonly SemaphoreSlim _modelLock = new SemaphoreSlim(1, 1);
     private readonly SemaphoreSlim _generatingLock = new SemaphoreSlim(1, 1);
+    private string _modelName;
 
     private async Task LoadModelInternalAsync(string modelPath, bool isEmbeddingModel = true)
     {
@@ -44,6 +45,12 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
         _loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
         _embedder = new LLamaEmbedder(_loadedModel, parameters);
         Debug.WriteLine($"Loaded model: {fullModelPath}");
+        _modelName = Path.GetFileNameWithoutExtension(fullModelPath);
+    }
+
+    public string ModelName()
+    {
+        return _modelName;
     }
 
     public async Task LoadModelAsync(string modelPath, bool isEmbeddingModel = true)

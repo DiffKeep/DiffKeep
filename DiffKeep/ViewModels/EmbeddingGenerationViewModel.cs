@@ -78,7 +78,7 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
         try
         {
             const int batchSize = 50;
-            var batch = new List<(long ImageId, EmbeddingType Type, float[] Embedding)>(batchSize);
+            var batch = new List<(long ImageId, EmbeddingSource Source, string model, float[] Embedding)>(batchSize);
 
             while (_embeddingQueue.TryDequeue(out var message))
             {
@@ -92,7 +92,7 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
                     // Add all embeddings for this message to the batch
                     foreach (var embedding in embeddings)
                     {
-                        batch.Add((message.ImageId, message.EmbeddingType, embedding));
+                        batch.Add((message.ImageId, message.EmbeddingSource, _embeddingService.ModelName(), embedding));
                     }
 
                     // If we've reached the batch size or this is the last item, process the batch

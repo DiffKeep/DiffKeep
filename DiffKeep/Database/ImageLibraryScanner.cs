@@ -200,7 +200,7 @@ public class ImageLibraryScanner
                     {
                         // Send message to generate embedding for this image
                         WeakReferenceMessenger.Default.Send(
-                            new GenerateEmbeddingMessage(image.Id, EmbeddingType.PositivePrompt, image.PositivePrompt)
+                            new GenerateEmbeddingMessage(image.Id, EmbeddingSource.PositivePrompt, image.PositivePrompt)
                             );
                     }
                 }
