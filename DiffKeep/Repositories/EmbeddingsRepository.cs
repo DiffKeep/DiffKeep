@@ -94,26 +94,20 @@ public class EmbeddingsRepository : IEmbeddingsRepository
     public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(
         float[] embedding, int limit = 100)
     {
-        var results = new List<(long ImageId, string Path, float Score)>();
+        var resultDict = new Dictionary<long, (long ImageId, string Path, float Score)>();
         using var connection = CreateConnection();
         using var command = connection.CreateCommand();
 
-        // it's a little funky, but because we are querying inside a query and vec0 queries require a limit but
-        // the limit the yser expects is for the outer query, and we want to get good results from all embeddings an image might have,
-        // we use a tripled limit clause in the inner vec0 query
-        var innerLimit = limit * 3;
-
         command.CommandText = @"
-            SELECT 
-                e.ImageId,
-                i.Path,
-                e.distance
-            FROM Embeddings e
-            INNER JOIN Images i ON e.ImageId = i.Id
-            WHERE e.Embedding MATCH @Embedding
-            AND k = @Limit
-            ORDER BY e.distance ASC";
-
+        SELECT 
+            e.ImageId,
+            i.Path,
+            e.distance
+        FROM Embeddings e
+        INNER JOIN Images i ON e.ImageId = i.Id
+        WHERE e.Embedding MATCH @Embedding
+        AND k = @Limit
+        ORDER BY e.distance ASC";
 
         command.CreateParameter("@Embedding", $"[{string.Join(",", embedding)}]");
         command.CreateParameter("@Limit", limit);
@@ -124,9 +118,21 @@ public class EmbeddingsRepository : IEmbeddingsRepository
             var imageId = reader.GetInt64(0);
             var path = reader.GetString(1);
             var score = reader.GetFloat(2);
-            results.Add((imageId, path, score));
+
+            if (resultDict.TryGetValue(imageId, out var existing))
+            {
+                if (score < existing.Score) // Lower distance means better match
+                {
+                    resultDict[imageId] = (imageId, path, score);
+                }
+            }
+            else
+            {
+                resultDict[imageId] = (imageId, path, score);
+            }
         }
 
+        var results = resultDict.Values.ToList();
         Debug.WriteLine($"Search returned {results.Count} results with a limit of {limit}");
 
         return results;
