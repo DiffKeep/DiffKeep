@@ -254,7 +254,7 @@ public class ImageLibraryScanner
         // Calculate file hash
         string hash;
         using (var md5 = MD5.Create())
-        using (var stream = File.OpenRead(imagePath))
+        await using (var stream = File.OpenRead(imagePath))
         {
             var hashBytes = await md5.ComputeHashAsync(stream);
             hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();

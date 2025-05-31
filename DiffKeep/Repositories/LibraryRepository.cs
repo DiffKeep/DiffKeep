@@ -22,12 +22,12 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task<Library?> GetByIdAsync(long id)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM Libraries WHERE Id = @Id";
         command.CreateParameter("@Id", id);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         if (!await reader.ReadAsync())
             return null;
 
@@ -40,12 +40,12 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task<Library?> GetByPathAsync(string path)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM Libraries WHERE Path = @Path";
         command.CreateParameter("@Path", path);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         if (!await reader.ReadAsync())
             return null;
 
@@ -59,11 +59,11 @@ public class LibraryRepository : ILibraryRepository
     public async Task<IEnumerable<Library>> GetAllAsync()
     {
         var libraries = new List<Library>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM Libraries";
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             libraries.Add(new Library
@@ -78,8 +78,8 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task<long> AddAsync(Library library)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "INSERT INTO Libraries (Path) VALUES (@Path) RETURNING Id";
         command.CreateParameter("@Path", library.Path);
 
@@ -88,8 +88,8 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task UpdateAsync(Library library)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "UPDATE Libraries SET Path = @Path WHERE Id = @Id";
         command.CreateParameter("@Path", library.Path);
         command.CreateParameter("@Id", library.Id);
@@ -99,8 +99,8 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task DeleteAsync(long id)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM Libraries WHERE Id = @Id";
         command.CreateParameter("@Id", id);
 
@@ -109,8 +109,8 @@ public class LibraryRepository : ILibraryRepository
 
     public async Task<bool> ExistsAsync(string path)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT EXISTS(SELECT 1 FROM Libraries WHERE Path = @Path)";
         command.CreateParameter("@Path", path);
 

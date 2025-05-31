@@ -9,6 +9,7 @@ using DiffKeep.Models;
 using Microsoft.Data.Sqlite;
 using System.Diagnostics;
 using System.Linq;
+using DiffKeep.Services;
 
 namespace DiffKeep.Repositories;
 
@@ -41,38 +42,73 @@ public class ImageRepository : IImageRepository
         return new Bitmap(memStream);
     }
 
-    private static Image ReadImage(SqliteDataReader reader)
+private static Image ReadImage(SqliteDataReader reader)
+{
+    var image = new Image();
+
+    // Helper function to safely get value
+    T GetValueSafe<T>(string columnName, T defaultValue = default) where T : class
     {
-        byte[]? thumbnailBytes = null;
-        if (SqliteHelper.HasColumn(reader, "thumbnail")) 
+        if (!SqliteHelper.HasColumn(reader, columnName))
+            return defaultValue;
+            
+        var ordinal = reader.GetOrdinal(columnName);
+        return reader.IsDBNull(ordinal) ? defaultValue : reader.GetValue<T>(columnName);
+    }
+
+    // Helper function for value types
+    T GetValueTypeSafe<T>(string columnName, T defaultValue = default) where T : struct
+    {
+        if (!SqliteHelper.HasColumn(reader, columnName))
+            return defaultValue;
+            
+        var ordinal = reader.GetOrdinal(columnName);
+        return reader.IsDBNull(ordinal) ? defaultValue : reader.GetValue<T>(columnName);
+    }
+
+    // Required Id field - if this fails, we want it to throw
+    image.Id = reader.GetValue<long>("Id");
+
+    // Optional fields - use safe getters
+    image.LibraryId = GetValueTypeSafe<long>("LibraryId");
+    image.Path = GetValueSafe<string>("Path", string.Empty);
+    image.Hash = GetValueSafe<string>("Hash", string.Empty);
+    image.PositivePrompt = GetValueSafe<string>("PositivePrompt");
+    image.NegativePrompt = GetValueSafe<string>("NegativePrompt");
+    image.Description = GetValueSafe<string>("Description");
+
+    // Handle Created date
+    var createdStr = GetValueSafe<string>("Created");
+    image.Created = !string.IsNullOrEmpty(createdStr) 
+        ? DateTime.Parse(createdStr) 
+        : DateTime.MinValue;
+
+    // Handle Thumbnail separately since it needs conversion
+    if (SqliteHelper.HasColumn(reader, "Thumbnail"))
+    {
+        var ordinal = reader.GetOrdinal("Thumbnail");
+        if (!reader.IsDBNull(ordinal))
         {
-            var ordinal = reader.GetOrdinal("Thumbnail");
-            if (!reader.IsDBNull(ordinal))
+            try
             {
-                thumbnailBytes = reader.GetValue<byte[]>("Thumbnail");
+                var thumbnailBytes = reader.GetValue<byte[]>("Thumbnail");
+                image.Thumbnail = BytesToBitmap(thumbnailBytes);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading thumbnail: {ex.Message}");
+                image.Thumbnail = null;
             }
         }
-
-        return new Image
-        {
-            Id = reader.GetValue<long>("Id"),
-            LibraryId = reader.GetValue<long>("LibraryId"),
-            Path = reader.GetValue<string>("Path"),
-            Hash = reader.GetValue<string>("Hash"),
-            Thumbnail = BytesToBitmap(thumbnailBytes),
-            PositivePrompt = reader.GetValue<string>("PositivePrompt"),
-            NegativePrompt = reader.GetValue<string>("NegativePrompt"),
-            Description = reader.GetValue<string>("Description"),
-            Created = reader.GetValue<string>("Created") != null
-                ? DateTime.Parse(reader.GetValue<string>("Created"))
-                : DateTime.MinValue
-        };
     }
+
+    return image;
+}
     
     public async Task<int> GetCountAsync(long? libraryId = null, string? path = null)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
     
         var sql = "SELECT COUNT(*) FROM Images WHERE 1=1";
         if (libraryId.HasValue)
@@ -92,8 +128,8 @@ public class ImageRepository : IImageRepository
 
     public async Task<int> GetSearchCountAsync(string searchText, long? libraryId = null, string? directoryPath = null)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         // Base query using FTS5 virtual table for full-text search
         var baseQuery = @"
@@ -133,8 +169,8 @@ public class ImageRepository : IImageRepository
     public async Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, int offset, int? limit, long? libraryId = null, string? directoryPath = null)
     {
         var images = new List<Image>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         // Base query using FTS5 virtual table for full-text search
         var baseQuery = @"
@@ -168,7 +204,7 @@ public class ImageRepository : IImageRepository
             command.CreateParameter("@DirectoryPath", directoryPath);
         }
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             images.Add(ReadImage(reader));
@@ -181,8 +217,8 @@ public class ImageRepository : IImageRepository
         int offset, int? limit, ImageSortOption sortOption)
     {
         var images = new List<Image>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         var limitClause = limit.HasValue ? "LIMIT @Limit" : "";
         var offsetClause = limit.HasValue ? "OFFSET @Offset" : "";
@@ -198,7 +234,7 @@ public class ImageRepository : IImageRepository
             command.CreateParameter("@Offset", offset);
         }
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             images.Add(ReadImage(reader));
@@ -269,20 +305,20 @@ public class ImageRepository : IImageRepository
 
     public async Task<Image?> GetByIdAsync(long id)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM Images WHERE Id = @Id";
         command.CreateParameter("@Id", id);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
     public async Task<Image?> GetByPathAsync(long libraryId, string path,
         ImageSortOption sortOption = ImageSortOption.NewestFirst)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         var orderBy = GetSortClause(sortOption);
 
@@ -290,18 +326,18 @@ public class ImageRepository : IImageRepository
         command.CreateParameter("@LibraryId", libraryId);
         command.CreateParameter("@Path", path);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
     public async Task<Image?> GetByHashAsync(string hash)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM Images WHERE Hash = @Hash";
         command.CreateParameter("@Hash", hash);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         return await reader.ReadAsync() ? ReadImage(reader) : null;
     }
 
@@ -309,8 +345,8 @@ public class ImageRepository : IImageRepository
     public async Task<Dictionary<long, Bitmap?>> GetThumbnailsByIdsAsync(IEnumerable<long> ids)
     {
         var thumbnails = new Dictionary<long, Bitmap?>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         // Create a parameter string with the correct number of parameters
         var parameters = string.Join(",", ids.Select((_, index) => $"@Id{index}"));
@@ -324,7 +360,7 @@ public class ImageRepository : IImageRepository
             index++;
         }
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             var id = reader.GetValue<long>("Id");
@@ -338,34 +374,18 @@ public class ImageRepository : IImageRepository
         return thumbnails;
     }
 
-    public async Task<long> AddAsync(Image image)
+    public async Task AddAsync(Image image)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = @"
-            INSERT INTO Images (LibraryId, Path, Hash, PositivePrompt, NegativePrompt, Description, Created, Thumbnail)
-            VALUES (@LibraryId, @Path, @Hash, @PositivePrompt, @NegativePrompt, @Description, @Created, @Thumbnail)
-            RETURNING Id";
-
-        command.CreateParameter("@LibraryId", image.LibraryId);
-        command.CreateParameter("@Path", image.Path);
-        command.CreateParameter("@Hash", image.Hash);
-        command.CreateParameter("@PositivePrompt", (object?)image.PositivePrompt ?? DBNull.Value);
-        command.CreateParameter("@NegativePrompt", (object?)image.NegativePrompt ?? DBNull.Value);
-        command.CreateParameter("@Description", (object?)image.Description ?? DBNull.Value);
-        command.CreateParameter("@Created", image.Created);
-        command.CreateParameter("@Thumbnail", (object?)BitmapToBytes(image.Thumbnail) ?? DBNull.Value);
-
-        return await command.ExecuteScalarAsync<long>();
+        await AddBatchAsync([image]);
     }
 
     public async Task AddBatchAsync(IEnumerable<Image> images)
     {
-        using var connection = CreateConnection();
-        using var transaction = connection.BeginTransaction();
+        await using var connection = CreateConnection();
+        await using var transaction = connection.BeginTransaction();
         try
         {
-            using var command = connection.CreateCommand();
+            await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = @"
             INSERT INTO Images (LibraryId, Path, Hash, PositivePrompt, NegativePrompt, Description, Created, Thumbnail)
@@ -409,9 +429,9 @@ public class ImageRepository : IImageRepository
                 libIdParam.Value = image.LibraryId;
                 pathParam.Value = image.Path;
                 hashParam.Value = image.Hash;
-                posPromptParam.Value = (object?)image.PositivePrompt ?? DBNull.Value;
-                negPromptParam.Value = (object?)image.NegativePrompt ?? DBNull.Value;
-                descParam.Value = (object?)image.Description ?? DBNull.Value;
+                posPromptParam.Value = (object?)TextService.TruncateIntelligently(image.PositivePrompt, 2048) ?? DBNull.Value;
+                negPromptParam.Value = (object?)TextService.TruncateIntelligently(image.NegativePrompt, 2048) ?? DBNull.Value;
+                descParam.Value = (object?)TextService.TruncateIntelligently(image.Description, 2048) ?? DBNull.Value;
                 createdParam.Value = image.Created;
                 thumbParam.Value = (object?)BitmapToBytes(image.Thumbnail) ?? DBNull.Value;
 
@@ -430,8 +450,8 @@ public class ImageRepository : IImageRepository
 
     public async Task DeleteAsync(long id)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM Images WHERE Id = @Id";
         command.CreateParameter("@Id", id);
 
@@ -440,8 +460,8 @@ public class ImageRepository : IImageRepository
 
     public async Task DeleteByLibraryIdAsync(long libraryId)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM Images WHERE LibraryId = @LibraryId";
         command.CreateParameter("@LibraryId", libraryId);
         await command.ExecuteNonQueryAsync();
@@ -449,8 +469,8 @@ public class ImageRepository : IImageRepository
 
     public async Task UpdateAsync(Image image)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = @"
             UPDATE Images 
             SET LibraryId = @LibraryId,
@@ -479,8 +499,8 @@ public class ImageRepository : IImageRepository
     // Add method to update just the thumbnail
     public async Task UpdateThumbnailAsync(long imageId, Bitmap? thumbnail)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = @"
             UPDATE Images 
             SET Thumbnail = @Thumbnail
@@ -494,8 +514,8 @@ public class ImageRepository : IImageRepository
 
     public async Task<bool> ExistsAsync(long libraryId, string path)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "SELECT EXISTS(SELECT 1 FROM Images WHERE LibraryId = @LibraryId AND Path = @Path)";
         command.CreateParameter("@LibraryId", libraryId);
         command.CreateParameter("@Path", path);
@@ -506,8 +526,8 @@ public class ImageRepository : IImageRepository
     public async Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null)
     {
         var images = new List<Image>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         
         command.CommandText = @"
             SELECT i.Id, i.PositivePrompt 
@@ -523,7 +543,7 @@ public class ImageRepository : IImageRepository
             command.CreateParameter("@LibraryId", libraryId.Value);
         }
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             images.Add(ReadImage(reader));

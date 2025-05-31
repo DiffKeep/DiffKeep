@@ -35,7 +35,7 @@ public interface IImageRepository
         ImageSortOption sortOption);
 
     Task<Dictionary<long, Bitmap?>> GetThumbnailsByIdsAsync(IEnumerable<long> ids);
-    Task<long> AddAsync(Image image);
+    Task AddAsync(Image image);
     Task AddBatchAsync(IEnumerable<Image> images);
     Task DeleteByLibraryIdAsync(long libraryId);
     Task UpdateAsync(Image image);

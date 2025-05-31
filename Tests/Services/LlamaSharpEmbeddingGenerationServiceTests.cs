@@ -2,12 +2,9 @@ using DiffKeep.Services;
 using LLama;
 using LLama.Common;
 using Xunit.Abstractions;
+using FluentAssertions;
 
 namespace Tests.Services;
-
-using System.Threading.Tasks;
-using Xunit;
-using FluentAssertions;
 
 public class LlamaSharpEmbeddingGenerateServiceTests
 {

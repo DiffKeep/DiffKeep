@@ -40,11 +40,11 @@ public class EmbeddingsRepository : IEmbeddingsRepository
     public async Task StoreBatchEmbeddingsAsync(
         IEnumerable<(long ImageId, EmbeddingSource Source, string Model, float[] Embedding)> embeddings)
     {
-        using var connection = CreateConnection();
-        using var transaction = connection.BeginTransaction();
+        await using var connection = CreateConnection();
+        await using var transaction = connection.BeginTransaction();
         try
         {
-            using var command = connection.CreateCommand();
+            await using var command = connection.CreateCommand();
             var embeddingSize = embeddings.First().Embedding.Length;
             command.Transaction = transaction;
             command.CommandText = @"
@@ -98,8 +98,8 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         float[] embedding, int limit = 100)
     {
         var resultDict = new Dictionary<long, (long ImageId, string Path, float Score)>();
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
 
         command.CommandText = @"
         SELECT 
@@ -114,7 +114,7 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         command.Parameters.AddWithValue("@Embedding", VectorToBlob(embedding));
         command.Parameters.AddWithValue("@Limit", limit);
 
-        using var reader = await command.ExecuteReaderAsync();
+        await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             var imageId = reader.GetInt64(0);
@@ -142,8 +142,8 @@ public class EmbeddingsRepository : IEmbeddingsRepository
 
     public async Task DeleteEmbeddingsForImageAsync(long imageId)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = "DELETE FROM Embeddings WHERE ImageId = @ImageId";
         command.CreateParameter("@ImageId", imageId);
         await command.ExecuteNonQueryAsync();
@@ -151,8 +151,8 @@ public class EmbeddingsRepository : IEmbeddingsRepository
     
     public async Task DeleteEmbeddingsForLibraryAsync(long libraryId)
     {
-        using var connection = CreateConnection();
-        using var command = connection.CreateCommand();
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
         command.CommandText = @"
         DELETE FROM Embeddings 
         WHERE ImageId IN (

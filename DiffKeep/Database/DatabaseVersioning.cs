@@ -64,7 +64,7 @@ public static class DatabaseVersioning
             
             Debug.WriteLine($"Applying migration: {version}");
 
-            using var stream = assembly.GetManifestResourceStream(resourceName);
+            await using var stream = assembly.GetManifestResourceStream(resourceName);
             using var reader = new StreamReader(stream!);
             var sql = await reader.ReadToEndAsync();
 
