@@ -235,6 +235,7 @@ public partial class ImageItemViewModel : ViewModelBase
     public long Id { get; }
     public string? Path { get; }
     public string? FileName { get; }
+    public float? Score { get; }
 
     public void UpdateThumbnail()
     {
@@ -246,6 +247,7 @@ public partial class ImageItemViewModel : ViewModelBase
         Id = image.Id;
         Path = image.Path;
         FileName = System.IO.Path.GetFileName(image.Path);
+        Score = image.Score;
         _galleryViewModel = new WeakReference<ImageGalleryViewModel>(galleryViewModel);
         UpdateThumbnail(); // Initial thumbnail value
     }

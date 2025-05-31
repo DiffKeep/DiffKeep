@@ -14,6 +14,7 @@ public class Image
     public string? Description { get; set; }
     public DateTime Created { get; set; }
     public Bitmap? Thumbnail { get; set; }
+    public float? Score { get; set; }
     
     // Navigation property
     public Library? Library { get; set; }

@@ -121,16 +121,27 @@
                                             IsVisible="{Binding IsSelected}"
                                             Margin="-1" />
                                     <!-- Content -->
-                                    <StackPanel>
-                                        <Image Source="{Binding Thumbnail}"
-                                               Width="200"
-                                               Height="200"
-                                               Stretch="Uniform"/>
-                                        <TextBlock Text="{Binding FileName}"
-                                                   Margin="5 10"
-                                                   TextAlignment="Center"
-                                                   TextWrapping="Wrap" />
-                                    </StackPanel>
+                                    <Grid>
+                                        <StackPanel>
+                                            <Image Source="{Binding Thumbnail}"
+                                                   Width="200"
+                                                   Height="200"
+                                                   Stretch="Uniform"/>
+                                            <TextBlock Text="{Binding FileName}"
+                                                       Margin="5 10"
+                                                       TextAlignment="Center"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <!-- Score Display -->
+                                        <TextBlock Text="{Binding Score, StringFormat={}{0:F3}}"
+                                                   HorizontalAlignment="Left"
+                                                   VerticalAlignment="Top"
+                                                   Margin="0,0,5,5"
+                                                   Background="#80000000"
+                                                   Padding="4,2"
+                                                   Foreground="White"/>
+                                    </Grid>
+
                                 </Grid>
                             </Border>
                         </DataTemplate>

@@ -27,6 +27,7 @@ public class SearchService
             Id = result.ImageId,
             Path = result.Path,
             Hash = "",
+            Score = result.Score,
         });
     }
 
