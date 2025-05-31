@@ -10,6 +10,7 @@ using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Repositories;
@@ -27,27 +28,20 @@ public partial class ImageGalleryViewModel : ViewModelBase
     private long? _currentLibraryId;
     private string? _currentPath;
     private string? _currentName;
-    public Dictionary<long, Bitmap> Thumbnails;
+    public Dictionary<long, Bitmap?> Thumbnails;
     public event EventHandler? ImagesCollectionChanged;
     public event Action? ResetScrollRequested;
     public event Action? SaveScrollPositionRequested;
     public event Action? RestoreScrollPositionRequested;
 
-    
-    [ObservableProperty]
-    private ImageItemViewModel? _selectedImage;
-    [ObservableProperty]
-    private string? _currentDirectory;
-    [ObservableProperty]
-    private ImageSortOption _currentSortOption = ImageSortOption.NewestFirst;
-    [ObservableProperty]
-    private string _searchText = string.Empty;
-    [ObservableProperty]
-    private string _imagesCount;
-    [ObservableProperty]
-    private bool _isLoading;
-    [ObservableProperty]
-    private int _totalCount;
+
+    [ObservableProperty] private ImageItemViewModel? _selectedImage;
+    [ObservableProperty] private string? _currentDirectory;
+    [ObservableProperty] private ImageSortOption _currentSortOption = ImageSortOption.NewestFirst;
+    [ObservableProperty] private string _searchText = string.Empty;
+    [ObservableProperty] private string _imagesCount;
+    [ObservableProperty] private bool _isLoading;
+    [ObservableProperty] private int _totalCount;
 
     public ObservableCollection<ImageItemViewModel> Images
     {
@@ -55,14 +49,15 @@ public partial class ImageGalleryViewModel : ViewModelBase
         set => SetProperty(ref _images, value);
     }
 
-    public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService, SearchService searchService)
+    public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService,
+        SearchService searchService)
     {
         _imageRepository = imageRepository;
         _imageService = imageService;
         _searchService = searchService;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
-        
+
         // Subscribe to library updated messages
         WeakReferenceMessenger.Default.Register<LibraryUpdatedMessage>(this, (r, m) =>
         {
@@ -72,7 +67,6 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 LoadImagesAsync(null).FireAndForget();
             }
         });
-
     }
 
     public async Task LoadImagesAsync(LibraryTreeItem? item)
@@ -83,7 +77,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             _currentPath = item.Path;
             _currentName = item.Name;
         }
-        
+
         Debug.WriteLine($"Loading images for library {_currentLibraryId}, path: {_currentPath}");
         IsLoading = true;
 
@@ -92,7 +86,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             IEnumerable<Image> dbImages;
             if (!string.IsNullOrWhiteSpace(SearchText))
             {
-                dbImages = await _searchService.SearchByTextAndGetImagesAsync(SearchText);
+                dbImages = await _searchService.TextSearchImagesAsync(SearchText);
             }
             else if (_currentLibraryId == null)
             {
@@ -100,18 +94,20 @@ public partial class ImageGalleryViewModel : ViewModelBase
             }
             else if (_currentPath == null)
             {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, 0, null, CurrentSortOption);
+                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, 0, null,
+                    CurrentSortOption);
             }
             else
             {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath, 0, null, CurrentSortOption);
+                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath,
+                    0, null, CurrentSortOption);
             }
-            
+
             TotalCount = dbImages.Count();
 
             ImagesCount = $"({TotalCount} images)";
 
-            var viewModels = await Task.Run(() => 
+            var viewModels = await Task.Run(() =>
                 dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
 
             await Task.Run(async () =>
@@ -120,13 +116,13 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 {
                     var selectedId = SelectedImage?.Id;
                     await Dispatcher.UIThread.InvokeAsync(() => SaveScrollPositionRequested?.Invoke());
-            
+
                     await Task.Run(() =>
                     {
                         Images.Clear();
                         Images = new ObservableCollection<ImageItemViewModel>(viewModels);
                     });
-            
+
                     await Dispatcher.UIThread.InvokeAsync(() => RestoreScrollPositionRequested?.Invoke());
                     if (selectedId != null)
                     {
@@ -140,10 +136,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
                     Images.Clear();
                     Images = new ObservableCollection<ImageItemViewModel>(viewModels);
                 }
-                
+
                 if (ImagesCollectionChanged != null)
                     ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
-                
             });
         }
         finally
@@ -151,7 +146,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             IsLoading = false;
         }
     }
-    
+
     [RelayCommand]
     private async Task SearchPrompts()
     {
@@ -166,31 +161,61 @@ public partial class ImageGalleryViewModel : ViewModelBase
         SearchText = string.Empty;
         await SearchPrompts();
     }
-    
+
     [RelayCommand]
     private Task SortImagesAsync(ImageSortOption sortOption)
     {
         Debug.WriteLine($"Sorting images by {sortOption}");
         if (CurrentSortOption == sortOption) return Task.CompletedTask;
-        
+
         CurrentSortOption = sortOption;
         return LoadImagesAsync(null);
     }
-    
+
     partial void OnCurrentSortOptionChanged(ImageSortOption value)
     {
         Debug.WriteLine($"Current sort option changed to {value}");
         LoadImagesAsync(null).FireAndForget();
     }
-    
-    public async Task UpdateVisibleThumbnails(IEnumerable<long> visibleIds)
+
+    public async Task UpdateVisibleThumbnails(IEnumerable<ImageItemViewModel> visibleImages)
     {
-        Debug.WriteLine($"Updating visible thumbnails for {visibleIds.Count()} images");
+        var visibleImageArray = visibleImages as ImageItemViewModel[] ?? visibleImages.ToArray();
+        Debug.WriteLine($"Updating visible thumbnails for {visibleImageArray.Count()} images");
 
         await Task.Run(async () =>
         {
             // Get thumbnails for visible items and some items ahead/behind
-            Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleIds);
+            if (Program.Settings.StoreThumbnails)
+                Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleImageArray.Select(i => i.Id));
+            else
+            {
+                Thumbnails = new Dictionary<long, Bitmap?>();
+                var lockObject = new object();
+
+                await Parallel.ForEachAsync(
+                    visibleImageArray,
+                    new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = Environment.ProcessorCount
+                    },
+                    async (image, token) =>
+                    {
+                        if (image.Path != null)
+                        {
+                            var thumbnail = await ImageService.GenerateThumbnailAsync(
+                                image.Path,
+                                ImageLibraryScanner.ThumbnailSize);
+
+                            lock (lockObject)
+                            {
+                                Thumbnails[image.Id] = thumbnail;
+                            }
+
+                            image.UpdateThumbnail();
+                        }
+                    });
+            }
 
             // Update the view models
             foreach (var image in Images)
@@ -199,7 +224,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             }
         });
     }
-    
+
     public async Task DeleteImage(ImageItemViewModel image, Window parentWindow)
     {
         if (await _imageService.DeleteImageAsync(image, parentWindow))
@@ -226,11 +251,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
 public partial class ImageItemViewModel : ViewModelBase
 {
     private readonly WeakReference<ImageGalleryViewModel> _galleryViewModel;
-    
-    [ObservableProperty]
-    private Bitmap? _thumbnail;
-    [ObservableProperty]
-    private bool _isSelected;
+
+    [ObservableProperty] private Bitmap? _thumbnail;
+    [ObservableProperty] private bool _isSelected;
 
     public long Id { get; }
     public string? Path { get; }

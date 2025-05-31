@@ -9,7 +9,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.Messaging;
-using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Models;
 using DiffKeep.Parsing;
@@ -24,7 +23,7 @@ public class ImageLibraryScanner
     private readonly IImageRepository _imageRepository;
     private readonly ImageParser _imageParser;
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _scanCancellations = new();
-    private const int ThumbnailSize = 200;
+    public const int ThumbnailSize = 200;
     private const int MaxConcurrentThumbnails = 16;
     private const int BatchSize = 500; // Size of batches for database inserts
 
@@ -77,19 +76,8 @@ public class ImageLibraryScanner
         Debug.Print($"Found {totalFiles} files");
 
         using var semaphore = new SemaphoreSlim(MaxConcurrentThumbnails);
-        var imageBatch = new ConcurrentBag<Image>();
+        var imageBatch = new List<Image>();
         var processingTasks = new List<Task>();
-
-        async Task ProcessBatchAsync()
-        {
-            var batchToProcess = imageBatch.Where(img => img != null).ToList();
-            if (batchToProcess.Count > 0)
-            {
-                imageBatch = new ConcurrentBag<Image>();
-                await _imageRepository.AddBatchAsync(batchToProcess);
-                Debug.Print($"Inserted batch of {batchToProcess.Count} images");
-            }
-        }
 
         foreach (var file in files)
         {
@@ -98,6 +86,16 @@ public class ImageLibraryScanner
 
             try
             {
+                if (imageBatch.Count >= BatchSize)
+                {
+                    // Wait for any ongoing processing tasks to complete
+                    await Task.WhenAll(processingTasks);
+                    processingTasks.Clear();
+                    
+                    // Process the current batch
+                    await ProcessBatchAsync();
+                }
+
                 if (!await _imageRepository.ExistsAsync(library.Id, file))
                 {
                     await semaphore.WaitAsync(cancellationToken);
@@ -107,13 +105,13 @@ public class ImageLibraryScanner
                         try
                         {
                             var image = await CreateImageFromFile(file, library.Id);
-
-                            imageBatch.Add(image);
-                            Debug.Print($"Processed {file}");
-
-                            if (imageBatch.Count >= BatchSize)
+                            if (image != null)
                             {
-                                await ProcessBatchAsync();
+                                lock (imageBatch)
+                                {
+                                    imageBatch.Add(image);
+                                }
+                                Debug.Print($"Processed {file}");
                             }
                         }
                         catch (Exception ex)
@@ -140,7 +138,7 @@ public class ImageLibraryScanner
 
         try
         {
-            // Wait for all processing tasks to complete
+            // Wait for all remaining processing tasks to complete
             await Task.WhenAll(processingTasks);
 
             // Process any remaining images in the final batch
@@ -154,23 +152,39 @@ public class ImageLibraryScanner
 
         OnScanCompleted(library.Id, processedFiles);
         WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(library.Id));
+        return;
+
+        async Task ProcessBatchAsync()
+        {
+            if (imageBatch.Count > 0)
+            {
+                var batchToProcess = imageBatch.ToList();
+                await _imageRepository.AddBatchAsync(batchToProcess);
+                Debug.Print($"Inserted batch of {batchToProcess.Count} images");
+                imageBatch.Clear();
+            }
+        }
     }
 
     public async Task CreateOrUpdateSingleFile(long libraryId, string filePath)
     {
         var dbImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
         var image = await CreateImageFromFile(filePath, libraryId);
-        if (dbImage.Count() == 1)
+        var foundImages = dbImage as Image[] ?? dbImage.ToArray();
+        if (foundImages.Length == 1)
         {
-            Debug.WriteLine($"Existing image found for {image.Path}, updating image");
-            var i = dbImage.First();
-            image.Id = i.Id;
-            await _imageRepository.UpdateAsync(image);
+            Debug.WriteLine($"Existing image found for {image?.Path}, updating image");
+            var i = foundImages.First();
+            if (image != null)
+            {
+                image.Id = i.Id;
+                await _imageRepository.UpdateAsync(image);
+            }
         }
         else
         {
-            Debug.WriteLine($"No previous image found for {image.Path}, inserting image");
-            await _imageRepository.AddAsync(image);
+            Debug.WriteLine($"No previous image found for {image?.Path}, inserting image");
+            if (image != null) await _imageRepository.AddAsync(image);
         }
     }
 
@@ -183,6 +197,9 @@ public class ImageLibraryScanner
     {
         ScanCompleted?.Invoke(this, new ScanCompletedEventArgs(libraryId, processedFiles));
         
+        if (!Program.Settings.UseEmbeddings)
+            return;
+        
         Debug.WriteLine($"Finished scanning library {libraryId}, checking for images without embeddings");
         // find and queue all images in the library that don't have embeddings
         Task.Run(async () =>
@@ -191,10 +208,11 @@ public class ImageLibraryScanner
             {
                 // Get all images from this library
                 var images = await _imageRepository.GetImagesWithoutEmbeddingsAsync(libraryId);
-                Debug.WriteLine($"Found {images.Count()} images in library {libraryId} without embeddings");
+                var imageArray = images as Image[] ?? images.ToArray();
+                Debug.WriteLine($"Found {imageArray.Length} images in library {libraryId} without embeddings");
             
                 // Filter for images that have a positive prompt but no embedding
-                foreach (var image in images)
+                foreach (var image in imageArray)
                 {
                     if (!string.IsNullOrWhiteSpace(image.PositivePrompt))
                     {
@@ -225,17 +243,17 @@ public class ImageLibraryScanner
         var fileInfo = new FileInfo(file);
 
         Bitmap? thumbnail = null;
-        try
+        if (Program.Settings.StoreThumbnails)
         {
-            using var vipsThumbnail = NetVips.Image.Thumbnail(file, ThumbnailSize);
-            var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
-            using var stream = new MemoryStream(buffer);
-            thumbnail = new Bitmap(stream);
-        }
-        catch (Exception ex)
-        {
-            Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
-            return null;
+            try
+            {
+                thumbnail = await ImageService.GenerateThumbnailAsync(file, ThumbnailSize);
+            }
+            catch (Exception ex)
+            {
+                Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
+                return null;
+            }
         }
 
         return new Image
@@ -243,7 +261,7 @@ public class ImageLibraryScanner
             LibraryId = libraryId,
             Path = file,
             Hash = hash,
-            PositivePrompt = metadata?.Prompt,
+            PositivePrompt = metadata.Prompt,
             Created = fileInfo.CreationTime,
             Thumbnail = thumbnail
         };
@@ -252,13 +270,10 @@ public class ImageLibraryScanner
     private static async Task<string> Hash(string imagePath)
     {
         // Calculate file hash
-        string hash;
-        using (var md5 = MD5.Create())
-        await using (var stream = File.OpenRead(imagePath))
-        {
-            var hashBytes = await md5.ComputeHashAsync(stream);
-            hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
-        }
+        using var md5 = MD5.Create();
+        await using var stream = File.OpenRead(imagePath);
+        var hashBytes = await md5.ComputeHashAsync(stream);
+        var hash = Convert.ToHexStringLower(hashBytes);
 
         return hash;
     }

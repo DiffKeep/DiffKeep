@@ -32,6 +32,7 @@ public partial class ImageGalleryView : UserControl
     private double? _lastThumbnailUpdatePosition;
     private const double SCROLL_UPDATE_THRESHOLD = 800;
     private DispatcherTimer? _layoutDebounceTimer;
+    private bool _canInteract = true;
 
     public ImageGalleryView()
     {
@@ -131,9 +132,12 @@ public partial class ImageGalleryView : UserControl
             ScrollSelectedItemIntoView();
     }
 
-    private void OnKeyDown(object? sender, KeyEventArgs e)
+    private async void OnKeyDown(object? sender, KeyEventArgs e)
     {
         if (DataContext is not ImageGalleryViewModel vm || _itemsRepeater == null || vm.Images.Count == 0)
+            return;
+
+        if (!_canInteract)
             return;
 
         if (e.Key == Key.Enter && vm.SelectedImage != null)
@@ -145,7 +149,9 @@ public partial class ImageGalleryView : UserControl
 
         if (e.Key == Key.Delete && vm.SelectedImage != null)
         {
-            DeleteSelectedImage();
+            _canInteract = false;
+            await DeleteSelectedImage();
+            _canInteract = true;
             e.Handled = true;
             return;
         }
@@ -199,7 +205,7 @@ public partial class ImageGalleryView : UserControl
         }
     }
     
-    private async void DeleteSelectedImage()
+    private async Task DeleteSelectedImage()
     {
         if (DataContext is not ImageGalleryViewModel vm || vm.SelectedImage == null)
             return;
@@ -375,7 +381,7 @@ public partial class ImageGalleryView : UserControl
         var visibleItems = GetVisibleItems();
         if (DataContext is ImageGalleryViewModel viewModel)
         {
-            viewModel.UpdateVisibleThumbnails(visibleItems.Select(i => i.Id)).FireAndForget();
+            viewModel.UpdateVisibleThumbnails(visibleItems).FireAndForget();
         }
     }
 

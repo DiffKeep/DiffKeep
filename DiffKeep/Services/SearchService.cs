@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -10,17 +11,26 @@ public class SearchService
 {
     private readonly IEmbeddingGenerationService _embeddingService;
     private readonly IEmbeddingsRepository _embeddingsRepository;
+    private readonly IImageRepository _imageRepository;
 
     public SearchService(
         IEmbeddingGenerationService embeddingService,
-        IEmbeddingsRepository embeddingsRepository)
+        IEmbeddingsRepository embeddingsRepository,
+        IImageRepository imageRepository)
     {
         _embeddingService = embeddingService;
         _embeddingsRepository = embeddingsRepository;
+        _imageRepository = imageRepository;
     }
     
-    public async Task<IEnumerable<Image>> SearchByTextAndGetImagesAsync(string searchText)
+    public async Task<IEnumerable<Image>> TextSearchImagesAsync(string searchText)
     {
+        if (!Program.Settings.UseEmbeddings)
+        {
+            // search using FTS
+            return await _imageRepository.SearchByPromptAsync(searchText, 0, null);
+        }
+        
         var searchResults = await SearchByTextAsync(searchText);
         return searchResults.Select(result => new Image
         {
@@ -31,7 +41,7 @@ public class SearchService
         });
     }
 
-    public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText)
+    private async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText)
     {
         // Generate embedding for the search text
         var embeddings = await _embeddingService.GenerateEmbeddingAsync(searchText);

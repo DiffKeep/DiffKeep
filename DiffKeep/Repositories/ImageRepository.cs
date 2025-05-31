@@ -69,6 +69,19 @@ private static Image ReadImage(SqliteDataReader reader)
     // Required Id field - if this fails, we want it to throw
     image.Id = reader.GetValue<long>("Id");
 
+    // Handle rank if present
+    if (SqliteHelper.HasColumn(reader, "rank"))
+    {
+        var rank = GetValueTypeSafe<double>("rank");
+        // Convert negative ranks to positive percentages
+        // -10 -> 1.0 (100%)
+        // -5  -> 0.5 (50%)
+        // -1  -> 0.1 (10%)
+        // 0   -> 0.0 (0%)
+        image.Score = (float)Math.Min(1.0, Math.Abs(rank) / 10.0);
+
+    }
+
     // Optional fields - use safe getters
     image.LibraryId = GetValueTypeSafe<long>("LibraryId");
     image.Path = GetValueSafe<string>("Path", string.Empty);
@@ -174,7 +187,7 @@ private static Image ReadImage(SqliteDataReader reader)
 
         // Base query using FTS5 virtual table for full-text search
         var baseQuery = @"
-        SELECT i.Id, i.Path
+        SELECT i.Id, i.Path, rank
         FROM Images i
         INNER JOIN ImagePromptIndex fts ON i.Id = fts.rowid
         WHERE fts.PositivePrompt MATCH @SearchText";

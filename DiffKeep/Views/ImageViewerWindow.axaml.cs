@@ -15,6 +15,7 @@ public partial class ImageViewerWindow : Window
     private Avalonia.Controls.WindowState _previousWindowState;
     private bool _isResizing;
     private Point _lastPos;
+    private bool _canInteract = true;
 
     public ImageViewerWindow()
     {
@@ -39,49 +40,49 @@ public partial class ImageViewerWindow : Window
 
     private async void ImageViewerWindow_KeyDown(object? sender, KeyEventArgs e)
     {
-        if (DataContext is ImageViewerViewModel vm)
+        if (DataContext is not ImageViewerViewModel vm || !_canInteract) return;
+        switch (e.Key)
         {
-            switch (e.Key)
-            {
-                case Key.Left:
-                case Key.Up:
-                    vm.NavigatePreviousCommand.Execute(null);
-                    e.Handled = true;
-                    break;
-                case Key.Right:
-                case Key.Down:
-                    vm.NavigateNextCommand.Execute(null);
-                    e.Handled = true;
-                    break;
-                case Key.Escape:
-                    Close();
-                    e.Handled = true;
-                    break;
-                case Key.F11:
-                    ToggleFullScreen(null, new RoutedEventArgs());
-                    e.Handled = true;
-                    break;
-                case Key.I:
-                    if (DataContext is ImageViewerViewModel vm1)
-                    {
-                        vm1.IsInfoPanelVisible = !vm1.IsInfoPanelVisible;
-                    }
+            case Key.Left:
+            case Key.Up:
+                vm.NavigatePreviousCommand.Execute(null);
+                e.Handled = true;
+                break;
+            case Key.Right:
+            case Key.Down:
+                vm.NavigateNextCommand.Execute(null);
+                e.Handled = true;
+                break;
+            case Key.Escape:
+                Close();
+                e.Handled = true;
+                break;
+            case Key.F11:
+                ToggleFullScreen(null, new RoutedEventArgs());
+                e.Handled = true;
+                break;
+            case Key.I:
+                if (DataContext is ImageViewerViewModel vm1)
+                {
+                    vm1.IsInfoPanelVisible = !vm1.IsInfoPanelVisible;
+                }
 
-                    e.Handled = true;
-                    break;
-                case Key.Delete:
-                    if (DataContext is ImageViewerViewModel vm2)
+                e.Handled = true;
+                break;
+            case Key.Delete:
+                if (DataContext is ImageViewerViewModel vm2)
+                {
+                    _canInteract = false;
+                    var result = await vm2.DeleteCurrentImage(this);
+                    if (result)
                     {
-                        var result = await vm2.DeleteCurrentImage(this);
-                        if (result)
-                        {
-                            vm2.LoadCurrentImage();
-                        }
+                        vm2.LoadCurrentImage();
                     }
+                    _canInteract = true;
+                }
 
-                    e.Handled = true;
-                    break;
-            }
+                e.Handled = true;
+                break;
         }
     }
 

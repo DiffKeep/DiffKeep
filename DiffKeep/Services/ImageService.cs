@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Avalonia.Controls;
 using DiffKeep.ViewModels;
 using System.Diagnostics;
+using Avalonia.Media.Imaging;
 using DiffKeep.Repositories;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Dto;
@@ -26,7 +27,6 @@ public class ImageService : IImageService
     {
         if (!_skipDeleteConfirmation)
         {
-
             var dialog = MessageBoxManager.GetMessageBoxCustom(new MessageBoxCustomParams()
             {
                 ButtonDefinitions = new List<ButtonDefinition>
@@ -36,12 +36,13 @@ public class ImageService : IImageService
                     new() { Name = "Cancel", },
                 },
                 ContentTitle = "Confirm Delete",
-                ContentMessage = $"Are you sure you want to delete the image: {image.Path}? This action cannot be undone.",
+                ContentMessage =
+                    $"Are you sure you want to delete the image: {image.Path}? This action cannot be undone.",
                 Topmost = true,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
             });
 
-            var result = await dialog.ShowAsync();
+            var result = await dialog.ShowWindowDialogAsync(parentWindow);
             Debug.WriteLine($"Dialog result: {result}");
 
             if (result == "Cancel" || String.IsNullOrWhiteSpace(result))
@@ -54,30 +55,43 @@ public class ImageService : IImageService
             {
                 _skipDeleteConfirmation = true;
             }
-        }
 
-        try
-        {
-            // Delete the file from filesystem
-            if (File.Exists(image.Path))
+            try
             {
-                Debug.WriteLine($"Deleting from filesystem image {image.Path}");
-                File.Delete(image.Path);
+                // Delete the file from filesystem
+                if (File.Exists(image.Path))
+                {
+                    Debug.WriteLine($"Deleting from filesystem image {image.Path}");
+                    File.Delete(image.Path);
+                }
+
+                // Delete from the database
+                Debug.WriteLine($"Deleting from database image {image.Id}");
+                await _imageRepository.DeleteAsync(image.Id);
+
+                return true;
             }
-
-            // Delete from the database
-            Debug.WriteLine($"Deleting from database image {image.Id}");
-            await _imageRepository.DeleteAsync(image.Id);
-
-            return true;
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error deleting image: {ex}");
+                var errorDialog =
+                    MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
+                await errorDialog.ShowWindowDialogAsync(parentWindow);
+                return false;
+            }
         }
-        catch (Exception ex)
+
+        return false;
+    }
+
+    public static async Task<Bitmap?> GenerateThumbnailAsync(string file, int size)
+    {
+        return await Task.Run(() =>
         {
-            Debug.WriteLine($"Error deleting image: {ex}");
-            var errorDialog =
-                MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
-            await errorDialog.ShowAsync();
-            return false;
-        }
+            using var vipsThumbnail = NetVips.Image.Thumbnail(file, size);
+            var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
+            using var stream = new MemoryStream(buffer);
+            return new Bitmap(stream);
+        });
     }
 }

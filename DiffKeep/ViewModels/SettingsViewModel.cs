@@ -24,9 +24,10 @@ public partial class SettingsViewModel : ViewModelBase
 
     [ObservableProperty]
     private string _theme;
-
     [ObservableProperty]
     private string _language;
+    [ObservableProperty] private bool _storeThumbnails;
+    [ObservableProperty] private bool _useEmbeddings;
 
     public partial class LibraryItem : ObservableObject
     {
@@ -67,6 +68,8 @@ public partial class SettingsViewModel : ViewModelBase
         {
             Theme = Theme,
             Language = Language,
+            StoreThumbnails = StoreThumbnails,
+            UseEmbeddings = UseEmbeddings,
         };
 
         var wrapper = new AppSettingsWrapper { AppSettings = settings };
@@ -151,26 +154,22 @@ public partial class SettingsViewModel : ViewModelBase
     [RelayCommand]
     private async Task DeleteLibrary(LibraryItem item)
     {
-        if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime {MainWindow: not null} desktop)
         {
-            var window = desktop.Windows.FirstOrDefault(w => w.IsActive);
-            if (window != null)
-            {
-                if (item.Id == null)
-                    return;
-                var dialog = MessageBoxManager.GetMessageBoxStandard(
-                    "Confirm Delete", $"Are you sure you want to remove this library?\n{item.Path}", ButtonEnum.OkCancel);
+            if (item.Id == null)
+                return;
+            var dialog = MessageBoxManager.GetMessageBoxStandard(
+                "Confirm Delete", $"Are you sure you want to remove this library?\n{item.Path}", ButtonEnum.OkCancel);
 
-                if (await dialog.ShowAsync() == ButtonResult.Ok)
-                {
-                    // delete all the embeddings associated with images associated with this library
-                    await _embeddingsRepository.DeleteEmbeddingsForLibraryAsync(item.Id.Value);
-                    // delete all the images associated with this library
-                    await _imageRepository.DeleteByLibraryIdAsync(item.Id.Value);
-                    // delete the library itself
-                    await _libraryRepository.DeleteAsync(item.Id.Value);
-                    Libraries.Remove(item);
-                }
+            if (await dialog.ShowWindowDialogAsync(desktop.MainWindow) == ButtonResult.Ok)
+            {
+                // delete all the embeddings associated with images associated with this library
+                await _embeddingsRepository.DeleteEmbeddingsForLibraryAsync(item.Id.Value);
+                // delete all the images associated with this library
+                await _imageRepository.DeleteByLibraryIdAsync(item.Id.Value);
+                // delete the library itself
+                await _libraryRepository.DeleteAsync(item.Id.Value);
+                Libraries.Remove(item);
             }
         }
     }

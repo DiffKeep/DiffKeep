@@ -10,7 +10,10 @@
         Width="500" MinWidth="400"
         Height="450" MinHeight="300"
         WindowStartupLocation="CenterOwner">
-
+    <Window.Resources>
+        <StreamGeometry x:Key="QuestionMarkIcon">M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0-1A6 6 0 1 0 8 2a6 6 0 0 0 0 12zm-.086-8.797c.17-.744.897-1.213 1.635-1.213.903 0 1.635.733 1.635 1.635 0 .609-.332 1.139-.823 1.424-1.073.623-1.447 1.79-1.447 2.796v.155a.5.5 0 0 0 1 0v-.155c0-.734.25-1.553 1.024-1.988.92-.535 1.496-1.527 1.496-2.632C12.434 4.263 11.172 3 9.6 3c-1.328 0-2.455.84-2.88 2.023a.5.5 0 1 0 .944.33zM8.5 13a.5.5 0 1 1-1 0 .5.5 0 0 1 1 0z</StreamGeometry>
+    </Window.Resources>
+    
     <DockPanel Margin="20">
         <StackPanel DockPanel.Dock="Bottom" 
                     Orientation="Horizontal" 
@@ -41,6 +44,26 @@
                             <x:String>en-GB</x:String>
                         </ComboBox.Items>
                     </ComboBox>
+                </StackPanel>
+                
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <CheckBox Content="Store Thumbnails" IsChecked="{Binding StoreThumbnails}"/>
+                    <Button Width="16" Height="16" Padding="0" VerticalAlignment="Center"
+                            ToolTip.Tip="Store image thumbnails to speed up browsing but uses more disk space">
+                        <Path Data="{StaticResource QuestionMarkIcon}"
+                              Width="14" Height="14"
+                              Fill="{DynamicResource ButtonForeground}"/>
+                    </Button>
+                </StackPanel>
+                
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <CheckBox Content="Use Embeddings" IsChecked="{Binding UseEmbeddings}"/>
+                    <Button Width="16" Height="16" Padding="0" VerticalAlignment="Center"
+                            ToolTip.Tip="Enable AI-powered image similarity search using embeddings">
+                        <Path Data="{StaticResource QuestionMarkIcon}"
+                              Width="14" Height="14"
+                              Fill="{DynamicResource ButtonForeground}"/>
+                    </Button>
                 </StackPanel>
                 
                 <StackPanel>
