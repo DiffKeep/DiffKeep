@@ -29,8 +29,7 @@
                                     Spacing="2">
                             <ProgressBar Value="{Binding ScanProgress}"
                                          Maximum="1.0"
-                                         Height="2"
-                                         MinWidth="100" />
+                                         Height="2"/>
                             <TextBlock Text="{Binding ScanStatus}"
                                        FontSize="11"
                                        Foreground="#666666" />

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using LLama;
@@ -30,13 +31,15 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
         var parameters = new ModelParams(fullModelPath)
         {
             GpuLayerCount = 999,
-            ContextSize = 1024,
         };
         _modelParams = parameters;
         if (isEmbeddingModel)
             parameters.Embeddings = true;
         else
+        {
             parameters.PoolingType = LLamaPoolingType.Mean;
+            parameters.ContextSize = 1024;
+        }
 
         _loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
         _embedder = new LLamaEmbedder(_loadedModel, parameters);
@@ -80,10 +83,9 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
         await _generatingLock.WaitAsync();
         try
         {
-            if (_isEmbeddingModel && _embedder != null)
-                return await _embedder.GetEmbeddings(text);
-
-            return await GenerateEmbeddingsFromNormalModelAsync(text);
+            return _isEmbeddingModel && _embedder != null
+                ? await _embedder.GetEmbeddings(text)
+                : await GenerateEmbeddingsFromNormalModelAsync(text);
         }
         finally
         {

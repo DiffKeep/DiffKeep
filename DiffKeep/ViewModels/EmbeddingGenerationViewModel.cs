@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
@@ -8,6 +9,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Extensions;
 using DiffKeep.Messages;
+using DiffKeep.Models;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 
@@ -18,12 +20,9 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
     private readonly IEmbeddingGenerationService _embeddingService;
     private readonly IEmbeddingsRepository _embeddingsRepository;
     private readonly ConcurrentQueue<GenerateEmbeddingMessage> _embeddingQueue;
-    [ObservableProperty]
-    private bool _isProcessing;
-    [ObservableProperty]
-    private int _totalItems;
-    [ObservableProperty]
-    private int _processedItems;
+    [ObservableProperty] private bool _isProcessing;
+    [ObservableProperty] private int _totalItems;
+    [ObservableProperty] private int _processedItems;
 
     public double Progress => TotalItems == 0 ? 0 : (double)ProcessedItems / TotalItems;
 
@@ -36,33 +35,30 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
         _embeddingService = embeddingService;
         _embeddingsRepository = embeddingsRepository;
         _embeddingQueue = new ConcurrentQueue<GenerateEmbeddingMessage>();
-        
+
         ProcessingItems = new ObservableCollection<ProcessingItem>();
-        
-        Task.Run(async () =>
+
+        /*Task.Run(async () =>
         {
             // load the fancy new gemma
+            // using a generative model doesn't work for now, embeddings are nonsense
+            //await _embeddingService.LoadModelAsync("gte-large.Q6_K.gguf", false);
             await _embeddingService.LoadModelAsync("gemma-3-4b-it-Q6_K.gguf", false);
-            Debug.WriteLine("Gemma3 loaded");
-            await Task.Delay(1000);
-        }).FireAndForget();
-        
-        
-        
+            Debug.WriteLine("LLM loaded");
+        }).FireAndForget();*/
+
         // Subscribe to library updated messages
-        WeakReferenceMessenger.Default.Register<GenerateEmbeddingMessage>(this, (r, m) =>
-        {
-            EnqueueMessageAsync(m).FireAndForget();
-        });
+        WeakReferenceMessenger.Default.Register<GenerateEmbeddingMessage>(this,
+            (r, m) => { EnqueueMessageAsync(m).FireAndForget(); });
     }
 
     public async Task EnqueueMessageAsync(GenerateEmbeddingMessage message)
     {
         _embeddingQueue.Enqueue(message);
         TotalItems++;
-        
-        ProcessingItems.Add(new ProcessingItem 
-        { 
+
+        ProcessingItems.Add(new ProcessingItem
+        {
             ImageId = message.ImageId,
             Status = "Queued",
             Text = message.Text
@@ -81,6 +77,9 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
 
         try
         {
+            const int batchSize = 50;
+            var batch = new List<(long ImageId, EmbeddingType Type, float[] Embedding)>(batchSize);
+
             while (_embeddingQueue.TryDequeue(out var message))
             {
                 var processingItem = ProcessingItems.First(x => x.ImageId == message.ImageId);
@@ -89,24 +88,50 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
                 try
                 {
                     var embeddings = await _embeddingService.GenerateEmbeddingAsync(message.Text);
+
+                    // Add all embeddings for this message to the batch
                     foreach (var embedding in embeddings)
                     {
-                         await _embeddingsRepository.StoreEmbeddingAsync(
-                                                message.ImageId, 
-                                                message.EmbeddingType, 
-                                                embedding);
+                        batch.Add((message.ImageId, message.EmbeddingType, embedding));
                     }
-                   
+
+                    // If we've reached the batch size or this is the last item, process the batch
+                    if (batch.Count >= batchSize || _embeddingQueue.IsEmpty)
+                    {
+                        await _embeddingsRepository.StoreBatchEmbeddingsAsync(batch);
+                        batch.Clear();
+                    }
 
                     processingItem.Status = "Completed";
                 }
                 catch (Exception ex)
                 {
                     processingItem.Status = $"Error: {ex.Message}";
+
+                    // If there was an error, try to save any accumulated batch items
+                    if (batch.Count > 0)
+                    {
+                        try
+                        {
+                            await _embeddingsRepository.StoreBatchEmbeddingsAsync(batch);
+                            batch.Clear();
+                        }
+                        catch
+                        {
+                            // If batch save fails, log or handle the error as needed
+                            Debug.WriteLine("Failed to save batch after error");
+                        }
+                    }
                 }
 
                 ProcessedItems++;
                 OnPropertyChanged(nameof(Progress));
+            }
+
+            // Process any remaining items in the final batch
+            if (batch.Count > 0)
+            {
+                await _embeddingsRepository.StoreBatchEmbeddingsAsync(batch);
             }
         }
         finally

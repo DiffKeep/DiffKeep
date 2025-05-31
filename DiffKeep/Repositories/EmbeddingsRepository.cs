@@ -45,6 +45,52 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         await command.ExecuteNonQueryAsync();
     }
 
+    public async Task StoreBatchEmbeddingsAsync(
+        IEnumerable<(long ImageId, EmbeddingType Type, float[] Embedding)> embeddings)
+    {
+        using var connection = CreateConnection();
+        using var transaction = connection.BeginTransaction();
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+            INSERT INTO Embeddings (ImageId, EmbeddingType, Embedding) 
+            VALUES (@ImageId, @EmbeddingType, @Embedding)";
+
+            var imageIdParam = command.CreateParameter();
+            imageIdParam.ParameterName = "@ImageId";
+            command.Parameters.Add(imageIdParam);
+
+            var typeParam = command.CreateParameter();
+            typeParam.ParameterName = "@EmbeddingType";
+            command.Parameters.Add(typeParam);
+
+            var embeddingParam = command.CreateParameter();
+            embeddingParam.ParameterName = "@Embedding";
+            command.Parameters.Add(embeddingParam);
+
+            foreach (var (imageId, type, embedding) in embeddings)
+            {
+                if (embedding.Length != VectorDimension)
+                    throw new ArgumentException($"Vector must have exactly {VectorDimension} dimensions");
+
+                imageIdParam.Value = imageId;
+                typeParam.Value = type.ToString();
+                embeddingParam.Value = $"[{string.Join(",", embedding)}]";
+
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+    }
+
     public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(
         float[] embedding, int limit = 100)
     {
