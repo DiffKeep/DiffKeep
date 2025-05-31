@@ -39,6 +39,16 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
         
         ProcessingItems = new ObservableCollection<ProcessingItem>();
         
+        Task.Run(async () =>
+        {
+            // load the fancy new gemma
+            await _embeddingService.LoadModelAsync("gemma-3-4b-it-Q6_K.gguf", false);
+            Debug.WriteLine("Gemma3 loaded");
+            await Task.Delay(1000);
+        }).FireAndForget();
+        
+        
+        
         // Subscribe to library updated messages
         WeakReferenceMessenger.Default.Register<GenerateEmbeddingMessage>(this, (r, m) =>
         {

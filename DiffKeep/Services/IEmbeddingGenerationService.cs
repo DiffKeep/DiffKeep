@@ -5,6 +5,6 @@ namespace DiffKeep.Services;
 
 public interface IEmbeddingGenerationService
 {
-    Task LoadModelAsync(string modelPath);
+    Task LoadModelAsync(string modelPath, bool isEmbeddingModel = true);
     Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text);
 }

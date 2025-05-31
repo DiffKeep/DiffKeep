@@ -1,6 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using LLama;
 using LLama.Common;
@@ -8,43 +10,92 @@ using LLama.Native;
 
 namespace DiffKeep.Services;
 
-public class LlamaSharpEmbeddingGenerateService: IEmbeddingGenerationService
+public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
 {
     private const string DefaultModel = "gte-large.Q6_K.gguf";
-    private LLamaWeights? loadedModel;
-    private LLamaEmbedder? embedder;
+    private LLamaWeights? _loadedModel;
+    private LLamaEmbedder? _embedder;
+    private LLamaContext? _context;
+    private bool _isEmbeddingModel = true;
+    private ModelParams? _modelParams;
+    private readonly SemaphoreSlim _modelLock = new SemaphoreSlim(1, 1);
+    private readonly SemaphoreSlim _generatingLock = new SemaphoreSlim(1, 1);
 
-    public LlamaSharpEmbeddingGenerateService()
-    {
-        NativeLibraryConfig.All.WithLogCallback(delegate(LLamaLogLevel level, string message)
-        {
-            Debug.WriteLine($"{level}: {message}");
-        });
-    }
-    
-    public async Task LoadModelAsync(string modelPath)
+    private async Task LoadModelInternalAsync(string modelPath, bool isEmbeddingModel = true)
     {
         var fullModelPath = Path.Join(Program.DataPath, "models", modelPath);
-        
+        _isEmbeddingModel = isEmbeddingModel;
+        Debug.WriteLine($"Loading model: {fullModelPath}. EmbeddingModel: {_isEmbeddingModel}");
+
         var parameters = new ModelParams(fullModelPath)
         {
-            Embeddings = true,
             GpuLayerCount = 999,
-            Threads = 16,
-            BatchThreads = 16,
-            // add model params as needed
+            ContextSize = 1024,
         };
-        loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
-        embedder = new LLamaEmbedder(loadedModel, parameters);
+        _modelParams = parameters;
+        if (isEmbeddingModel)
+            parameters.Embeddings = true;
+        else
+            parameters.PoolingType = LLamaPoolingType.Mean;
+
+        _loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
+        _embedder = new LLamaEmbedder(_loadedModel, parameters);
+        Debug.WriteLine($"Loaded model: {fullModelPath}");
+    }
+
+    public async Task LoadModelAsync(string modelPath, bool isEmbeddingModel = true)
+    {
+        await _modelLock.WaitAsync();
+        try
+        {
+            if (_loadedModel != null)
+                return;
+
+            await LoadModelInternalAsync(modelPath, isEmbeddingModel);
+        }
+        finally
+        {
+            _modelLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text)
     {
-        if (loadedModel == null)
+        if (_loadedModel == null)
         {
-            await LoadModelAsync(DefaultModel);
+            await _modelLock.WaitAsync();
+            try
+            {
+                if (_loadedModel == null)
+                {
+                    await LoadModelInternalAsync(DefaultModel);
+                }
+            }
+            finally
+            {
+                _modelLock.Release();
+            }
         }
 
-        return await embedder.GetEmbeddings(text);
+        await _generatingLock.WaitAsync();
+        try
+        {
+            if (_isEmbeddingModel && _embedder != null)
+                return await _embedder.GetEmbeddings(text);
+
+            return await GenerateEmbeddingsFromNormalModelAsync(text);
+        }
+        finally
+        {
+            _generatingLock.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<float[]>> GenerateEmbeddingsFromNormalModelAsync(string text)
+    {
+        if (_loadedModel == null || _modelParams == null || _embedder == null)
+            throw new InvalidOperationException("Model must be loaded before generating embeddings");
+        
+        return await _embedder.GetEmbeddings(text);
     }
 }

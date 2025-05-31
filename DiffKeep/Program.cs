@@ -15,6 +15,7 @@ using DiffKeep.Parsing;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using DiffKeep.ViewModels;
+using LLama.Native;
 using Microsoft.Data.Sqlite;
 
 namespace DiffKeep;
@@ -76,6 +77,12 @@ sealed class Program
 
         try
         {
+            /*
+            NativeLibraryConfig.All.WithLogCallback(delegate(LLamaLogLevel level, string message)
+            {
+                Debug.WriteLine($"{level}: {message}");
+            });
+            */
             SetupConfiguration();
             BuildAvaloniaApp()
                 .StartWithClassicDesktopLifetime(args);
