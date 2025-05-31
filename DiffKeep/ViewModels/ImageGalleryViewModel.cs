@@ -236,6 +236,7 @@ public partial class ImageItemViewModel : ViewModelBase
     public string? Path { get; }
     public string? FileName { get; }
     public float? Score { get; }
+    public bool HasScore => Score.HasValue;
 
     public void UpdateThumbnail()
     {

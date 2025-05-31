@@ -27,7 +27,7 @@ public class SearchService
             Id = result.ImageId,
             Path = result.Path,
             Hash = "",
-            Score = result.Score,
+            Score = 1 - result.Score, // invert the "lower is better" similarity score, for better UX
         });
     }
 
@@ -44,6 +44,6 @@ public class SearchService
         }
 
         // Search for similar vectors in the repository
-        return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0]);
+        return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0], 1000);
     }
 }
