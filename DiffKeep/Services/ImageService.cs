@@ -55,33 +55,31 @@ public class ImageService : IImageService
             {
                 _skipDeleteConfirmation = true;
             }
-
-            try
-            {
-                // Delete the file from filesystem
-                if (File.Exists(image.Path))
-                {
-                    Debug.WriteLine($"Deleting from filesystem image {image.Path}");
-                    File.Delete(image.Path);
-                }
-
-                // Delete from the database
-                Debug.WriteLine($"Deleting from database image {image.Id}");
-                await _imageRepository.DeleteAsync(image.Id);
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error deleting image: {ex}");
-                var errorDialog =
-                    MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
-                await errorDialog.ShowWindowDialogAsync(parentWindow);
-                return false;
-            }
         }
 
-        return false;
+        try
+        {
+            // Delete the file from filesystem
+            if (File.Exists(image.Path))
+            {
+                Debug.WriteLine($"Deleting from filesystem image {image.Path}");
+                File.Delete(image.Path);
+            }
+
+            // Delete from the database
+            Debug.WriteLine($"Deleting from database image {image.Id}");
+            await _imageRepository.DeleteAsync(image.Id);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error deleting image: {ex}");
+            var errorDialog =
+                MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
+            await errorDialog.ShowWindowDialogAsync(parentWindow);
+            return false;
+        }
     }
 
     public static async Task<Bitmap?> GenerateThumbnailAsync(string file, int size)
