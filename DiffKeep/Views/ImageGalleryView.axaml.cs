@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -335,7 +336,9 @@ public partial class ImageGalleryView : UserControl
             var imageItem = vm.SelectedImage;
 
             if (string.IsNullOrEmpty(imageItem.Path)) return;
-            var window = new ImageViewerWindow(vm.Images, imageItem);
+            // Create a new list with the current items
+            var imagesCopy = new ObservableCollection<ImageItemViewModel>(vm.Images);
+            var window = new ImageViewerWindow(imagesCopy, imageItem);
             window.Show();
         }
     }
