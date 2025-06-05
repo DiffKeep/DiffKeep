@@ -148,13 +148,13 @@
                                            Foreground="White"
                                            FontWeight="SemiBold" />
                                 <StackPanel Margin="0,5,0,15">
-                                    <TextBlock Text="{Binding ImageFilePath}"
-                                               Foreground="LightGray"
-                                               TextWrapping="Wrap" />
-                                    <TextBlock Text="{Binding ImageDimensions}"
-                                               Foreground="LightGray" />
-                                    <TextBlock Text="{Binding FileSize}"
-                                               Foreground="LightGray" />
+                                    <SelectableTextBlock Text="{Binding ImageFilePath}"
+                                                         Foreground="LightGray"
+                                                         TextWrapping="Wrap" />
+                                    <SelectableTextBlock Text="{Binding ImageDimensions}"
+                                                         Foreground="LightGray" />
+                                    <SelectableTextBlock Text="{Binding FileSize}"
+                                                         Foreground="LightGray" />
                                 </StackPanel>
 
                                 <!-- Generation Info -->
@@ -164,9 +164,9 @@
                                 <StackPanel Margin="0,5,0,15">
                                     <TextBlock Text="Image Generated With:"
                                            Foreground="White"/>
-                                    <TextBlock Text="{Binding DetectedTool}"
-                                               Foreground="LightGray"
-                                               FontStyle="Italic" />
+                                    <SelectableTextBlock Text="{Binding DetectedTool}"
+                                                         Foreground="LightGray"
+                                                         FontStyle="Italic" />
                                     <Grid>
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
