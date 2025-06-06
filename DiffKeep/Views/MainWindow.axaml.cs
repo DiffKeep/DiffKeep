@@ -17,11 +17,13 @@ public partial class MainWindow : Window
         Program.DataPath,
         "windowstate.json"
     );
+    private readonly ILicenseService _licenseService;
 
     
     public MainWindow()
     {
         InitializeComponent();
+        _licenseService = Program.Services.GetRequiredService<ILicenseService>();
         
         // Ensure directory exists
         var directory = Path.GetDirectoryName(StateFile);
@@ -44,6 +46,25 @@ public partial class MainWindow : Window
         this.GetObservable(ClientSizeProperty).Subscribe(new AnonymousObserver<Size>(_ => 
             SaveWindowState()));
     }
+    
+    protected override async void OnLoaded(RoutedEventArgs e)
+    {
+        base.OnLoaded(e);
+        
+        if (!await _licenseService.CheckLicenseValidAsync())
+        {
+            var licenseWindow = new LicenseKeyWindow();
+            await licenseWindow.ShowDialog(this);
+            
+            // Check again after dialog closes
+            if (!await _licenseService.CheckLicenseValidAsync())
+            {
+                Close();
+                return;
+            }
+        }
+    }
+
 
     private void LoadWindowState()
     {

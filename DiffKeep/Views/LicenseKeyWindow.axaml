@@ -1,0 +1,23 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="DiffKeep.Views.LicenseKeyWindow"
+        Title="License Key Required"
+        Width="400"
+        Height="200"
+        xmlns:vm="using:DiffKeep.ViewModels"
+        WindowStartupLocation="CenterOwner"
+        x:DataType="vm:LicenseKeyViewModel">
+    <StackPanel Margin="20">
+        <TextBlock Text="{Binding ErrorMessage}"
+                   IsVisible="{Binding HasError}"
+                   Foreground="Red"
+                   Margin="0,0,0,10"/>
+        <TextBlock Text="Please enter your license key:"/>
+        <TextBox Margin="0,10"
+                 Text="{Binding LicenseKey}"/>
+        <Button Content="Validate"
+                HorizontalAlignment="Right"
+                Command="{Binding ValidateCommand}"/>
+    </StackPanel>
+</Window>
+

@@ -19,4 +19,5 @@ public class AppSettings
     public string Language { get; set; } = "en-US";
     public bool StoreThumbnails { get; set; } = false;
     public bool UseEmbeddings { get; set; } = false;
+    public string? LicenseKey { get; set; }
 }

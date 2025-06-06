@@ -101,7 +101,6 @@ sealed class Program
 
         // Default config file path
         string configPath = Path.Combine(DataPath, "appsettings.json");
-        string dbPath = Path.Combine(DataPath, DbFilename);
 
         ConfigPath = configPath;
 
@@ -172,6 +171,7 @@ sealed class Program
             new ImageService(sp.GetRequiredService<IImageRepository>())
         );
         services.AddSingleton<SearchService>();
+        services.AddSingleton<ILicenseService, LicenseService>();
 
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
