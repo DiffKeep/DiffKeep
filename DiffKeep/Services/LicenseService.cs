@@ -8,14 +8,15 @@ using DiffKeep;
 using DiffKeep.Settings;
 using Microsoft.Extensions.Configuration;
 using System.IO.Compression;
+using System.Linq;
 
 public class LicenseInfo
 {
     public string Email { get; set; }
     public string VersionType { get; set; }  // "Beta", "Release", etc.
     public string Version { get; set; }      // Specific version if needed
-    public DateTime ValidFrom { get; set; }
-    public DateTime ValidUntil { get; set; }
+    public DateTime? ValidFrom { get; set; }
+    public DateTime? ValidUntil { get; set; }
 }
 
 public class Version
@@ -43,15 +44,6 @@ public class Version
 
     public bool Matches(Version other)
     {
-        // If versions have different pre-release tags, they must match exactly
-        if (PreRelease != null || other.PreRelease != null)
-        {
-            return Major == other.Major && 
-                   Minor == other.Minor && 
-                   Patch == other.Patch && 
-                   PreRelease == other.PreRelease;
-        }
-
         // Match based on specified parts
         return _partsSpecified switch
         {
@@ -73,9 +65,9 @@ public class Version
 
 public interface ILicenseService
 {
-    Task<bool> ValidateLicenseKeyAsync(string licenseKey);
+    Task<bool> ValidateLicenseKeyAsync(string licenseKey, string email);
     Task<bool> CheckLicenseValidAsync();
-    Task SaveLicenseKeyAsync(string licenseKey);
+    Task SaveLicenseKeyAsync(string licenseKey, string email);
 }
 
 public class LicenseService : ILicenseService
@@ -87,11 +79,11 @@ public class LicenseService : ILicenseService
         _validator = new LicenseKeyValidator(null);
     }
 
-    public async Task<bool> ValidateLicenseKeyAsync(string licenseKey)
+    public async Task<bool> ValidateLicenseKeyAsync(string licenseKey, string email)
     {
         try
         {
-            _validator.ValidateLicenseKey(licenseKey, GitVersion.FullVersion);
+            _validator.ValidateLicenseKey(licenseKey, GitVersion.FullVersion, email);
             return true;
         }
         catch (Exception)
@@ -103,15 +95,17 @@ public class LicenseService : ILicenseService
     public async Task<bool> CheckLicenseValidAsync()
     {
         var licenseKey = Program.Settings.LicenseKey;
-        if (string.IsNullOrEmpty(licenseKey))
+        var email = Program.Settings.Email;
+        if (string.IsNullOrEmpty(licenseKey) || string.IsNullOrEmpty(email))
             return false;
 
-        return await ValidateLicenseKeyAsync(licenseKey);
+        return await ValidateLicenseKeyAsync(licenseKey, email);
     }
 
-    public async Task SaveLicenseKeyAsync(string licenseKey)
+    public async Task SaveLicenseKeyAsync(string licenseKey, string email)
     {
         Program.Settings.LicenseKey = licenseKey;
+        Program.Settings.Email = email;
         var configPath = Program.ConfigPath;
         var wrapper = new AppSettingsWrapper { AppSettings = Program.Settings };
         string jsonString = System.Text.Json.JsonSerializer.Serialize(wrapper, AppSettingsContext.Default.AppSettingsWrapper);
@@ -123,7 +117,7 @@ public class LicenseService : ILicenseService
 public class LicenseKeyValidator
 {
     private readonly ECDsa _publicKey;
-    private static readonly byte[] DefaultPublicKey = Convert.FromBase64String("MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQAO0SD3ncynDRzRvXJ6WKtLHAjQb39g+mpatQdzj84rAH/oRckQaxXrG0+7KjxTFv//lYK/2GjPLJTlunSxgej6ygAyM9gKAG2C2J/fAedITBOP1eEDefTXyQREQ/q2GIabT7BfGp6BHY5wX+zw/bszg+hjlizSml07gSrA528JAf9OHk=");
+    private static readonly byte[] DefaultPublicKey = Convert.FromBase64String("MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQBSZ2zIeSebkXL1f54jBT53r/kT5jHKqpZT9k1uAWQ8fqC+Op98Xg15qrjq7Hp+SGUNLAzfFVOEa5WeS4bFVKMbMYACGgjNwj60OIW5a72epkE8JWS5h9qjCp/0wFsB5MeeWN0HlEgjGPyOX3eruXEohWqTXqiqUN0gT3/mBKBJtn/RAQ=");
     
     public LicenseKeyValidator(byte[]? publicKeyBytes)
     {
@@ -134,12 +128,11 @@ public class LicenseKeyValidator
             _publicKey.ImportSubjectPublicKeyInfo(DefaultPublicKey, out _);
     }
 
-
-    public LicenseInfo ValidateLicenseKey(string licenseKey, string currentVersion)
+    public LicenseInfo ValidateLicenseKey(string licenseKey, string currentVersion, string email)
     {
         try
         {
-            var licenseInfo = ValidateLicenseKeyInternal(licenseKey);
+            var licenseInfo = ValidateLicenseKeyInternal(licenseKey, email);
             ValidateVersion(licenseInfo.Version, currentVersion);
             return licenseInfo;
         }
@@ -149,50 +142,36 @@ public class LicenseKeyValidator
         }
     }
 
-    private LicenseInfo ValidateLicenseKeyInternal(string licenseKey)
+    private LicenseInfo ValidateLicenseKeyInternal(string licenseKey, string email)
     {
         // Restore padding and convert from URL-safe base64
         var padding = licenseKey.Length % 4;
         if (padding > 0)
             licenseKey += new string('=', 4 - padding);
         
-        var data = Convert.FromBase64String(
+        var byteData = Convert.FromBase64String(
             licenseKey.Replace('-', '+').Replace('_', '/'));
 
-        using var ms = new MemoryStream(data);
+        using var ms = new MemoryStream(byteData);
         using var reader = new BinaryReader(ms);
 
-        // Read the compressed data length
-        var compressedLength = reader.ReadUInt16();
+        // Read the data length
+        var dataLength = reader.ReadUInt16();
         
-        // Read the compressed data
-        var compressed = reader.ReadBytes(compressedLength);
+        // Read the data
+        var data = reader.ReadBytes(dataLength);
         
         // Read the signature
         var signature = reader.ReadBytes((int)(ms.Length - ms.Position));
 
         // Verify signature
-        if (!_publicKey.VerifyData(compressed, signature, HashAlgorithmName.SHA256))
+        if (!_publicKey.VerifyData(data, signature, HashAlgorithmName.SHA256))
         {
             throw new InvalidOperationException("Invalid license key.");
         }
 
-        // Decompress the data
-        byte[] decompressed;
-        using (var decompressedStream = new MemoryStream())
-        using (var compressedStream = new MemoryStream(compressed))
-        using (var gzip = new GZipStream(compressedStream, CompressionMode.Decompress))
-        {
-            gzip.CopyTo(decompressedStream);
-            decompressed = decompressedStream.ToArray();
-        }
-
         // Parse the license info
-        using var licenseReader = new BinaryReader(new MemoryStream(decompressed));
-        
-        // Read email
-        var emailLength = licenseReader.ReadByte();
-        var email = Encoding.UTF8.GetString(licenseReader.ReadBytes(emailLength));
+        using var licenseReader = new BinaryReader(new MemoryStream(data));
         
         // Read version type
         var versionTypeChar = licenseReader.ReadChar();
@@ -209,15 +188,43 @@ public class LicenseKeyValidator
         var versionLength = licenseReader.ReadByte();
         var version = Encoding.UTF8.GetString(licenseReader.ReadBytes(versionLength));
         
+        var now = DateTime.UtcNow;
         // Read dates
-        var now = DateTime.Now;
-        var validFrom = DateTime.FromBinary(licenseReader.ReadInt64());
-        var validUntil = DateTime.FromBinary(licenseReader.ReadInt64());
-        if (validFrom > now)
+        DateTime? validFrom = null;
+        var hasValidFromDate = licenseReader.ReadBoolean();
+        if (hasValidFromDate)
+        {
+            var validFromYear = licenseReader.ReadUInt16();
+            var validFromMonth = licenseReader.ReadByte();
+            var validFromDay = licenseReader.ReadByte();
+            validFrom = new DateTime(validFromYear, validFromMonth, validFromDay).ToUniversalTime();
+        }
+
+        DateTime? validUntil = null;
+        var hasValidUntilDate = licenseReader.ReadBoolean();
+        if (hasValidUntilDate)
+        {
+            var validUntilYear = licenseReader.ReadUInt16();
+            var validUntilMonth = licenseReader.ReadByte();
+            var validUntilDay = licenseReader.ReadByte();
+            validUntil = new DateTime(validUntilYear, validUntilMonth, validUntilDay).ToUniversalTime();
+        }
+
+        // Read and verify email hash
+        var storedEmailHash = licenseReader.ReadBytes(16); // MD5 produces 16 bytes
+        using var md5 = MD5.Create();
+        var providedEmailHash = md5.ComputeHash(Encoding.UTF8.GetBytes(email));
+        
+        if (!storedEmailHash.SequenceEqual(providedEmailHash))
+        {
+            throw new InvalidOperationException("Invalid email address for this license key.");
+        }
+
+        if (validFrom is not null && validFrom > now)
         {
             throw new InvalidOperationException("License is not yet valid");
         }
-        if (validUntil < now)
+        if (validUntil is not null && validUntil < now)
         {
             throw new InvalidOperationException("License has expired");
         }

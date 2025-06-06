@@ -20,4 +20,5 @@ public class AppSettings
     public bool StoreThumbnails { get; set; } = false;
     public bool UseEmbeddings { get; set; } = false;
     public string? LicenseKey { get; set; }
+    public string? Email { get; set; }
 }

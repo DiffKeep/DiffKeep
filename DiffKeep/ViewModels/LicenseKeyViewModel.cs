@@ -14,6 +14,9 @@ public partial class LicenseKeyViewModel : ObservableObject
 
     [ObservableProperty]
     private string _licenseKey = string.Empty;
+    
+    [ObservableProperty]
+    private string _email = string.Empty;
 
     [ObservableProperty]
     private string _errorMessage = string.Empty;
@@ -37,16 +40,23 @@ public partial class LicenseKeyViewModel : ObservableObject
             ErrorMessage = "License key cannot be empty";
             return;
         }
-
-        if (await _licenseService.ValidateLicenseKeyAsync(LicenseKey))
+        
+        if (string.IsNullOrWhiteSpace(Email))
         {
-            await _licenseService.SaveLicenseKeyAsync(LicenseKey);
+            HasError = true;
+            ErrorMessage = "Email is required";
+            return;
+        }
+
+        if (await _licenseService.ValidateLicenseKeyAsync(LicenseKey, Email))
+        {
+            await _licenseService.SaveLicenseKeyAsync(LicenseKey, Email);
             RequestClose?.Invoke(this, EventArgs.Empty);
         }
         else
         {
             HasError = true;
-            ErrorMessage = "Invalid license key";
+            ErrorMessage = "Invalid license key or email";
         }
     }
 }
