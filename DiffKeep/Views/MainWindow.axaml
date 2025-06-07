@@ -22,6 +22,7 @@
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">
                 <MenuItem Header="_Settings" Click="ShowSettingsDialog" />
+                <MenuItem Header="E_xit" Click="Exit" />
             </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="_About" Click="ShowAboutDialog" />

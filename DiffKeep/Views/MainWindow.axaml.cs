@@ -162,6 +162,11 @@ public partial class MainWindow : Window
             viewModel.RefreshLibraries();
         }
     }
+
+    private void Exit(object? sender, RoutedEventArgs e)
+    {
+        Close();
+    }
 }
 
 public class WindowState
