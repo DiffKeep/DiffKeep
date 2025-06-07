@@ -75,11 +75,21 @@ public partial class ImageGalleryViewModel : ViewModelBase
             var imageToRemove = Images.FirstOrDefault(img => img.Path == m.ImagePath);
             if (imageToRemove is not null)
             {
+                var index = Images.IndexOf(imageToRemove);
                 if (SelectedImage?.Id == imageToRemove.Id)
                 {
                     SelectedImage = null;
                 }
                 Images.Remove(imageToRemove);
+                // If there are any images left, select one
+                if (Images.Count > 0)
+                {
+                    // If we deleted the last image, select the new last image
+                    // Otherwise, select the image at the same index (which will be the next image)
+                    var newIndex = Math.Min(index, Images.Count - 1);
+                    SelectedImage = Images[newIndex];
+                    SelectedImage.IsSelected = true;
+                }
             }
         });
     }
