@@ -51,11 +51,12 @@ public partial class MainWindow : Window
     {
         base.OnLoaded(e);
         
+#if !SKIP_LICENSE_CHECK
         if (!await _licenseService.CheckLicenseValidAsync())
         {
             var licenseWindow = new LicenseKeyWindow();
             await licenseWindow.ShowDialog(this);
-            
+        
             // Check again after dialog closes
             if (!await _licenseService.CheckLicenseValidAsync())
             {
@@ -63,6 +64,8 @@ public partial class MainWindow : Window
                 return;
             }
         }
+#endif
+
     }
 
 

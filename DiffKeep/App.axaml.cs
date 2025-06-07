@@ -4,7 +4,9 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
 using System.Linq;
+using Avalonia.Controls;
 using Avalonia.Markup.Xaml;
+using Avalonia.Platform;
 using DiffKeep.ViewModels;
 using DiffKeep.Views;
 using Microsoft.Extensions.DependencyInjection;
@@ -33,6 +35,13 @@ public partial class App : Application
             {
                 DataContext = Services.GetRequiredService<MainWindowViewModel>()
             };
+            // Set window icon
+            if (desktop.MainWindow.PlatformImpl != null)
+            {
+                var iconAsset = AssetLoader.Open(new Uri("avares://DiffKeep/Assets/diffkeep.ico"));
+                desktop.MainWindow.Icon = new WindowIcon(iconAsset);
+            }
+
         }
 
         base.OnFrameworkInitializationCompleted();

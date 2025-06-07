@@ -17,6 +17,10 @@
         <AssemblyVersion>$(GitVersion_SemVer)</AssemblyVersion>
         <FileVersion>$(GitVersion_SemVer)</FileVersion>
         <InformationalVersion>$(GitVersion_InformationalVersion)</InformationalVersion>
+        <ApplicationIcon>Assets\diffkeep.ico</ApplicationIcon>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+        <DefineConstants>TRACE;DEBUG;SKIP_LICENSE_CHECK</DefineConstants>
     </PropertyGroup>
 
     <ItemGroup>
