@@ -23,43 +23,32 @@ public partial class ImageViewerViewModel : ViewModelBase
     private readonly IImageService _imageService;
     private int _currentIndex;
 
-    [ObservableProperty]
-    private Bitmap? _imageSource;
+    [ObservableProperty] private Bitmap? _imageSource;
 
-    [ObservableProperty]
-    private string _imageName = string.Empty;
+    [ObservableProperty] private string _imageName = string.Empty;
 
-    [ObservableProperty]
-    private bool _hasPrevious;
+    [ObservableProperty] private bool _hasPrevious;
 
-    [ObservableProperty]
-    private bool _hasNext;
+    [ObservableProperty] private bool _hasNext;
 
-    [ObservableProperty]
-    private bool _isInfoPanelVisible;
+    [ObservableProperty] private bool _isInfoPanelVisible;
 
-    [ObservableProperty]
-    private string _detectedTool = string.Empty;
+    [ObservableProperty] private string _detectedTool = string.Empty;
 
-    [ObservableProperty]
-    private string _generationPrompt = string.Empty;
+    [ObservableProperty] private string _generationPrompt = string.Empty;
 
-    [ObservableProperty]
-    private List<KeyValuePair<string, string?>>? _rawMetadata;
-    
-    [ObservableProperty]
-    private double _infoPanelWidth = 300;
+    [ObservableProperty] private List<KeyValuePair<string, string?>>? _rawMetadata;
 
-    [ObservableProperty]
-    private string _imageFilePath = string.Empty;
-    
-    [ObservableProperty]
-    private string _imageDimensions = string.Empty;
+    [ObservableProperty] private double _infoPanelWidth = 300;
 
-    [ObservableProperty]
-    private string _fileSize = string.Empty;
+    [ObservableProperty] private string _imageFilePath = string.Empty;
 
-    public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage, IImageService imageService)
+    [ObservableProperty] private string _imageDimensions = string.Empty;
+
+    [ObservableProperty] private string _fileSize = string.Empty;
+
+    public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage,
+        IImageService imageService)
     {
         _allImages = images;
         _currentIndex = images.IndexOf(currentImage);
@@ -67,7 +56,7 @@ public partial class ImageViewerViewModel : ViewModelBase
         _imageParser = new ImageParser(); // Composite parser that handles all formats
         LoadCurrentImage();
     }
-    
+
     [RelayCommand]
     private async Task CopyPrompt()
     {
@@ -120,24 +109,25 @@ public partial class ImageViewerViewModel : ViewModelBase
         {
             return;
         }
+
         var currentItem = _allImages[_currentIndex];
         ImageSource?.Dispose();
         ImageSource = new Bitmap(currentItem.Path);
         // get the file name from the path
         ImageName = Path.GetFileName(currentItem.Path);
         ImageFilePath = currentItem.Path;
-        
+
         // Add file info
         var fileInfo = new FileInfo(currentItem.Path);
         FileSize = $"{fileInfo.Length / 1024:N0} KB";
         ImageDimensions = $"{ImageSource.PixelSize.Width} × {ImageSource.PixelSize.Height}";
-        
+
         HasPrevious = _currentIndex > 0;
         HasNext = _currentIndex < _allImages.Count - 1;
 
         await LoadImageMetadataAsync();
     }
-    
+
     public async Task<bool> DeleteCurrentImage(Window parentWindow)
     {
         ImageItemViewModel currentImage;
@@ -158,6 +148,7 @@ public partial class ImageViewerViewModel : ViewModelBase
             // Remove from gallery
             _allImages.Remove(currentImage);
         }
+
         return result;
     }
 
@@ -166,16 +157,18 @@ public partial class ImageViewerViewModel : ViewModelBase
         try
         {
             var result = await Task.Run(() => _imageParser.ParseImage(_allImages[_currentIndex].Path));
-        
+
             DetectedTool = result.Tool?.ToString() ?? "Unknown Tool";
             GenerationPrompt = result.Prompt ?? "No prompt found";
-            RawMetadata = result.RawMetadata?.ToList() ?? new List<KeyValuePair<string, string?>> { new("Error", "No metadata found") };
+            RawMetadata = result.RawMetadata?.ToList() ?? new List<KeyValuePair<string, string?>>
+                { new("Error", "No metadata found") };
         }
         catch (Exception ex)
         {
             DetectedTool = "Error detecting tool";
             GenerationPrompt = "Error extracting prompt";
-            RawMetadata = new List<KeyValuePair<string, string?>> { new("Error", $"Error parsing metadata: {ex.Message}") };
+            RawMetadata = new List<KeyValuePair<string, string?>>
+                { new("Error", $"Error parsing metadata: {ex.Message}") };
         }
     }
 
@@ -223,6 +216,142 @@ public partial class ImageViewerViewModel : ViewModelBase
     {
         IsInfoPanelVisible = !IsInfoPanelVisible;
     }
+
+    [RelayCommand]
+    private void OpenInFileExplorer()
+    {
+        if (string.IsNullOrEmpty(ImageFilePath) || !File.Exists(ImageFilePath))
+            return;
+
+        try
+        {
+            string filePath = ImageFilePath;
+
+            // Cross-platform implementation
+            if (OperatingSystem.IsWindows())
+            {
+                // On Windows, we can use explorer.exe to select the file
+                Process.Start("explorer.exe", $"/select,\"{filePath}\"");
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                // On macOS, we use the open command with the -R flag to reveal in Finder
+                Process.Start("open", $"-R \"{filePath}\"");
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                // On Linux, try different file managers with their specific selection options
+                string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
+                if (string.IsNullOrEmpty(directory))
+                    return;
+
+                bool success = false;
+
+                // Try desktop-environment-specific file managers first with selection capability
+                // For GNOME Nautilus (Files)
+                try
+                {
+                    Process.Start("nautilus", $"--select \"{filePath}\"");
+                    success = true;
+                }
+                catch { /* Continue to next option */ }
+
+                // For KDE Dolphin
+                if (!success)
+                {
+                    try
+                    {
+                        Process.Start("dolphin", $"--select \"{filePath}\"");
+                        success = true;
+                    }
+                    catch { /* Continue to next option */ }
+                }
+
+                // For Cinnamon's Nemo
+                if (!success)
+                {
+                    try
+                    {
+                        Process.Start("nemo", $"\"{filePath}\"");
+                        success = true;
+                    }
+                    catch { /* Continue to next option */ }
+                }
+
+                // For XFCE's Thunar
+                if (!success)
+                {
+                    try
+                    {
+                        // Thunar can select files, but syntax varies by version
+                        Process.Start("thunar", $"\"{filePath}\"");
+                        success = true;
+                    }
+                    catch { /* Continue to next option */ }
+                }
+
+                // Fallback to xdg-open on the directory if specific file managers failed
+                if (!success)
+                {
+                    try
+                    {
+                        Process.Start("xdg-open", directory);
+                        success = true;
+                    }
+                    catch { /* Continue to next option */ }
+                }
+
+                // Last resort: try common file managers with just the directory
+                if (!success)
+                {
+                    string[] fileManagers = new[] 
+                    { 
+                        "pcmanfm",      // LXDE
+                        "caja",         // MATE
+                        "pantheon-files", // Elementary OS
+                        "konqueror"     // Older KDE
+                    };
+
+                    foreach (string fileManager in fileManagers)
+                    {
+                        try
+                        {
+                            Process.Start(fileManager, directory);
+                            success = true;
+                            break;
+                        }
+                        catch
+                        {
+                            // Try the next file manager
+                            continue;
+                        }
+                    }
+                }
+
+                // If all else fails, try to open the directory with the default application
+                if (!success)
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = directory,
+                            UseShellExecute = true
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Failed to open directory: {ex.Message}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error opening file in explorer: {ex.Message}");
+        }
+    }
+
 
     public void Dispose()
     {
