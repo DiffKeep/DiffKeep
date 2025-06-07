@@ -67,6 +67,21 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 LoadImagesAsync(null).FireAndForget();
             }
         });
+        
+        // Subscribe to image deleted messages
+        WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
+        {
+            Debug.WriteLine($"Gallery deleting from images {m.ImagePath}");
+            var imageToRemove = Images.FirstOrDefault(img => img.Path == m.ImagePath);
+            if (imageToRemove is not null)
+            {
+                if (SelectedImage?.Id == imageToRemove.Id)
+                {
+                    SelectedImage = null;
+                }
+                Images.Remove(imageToRemove);
+            }
+        });
     }
 
     public async Task LoadImagesAsync(LibraryTreeItem? item)
@@ -227,24 +242,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
     public async Task DeleteImage(ImageItemViewModel image, Window parentWindow)
     {
-        if (await _imageService.DeleteImageAsync(image, parentWindow))
-        {
-            var index = Images.IndexOf(image);
-            Images.Remove(image);
-            // If there are any images left, select one
-            if (Images.Count > 0)
-            {
-                // If we deleted the last image, select the new last image
-                // Otherwise, select the image at the same index (which will be the next image)
-                var newIndex = Math.Min(index, Images.Count - 1);
-                SelectedImage = Images[newIndex];
-                SelectedImage.IsSelected = true;
-            }
-            else
-            {
-                SelectedImage = null;
-            }
-        }
+        await _imageService.DeleteImageAsync(image, parentWindow);
     }
 }
 

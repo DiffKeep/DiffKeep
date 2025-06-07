@@ -12,6 +12,8 @@ using System.Linq;
 using System.Threading;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
+using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Messages;
 using DiffKeep.Services;
 
 namespace DiffKeep.ViewModels;
@@ -54,6 +56,22 @@ public partial class ImageViewerViewModel : ViewModelBase
         _currentIndex = images.IndexOf(currentImage);
         _imageService = imageService;
         _imageParser = new ImageParser(); // Composite parser that handles all formats
+        
+        // Subscribe to image deleted messages
+        WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
+        {
+            Debug.WriteLine($"Gallery deleting from images {m.ImagePath}");
+            var imageToRemove = _allImages.FirstOrDefault(img => img.Path == m.ImagePath);
+            if (imageToRemove is not null)
+            {
+                if (_allImages[_currentIndex].Id == imageToRemove.Id)
+                {
+                    NavigateNextOrPrevious();
+                }
+                _allImages.Remove(imageToRemove);
+            }
+        });
+        
         LoadCurrentImage();
     }
 
@@ -142,14 +160,7 @@ public partial class ImageViewerViewModel : ViewModelBase
             currentImage = _allImages[_currentIndex];
         }
 
-        var result = await _imageService.DeleteImageAsync(currentImage, parentWindow);
-        if (result)
-        {
-            // Remove from gallery
-            _allImages.Remove(currentImage);
-        }
-
-        return result;
+        return await _imageService.DeleteImageAsync(currentImage, parentWindow);
     }
 
     private async Task LoadImageMetadataAsync()

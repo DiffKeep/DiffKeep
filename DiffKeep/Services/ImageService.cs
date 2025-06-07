@@ -6,6 +6,8 @@ using Avalonia.Controls;
 using DiffKeep.ViewModels;
 using System.Diagnostics;
 using Avalonia.Media.Imaging;
+using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Messages;
 using DiffKeep.Repositories;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Dto;
@@ -69,6 +71,8 @@ public class ImageService : IImageService
             // Delete from the database
             Debug.WriteLine($"Deleting from database image {image.Id}");
             await _imageRepository.DeleteAsync(image.Id);
+
+            WeakReferenceMessenger.Default.Send(new ImageDeletedMessage(image.Path));
 
             return true;
         }
