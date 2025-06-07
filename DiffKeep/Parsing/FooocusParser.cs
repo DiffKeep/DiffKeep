@@ -5,13 +5,13 @@ namespace DiffKeep.Parsing;
 
 public class FooocusParser : IPromptParser
 {
-    public string ExtractPrompt(JsonDocument promptData)
+    public ParsedImageMetadata ExtractPrompt(JsonDocument promptData)
     {
         // Implement Fooocus-specific prompt extraction
         throw new NotImplementedException();
     }
 
-    public JsonDocument GetWorkflowData(JsonDocument workflowData)
+    public ParsedImageMetadata ExtractPrompt(string promptData)
     {
         throw new NotImplementedException();
     }

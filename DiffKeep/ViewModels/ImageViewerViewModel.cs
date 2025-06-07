@@ -170,7 +170,7 @@ public partial class ImageViewerViewModel : ViewModelBase
             var result = await Task.Run(() => _imageParser.ParseImage(_allImages[_currentIndex].Path));
 
             DetectedTool = result.Tool?.ToString() ?? "Unknown Tool";
-            GenerationPrompt = result.Prompt ?? "No prompt found";
+            GenerationPrompt = result.PositivePrompt ?? "No prompt found";
             RawMetadata = result.RawMetadata?.ToList() ?? new List<KeyValuePair<string, string?>>
                 { new("Error", "No metadata found") };
         }

@@ -11,8 +11,14 @@ namespace DiffKeep.Parsing;
 
 public interface IPromptParser
 {
-    string ExtractPrompt(JsonDocument promptData);
-    JsonDocument GetWorkflowData(JsonDocument workflowData);
+    ParsedImageMetadata ExtractPrompt(JsonDocument promptData);
+    ParsedImageMetadata ExtractPrompt(string promptData);
+}
+
+public struct ParsedImageMetadata
+{
+    public string? PositivePrompt { get; set; }
+    public string? NegativePrompt { get; set; }
 }
 
 public class PngMetadataParser : IImageParser
@@ -76,7 +82,7 @@ public class PngMetadataParser : IImageParser
                 {
                     if (value.StartsWith("\"") && value.EndsWith("\""))
                         value = value[1..^1];
-                    result.Prompt = value;
+                    result.PositivePrompt = value;
                     return result;
                 }
             }
@@ -90,12 +96,29 @@ public class PngMetadataParser : IImageParser
                 try
                 {
                     var workflowData = JsonDocument.Parse(workflowEntry.Value);
-                    result.Prompt = parser.ExtractPrompt(workflowData);
+                    var prompts = parser.ExtractPrompt(workflowData);
+                    result.PositivePrompt = prompts.PositivePrompt;
+                    result.NegativePrompt = prompts.NegativePrompt;
                     return result;
                 }
                 catch
                 {
                     // Invalid JSON in workflow, continue
+                }
+            }
+            var parametersEntry = metadataChunks.FirstOrDefault(m => m.Key == "parameters");
+            if (parametersEntry.Value != null && result.Tool == GenerationTool.Automatic1111)
+            {
+                try
+                {
+                    var prompts = parser.ExtractPrompt(parametersEntry.Value);
+                    result.PositivePrompt = prompts.PositivePrompt;
+                    result.NegativePrompt = prompts.NegativePrompt;
+                    return result;
+                }
+                catch
+                {
+                    // Invalid data, continue
                 }
             }
 
@@ -107,7 +130,9 @@ public class PngMetadataParser : IImageParser
                 try
                 {
                     var promptData = JsonDocument.Parse(promptEntry.Value);
-                    result.Prompt = parser.ExtractPrompt(promptData);
+                    var prompts = parser.ExtractPrompt(promptData);
+                    result.PositivePrompt = prompts.PositivePrompt;
+                    result.NegativePrompt = prompts.NegativePrompt;
                     return result;
                 }
                 catch

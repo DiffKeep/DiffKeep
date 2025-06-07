@@ -261,7 +261,7 @@ public class ImageLibraryScanner
             LibraryId = libraryId,
             Path = file,
             Hash = hash,
-            PositivePrompt = metadata.Prompt,
+            PositivePrompt = metadata.PositivePrompt,
             Created = fileInfo.CreationTime,
             Thumbnail = thumbnail
         };

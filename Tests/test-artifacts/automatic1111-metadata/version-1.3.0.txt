@@ -1,0 +1,3 @@
+this is the prompt text! it has lots of cool stuff in it
+Negative prompt: this is a prompt too but it's negative!
+Steps: 30, Sampler: DPM++ SDE Karras, CFG scale: 7, Seed: 2775894964, Size: 512x512, Model hash: c249d7853b, Model: dreamshaper_6BakedVae, Discard penultimate sigma: True, Version: v1.3.0

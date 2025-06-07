@@ -8,11 +8,11 @@ public class ComfyUIParser : IPromptParser
     private JsonElement nodes;
     private JsonElement links;
 
-    public string ExtractPrompt(JsonDocument workflowData)
+    public ParsedImageMetadata ExtractPrompt(JsonDocument workflowData)
     {
         if (!workflowData.RootElement.TryGetProperty("nodes", out nodes) ||
             !workflowData.RootElement.TryGetProperty("links", out links))
-            return string.Empty;
+            return new ParsedImageMetadata();
 
         // Find all active save nodes
         var saveNodes = FindSaveImageNodes();
@@ -22,10 +22,15 @@ public class ComfyUIParser : IPromptParser
         {
             var prompt = TraceBackToPrompt(saveNode);
             if (!string.IsNullOrEmpty(prompt))
-                return prompt;
+                return new ParsedImageMetadata{ PositivePrompt = prompt };
         }
 
-        return string.Empty;
+        return new ParsedImageMetadata();
+    }
+
+    public ParsedImageMetadata ExtractPrompt(string promptData)
+    {
+        throw new System.NotImplementedException();
     }
 
     private List<JsonElement> FindSaveImageNodes()
@@ -235,11 +240,5 @@ public class ComfyUIParser : IPromptParser
         }
 
         return null;
-    }
-
-    public JsonDocument GetWorkflowData(JsonDocument workflowData)
-    {
-        // Return as-is for now, could be processed/cleaned up if needed
-        return workflowData;
     }
 }

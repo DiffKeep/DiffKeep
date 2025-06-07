@@ -33,5 +33,6 @@
     &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LlamaSharpEmbeddingGenerateServiceTests&lt;/TestId&gt;
     &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.TextServiceTests&lt;/TestId&gt;
     &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LicenseServiceTests&lt;/TestId&gt;
+    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Parsing.Automatic1111ParserTests&lt;/TestId&gt;
   &lt;/TestAncestor&gt;
 &lt;/SessionState&gt;</s:String></wpf:ResourceDictionary>

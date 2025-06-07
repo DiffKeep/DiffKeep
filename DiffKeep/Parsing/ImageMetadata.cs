@@ -5,7 +5,8 @@ namespace DiffKeep.Parsing;
 public class ImageMetadata
 {
     public GenerationTool? Tool { get; set; }
-    public string? Prompt { get; set; }
+    public string? PositivePrompt { get; set; }
+    public string? NegativePrompt { get; set; }
     public List<KeyValuePair<string, string?>>? RawMetadata { get; set; }
 }
 

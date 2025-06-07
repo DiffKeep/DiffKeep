@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DiffKeep.Parsing;
+using FluentAssertions;
 using Xunit;
 
 namespace Tests.Parsing;
@@ -18,7 +19,7 @@ public class ComfyUIParserTests
         var promptData = JsonDocument.Parse(promptJson);
 
         // Act
-        var extractedPrompt = parser.ExtractPrompt(promptData);
+        var extractedPrompt = parser.ExtractPrompt(promptData).PositivePrompt;
 
         // Assert
         if (extractedPrompt.StartsWith("IMAGE:"))
@@ -50,6 +51,6 @@ public class ComfyUIParserTests
         var result = parser.ExtractPrompt(emptyWorkflow);
 
         // Assert
-        Assert.Empty(result);
+        result.PositivePrompt.Should().BeNull();
     }
 }
