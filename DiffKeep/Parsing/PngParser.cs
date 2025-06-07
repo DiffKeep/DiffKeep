@@ -74,6 +74,8 @@ public class PngMetadataParser : IImageParser
                 // If it doesn't start with { or [, it's likely a plain text prompt
                 if (!value.StartsWith("{") && !value.StartsWith("["))
                 {
+                    if (value.StartsWith("\"") && value.EndsWith("\""))
+                        value = value[1..^1];
                     result.Prompt = value;
                     return result;
                 }
