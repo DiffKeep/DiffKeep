@@ -10,5 +10,5 @@ public interface IEmbeddingsRepository
     Task DeleteEmbeddingsForLibraryAsync(long libraryId);
     Task StoreEmbeddingAsync(long imageId, EmbeddingSource source, string model, float[] embedding);
     Task StoreBatchEmbeddingsAsync(IEnumerable<(long ImageId, EmbeddingSource Source, string Model, float[] Embedding)> embeddings);
-    Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(float[] embedding, int limit = 100);
+    Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(float[] embedding, int limit = 100, long? libraryId = null, string path = null);
 }

@@ -7,8 +7,7 @@ namespace DiffKeep.Repositories;
 
 public interface IImageRepository
 {
-    Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, int offset,
-        int? limit, long? libraryId = null, string? directoryPath = null);
+    Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, long? libraryId = null, string? directoryPath = null);
 
     Task<IEnumerable<Image>> GetAllAsync(ImageSortOption sortOption = ImageSortOption.NewestFirst);
     Task<Image?> GetByIdAsync(long id);

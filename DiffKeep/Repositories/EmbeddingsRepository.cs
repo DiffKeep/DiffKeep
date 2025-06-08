@@ -95,7 +95,7 @@ public class EmbeddingsRepository : IEmbeddingsRepository
     }
 
     public async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchSimilarByVectorAsync(
-        float[] embedding, int limit = 100)
+        float[] embedding, int limit = 100, long? libraryId = null, string? path = null)
     {
         var resultDict = new Dictionary<long, (long ImageId, string Path, float Score)>();
         await using var connection = CreateConnection();
@@ -108,7 +108,21 @@ public class EmbeddingsRepository : IEmbeddingsRepository
             vec_distance_L2(e.Embedding, @Embedding) as distance
         FROM Embeddings e
         INNER JOIN Images i ON e.ImageId = i.Id
-        ORDER BY distance ASC
+        WHERE 1 = 1";
+        
+        if (libraryId.HasValue)
+        {
+            command.CommandText += " AND i.LibraryId = @LibraryId";
+            command.Parameters.AddWithValue("@LibraryId", libraryId.Value);
+        }
+
+        if (!string.IsNullOrEmpty(path))
+        {
+            command.CommandText += " AND i.Path LIKE @DirectoryPath || '%'";
+            command.Parameters.AddWithValue("@DirectoryPath", path);
+        }
+        
+        command.CommandText += @" ORDER BY distance ASC
         LIMIT @Limit";
 
         command.Parameters.AddWithValue("@Embedding", VectorToBlob(embedding));
@@ -118,19 +132,19 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         while (await reader.ReadAsync())
         {
             var imageId = reader.GetInt64(0);
-            var path = reader.GetString(1);
+            var imgPath = reader.GetString(1);
             var score = reader.GetFloat(2);
 
             if (resultDict.TryGetValue(imageId, out var existing))
             {
                 if (score < existing.Score) // Lower distance means better match
                 {
-                    resultDict[imageId] = (imageId, path, score);
+                    resultDict[imageId] = (imageId, imgPath, score);
                 }
             }
             else
             {
-                resultDict[imageId] = (imageId, path, score);
+                resultDict[imageId] = (imageId, imgPath, score);
             }
         }
 

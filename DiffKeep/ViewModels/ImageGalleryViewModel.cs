@@ -111,7 +111,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             IEnumerable<Image> dbImages;
             if (!string.IsNullOrWhiteSpace(SearchText))
             {
-                dbImages = await _searchService.TextSearchImagesAsync(SearchText);
+                dbImages = await _searchService.TextSearchImagesAsync(SearchText, _currentLibraryId, _currentPath);
             }
             else if (_currentLibraryId == null)
             {

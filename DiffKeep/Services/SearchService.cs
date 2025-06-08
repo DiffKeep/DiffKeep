@@ -23,15 +23,15 @@ public class SearchService
         _imageRepository = imageRepository;
     }
     
-    public async Task<IEnumerable<Image>> TextSearchImagesAsync(string searchText)
+    public async Task<IEnumerable<Image>> TextSearchImagesAsync(string searchText, long? libraryId = null, string? path = null)
     {
         if (!Program.Settings.UseEmbeddings)
         {
             // search using FTS
-            return await _imageRepository.SearchByPromptAsync(searchText, 0, null);
+            return await _imageRepository.SearchByPromptAsync(searchText, libraryId, path);
         }
         
-        var searchResults = await SearchByTextAsync(searchText);
+        var searchResults = await SearchByTextAsync(searchText, libraryId, path);
         return searchResults.Select(result => new Image
         {
             Id = result.ImageId,
@@ -41,7 +41,7 @@ public class SearchService
         });
     }
 
-    private async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText)
+    private async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText, long? libraryId = null, string? path = null)
     {
         // Generate embedding for the search text
         var embeddings = await _embeddingService.GenerateEmbeddingAsync(searchText);
@@ -54,6 +54,6 @@ public class SearchService
         }
 
         // Search for similar vectors in the repository
-        return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0], 1000);
+        return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0], 1000, libraryId, path);
     }
 }

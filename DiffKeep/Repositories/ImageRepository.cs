@@ -179,7 +179,7 @@ private static Image ReadImage(SqliteDataReader reader)
         return await command.ExecuteScalarAsync<int>();
     }
 
-    public async Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, int offset, int? limit, long? libraryId = null, string? directoryPath = null)
+    public async Task<IEnumerable<Image>> SearchByPromptAsync(string searchText, long? libraryId = null, string? directoryPath = null)
     {
         var images = new List<Image>();
         await using var connection = CreateConnection();
