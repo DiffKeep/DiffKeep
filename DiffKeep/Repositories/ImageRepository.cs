@@ -493,7 +493,7 @@ private static Image ReadImage(SqliteDataReader reader)
                 NegativePrompt = @NegativePrompt,
                 Description = @Description,
                 Created = @Created,
-                Thumbnail = @Thumbnail,
+                Thumbnail = @Thumbnail
             WHERE Id = @Id";
 
         command.CreateParameter("@Id", image.Id);
