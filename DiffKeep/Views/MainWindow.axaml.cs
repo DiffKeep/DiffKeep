@@ -45,6 +45,11 @@ public partial class MainWindow : Window
 
         this.GetObservable(ClientSizeProperty).Subscribe(new AnonymousObserver<Size>(_ => 
             SaveWindowState()));
+        // Set initial window size
+        if (DataContext is MainWindowViewModel vm)
+        {
+            vm.WindowWidth = Bounds.Width;
+        }
     }
     
     protected override async void OnLoaded(RoutedEventArgs e)
@@ -124,6 +129,11 @@ public partial class MainWindow : Window
 
             var json = JsonSerializer.Serialize(state, JsonContext.Default.WindowState);
             File.WriteAllText(StateFile, json);
+            if (DataContext is MainWindowViewModel vm)
+            {
+                // Update window width in ViewModel when window size changes
+                vm.UpdateWindowSize(Bounds.Width);
+            }
         }
         catch
         {

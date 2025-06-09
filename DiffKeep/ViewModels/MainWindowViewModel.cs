@@ -14,20 +14,22 @@ public partial class MainWindowViewModel : ViewModelBase
 {
     [ObservableProperty]
     private bool _isLeftPanelOpen = true;
-    
+    [ObservableProperty]
+    private double _windowWidth;
     [ObservableProperty]
     private GridLength _leftPanelWidth;
-
-    public string Greeting { get; } = "Welcome to DiffKeep!";
+    [ObservableProperty]
+    private double _leftPanelMaxWidth;
     public LeftPanelViewModel LeftPanel { get; }
     public ImageGalleryViewModel ImageGallery { get; }
+
 
 
     public MainWindowViewModel()
     {
         LeftPanel = Program.Services.GetRequiredService<LeftPanelViewModel>();
         ImageGallery = Program.Services.GetRequiredService<ImageGalleryViewModel>();
-        _leftPanelWidth = new GridLength(250);
+        LeftPanelWidth = new GridLength(250);
         
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
@@ -48,7 +50,34 @@ public partial class MainWindowViewModel : ViewModelBase
 
     partial void OnLeftPanelWidthChanged(GridLength value)
     {
-        Debug.Print($"Width is now {value}");
+        Debug.Print($"Left panel width is now {value}");
+        // Calculate max width (50% of window width)
+        double maxWidth = WindowWidth * 0.5;
+                
+        // If the new value exceeds max width, cap it
+        if (WindowWidth > 0 && value.Value > maxWidth)
+        {
+            LeftPanelWidth = new GridLength(maxWidth);
+        }
+        else
+        {
+            LeftPanelWidth = value;
+        }
+    }
+    
+    public void UpdateWindowSize(double width)
+    {
+        if (width <= 0) return;
+        Debug.Print($"Window width is now {width}");
+        WindowWidth = width;
+            
+        // Check if current left panel width exceeds the new max width
+        double maxWidth = WindowWidth * 0.5;
+        LeftPanelMaxWidth = maxWidth;
+        if (_leftPanelWidth.Value > maxWidth)
+        {
+            LeftPanelWidth = new GridLength(maxWidth);
+        }
     }
 
     [RelayCommand]
