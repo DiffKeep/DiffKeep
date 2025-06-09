@@ -185,6 +185,17 @@ public class ImageLibraryScanner
         {
             Debug.WriteLine($"No previous image found for {image?.Path}, inserting image");
             if (image != null) await _imageRepository.AddAsync(image);
+            // get the image we just added, so we have the ID
+            var addedImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
+            if (addedImage.Count() == 1)
+            {
+                image.Id = addedImage.First().Id;
+            }
+        }
+
+        if (Program.Settings.UseEmbeddings && image is { Id: not 0, PositivePrompt: not null })
+        {
+            WeakReferenceMessenger.Default.Send(new GenerateEmbeddingMessage(image.Id, EmbeddingSource.PositivePrompt, image.PositivePrompt));
         }
     }
 
