@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -47,6 +48,18 @@ public partial class SettingsViewModel : ViewModelBase
         _theme = settings.Theme;
         _language = settings.Language;
         Libraries = new ObservableCollection<LibraryItem>();
+        LoadLibrariesAsync().FireAndForget();
+    }
+    
+    public void LoadCurrentSettings()
+    {
+        var settings = Program.Settings;
+        Debug.WriteLine($"Loading current settings for the window. StoreThumbnails: {settings.StoreThumbnails}");
+        
+        Theme = settings.Theme;
+        Language = settings.Language;
+        StoreThumbnails = settings.StoreThumbnails;
+        UseEmbeddings = settings.UseEmbeddings;
         LoadLibrariesAsync().FireAndForget();
     }
 

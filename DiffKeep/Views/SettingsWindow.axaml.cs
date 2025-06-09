@@ -10,7 +10,14 @@ public partial class SettingsWindow : Window
     public SettingsWindow()
     {
         InitializeComponent();
-        DataContext = Program.Services.GetRequiredService<SettingsViewModel>();
+        Loaded += (s, e) =>
+        {
+            if (DataContext is SettingsViewModel vm)
+            {
+                vm.LoadCurrentSettings();
+            }
+        };
+
     }
 
     private void OnCancelClick(object? sender, RoutedEventArgs e)
