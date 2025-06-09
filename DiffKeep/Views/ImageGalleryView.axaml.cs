@@ -257,8 +257,11 @@ public partial class ImageGalleryView : UserControl
         _scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
         if (_itemsRepeater != null)
         {
-            _itemsRepeater.LayoutUpdated += ItemsRepeater_LayoutUpdated;
+            _itemsRepeater.SizeChanged += ItemsRepeater_SizeChanged;
         }
+        
+        // Initial layout calculation
+        CalculateLayout();
     }
 
     protected override void OnUnloaded(RoutedEventArgs e)
@@ -266,29 +269,44 @@ public partial class ImageGalleryView : UserControl
         base.OnUnloaded(e);
         if (_itemsRepeater != null)
         {
-            _itemsRepeater.LayoutUpdated -= ItemsRepeater_LayoutUpdated;
+            _itemsRepeater.SizeChanged -= ItemsRepeater_SizeChanged;
+        }
+        
+        // Clean up the timer
+        if (_layoutDebounceTimer != null)
+        {
+            _layoutDebounceTimer.Stop();
+            _layoutDebounceTimer.Tick -= LayoutDebounceTimer_Tick;
+            _layoutDebounceTimer = null;
         }
     }
 
-    private void ItemsRepeater_LayoutUpdated(object? sender, EventArgs e)
+    private void ItemsRepeater_SizeChanged(object? sender, SizeChangedEventArgs e)
     {
-        if (_itemsRepeater?.ItemsSource == null || !_itemsRepeater.ItemsSource.Cast<object>().Any())
-            return;
-        
-        if (_layoutDebounceTimer == null)
+        // Only respond to actual size changes
+        if (!e.PreviousSize.Equals(e.NewSize))
         {
-            _layoutDebounceTimer = new DispatcherTimer
+            if (_layoutDebounceTimer == null)
             {
-                Interval = TimeSpan.FromMilliseconds(300)
-            };
-            _layoutDebounceTimer.Tick += LayoutDebounceTimer_Tick;
-        }
+                _layoutDebounceTimer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(300)
+                };
+                _layoutDebounceTimer.Tick += LayoutDebounceTimer_Tick;
+            }
 
-        _layoutDebounceTimer.Stop();
-        _layoutDebounceTimer.Start();
+            _layoutDebounceTimer.Stop();
+            _layoutDebounceTimer.Start();
+        }
     }
 
     private void LayoutDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _layoutDebounceTimer?.Stop();
+        CalculateLayout();
+    }
+
+    private void CalculateLayout()
     {
         Debug.WriteLine("LayoutDebounceTimer_Tick called");
         // Try to find any realized element
@@ -392,40 +410,28 @@ public partial class ImageGalleryView : UserControl
     {
         var scrollViewer = this.GetControl<ScrollViewer>("ScrollViewer");
         var itemsRepeater = this.GetControl<ItemsRepeater>("ItemsRepeater");
-        
-        if (scrollViewer == null || itemsRepeater == null || itemsRepeater.ItemsSource == null) 
+    
+        if (scrollViewer == null || itemsRepeater == null || itemsRepeater.ItemsSource == null || 
+            DataContext is not ImageGalleryViewModel viewModel) 
             return Enumerable.Empty<ImageItemViewModel>();
 
         // Get the visible range with padding
         var scrollOffset = scrollViewer.Offset.Y;
         var viewportHeight = scrollViewer.Viewport.Height;
-        var padding = viewportHeight * 3; // Three viewport height padding for smoother scrolling
-        
+        var paddingMultiplier = 3; // Adjust this value as needed
+        var padding = viewportHeight * paddingMultiplier;
+    
         var visibleRangeStart = Math.Max(0, scrollOffset - padding);
         var visibleRangeEnd = scrollOffset + viewportHeight + padding;
 
-        var visibleItems = new List<ImageItemViewModel>();
-        var itemCount = itemsRepeater.ItemsSource.Cast<object>().Count();
-        
-        for (var i = 0; i < itemCount; i++)
-        {
-            if (itemsRepeater.TryGetElement(i) is Control element)
-            {
-                var elementBounds = element.Bounds;
-                var elementTop = elementBounds.Y;
-                var elementBottom = elementTop + elementBounds.Height;
+        // Calculate approximate visible items based on item height and column count
+        var firstVisibleRow = (int)(visibleRangeStart / _effectiveItemHeight);
+        var lastVisibleRow = (int)Math.Ceiling(visibleRangeEnd / _effectiveItemHeight);
+    
+        var firstVisibleIndex = firstVisibleRow * _columnCount;
+        var lastVisibleIndex = Math.Min((lastVisibleRow + 1) * _columnCount - 1, viewModel.Images.Count - 1);
 
-                if (elementBottom >= visibleRangeStart && elementTop <= visibleRangeEnd)
-                {
-                    if (element.DataContext is ImageItemViewModel item)
-                    {
-                        visibleItems.Add(item);
-                    }
-                }
-            }
-        }
-
-        return visibleItems;
+        return viewModel.Images.Skip(firstVisibleIndex).Take(lastVisibleIndex - firstVisibleIndex + 1);
     }
 
     private void Image_OnPointerPressed(object? sender, PointerPressedEventArgs e)

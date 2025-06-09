@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using DiffKeep.ViewModels;
 using System.Diagnostics;
+using System.Threading;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Messages;
@@ -19,6 +21,7 @@ public class ImageService : IImageService
 {
     private readonly IImageRepository _imageRepository;
     private static bool _skipDeleteConfirmation;
+    private static readonly ImageBufferPool _bufferPool = new ImageBufferPool(20);
 
     public ImageService(IImageRepository imageRepository)
     {
@@ -86,14 +89,99 @@ public class ImageService : IImageService
         }
     }
 
-    public static async Task<Bitmap?> GenerateThumbnailAsync(string file, int size)
+    public static async Task<Bitmap?> GenerateThumbnailAsync(string file, int size, int quality = 85)
     {
+        if (!File.Exists(file))
+            return null;
+        
         return await Task.Run(() =>
         {
-            using var vipsThumbnail = NetVips.Image.Thumbnail(file, size);
-            var buffer = vipsThumbnail.WriteToBuffer(".jpg[Q=95]");
-            using var stream = new MemoryStream(buffer);
-            return new Bitmap(stream);
+            try
+            {
+                using var vipsThumbnail = NetVips.Image.Thumbnail(file, size, height: size);
+            
+                // Use a lower quality setting to reduce memory usage
+                var jpgOptions = $".jpg[Q={quality}]";
+                byte[] buffer = vipsThumbnail.WriteToBuffer(jpgOptions);
+            
+                // Use the buffer pool for the memory stream
+                var stream = _bufferPool.Rent();
+                try
+                {
+                    stream.Write(buffer, 0, buffer.Length);
+                    stream.Position = 0;
+                    return new Bitmap(stream);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error creating bitmap: {ex.Message}");
+                    _bufferPool.Return(stream);
+                    return null;
+                }
+                finally
+                {
+                    // Explicitly release NetVips memory
+                    GC.Collect(0, GCCollectionMode.Forced);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error generating thumbnail for {file}: {ex.Message}");
+                return null;
+            }
         });
+    }
+
+}
+
+public class ImageBufferPool
+{
+    private readonly ConcurrentBag<MemoryStream> _streamPool = new();
+    private readonly int _maxPoolSize;
+    private int _currentPoolSize;
+
+    public ImageBufferPool(int maxPoolSize = 20)
+    {
+        _maxPoolSize = maxPoolSize;
+    }
+
+    public MemoryStream Rent()
+    {
+        if (_streamPool.TryTake(out var stream))
+        {
+            stream.SetLength(0);
+            stream.Position = 0;
+            return stream;
+        }
+        
+        Interlocked.Increment(ref _currentPoolSize);
+        return new MemoryStream();
+    }
+
+    public void Return(MemoryStream stream)
+    {
+        if (stream == null) return;
+        
+        // Only keep streams up to our max pool size
+        if (Interlocked.CompareExchange(ref _currentPoolSize, 0, 0) <= _maxPoolSize)
+        {
+            stream.SetLength(0);
+            stream.Position = 0;
+            _streamPool.Add(stream);
+        }
+        else
+        {
+            Interlocked.Decrement(ref _currentPoolSize);
+            stream.Dispose();
+        }
+    }
+
+    public void Clear()
+    {
+        while (_streamPool.TryTake(out var stream))
+        {
+            stream.Dispose();
+            Interlocked.Decrement(ref _currentPoolSize);
+        }
     }
 }

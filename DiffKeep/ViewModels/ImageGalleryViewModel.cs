@@ -163,6 +163,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 }
 
                 if (ImagesCollectionChanged != null)
+                    Debug.WriteLine("Images collection changed");
                     ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
             });
         }
@@ -212,14 +213,34 @@ public partial class ImageGalleryViewModel : ViewModelBase
         {
             // Get thumbnails for visible items and some items ahead/behind
             if (Program.Settings.StoreThumbnails)
+            {
+                // Database-stored thumbnail scenario
                 Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleImageArray.Select(i => i.Id));
+            }
             else
             {
-                Thumbnails = new Dictionary<long, Bitmap?>();
+                // On-the-fly thumbnail generation scenario
+                var newThumbnails = new Dictionary<long, Bitmap?>();
                 var lockObject = new object();
+                var visibleIds = visibleImageArray.Select(i => i.Id).ToHashSet();
 
+                // First, copy still-visible thumbnails to the new dictionary
+                if (Thumbnails != null)
+                {
+                    foreach (var id in visibleIds)
+                    {
+                        if (Thumbnails.TryGetValue(id, out var existingThumbnail))
+                        {
+                            newThumbnails[id] = existingThumbnail;
+                        }
+                    }
+                }
+
+                // Generate missing thumbnails
+                var missingImages = visibleImageArray.Where(img => !newThumbnails.ContainsKey(img.Id)).ToArray();
+            
                 await Parallel.ForEachAsync(
-                    visibleImageArray,
+                    missingImages,
                     new ParallelOptions
                     {
                         MaxDegreeOfParallelism = Environment.ProcessorCount
@@ -234,12 +255,27 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
                             lock (lockObject)
                             {
-                                Thumbnails[image.Id] = thumbnail;
+                                newThumbnails[image.Id] = thumbnail;
                             }
 
                             image.UpdateThumbnail();
                         }
                     });
+
+                // Dispose old thumbnails that are no longer visible
+                if (Thumbnails != null)
+                {
+                    foreach (var kvp in Thumbnails)
+                    {
+                        if (!visibleIds.Contains(kvp.Key) && kvp.Value != null)
+                        {
+                            kvp.Value.Dispose();
+                        }
+                    }
+                }
+
+                // Assign the new dictionary
+                Thumbnails = newThumbnails;
             }
 
             // Update the view models

@@ -25,6 +25,8 @@ public partial class LeftPanelViewModel : ViewModelBase
     [ObservableProperty]
     private LibraryTreeItem _selectedItem;
     private readonly SemaphoreSlim _scanSemaphore = new(1, 1);
+    private DateTime _lastUpdateTime = DateTime.MinValue;
+    private const int UPDATE_INTERVAL_MS = 100; // Update UI at most every 100ms
     
     public ObservableCollection<LibraryTreeItem> Items
     {
@@ -66,6 +68,12 @@ public partial class LeftPanelViewModel : ViewModelBase
 
     private void OnScanProgress(object? sender, ScanProgressEventArgs e)
     {
+        // Only update UI at specified intervals
+        if ((DateTime.Now - _lastUpdateTime).TotalMilliseconds < UPDATE_INTERVAL_MS)
+            return;
+        
+        _lastUpdateTime = DateTime.Now;
+        
         var libraryItem = FindLibraryItem(e.LibraryId);
         if (libraryItem != null)
         {
