@@ -30,7 +30,7 @@ public partial class ImageViewerWindow : Window
 
     public ImageViewerWindow(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage) : this()
     {
-        DataContext = new ImageViewerViewModel(images, currentImage, App.GetService<IImageService>());
+        DataContext = new ImageViewerViewModel(images, currentImage, App.GetService<IImageService>(), App.GetService<IAppStateService>());
 
         KeyDown += ImageViewerWindow_KeyDown;
 

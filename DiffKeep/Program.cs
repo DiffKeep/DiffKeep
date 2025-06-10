@@ -172,6 +172,7 @@ sealed class Program
         );
         services.AddSingleton<SearchService>();
         services.AddSingleton<ILicenseService, LicenseService>();
+        services.AddSingleton<IAppStateService, AppStateService>();
 
         // Register view models
         services.AddSingleton<MainWindowViewModel>();

@@ -1,3 +1,5 @@
+using System;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using System.Text.Json;
@@ -6,6 +8,7 @@ using System.Linq;
 using System.Text.Json.Serialization;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
+using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -18,12 +21,14 @@ public partial class MainWindow : Window
         "windowstate.json"
     );
     private readonly ILicenseService _licenseService;
+    private readonly IAppStateService _appStateService;
 
     
     public MainWindow()
     {
         InitializeComponent();
         _licenseService = Program.Services.GetRequiredService<ILicenseService>();
+        _appStateService = Program.Services.GetRequiredService<IAppStateService>();
         
         // Ensure directory exists
         var directory = Path.GetDirectoryName(StateFile);
@@ -55,6 +60,7 @@ public partial class MainWindow : Window
     protected override async void OnLoaded(RoutedEventArgs e)
     {
         base.OnLoaded(e);
+        LoadWindowState();
         
 #if !SKIP_LICENSE_CHECK
         if (!await _licenseService.CheckLicenseValidAsync())
@@ -73,64 +79,78 @@ public partial class MainWindow : Window
 
     }
 
-
     private void LoadWindowState()
     {
         try
         {
-            if (File.Exists(StateFile))
+            var state = _appStateService.GetState();
+        
+            // Apply the saved left panel width
+            if (DataContext is MainWindowViewModel vm && state.LeftPanelWidth > 0)
             {
-                var json = File.ReadAllText(StateFile);
-                var state = JsonSerializer.Deserialize(json, JsonContext.Default.WindowState);
-            
-                // Only set position if it would be visible on screen
-                var screens = Screens.All;
-                var isValidPosition = screens.Any(screen => 
-                    screen.Bounds.Contains(new PixelPoint((int)state.X, (int)state.Y)));
-            
-                if (isValidPosition)
+                if (state.LeftPanelOpen)
                 {
-                    Position = new PixelPoint((int)state.X, (int)state.Y);
+                    Debug.WriteLine($"Setting left panel width to {state.LeftPanelWidth}");
+                    vm.LeftPanelWidth = new GridLength(state.LeftPanelWidth);
+                }
+                else
+                {
+                    Debug.WriteLine($"Setting left panel width to 0 because it's closed right now.");
+                    vm.LeftPanelWidth = new GridLength(0);
                 }
 
-                if (state.Width > 0 && state.Height > 0)
-                {
-                    Width = state.Width;
-                    Height = state.Height;
-                }
+                vm.IsLeftPanelOpen = state.LeftPanelOpen;
+            }
+        
+            // Only set position if it would be visible on screen
+            var screens = Screens.All;
+            var isValidPosition = screens.Any(screen => 
+                screen.Bounds.Contains(new PixelPoint((int)state.X, (int)state.Y)));
+        
+            if (isValidPosition)
+            {
+                Position = new PixelPoint((int)state.X, (int)state.Y);
+            }
 
-                if (state.IsMaximized)
-                {
-                    WindowState = Avalonia.Controls.WindowState.Maximized;
-                }
+            if (state is { Width: > 200, Height: > 200 })
+            {
+                Width = state.Width;
+                Height = state.Height;
+            }
+
+            if (state.IsMaximized)
+            {
+                WindowState = Avalonia.Controls.WindowState.Maximized;
             }
         }
         catch
         {
-           Position = new PixelPoint(100, 100);
-           Width = 800;
-           Height = 600;
-           WindowState = Avalonia.Controls.WindowState.Normal;
+            Position = new PixelPoint(100, 100);
+            Width = 800;
+            Height = 600;
+            WindowState = Avalonia.Controls.WindowState.Normal;
         }
     }
 
-    private void SaveWindowState()
+    private void SaveWindowState(bool closing = false)
     {
         try
         {
-            var state = new WindowState
-            {
-                Width = ClientSize.Width,
-                Height = ClientSize.Height,
-                X = Position.X,
-                Y = Position.Y,
-                IsMaximized = WindowState == Avalonia.Controls.WindowState.Maximized
-            };
-
-            var json = JsonSerializer.Serialize(state, JsonContext.Default.WindowState);
-            File.WriteAllText(StateFile, json);
             if (DataContext is MainWindowViewModel vm)
             {
+                var state = _appStateService.GetState();
+                state.Width = Width;
+                state.Height = Height;
+                state.X = Position.X;
+                state.Y = Position.Y;
+                state.IsMaximized = WindowState == Avalonia.Controls.WindowState.Maximized;
+                state.LeftPanelWidth = vm.LeftPanelWidth.Value;
+                state.LeftPanelOpen = vm.IsLeftPanelOpen;
+
+                _appStateService.SaveState(state);
+                if (closing)
+                    _appStateService.SaveImmediately();
+            
                 // Update window width in ViewModel when window size changes
                 vm.UpdateWindowSize(Bounds.Width);
             }
@@ -143,7 +163,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
-        SaveWindowState();
+        //SaveWindowState();
         base.OnClosing(e);
     }
     
@@ -179,13 +199,31 @@ public partial class MainWindow : Window
     }
 }
 
-public class WindowState
+public class WindowState: ICloneable
 {
-    public double Width { get; set; }
-    public double Height { get; set; }
+    public double Width { get; set; } = 1024;
+    public double Height { get; set; } = 768;
     public double X { get; set; }
     public double Y { get; set; }
-    public bool IsMaximized { get; set; }
+    public bool IsMaximized { get; set; } = false;
+    public double LeftPanelWidth { get; set; } = 150; // Default value
+    public bool LeftPanelOpen { get; set; } = true;
+    public bool ImageViewerInfoPanelOpen { get; set; } = false;
+    
+    public object Clone()
+    {
+        return new WindowState
+        {
+            Width = Width,
+            Height = Height,
+            X = X,
+            Y = Y,
+            IsMaximized = IsMaximized,
+            LeftPanelWidth = LeftPanelWidth,
+            LeftPanelOpen = LeftPanelOpen,
+            ImageViewerInfoPanelOpen = ImageViewerInfoPanelOpen,
+        };
+    }
 }
 
 [JsonSourceGenerationOptions(WriteIndented = true)]

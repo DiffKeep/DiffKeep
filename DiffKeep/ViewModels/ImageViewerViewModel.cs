@@ -23,6 +23,7 @@ public partial class ImageViewerViewModel : ViewModelBase
     private readonly ObservableCollection<ImageItemViewModel> _allImages;
     private readonly IImageParser _imageParser;
     private readonly IImageService _imageService;
+    private readonly IAppStateService _appStateService;
     private int _currentIndex;
 
     [ObservableProperty] private Bitmap? _imageSource;
@@ -50,12 +51,15 @@ public partial class ImageViewerViewModel : ViewModelBase
     [ObservableProperty] private string _fileSize = string.Empty;
 
     public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage,
-        IImageService imageService)
+        IImageService imageService, IAppStateService appStateService)
     {
         _allImages = images;
         _currentIndex = images.IndexOf(currentImage);
         _imageService = imageService;
+        _appStateService = appStateService;
         _imageParser = new ImageParser(); // Composite parser that handles all formats
+
+        IsInfoPanelVisible = _appStateService.GetInfoPanelVisibility();
         
         // Subscribe to image deleted messages
         WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
@@ -226,6 +230,7 @@ public partial class ImageViewerViewModel : ViewModelBase
     private void ToggleInfoPanel()
     {
         IsInfoPanelVisible = !IsInfoPanelVisible;
+        _appStateService.UpdateInfoPanelVisibility(IsInfoPanelVisible);
     }
 
     [RelayCommand]

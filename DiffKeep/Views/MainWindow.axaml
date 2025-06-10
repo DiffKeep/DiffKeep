@@ -34,7 +34,7 @@
                 <ColumnDefinition
                     Width="{Binding LeftPanelWidth, Mode=TwoWay}"
                     MaxWidth="{Binding LeftPanelMaxWidth}"
-                    MinWidth="100"/>
+                    MinWidth="{Binding LeftPanelMinWidth}"/>
                 <ColumnDefinition Width="3" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>

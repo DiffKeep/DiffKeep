@@ -6,12 +6,14 @@ using CommunityToolkit.Mvvm.Input;
 using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Repositories;
+using DiffKeep.Services;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace DiffKeep.ViewModels;
 
 public partial class MainWindowViewModel : ViewModelBase
 {
+    private readonly IAppStateService _appStateService;
     [ObservableProperty]
     private bool _isLeftPanelOpen = true;
     [ObservableProperty]
@@ -20,17 +22,32 @@ public partial class MainWindowViewModel : ViewModelBase
     private GridLength _leftPanelWidth;
     [ObservableProperty]
     private double _leftPanelMaxWidth;
+    [ObservableProperty]
+    private double _leftPanelMinWidth;
     public LeftPanelViewModel LeftPanel { get; }
     public ImageGalleryViewModel ImageGallery { get; }
 
 
 
-    public MainWindowViewModel()
+    public MainWindowViewModel(IAppStateService appStateService)
     {
+        _appStateService = appStateService;
         LeftPanel = Program.Services.GetRequiredService<LeftPanelViewModel>();
         ImageGallery = Program.Services.GetRequiredService<ImageGalleryViewModel>();
-        LeftPanelWidth = new GridLength(250);
-        
+        var state = _appStateService.GetState();
+        if (state.LeftPanelOpen)
+        {
+            _leftPanelWidth = new GridLength(state.LeftPanelWidth);
+            _leftPanelMinWidth = 100;
+            _isLeftPanelOpen = true;
+        }
+        else
+        {
+            _leftPanelWidth = new GridLength(0);
+            _leftPanelMinWidth = 0;
+            _isLeftPanelOpen = false;
+        }
+
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
         {
@@ -53,7 +70,7 @@ public partial class MainWindowViewModel : ViewModelBase
         Debug.Print($"Left panel width is now {value}");
         // Calculate max width (50% of window width)
         double maxWidth = WindowWidth * 0.5;
-                
+
         // If the new value exceeds max width, cap it
         if (WindowWidth > 0 && value.Value > maxWidth)
         {
@@ -62,6 +79,13 @@ public partial class MainWindowViewModel : ViewModelBase
         else
         {
             LeftPanelWidth = value;
+        }
+
+        if (LeftPanelWidth.Value > 0)
+        {
+            var state = _appStateService.GetState();
+            state.LeftPanelWidth = LeftPanelWidth.Value;
+            _appStateService.SaveState(state);
         }
     }
     
@@ -77,13 +101,20 @@ public partial class MainWindowViewModel : ViewModelBase
         if (_leftPanelWidth.Value > maxWidth)
         {
             LeftPanelWidth = new GridLength(maxWidth);
+            var state = _appStateService.GetState();
+            state.LeftPanelWidth = LeftPanelWidth.Value;
+            _appStateService.SaveState(state);
         }
     }
 
     [RelayCommand]
     private void ToggleLeftPanel()
     {
+        var state = _appStateService.GetState();
         IsLeftPanelOpen = !IsLeftPanelOpen;
-        LeftPanelWidth = IsLeftPanelOpen ? new GridLength(250) : new GridLength(0);
+        LeftPanelWidth = IsLeftPanelOpen ? new GridLength(state.LeftPanelWidth) : new GridLength(0);
+        LeftPanelMinWidth = IsLeftPanelOpen ? 100 : 0;
+        state.LeftPanelOpen = IsLeftPanelOpen;
+        _appStateService.SaveState(state);
     }
 }
