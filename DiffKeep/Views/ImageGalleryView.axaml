@@ -31,6 +31,9 @@
                 <TextBlock Text="{Binding ImagesCount}"
                            VerticalAlignment="Center"
                            Margin="5,0,0,0" />
+                <TextBlock Text="{Binding SelectedImagesCount}"
+                           VerticalAlignment="Center"
+                           Margin="5,0,0,0" />
             </StackPanel>
 
             <!-- Search -->
@@ -86,9 +89,9 @@
         <ScrollViewer Grid.Row="1" Name="ScrollViewer" ScrollChanged="ScrollViewer_ScrollChanged">
             <Grid>
                 <!-- Dummy border to fake height -->
-                <Border Name="VirtualHeightEnforcer" 
-                        Background="Transparent" 
-                        IsHitTestVisible="False"/>
+                <Border Name="VirtualHeightEnforcer"
+                        Background="Transparent"
+                        IsHitTestVisible="False" />
 
                 <ItemsRepeater ItemsSource="{Binding Images}"
                                Name="ItemsRepeater">
@@ -102,15 +105,19 @@
                             <Border Width="220"
                                     Height="240"
                                     CornerRadius="3"
-                                    Tapped="Border_OnTapped"
-                                    DoubleTapped="Border_OnDoubleTapped">
+                                    Background="Transparent"
+                                    BorderThickness="2"
+                                    Classes.selected="{Binding IsSelected}"
+                                    Classes.current="{Binding IsCurrent}"
+                                    PointerPressed="Image_OnPointerPressed"
+                                    PointerMoved="Image_OnPointerMoved"
+                                    DoubleTapped="Border_OnDoubleTapped"
+                                    Tapped="Border_OnTapped">
                                 <Border.Styles>
-                                    <Style Selector="Border">
-                                        <Setter Property="BorderBrush" Value="Gray" />
-                                        <Setter Property="BorderThickness" Value="1" />
-                                    </Style>
+                                    <!-- Hover state -->
                                     <Style Selector="Border:pointerover">
-                                        <Setter Property="BorderBrush" Value="Gray" />
+                                        <Setter Property="BorderBrush" Value="#80808080" />
+                                        <Setter Property="Background" Value="#10808080" />
                                     </Style>
                                 </Border.Styles>
                                 <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
@@ -119,6 +126,11 @@
                                             Background="DarkSlateGray"
                                             BorderThickness="2"
                                             IsVisible="{Binding IsSelected}"
+                                            Margin="-1" />
+                                    <!-- Current border -->
+                                    <Border BorderBrush="DarkBlue"
+                                            BorderThickness="2"
+                                            IsVisible="{Binding IsCurrent}"
                                             Margin="-1" />
                                     <!-- Content -->
                                     <Grid>

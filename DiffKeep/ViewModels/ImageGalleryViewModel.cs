@@ -35,13 +35,19 @@ public partial class ImageGalleryViewModel : ViewModelBase
     public event Action? RestoreScrollPositionRequested;
 
 
-    [ObservableProperty] private ImageItemViewModel? _selectedImage;
+    [ObservableProperty] private ImageItemViewModel? _currentImage;
+    private ImageItemViewModel? _previousCurrentImage;
     [ObservableProperty] private string? _currentDirectory;
     [ObservableProperty] private ImageSortOption _currentSortOption = ImageSortOption.NewestFirst;
     [ObservableProperty] private string _searchText = string.Empty;
     [ObservableProperty] private string _imagesCount;
     [ObservableProperty] private bool _isLoading;
     [ObservableProperty] private int _totalCount;
+    [ObservableProperty] private string _selectedImagesCount = "";
+    
+    private ObservableCollection<ImageItemViewModel> _selectedImages = new();
+    
+    public ObservableCollection<ImageItemViewModel> SelectedImages => _selectedImages;
 
     public ObservableCollection<ImageItemViewModel> Images
     {
@@ -76,10 +82,18 @@ public partial class ImageGalleryViewModel : ViewModelBase
             if (imageToRemove is not null)
             {
                 var index = Images.IndexOf(imageToRemove);
-                if (SelectedImage?.Id == imageToRemove.Id)
+                if (CurrentImage?.Id == imageToRemove.Id)
                 {
-                    SelectedImage = null;
+                    CurrentImage = null;
                 }
+                
+                // Remove from selection if selected
+                if (_selectedImages.Contains(imageToRemove))
+                {
+                    _selectedImages.Remove(imageToRemove);
+                    UpdateSelectedImagesCount();
+                }
+                
                 Images.Remove(imageToRemove);
                 // If there are any images left, select one
                 if (Images.Count > 0)
@@ -87,8 +101,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
                     // If we deleted the last image, select the new last image
                     // Otherwise, select the image at the same index (which will be the next image)
                     var newIndex = Math.Min(index, Images.Count - 1);
-                    SelectedImage = Images[newIndex];
-                    SelectedImage.IsSelected = true;
+                    CurrentImage = Images[newIndex];
                 }
             }
         });
@@ -139,28 +152,25 @@ public partial class ImageGalleryViewModel : ViewModelBase
             {
                 if (Images != null && Images.Count > 0)
                 {
-                    var selectedId = SelectedImage?.Id;
                     await Dispatcher.UIThread.InvokeAsync(() => SaveScrollPositionRequested?.Invoke());
 
                     await Task.Run(() =>
                     {
-                        Images.Clear();
+                        Images?.Clear();
                         Images = new ObservableCollection<ImageItemViewModel>(viewModels);
                     });
 
                     await Dispatcher.UIThread.InvokeAsync(() => RestoreScrollPositionRequested?.Invoke());
-                    if (selectedId != null)
-                    {
-                        SelectedImage = Images.FirstOrDefault(image => image.Id == selectedId);
-                        if (SelectedImage != null)
-                            SelectedImage.IsSelected = true;
-                    }
                 }
                 else
                 {
                     Images.Clear();
                     Images = new ObservableCollection<ImageItemViewModel>(viewModels);
                 }
+
+                // Clear selected images when loading new images
+                _selectedImages.Clear();
+                UpdateSelectedImagesCount();
 
                 if (ImagesCollectionChanged != null)
                     Debug.WriteLine("Images collection changed");
@@ -290,6 +300,86 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         await _imageService.DeleteImageAsync(image, parentWindow);
     }
+    
+    public void AddToSelection(ImageItemViewModel image)
+    {
+        if (_previousCurrentImage != null && !_selectedImages.Contains(_previousCurrentImage))
+        {
+            _selectedImages.Add(_previousCurrentImage);
+        }
+        if (!_selectedImages.Contains(image))
+        {
+            _selectedImages.Add(image);
+        }
+        UpdateSelectedImagesCount();
+        image.RefreshSelectionState(); // Notify the item
+    }
+    
+    public void RemoveFromSelection(ImageItemViewModel image)
+    {
+        if (_selectedImages.Contains(image))
+        {
+            _selectedImages.Remove(image);
+            UpdateSelectedImagesCount();
+            image.RefreshSelectionState(); // Notify the item
+        }
+    }
+    
+    public void ClearSelection()
+    {
+        // Cache the items that were selected
+        var previouslySelected = new List<ImageItemViewModel>(_selectedImages);
+        
+        _selectedImages.Clear();
+        
+        UpdateSelectedImagesCount();
+        
+        // Notify all previously selected items
+        foreach (var item in previouslySelected)
+        {
+            item.RefreshSelectionState();
+        }
+        
+        // Also notify current item if it wasn't in the list
+        CurrentImage?.RefreshSelectionState();
+    }
+    
+    public void SelectRange(ImageItemViewModel from, ImageItemViewModel to)
+    {
+        var fromIndex = Images.IndexOf(from);
+        var toIndex = Images.IndexOf(to);
+        
+        if (fromIndex == -1 || toIndex == -1)
+            return;
+        
+        var startIndex = Math.Min(fromIndex, toIndex);
+        var endIndex = Math.Max(fromIndex, toIndex);
+        
+        for (int i = startIndex; i <= endIndex; i++)
+        {
+            var image = Images[i];
+            AddToSelection(image);
+        }
+    }
+    
+    private void UpdateSelectedImagesCount()
+    {
+        SelectedImagesCount = _selectedImages.Count > 0 ? $"({_selectedImages.Count} Selected)" : "";
+    }
+    
+    partial void OnCurrentImageChanged(ImageItemViewModel? value)
+    {
+        // Previously current image
+        if (_previousCurrentImage != null)
+        {
+            _previousCurrentImage.RefreshSelectionState();
+        }
+        
+        _previousCurrentImage = value;
+        
+        // Notify the new current image
+        value?.RefreshSelectionState();
+    }
 }
 
 public partial class ImageItemViewModel : ViewModelBase
@@ -297,17 +387,33 @@ public partial class ImageItemViewModel : ViewModelBase
     private readonly WeakReference<ImageGalleryViewModel> _galleryViewModel;
 
     [ObservableProperty] private Bitmap? _thumbnail;
-    [ObservableProperty] private bool _isSelected;
 
     public long Id { get; }
     public string? Path { get; }
     public string? FileName { get; }
     public float? Score { get; }
     public bool HasScore => Score.HasValue;
+    
+    // Read-only property to check if this item is in the selected images collection
+    public bool IsSelected => 
+        _galleryViewModel.TryGetTarget(out var gallery) && 
+        gallery.SelectedImages.Contains(this);
+    
+    // Read-only property to check if this is the current item with keyboard focus
+    public bool IsCurrent => 
+        _galleryViewModel.TryGetTarget(out var gallery) && 
+        gallery.CurrentImage == this;
 
     public void UpdateThumbnail()
     {
         Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails?.GetValueOrDefault(Id) : null;
+    }
+    
+    // Trigger property change notification for selection state
+    public void RefreshSelectionState()
+    {
+        OnPropertyChanged(nameof(IsSelected));
+        OnPropertyChanged(nameof(IsCurrent));
     }
 
     public ImageItemViewModel(Image image, ImageGalleryViewModel galleryViewModel)

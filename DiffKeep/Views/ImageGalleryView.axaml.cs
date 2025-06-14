@@ -110,7 +110,35 @@ public partial class ImageGalleryView : UserControl
             sender is Border border &&
             border.DataContext is ImageItemViewModel imageItem)
         {
-            SelectImage(vm, imageItem, false);
+            var pointer = e.KeyModifiers;
+        
+            // Normal click (no modifiers) - unselect all images
+            if (pointer == KeyModifiers.None)
+            {
+                vm.ClearSelection();
+                MakeCurrentImage(vm, imageItem, false);
+            }
+            // Ctrl+Click - toggle selection of this image
+            else if (pointer == KeyModifiers.Control)
+            {
+                if (vm.SelectedImages.Contains(imageItem))
+                {
+                    vm.RemoveFromSelection(imageItem);
+                    MakeCurrentImage(vm, imageItem, false);
+                }
+                else
+                {
+                    vm.AddToSelection(imageItem);
+                    MakeCurrentImage(vm, imageItem, false);
+                }
+            }
+            // Shift+Click - select range from current to this image
+            else if (pointer == KeyModifiers.Shift && vm.CurrentImage != null)
+            {
+                vm.SelectRange(vm.CurrentImage, imageItem);
+                MakeCurrentImage(vm, imageItem, true);
+            }
+        
             border.Focus();
         }
     }
@@ -119,16 +147,12 @@ public partial class ImageGalleryView : UserControl
     {
         OpenImageViewer();
     }
-
-    private void SelectImage(ImageGalleryViewModel vm, ImageItemViewModel imageItem, bool scrollToView)
+    
+    private void MakeCurrentImage(ImageGalleryViewModel vm, ImageItemViewModel imageItem, bool scrollToView)
     {
-        if (vm.SelectedImage != null)
-        {
-            vm.SelectedImage.IsSelected = false;
-        }
-
-        imageItem.IsSelected = true;
-        vm.SelectedImage = imageItem;
+        // Just update the CurrentImage property
+        vm.CurrentImage = imageItem;
+    
         if (scrollToView)
             ScrollSelectedItemIntoView();
     }
@@ -141,23 +165,56 @@ public partial class ImageGalleryView : UserControl
         if (!_canInteract)
             return;
 
-        if (e.Key == Key.Enter && vm.SelectedImage != null)
+        // non-navigation keys that will return after execution
+        switch (e.Key)
         {
-            OpenImageViewer();
-            e.Handled = true;
-            return;
+            case Key.Enter:
+                if (vm.CurrentImage != null)
+                {
+                    OpenImageViewer();
+                }
+
+                e.Handled = true;
+                return;
+
+            case Key.Delete:
+                if (vm.CurrentImage != null)
+                {
+                    _canInteract = false;
+                    await DeleteSelectedImage();
+                    _canInteract = true;
+                }
+                e.Handled = true;
+                return;
+            
+            case Key.Space:
+                if (vm.CurrentImage != null)
+                {
+                    // Toggle selection with Space key
+                    if (vm.SelectedImages.Contains(vm.CurrentImage))
+                    {
+                        vm.RemoveFromSelection(vm.CurrentImage);
+                    }
+                    else
+                    {
+                        vm.AddToSelection(vm.CurrentImage);
+                    }
+                    e.Handled = true;
+                }
+                return;
+            
+            case Key.Escape:
+                if (vm.CurrentImage != null)
+                {
+                    // Unselect everything
+                    vm.CurrentImage = null;
+                    vm.ClearSelection();
+                }
+                e.Handled = true;
+                return;
         }
 
-        if (e.Key == Key.Delete && vm.SelectedImage != null)
-        {
-            _canInteract = false;
-            await DeleteSelectedImage();
-            _canInteract = true;
-            e.Handled = true;
-            return;
-        }
-
-        int currentIndex = vm.SelectedImage != null ? vm.Images.IndexOf(vm.SelectedImage) : -1;
+        int currentIndex = vm.CurrentImage != null ? vm.Images.IndexOf(vm.CurrentImage) : -1;
         int columns = GetColumnCount();
         int newIndex = currentIndex;
 
@@ -201,19 +258,19 @@ public partial class ImageGalleryView : UserControl
 
         if (newIndex != currentIndex && newIndex >= 0 && newIndex < vm.Images.Count)
         {
-            SelectImage(vm, vm.Images[newIndex], true);
+            MakeCurrentImage(vm, vm.Images[newIndex], true);
             e.Handled = true;
         }
     }
     
     private async Task DeleteSelectedImage()
     {
-        if (DataContext is not ImageGalleryViewModel vm || vm.SelectedImage == null)
+        if (DataContext is not ImageGalleryViewModel vm || vm.CurrentImage == null)
             return;
 
         if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime { MainWindow: not null } desktop)
         {
-            await vm.DeleteImage(vm.SelectedImage, desktop.MainWindow);
+            await vm.DeleteImage(vm.CurrentImage, desktop.MainWindow);
         }
     }
 
@@ -223,9 +280,9 @@ public partial class ImageGalleryView : UserControl
         if (_scrollViewer == null || _itemsRepeater == null) return;
         
         var viewModel = DataContext as ImageGalleryViewModel;
-        if (viewModel?.SelectedImage == null) return;
+        if (viewModel?.CurrentImage == null) return;
 
-        var selectedIndex = viewModel.Images.IndexOf(viewModel.SelectedImage);
+        var selectedIndex = viewModel.Images.IndexOf(viewModel.CurrentImage);
         if (selectedIndex == -1) return;
 
         // Calculate the position of the item
@@ -349,9 +406,9 @@ public partial class ImageGalleryView : UserControl
 
     private void OpenImageViewer()
     {
-        if (DataContext is ImageGalleryViewModel { SelectedImage: not null } vm)
+        if (DataContext is ImageGalleryViewModel { CurrentImage: not null } vm)
         {
-            var imageItem = vm.SelectedImage;
+            var imageItem = vm.CurrentImage;
 
             if (string.IsNullOrEmpty(imageItem.Path)) return;
             // Create a new list with the current items
