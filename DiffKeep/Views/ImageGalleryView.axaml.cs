@@ -169,7 +169,7 @@ public partial class ImageGalleryView : UserControl
         switch (e.Key)
         {
             case Key.Enter:
-                if (vm.CurrentImage != null)
+                if (vm.CurrentImage != null || vm.SelectedImages.Count > 0)
                 {
                     OpenImageViewer();
                 }
@@ -265,12 +265,19 @@ public partial class ImageGalleryView : UserControl
     
     private async Task DeleteSelectedImage()
     {
-        if (DataContext is not ImageGalleryViewModel vm || vm.CurrentImage == null)
+        if (DataContext is not ImageGalleryViewModel vm || (vm.CurrentImage == null && vm.SelectedImages.Count == 0))
             return;
 
         if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime { MainWindow: not null } desktop)
         {
-            await vm.DeleteImage(vm.CurrentImage, desktop.MainWindow);
+            if (vm.SelectedImages.Count > 0)
+            {
+                await vm.DeleteImages(vm.SelectedImages.ToList(), desktop.MainWindow);
+            }
+            else
+            {
+                await vm.DeleteImage(vm.CurrentImage, desktop.MainWindow);
+            }
         }
     }
 
@@ -411,8 +418,22 @@ public partial class ImageGalleryView : UserControl
             var imageItem = vm.CurrentImage;
 
             if (string.IsNullOrEmpty(imageItem.Path)) return;
-            // Create a new list with the current items
-            var imagesCopy = new ObservableCollection<ImageItemViewModel>(vm.Images);
+            // Create a new list with the selected items or the whole library
+            
+            ObservableCollection<ImageItemViewModel> imagesCopy;
+            if (vm.SelectedImages.Count > 0)
+            {
+                // use the selected images for the viewer, but sort them by the order they appear in the full list
+                imagesCopy = new ObservableCollection<ImageItemViewModel>(
+                    vm.SelectedImages
+                        .OrderBy(img => vm.Images.IndexOf(img))
+                );
+            }
+            else
+            {
+                // use all the current images in the viewer
+                imagesCopy = new ObservableCollection<ImageItemViewModel>(vm.Images);
+            }
             var window = new ImageViewerWindow(imagesCopy, imageItem);
             window.Show();
         }

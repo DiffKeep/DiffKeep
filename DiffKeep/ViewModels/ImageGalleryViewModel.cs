@@ -301,6 +301,11 @@ public partial class ImageGalleryViewModel : ViewModelBase
         await _imageService.DeleteImageAsync(image, parentWindow);
     }
     
+    public async Task DeleteImages(List<ImageItemViewModel> images, Window parentWindow)
+    {
+        await _imageService.DeleteImagesAsync(images, parentWindow);
+    }
+    
     public void AddToSelection(ImageItemViewModel image)
     {
         if (_previousCurrentImage != null && !_selectedImages.Contains(_previousCurrentImage))

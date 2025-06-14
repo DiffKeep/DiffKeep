@@ -40,6 +40,7 @@ public interface IImageRepository
     Task UpdateAsync(Image image);
     Task UpdateThumbnailAsync(long imageId, Bitmap? thumbnail);
     Task DeleteAsync(long id);
+    Task DeleteAsync(long[] ids);
     Task<bool> ExistsAsync(long libraryId, string path);
     Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null);
 }

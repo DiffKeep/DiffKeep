@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Avalonia.Controls;
 using DiffKeep.ViewModels;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.Messaging;
@@ -86,6 +87,59 @@ public class ImageService : IImageService
                 MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
             await errorDialog.ShowWindowDialogAsync(parentWindow);
             return false;
+        }
+    }
+    
+    public async Task DeleteImagesAsync(List<ImageItemViewModel> images, Window parentWindow)
+    {
+        var dialog = MessageBoxManager.GetMessageBoxCustom(new MessageBoxCustomParams()
+        {
+            ButtonDefinitions = new List<ButtonDefinition>
+            {
+                new() { Name = "Yes", },
+                new() { Name = "Cancel", },
+            },
+            ContentTitle = "Confirm Delete",
+            ContentMessage =
+                $"Are you sure you want to delete {images.Count} images? This action cannot be undone.",
+            Topmost = true,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+        });
+
+        var result = await dialog.ShowWindowDialogAsync(parentWindow);
+        Debug.WriteLine($"Dialog result: {result}");
+
+        if (result == "Cancel" || String.IsNullOrWhiteSpace(result))
+        {
+            Debug.WriteLine("Image delete cancelled");
+            return;
+        }
+
+        try
+        {
+            images.ForEach((image) =>
+            {
+                // Delete the file from filesystem
+                if (File.Exists(image.Path))
+                {
+                    Debug.WriteLine($"Deleting from filesystem image {image.Path}");
+                    File.Delete(image.Path);
+
+                    WeakReferenceMessenger.Default.Send(new ImageDeletedMessage(image.Path));
+                }
+            });
+
+            // Delete from the database
+            Debug.WriteLine($"Deleting {images.Count} images from database");
+            await _imageRepository.DeleteAsync(images.Select(img => img.Id).ToArray()
+            );
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error deleting images: {ex}");
+            var errorDialog =
+                MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the images: {ex.Message}");
+            await errorDialog.ShowWindowDialogAsync(parentWindow);
         }
     }
 

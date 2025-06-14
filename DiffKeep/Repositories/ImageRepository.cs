@@ -471,6 +471,23 @@ private static Image ReadImage(SqliteDataReader reader)
         await command.ExecuteNonQueryAsync();
     }
 
+    public async Task DeleteAsync(long[] ids)
+    {
+        await using var connection = CreateConnection();
+        await using var command = connection.CreateCommand();
+        // Create a parameter string with the correct number of parameters
+        var parameters = string.Join(",", ids.Select((_, index) => $"@Id{index}"));
+        command.CommandText = $"DELETE FROM Images WHERE Id IN ({parameters})";
+
+        // Add parameters
+        for (int i = 0; i < ids.Length; i++)
+        {
+            command.CreateParameter($"@Id{i}", ids[i]);
+        }
+
+        await command.ExecuteNonQueryAsync();
+    }
+
     public async Task DeleteByLibraryIdAsync(long libraryId)
     {
         await using var connection = CreateConnection();
