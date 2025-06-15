@@ -38,6 +38,7 @@
 
             <!-- Search -->
             <TextBox Grid.Column="1"
+                     Name="SearchTextBox"
                      Width="300"
                      HorizontalAlignment="Center"
                      Text="{Binding SearchText}"

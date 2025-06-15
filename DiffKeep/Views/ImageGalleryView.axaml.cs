@@ -164,6 +164,15 @@ public partial class ImageGalleryView : UserControl
 
         if (!_canInteract)
             return;
+    
+        // Find the search TextBox and check if it has focus
+        var searchTextBox = this.FindControl<TextBox>("SearchTextBox");
+        if (searchTextBox != null && searchTextBox.IsFocused)
+        {
+            // Don't process keyboard shortcuts when the search box has focus
+            return;
+        }
+
 
         // non-navigation keys that will return after execution
         switch (e.Key)
