@@ -6,23 +6,23 @@ using FluentAssertions;
 
 namespace Tests.Services;
 
-public class LlamaSharpEmbeddingGenerateServiceTests
+public class LlamaSharpTextTextEmbeddingGenerationServiceTests
 {
     private readonly ITestOutputHelper _testOutputHelper;
-    private LlamaSharpEmbeddingGenerateService _service;
+    private LlamaSharpTextTextEmbeddingGenerationService _service;
 
-    public LlamaSharpEmbeddingGenerateServiceTests(ITestOutputHelper testOutputHelper)
+    public LlamaSharpTextTextEmbeddingGenerationServiceTests(ITestOutputHelper testOutputHelper)
     {
         _testOutputHelper = testOutputHelper;
     }
 
-    private const string TestModelName = "gte-large.Q6_K.gguf";
+    private const string TestModelName = "snowflake-arctic-embed-l.Q8_0.gguf";
 
     [Fact]
     public async Task GenerateEmbeddingAsync_WithValidText_ShouldReturnEmbeddings()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
         var inputText = "Test text for embedding";
 
         // Act
@@ -39,7 +39,7 @@ public class LlamaSharpEmbeddingGenerateServiceTests
     public async Task LoadModelAsync_WithValidPath_ShouldLoadSuccessfully()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
         var modelPath = TestModelName;
 
         // Act & Assert
@@ -51,7 +51,7 @@ public class LlamaSharpEmbeddingGenerateServiceTests
     public async Task GenerateEmbeddingAsync_WithoutExplicitModelLoad_ShouldLoadDefaultModelAndGenerateEmbeddings()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
         var inputText = "Test text for embedding";
 
         // Act
@@ -68,7 +68,7 @@ public class LlamaSharpEmbeddingGenerateServiceTests
     public async Task GenerateEmbeddingAsync_WithNormalGenerativeModel_ShouldLoadAndGenerateEmbeddings()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
         var inputText = "Test text for embedding";
         var testModel = "gemma-3-4b-it-Q6_K.gguf";
         await _service.LoadModelAsync(testModel, false);
@@ -87,7 +87,7 @@ public class LlamaSharpEmbeddingGenerateServiceTests
     public async Task GenerateEmbedding_SimilarityTest()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
         //var testModel = "gemma-3-4b-it-Q6_K.gguf";
         //await _service.LoadModelAsync(testModel, false);
         
@@ -137,22 +137,24 @@ public class LlamaSharpEmbeddingGenerateServiceTests
     public async Task GenerateEmbedding_SimilarityPromptSearchTest()
     {
         // Arrange
-        _service = new LlamaSharpEmbeddingGenerateService();
-        //var testModel = "gemma-3-4b-it-Q6_K.gguf";
+        _service = new LlamaSharpTextTextEmbeddingGenerationService();
+        //var testModel = "bge-small-en-v1.5.Q8_0.gguf";
         //await _service.LoadModelAsync(testModel, false);
         
-        var search = "rain";
+        _testOutputHelper.WriteLine($"Using model {_service.ModelName()}");
+        
+        var search = "sad";
         var prompt1 = "rain, umbrella, girl, looking up, wet hair, city street, puddles, melancholic, atmospheric, soft lighting, bokeh, long hair, gentle expression, side view, full body, dynamic angle, blue tones, cozy, peaceful, shallow depth of field, realistic, cinematic, blurry background, raindrops, wind, motion blur, longing, vulnerable, youth, candid, street photography, overcast, detailed background, reflections, fashion, simple clothing, everyday life, artistic, emotional, vulnerable, natural light, wet pavement, city lights, urban scene, youth, lonely, thoughtful, side glance, wet clothes, pensive, cinematic lighting, diffused lighting, atmospheric, blurred motion, street fashion, realistic textures, detailed shadows, soft focus, realistic skin texture, natural pose, simple background, urban environment, quiet moment, emotional depth, muted colors, wet surfaces, street style, artistic photography, city life, lonely, pensive, side glance, realistic details, moody, rainy day, cozy atmosphere, blurred background, dynamic composition, artistic expression, atmospheric perspective, cinematic shot";
-        var prompt2 = "rain, umbrella, girl, looking_up, wet_hair, smiling, city, street, puddles, bokeh, soft_lighting, long_hair, shallow_depth_of_field, dynamic_pose, colorful_raincoat, joyful, whimsical, atmospheric, street_photography, candid, full_body, side_view, motion_blur, rainy_day, cozy, vibrant, cute, happy, youth, indoors, studio_shot, portrait, 1girl, solo, detailed_background, hd, high_resolution, masterpiece, best_quality, illustration, digital_art, trending_on_artstation";
+        var prompt2 = "umbrella, girl, looking_up, wet_hair, smiling, city, street, puddles, bokeh, soft_lighting, long_hair, shallow_depth_of_field, dynamic_pose, colorful_raincoat, joyful, whimsical, atmospheric, street_photography, candid, full_body, side_view, motion_blur, rainy_day, cozy, vibrant, cute, happy, youth, indoors, studio_shot, portrait, 1girl, solo, detailed_background, hd, high_resolution, masterpiece, best_quality, illustration, digital_art, trending_on_artstation";
         var prompt3 = "angel, female, electricity, glowing, wings, halo, divine, ethereal, long hair, detailed eyes, full body, dynamic pose, energy, sparks, light, fantasy, otherworldly, celestial, beautiful, serene, soft lighting, intricate details, flowing hair, pale skin, blue eyes, white wings, gold halo, dramatic lighting, power, magic, highly detailed, digital art, concept art, illustration, 8k, uhd, masterpiece, intricate, complex, vibrant colors";
-        var prompt4 = "nude, woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, cleavage, side_view, outdoors, magical, ethereal, detailed_background, realistic, nipples, spread_legs, provocative, dark_hair, breasts, buttocks, curvy, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, minimalist_clothing, witch_hat, windblown_hair, nipples_visible, suggestive, open_legs, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down";
+        var prompt4 = "woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, cleavage, side_view, outdoors, magical, ethereal, detailed_background, realistic, dark_hair, curvy, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, witch_hat, windblown_hair, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down";
 
         // Act
-        var embeddings1 = await make(search);
-        var embeddings2 = await make(prompt1);
-        var embeddings3 = await make(prompt2);
-        var embeddings4 = await make(prompt3);
-        var embeddings5 = await make(prompt4);
+        var embeddings1 = await _service.GenerateEmbeddingAsync(search);
+        var embeddings2 = await _service.GenerateEmbeddingAsync(prompt1);
+        var embeddings3 = await _service.GenerateEmbeddingAsync(prompt2);
+        var embeddings4 = await _service.GenerateEmbeddingAsync(prompt3);
+        var embeddings5 = await _service.GenerateEmbeddingAsync(prompt4);
         
         _testOutputHelper.WriteLine($"Embeddings count for search: {embeddings1.Count} Size of first element: {embeddings1.First().Length}");
         _testOutputHelper.WriteLine($"Embeddings count for prompt 1: {embeddings2.Count} Size of first element: {embeddings2.First().Length}");

@@ -22,6 +22,7 @@ public class ImageLibraryScanner
     private readonly ILibraryRepository _libraryRepository;
     private readonly IImageRepository _imageRepository;
     private readonly ImageParser _imageParser;
+    private readonly ITextEmbeddingGenerationService _textEmbeddingGenerationService;
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _scanCancellations = new();
     public const int ThumbnailSize = 200;
     private const int MaxConcurrentThumbnails = 16;
@@ -33,11 +34,13 @@ public class ImageLibraryScanner
     public ImageLibraryScanner(
         ILibraryRepository libraryRepository,
         IImageRepository imageRepository,
-        ImageParser imageParser)
+        ImageParser imageParser,
+        ITextEmbeddingGenerationService textEmbeddingGenerationService)
     {
         _libraryRepository = libraryRepository;
         _imageRepository = imageRepository;
         _imageParser = imageParser;
+        _textEmbeddingGenerationService = textEmbeddingGenerationService;
     }
 
     public void CancelScan(long libraryId)
@@ -74,6 +77,7 @@ public class ImageLibraryScanner
         var processedFiles = 0;
         Debug.Print($"Scanning library {library.Id} ({library.Path})");
         Debug.Print($"Found {totalFiles} files");
+        var foundNewFiles = false;
 
         using var semaphore = new SemaphoreSlim(MaxConcurrentThumbnails);
         var imageBatch = new List<Image>();
@@ -110,6 +114,7 @@ public class ImageLibraryScanner
                                 lock (imageBatch)
                                 {
                                     imageBatch.Add(image);
+                                    foundNewFiles = true;
                                 }
                                 Debug.Print($"Processed {file}");
                             }
@@ -151,7 +156,8 @@ public class ImageLibraryScanner
         }
 
         OnScanCompleted(library.Id, processedFiles);
-        WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(library.Id));
+        if (foundNewFiles)
+            WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(library.Id));
         return;
 
         async Task ProcessBatchAsync()
@@ -218,7 +224,7 @@ public class ImageLibraryScanner
             try
             {
                 // Get all images from this library
-                var images = await _imageRepository.GetImagesWithoutEmbeddingsAsync(libraryId);
+                var images = await _imageRepository.GetImagesWithoutEmbeddingsAsync(_textEmbeddingGenerationService.ModelName(), _textEmbeddingGenerationService.EmbeddingSize(), libraryId);
                 var imageArray = images as Image[] ?? images.ToArray();
                 Debug.WriteLine($"Found {imageArray.Length} images in library {libraryId} without embeddings");
             

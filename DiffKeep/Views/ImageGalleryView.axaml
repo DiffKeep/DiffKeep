@@ -1,3 +1,4 @@
+
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -37,29 +38,43 @@
             </StackPanel>
 
             <!-- Search -->
-            <TextBox Grid.Column="1"
-                     Name="SearchTextBox"
-                     Width="300"
-                     HorizontalAlignment="Center"
-                     Text="{Binding SearchText}"
-                     Watermark="Search prompts..."
-                     VerticalAlignment="Center">
-                <TextBox.InnerRightContent>
-                    <Button Command="{Binding ClearSearchCommand}"
-                            IsVisible="{Binding SearchText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
-                            Background="Transparent"
-                            Width="20" Height="20"
-                            Padding="0"
-                            VerticalAlignment="Center">
-                        <PathIcon
-                            Data="M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z" />
-                    </Button>
-                </TextBox.InnerRightContent>
-                <TextBox.KeyBindings>
-                    <KeyBinding Gesture="Enter"
-                                Command="{Binding SearchPromptsCommand}" />
-                </TextBox.KeyBindings>
-            </TextBox>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center">
+    
+                <!-- Search TextBox -->
+                <TextBox Name="SearchTextBox"
+                         Width="300"
+                         Text="{Binding SearchText}"
+                         Watermark="Search prompts..."
+                         VerticalAlignment="Center">
+                    <TextBox.InnerRightContent>
+                        <Button Command="{Binding ClearSearchCommand}"
+                                IsVisible="{Binding SearchText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                                Background="Transparent"
+                                Width="20" Height="20"
+                                Padding="0"
+                                VerticalAlignment="Center">
+                            <PathIcon
+                                Data="M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z" />
+                        </Button>
+                    </TextBox.InnerRightContent>
+                    <TextBox.KeyBindings>
+                        <KeyBinding Gesture="Enter"
+                                    Command="{Binding SearchPromptsCommand}" />
+                    </TextBox.KeyBindings>
+                </TextBox>
+    
+                <!-- Search Type Dropdown -->
+                <ComboBox Width="120"
+                          Margin="10,0,0,0"
+                          SelectedItem="{Binding CurrentSearchType}"
+                          ItemsSource="{Binding AvailableSearchTypes}">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Converter={StaticResource EnumToDisplayNameConverter}}" />
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                </ComboBox>
+            </StackPanel>
 
             <!-- Sort dropdown -->
             <ComboBox Grid.Column="2"
@@ -86,115 +101,119 @@
                 BorderBrush="Gray"
                 Margin="0,0,0,-1" />
 
-        <!-- Image gallery -->
-        <ScrollViewer Grid.Row="1" Name="ScrollViewer" ScrollChanged="ScrollViewer_ScrollChanged">
-            <Grid>
-                <!-- Dummy border to fake height -->
-                <Border Name="VirtualHeightEnforcer"
-                        Background="Transparent"
-                        IsHitTestVisible="False" />
+        <!-- Main Content Area (Row 1) - This is a grid to contain both the ScrollViewer and the loader -->
+        <Grid Grid.Row="1">
+            <!-- Image gallery -->
+            <ScrollViewer Name="ScrollViewer" ScrollChanged="ScrollViewer_ScrollChanged">
+                <Grid>
+                    <!-- Dummy border to fake height -->
+                    <Border Name="VirtualHeightEnforcer"
+                            Background="Transparent"
+                            IsHitTestVisible="False" />
 
-                <ItemsRepeater ItemsSource="{Binding Images}"
-                               Name="ItemsRepeater">
-                    <ItemsRepeater.Layout>
-                        <WrapLayout Orientation="Horizontal"
-                                    HorizontalSpacing="3"
-                                    VerticalSpacing="3" />
-                    </ItemsRepeater.Layout>
-                    <ItemsRepeater.ItemTemplate>
-                        <DataTemplate x:DataType="vm:ImageItemViewModel">
-                            <Border Width="220"
-                                    Height="240"
-                                    CornerRadius="3"
-                                    Background="Transparent"
-                                    BorderThickness="2"
-                                    Classes.selected="{Binding IsSelected}"
-                                    Classes.current="{Binding IsCurrent}"
-                                    PointerPressed="Image_OnPointerPressed"
-                                    PointerMoved="Image_OnPointerMoved"
-                                    DoubleTapped="Border_OnDoubleTapped"
-                                    Tapped="Border_OnTapped">
-                                <Border.Styles>
-                                    <!-- Hover state -->
-                                    <Style Selector="Border:pointerover">
-                                        <Setter Property="BorderBrush" Value="#80808080" />
-                                        <Setter Property="Background" Value="#10808080" />
-                                    </Style>
-                                </Border.Styles>
-                                <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
-                                    <!-- Selection border -->
-                                    <Border BorderBrush="DarkRed"
-                                            Background="DarkSlateGray"
-                                            BorderThickness="2"
-                                            IsVisible="{Binding IsSelected}"
-                                            Margin="-1" />
-                                    <!-- Current border -->
-                                    <Border BorderBrush="DarkBlue"
-                                            BorderThickness="2"
-                                            IsVisible="{Binding IsCurrent}"
-                                            Margin="-1" />
-                                    <!-- Content -->
-                                    <Grid>
-                                        <StackPanel>
-                                            <Image Source="{Binding Thumbnail}"
-                                                   Width="200"
-                                                   Height="200"
-                                                   Stretch="Uniform"/>
-                                            <TextBlock Text="{Binding FileName}"
-                                                       Margin="5 10"
-                                                       TextAlignment="Center"
-                                                       TextWrapping="Wrap" />
-                                        </StackPanel>
-                                        <!-- Score Display -->
-                                        <TextBlock IsVisible="{Binding HasScore}"
-                                                   Text="{Binding Score, StringFormat={}{0:P1}}"
-                                                   HorizontalAlignment="Left"
-                                                   VerticalAlignment="Top"
-                                                   Margin="0,0,5,5"
-                                                   Background="#80000000"
-                                                   Padding="4,2"
-                                                   Foreground="White"/>
+                    <ItemsRepeater ItemsSource="{Binding Images}"
+                                   Name="ItemsRepeater">
+                        <ItemsRepeater.Layout>
+                            <WrapLayout Orientation="Horizontal"
+                                        HorizontalSpacing="3"
+                                        VerticalSpacing="3" />
+                        </ItemsRepeater.Layout>
+                        <ItemsRepeater.ItemTemplate>
+                            <DataTemplate x:DataType="vm:ImageItemViewModel">
+                                <Border Width="220"
+                                        Height="240"
+                                        CornerRadius="3"
+                                        Background="Transparent"
+                                        BorderThickness="2"
+                                        Classes.selected="{Binding IsSelected}"
+                                        Classes.current="{Binding IsCurrent}"
+                                        PointerPressed="Image_OnPointerPressed"
+                                        PointerMoved="Image_OnPointerMoved"
+                                        DoubleTapped="Border_OnDoubleTapped"
+                                        Tapped="Border_OnTapped">
+                                    <Border.Styles>
+                                        <!-- Hover state -->
+                                        <Style Selector="Border:pointerover">
+                                            <Setter Property="BorderBrush" Value="#80808080" />
+                                            <Setter Property="Background" Value="#10808080" />
+                                        </Style>
+                                    </Border.Styles>
+                                    <Grid PointerPressed="Image_OnPointerPressed" PointerMoved="Image_OnPointerMoved">
+                                        <!-- Selection border -->
+                                        <Border BorderBrush="DarkRed"
+                                                Background="DarkSlateGray"
+                                                BorderThickness="2"
+                                                IsVisible="{Binding IsSelected}"
+                                                Margin="-1" />
+                                        <!-- Current border -->
+                                        <Border BorderBrush="DarkBlue"
+                                                BorderThickness="2"
+                                                IsVisible="{Binding IsCurrent}"
+                                                Margin="-1" />
+                                        <!-- Content -->
+                                        <Grid>
+                                            <StackPanel>
+                                                <Image Source="{Binding Thumbnail}"
+                                                       Width="200"
+                                                       Height="200"
+                                                       Stretch="Uniform"/>
+                                                <TextBlock Text="{Binding FileName}"
+                                                           Margin="5 10"
+                                                           TextAlignment="Center"
+                                                           TextWrapping="Wrap" />
+                                            </StackPanel>
+                                            <!-- Score Display -->
+                                            <TextBlock IsVisible="{Binding HasScore}"
+                                                       Text="{Binding Score}"
+                                                       HorizontalAlignment="Left"
+                                                       VerticalAlignment="Top"
+                                                       Margin="0,0,5,5"
+                                                       Background="#80000000"
+                                                       Padding="4,2"
+                                                       Foreground="White"/>
+                                        </Grid>
+
+                                    <Rectangle Fill="Transparent" 
+                                               IsHitTestVisible="True"
+                                               Grid.RowSpan="999" 
+                                               Grid.ColumnSpan="999"/>
                                     </Grid>
-
-                                <Rectangle Fill="Transparent" 
-                                           IsHitTestVisible="True"
-                                           Grid.RowSpan="999" 
-                                           Grid.ColumnSpan="999"/>
-                                </Grid>
-                            </Border>
-                        </DataTemplate>
-                    </ItemsRepeater.ItemTemplate>
-                </ItemsRepeater>
-                <!-- Loader Overlay -->
-                <Panel IsVisible="{Binding IsLoading}">
-                    <Border Background="Transparent"
-                            Width="40"
-                            Height="40"
-                            CornerRadius="20"
-                            HorizontalAlignment="Right"
-                            VerticalAlignment="Bottom"
-                            Margin="0,0,20,20">
-                        <PathIcon Data="M12,4V2A10,10 0 0,0 2,12H4A8,8 0 0,1 12,4Z">
-                            <PathIcon.Styles>
-                                <Style Selector="PathIcon">
-                                    <Style.Animations>
-                                        <Animation Duration="0:0:1"
-                                                   IterationCount="Infinite">
-                                            <KeyFrame Cue="0%">
-                                                <Setter Property="RotateTransform.Angle" Value="0.0" />
-                                            </KeyFrame>
-                                            <KeyFrame Cue="100%">
-                                                <Setter Property="RotateTransform.Angle" Value="360.0" />
-                                            </KeyFrame>
-                                        </Animation>
-                                    </Style.Animations>
-                                </Style>
-                            </PathIcon.Styles>
-                        </PathIcon>
-                    </Border>
-                </Panel>
-            </Grid>
-        </ScrollViewer>
-
+                                </Border>
+                            </DataTemplate>
+                        </ItemsRepeater.ItemTemplate>
+                    </ItemsRepeater>
+                </Grid>
+            </ScrollViewer>
+            
+            <!-- Loader Overlay -->
+            <Panel IsVisible="{Binding IsLoading}"
+                   HorizontalAlignment="Right"
+                   VerticalAlignment="Bottom"
+                   ZIndex="100">
+                <Border Background="Transparent"
+                        Width="40"
+                        Height="40"
+                        CornerRadius="20"
+                        Margin="0,0,20,20">
+                    <PathIcon Data="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z">
+                        <PathIcon.Styles>
+                            <Style Selector="PathIcon">
+                                <Style.Animations>
+                                    <Animation Duration="0:0:1"
+                                               IterationCount="Infinite">
+                                        <KeyFrame Cue="0%">
+                                            <Setter Property="RotateTransform.Angle" Value="0.0" />
+                                        </KeyFrame>
+                                        <KeyFrame Cue="100%">
+                                            <Setter Property="RotateTransform.Angle" Value="360.0" />
+                                        </KeyFrame>
+                                    </Animation>
+                                </Style.Animations>
+                            </Style>
+                        </PathIcon.Styles>
+                    </PathIcon>
+                </Border>
+            </Panel>
+        </Grid>
     </Grid>
 </UserControl>

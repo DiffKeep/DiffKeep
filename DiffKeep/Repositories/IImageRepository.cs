@@ -42,7 +42,7 @@ public interface IImageRepository
     Task DeleteAsync(long id);
     Task DeleteAsync(long[] ids);
     Task<bool> ExistsAsync(long libraryId, string path);
-    Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null);
+    Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(string modelName, int embeddingSize, long? libraryId = null);
 }
 
 public enum ImageSortOption

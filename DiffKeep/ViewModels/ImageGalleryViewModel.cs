@@ -44,15 +44,30 @@ public partial class ImageGalleryViewModel : ViewModelBase
     [ObservableProperty] private bool _isLoading;
     [ObservableProperty] private int _totalCount;
     [ObservableProperty] private string _selectedImagesCount = "";
-    
+
     private ObservableCollection<ImageItemViewModel> _selectedImages = new();
-    
+
     public ObservableCollection<ImageItemViewModel> SelectedImages => _selectedImages;
 
     public ObservableCollection<ImageItemViewModel> Images
     {
         get => _images;
         set => SetProperty(ref _images, value);
+    }
+    
+    private ObservableCollection<SearchTypeEnum> _availableSearchTypes = new();
+    public ObservableCollection<SearchTypeEnum> AvailableSearchTypes
+    {
+        get => _availableSearchTypes;
+        set => SetProperty(ref _availableSearchTypes, value);
+    }
+
+// Current selected search type
+    private SearchTypeEnum _currentSearchType;
+    public SearchTypeEnum CurrentSearchType
+    {
+        get => _currentSearchType;
+        set => SetProperty(ref _currentSearchType, value);
     }
 
     public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService,
@@ -63,6 +78,18 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _searchService = searchService;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
+        
+        // Initialize available search types with at least FullText
+        AvailableSearchTypes.Add(SearchTypeEnum.FullText);
+    
+        // Set default search type
+        CurrentSearchType = SearchTypeEnum.FullText;
+
+        if (Program.Settings.UseEmbeddings)
+        {
+            AvailableSearchTypes.Add(SearchTypeEnum.Semantic);
+            AvailableSearchTypes.Add(SearchTypeEnum.Hybrid);
+        }
 
         // Subscribe to library updated messages
         WeakReferenceMessenger.Default.Register<LibraryUpdatedMessage>(this, (r, m) =>
@@ -73,7 +100,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 LoadImagesAsync(null).FireAndForget();
             }
         });
-        
+
         // Subscribe to image deleted messages
         WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
         {
@@ -86,14 +113,14 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 {
                     CurrentImage = null;
                 }
-                
+
                 // Remove from selection if selected
                 if (_selectedImages.Contains(imageToRemove))
                 {
                     _selectedImages.Remove(imageToRemove);
                     UpdateSelectedImagesCount();
                 }
-                
+
                 Images.Remove(imageToRemove);
                 // If there are any images left, select one
                 if (Images.Count > 0)
@@ -121,35 +148,33 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
         try
         {
-            IEnumerable<Image> dbImages;
-            if (!string.IsNullOrWhiteSpace(SearchText))
-            {
-                dbImages = await _searchService.TextSearchImagesAsync(SearchText, _currentLibraryId, _currentPath);
-            }
-            else if (_currentLibraryId == null)
-            {
-                dbImages = await _imageRepository.GetPagedAllAsync(0, null, CurrentSortOption);
-            }
-            else if (_currentPath == null)
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAsync(_currentLibraryId.Value, 0, null,
-                    CurrentSortOption);
-            }
-            else
-            {
-                dbImages = await _imageRepository.GetPagedByLibraryIdAndPathAsync(_currentLibraryId.Value, _currentPath,
-                    0, null, CurrentSortOption);
-            }
-
-            TotalCount = dbImages.Count();
-
-            ImagesCount = $"({TotalCount} images)";
-
-            var viewModels = await Task.Run(() =>
-                dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
-
             await Task.Run(async () =>
             {
+                IEnumerable<Image> dbImages;
+                if (!string.IsNullOrWhiteSpace(SearchText))
+                {
+                    dbImages = await _searchService.TextSearchImagesAsync(SearchText, _currentLibraryId, _currentPath, _currentSearchType);
+                }
+                else if (_currentLibraryId == null)
+                {
+                    dbImages = await _imageRepository.GetAllAsync(CurrentSortOption);
+                }
+                else if (_currentPath == null)
+                {
+                    dbImages = await _imageRepository.GetByLibraryIdAsync(_currentLibraryId.Value, CurrentSortOption);
+                }
+                else
+                {
+                    dbImages = await _imageRepository.GetByLibraryIdAndPathAsync(_currentLibraryId.Value,
+                        _currentPath, CurrentSortOption);
+                }
+
+                TotalCount = dbImages.Count();
+
+                ImagesCount = $"({TotalCount} images)";
+
+                var viewModels = await Task.Run(() =>
+                    dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
                 if (Images != null && Images.Count > 0)
                 {
                     await Dispatcher.UIThread.InvokeAsync(() => SaveScrollPositionRequested?.Invoke());
@@ -174,7 +199,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
                 if (ImagesCollectionChanged != null)
                     Debug.WriteLine("Images collection changed");
-                    ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
+                ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
             });
         }
         finally
@@ -248,7 +273,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
                 // Generate missing thumbnails
                 var missingImages = visibleImageArray.Where(img => !newThumbnails.ContainsKey(img.Id)).ToArray();
-            
+
                 await Parallel.ForEachAsync(
                     missingImages,
                     new ParallelOptions
@@ -288,10 +313,21 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 Thumbnails = newThumbnails;
             }
 
-            // Update the view models
-            foreach (var image in Images)
+            // Get a snapshot of IDs to update
+            var imageIds = Images.Select(img => img.Id).ToList();
+
+            // Update each image by finding it in the collection at update time
+            foreach (var id in imageIds)
             {
-                image.UpdateThumbnail();
+                try
+                {
+                    var image = Images.FirstOrDefault(img => img.Id == id);
+                    image?.UpdateThumbnail();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Failed to update thumbnail for {id}:  {ex.Message}");
+                }
             }
         });
     }
@@ -300,26 +336,28 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         await _imageService.DeleteImageAsync(image, parentWindow);
     }
-    
+
     public async Task DeleteImages(List<ImageItemViewModel> images, Window parentWindow)
     {
         await _imageService.DeleteImagesAsync(images, parentWindow);
     }
-    
+
     public void AddToSelection(ImageItemViewModel image)
     {
         if (_previousCurrentImage != null && !_selectedImages.Contains(_previousCurrentImage))
         {
             _selectedImages.Add(_previousCurrentImage);
         }
+
         if (!_selectedImages.Contains(image))
         {
             _selectedImages.Add(image);
         }
+
         UpdateSelectedImagesCount();
         image.RefreshSelectionState(); // Notify the item
     }
-    
+
     public void RemoveFromSelection(ImageItemViewModel image)
     {
         if (_selectedImages.Contains(image))
@@ -329,49 +367,49 @@ public partial class ImageGalleryViewModel : ViewModelBase
             image.RefreshSelectionState(); // Notify the item
         }
     }
-    
+
     public void ClearSelection()
     {
         // Cache the items that were selected
         var previouslySelected = new List<ImageItemViewModel>(_selectedImages);
-        
+
         _selectedImages.Clear();
-        
+
         UpdateSelectedImagesCount();
-        
+
         // Notify all previously selected items
         foreach (var item in previouslySelected)
         {
             item.RefreshSelectionState();
         }
-        
+
         // Also notify current item if it wasn't in the list
         CurrentImage?.RefreshSelectionState();
     }
-    
+
     public void SelectRange(ImageItemViewModel from, ImageItemViewModel to)
     {
         var fromIndex = Images.IndexOf(from);
         var toIndex = Images.IndexOf(to);
-        
+
         if (fromIndex == -1 || toIndex == -1)
             return;
-        
+
         var startIndex = Math.Min(fromIndex, toIndex);
         var endIndex = Math.Max(fromIndex, toIndex);
-        
+
         for (int i = startIndex; i <= endIndex; i++)
         {
             var image = Images[i];
             AddToSelection(image);
         }
     }
-    
+
     private void UpdateSelectedImagesCount()
     {
         SelectedImagesCount = _selectedImages.Count > 0 ? $"({_selectedImages.Count} Selected)" : "";
     }
-    
+
     partial void OnCurrentImageChanged(ImageItemViewModel? value)
     {
         // Previously current image
@@ -379,9 +417,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
         {
             _previousCurrentImage.RefreshSelectionState();
         }
-        
+
         _previousCurrentImage = value;
-        
+
         // Notify the new current image
         value?.RefreshSelectionState();
     }
@@ -398,22 +436,22 @@ public partial class ImageItemViewModel : ViewModelBase
     public string? FileName { get; }
     public float? Score { get; }
     public bool HasScore => Score.HasValue;
-    
+
     // Read-only property to check if this item is in the selected images collection
-    public bool IsSelected => 
-        _galleryViewModel.TryGetTarget(out var gallery) && 
+    public bool IsSelected =>
+        _galleryViewModel.TryGetTarget(out var gallery) &&
         gallery.SelectedImages.Contains(this);
-    
+
     // Read-only property to check if this is the current item with keyboard focus
-    public bool IsCurrent => 
-        _galleryViewModel.TryGetTarget(out var gallery) && 
+    public bool IsCurrent =>
+        _galleryViewModel.TryGetTarget(out var gallery) &&
         gallery.CurrentImage == this;
 
     public void UpdateThumbnail()
     {
         Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails?.GetValueOrDefault(Id) : null;
     }
-    
+
     // Trigger property change notification for selection state
     public void RefreshSelectionState()
     {

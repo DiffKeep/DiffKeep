@@ -553,30 +553,40 @@ private static Image ReadImage(SqliteDataReader reader)
         return await command.ExecuteScalarAsync<bool>();
     }
 
-    public async Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(long? libraryId = null)
+    public async Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(string modelName, int embeddingSize, long? libraryId = null)
     {
+        Debug.WriteLine($"Getting all images without embeddings for {modelName} with size {embeddingSize}");
         var images = new List<Image>();
         await using var connection = CreateConnection();
         await using var command = connection.CreateCommand();
         
         command.CommandText = @"
-            SELECT i.Id, i.PositivePrompt 
+            SELECT i.Id, i.PositivePrompt, i.LibraryId 
             FROM Images i 
-            LEFT JOIN Embeddings e ON i.Id = e.ImageId
+            LEFT JOIN Embeddings e ON i.Id = e.ImageId AND e.Model = @ModelName AND e.Size = @EmbeddingSize
             WHERE i.PositivePrompt IS NOT NULL 
             AND i.PositivePrompt != ''
             AND e.ImageId IS NULL";
-
-        if (libraryId.HasValue)
-        {
-            command.CommandText += " AND i.LibraryId = @LibraryId";
-            command.CreateParameter("@LibraryId", libraryId.Value);
-        }
+        
+        command.CreateParameter("@ModelName", modelName);
+        command.CreateParameter("@EmbeddingSize", embeddingSize);
 
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            images.Add(ReadImage(reader));
+            var image = ReadImage(reader);
+            if (libraryId.HasValue)
+            {
+                // For some reason, adding the library ID as a constraint on the query makes it take
+                // an abnormally long amount of time (over 5 minutes for 35k images). To avoid this,
+                // we just prune them in code. Less "efficient" but multiple orders of magnitude faster.
+                if (image.LibraryId == libraryId.Value)
+                    images.Add(image);
+            }
+            else
+            {
+                images.Add(image);
+            }
         }
 
         return images;

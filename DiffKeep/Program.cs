@@ -166,7 +166,7 @@ sealed class Program
         services.AddSingleton<LibraryWatcherService>();
         services.AddSingleton<ImageLibraryScanner>();
         services.AddSingleton<PngMetadataParser>();
-        services.AddSingleton<IEmbeddingGenerationService, LlamaSharpEmbeddingGenerateService>();
+        services.AddSingleton<ITextEmbeddingGenerationService, LlamaSharpTextTextEmbeddingGenerationService>();
         services.AddSingleton<IImageService>(sp =>
             new ImageService(sp.GetRequiredService<IImageRepository>())
         );

@@ -7,31 +7,39 @@ using DiffKeep.Repositories;
 
 namespace DiffKeep.Services;
 
+public enum SearchTypeEnum
+{
+    FullText,
+    Semantic,
+    Hybrid
+}
+
 public class SearchService
 {
-    private readonly IEmbeddingGenerationService _embeddingService;
+    private readonly ITextEmbeddingGenerationService _textEmbeddingService;
     private readonly IEmbeddingsRepository _embeddingsRepository;
     private readonly IImageRepository _imageRepository;
 
     public SearchService(
-        IEmbeddingGenerationService embeddingService,
+        ITextEmbeddingGenerationService textEmbeddingService,
         IEmbeddingsRepository embeddingsRepository,
         IImageRepository imageRepository)
     {
-        _embeddingService = embeddingService;
+        _textEmbeddingService = textEmbeddingService;
         _embeddingsRepository = embeddingsRepository;
         _imageRepository = imageRepository;
     }
     
-    public async Task<IEnumerable<Image>> TextSearchImagesAsync(string searchText, long? libraryId = null, string? path = null)
+    public async Task<IEnumerable<Image>> TextSearchImagesAsync(string searchText, long? libraryId = null,
+        string? path = null, SearchTypeEnum searchType = SearchTypeEnum.FullText)
     {
-        if (!Program.Settings.UseEmbeddings)
+        if (searchType ==  SearchTypeEnum.FullText)
         {
             // search using FTS
             return await _imageRepository.SearchByPromptAsync(searchText, libraryId, path);
         }
         
-        var searchResults = await SearchByTextAsync(searchText, libraryId, path);
+        var searchResults = await SearchByTextAsync(searchText, libraryId, path, searchType);
         return searchResults.Select(result => new Image
         {
             Id = result.ImageId,
@@ -41,10 +49,11 @@ public class SearchService
         });
     }
 
-    private async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText, long? libraryId = null, string? path = null)
+    private async Task<IEnumerable<(long ImageId, string Path, float Score)>> SearchByTextAsync(string searchText,
+        long? libraryId = null, string? path = null, SearchTypeEnum searchType = SearchTypeEnum.Semantic)
     {
         // Generate embedding for the search text
-        var embeddings = await _embeddingService.GenerateEmbeddingAsync(searchText);
+        var embeddings = await _textEmbeddingService.GenerateEmbeddingAsync(searchText);
         
         // Since GenerateEmbeddingAsync returns IReadOnlyList<float[]>, we'll use the first embedding
         // Typically for text embeddings, we expect a single embedding vector
@@ -53,7 +62,13 @@ public class SearchService
             return new List<(long ImageId, string Path, float Score)>();
         }
 
-        // Search for similar vectors in the repository
-        return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0], 1000, libraryId, path);
+        if (searchType == SearchTypeEnum.Semantic)
+        {
+             return await _embeddingsRepository.SearchSimilarByVectorAsync(embeddings[0], _textEmbeddingService.ModelName(), 1000, libraryId, path);
+        }
+
+        // Otherwise, it's hybrid search
+        return await _embeddingsRepository.SearchCombinedAsync(searchText,
+            embeddings[0], _textEmbeddingService.ModelName(), _textEmbeddingService.EmbeddingSize(), 0.7f, 0.3f, 1000, libraryId, path);
     }
 }

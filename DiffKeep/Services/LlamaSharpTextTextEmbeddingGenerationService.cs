@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using LLama;
@@ -11,9 +10,9 @@ using LLama.Native;
 
 namespace DiffKeep.Services;
 
-public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
+public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenerationService
 {
-    private const string DefaultModel = "gte-large.Q6_K.gguf";
+    private const string DefaultModel = "bge-small-en-v1.5.Q8_0.gguf";
     private LLamaWeights? _loadedModel;
     private LLamaEmbedder? _embedder;
     private LLamaContext? _context;
@@ -21,7 +20,7 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
     private ModelParams? _modelParams;
     private readonly SemaphoreSlim _modelLock = new SemaphoreSlim(1, 1);
     private readonly SemaphoreSlim _generatingLock = new SemaphoreSlim(1, 1);
-    private string _modelName;
+    private string _modelName = Path.GetFileNameWithoutExtension(DefaultModel);
 
     private async Task LoadModelInternalAsync(string modelPath, bool isEmbeddingModel = true)
     {
@@ -51,6 +50,22 @@ public class LlamaSharpEmbeddingGenerateService : IEmbeddingGenerationService
     public string ModelName()
     {
         return _modelName;
+    }
+
+    public int EmbeddingSize()
+    {
+        if (_embedder == null)
+        {
+            // Load the model synchronously if it's not loaded yet
+            LoadModelAsync(DefaultModel).GetAwaiter().GetResult();
+        }
+    
+        if (_embedder == null)
+        {
+            throw new InvalidOperationException("Failed to load the model");
+        }
+    
+        return _embedder.EmbeddingSize;
     }
 
     public async Task LoadModelAsync(string modelPath, bool isEmbeddingModel = true)

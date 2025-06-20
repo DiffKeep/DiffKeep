@@ -17,7 +17,7 @@ namespace DiffKeep.ViewModels;
 
 public partial class EmbeddingsGenerationViewModel : ViewModelBase
 {
-    private readonly IEmbeddingGenerationService _embeddingService;
+    private readonly ITextEmbeddingGenerationService _textEmbeddingService;
     private readonly IEmbeddingsRepository _embeddingsRepository;
     private readonly ConcurrentQueue<GenerateEmbeddingMessage> _embeddingQueue;
     [ObservableProperty] private bool _isProcessing;
@@ -29,10 +29,10 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
     public ObservableCollection<ProcessingItem> ProcessingItems { get; }
 
     public EmbeddingsGenerationViewModel(
-        IEmbeddingGenerationService embeddingService,
+        ITextEmbeddingGenerationService textEmbeddingService,
         IEmbeddingsRepository embeddingsRepository)
     {
-        _embeddingService = embeddingService;
+        _textEmbeddingService = textEmbeddingService;
         _embeddingsRepository = embeddingsRepository;
         _embeddingQueue = new ConcurrentQueue<GenerateEmbeddingMessage>();
 
@@ -80,12 +80,13 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
 
                 try
                 {
-                    var embeddings = await _embeddingService.GenerateEmbeddingAsync(message.Text);
+                    var embeddings = await _textEmbeddingService.GenerateEmbeddingAsync(message.Text);
 
                     // Add all embeddings for this message to the batch
                     foreach (var embedding in embeddings)
                     {
-                        batch.Add((message.ImageId, message.EmbeddingSource, _embeddingService.ModelName(), embedding));
+                        batch.Add((message.ImageId, message.EmbeddingSource, _textEmbeddingService.ModelName(),
+                            embedding));
                     }
 
                     // If we've reached the batch size or this is the last item, process the batch
@@ -126,6 +127,10 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
             {
                 await _embeddingsRepository.StoreBatchEmbeddingsAsync(batch);
             }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error while generating embedding: {ex.Message}");
         }
         finally
         {

@@ -11,6 +11,7 @@ using System;
 using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Threading;
 using DiffKeep.Services;
 
 namespace DiffKeep.ViewModels;
@@ -51,19 +52,13 @@ public partial class LeftPanelViewModel : ViewModelBase
 
     public async Task WaitInitializeAsync()
     {
-        if (Application.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        await Dispatcher.UIThread.InvokeAsync(async () => 
         {
-            while (desktop.MainWindow is not { IsVisible: true })
-            {
-                // async sleep
-                await Task.Delay(100);
-            }
-            // give the window some time to set up
-            Debug.WriteLine("Application Initialized, pausing for paint");
-            await Task.Delay(500);
-            Debug.WriteLine("Main window is visible, initializing tree items");
-            await InitializeTreeItemsAsync();
-        }
+            // if we don't run this on the UI thread, it duplicates the libraries in the left pane,
+            // even though the task is immediately foisted onto another thread. don't ask me, but it works.
+            await Task.Run(InitializeTreeItemsAsync);
+        });
+
     }
 
     private void OnScanProgress(object? sender, ScanProgressEventArgs e)
@@ -104,12 +99,12 @@ public partial class LeftPanelViewModel : ViewModelBase
     public async Task RefreshLibrariesAsync()
     {
         Debug.WriteLine("Refreshing libraries");
-        Items.Clear();
         await InitializeTreeItemsAsync();
     }
 
     private async Task InitializeTreeItemsAsync()
     {
+        Debug.WriteLine("Initializing libraries");
         var libraries = await _libraryRepository.GetAllAsync();
         
         // Create the top-level "Libraries" item
