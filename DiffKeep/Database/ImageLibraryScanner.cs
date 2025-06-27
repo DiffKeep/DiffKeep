@@ -9,11 +9,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media.Imaging;
 using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Models;
 using DiffKeep.Parsing;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using ShadUI.Toasts;
 
 namespace DiffKeep.Database;
 
@@ -23,6 +25,7 @@ public class ImageLibraryScanner
     private readonly IImageRepository _imageRepository;
     private readonly ImageParser _imageParser;
     private readonly ITextEmbeddingGenerationService _textEmbeddingGenerationService;
+    private readonly ToastManager _toastManager;
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _scanCancellations = new();
     public const int ThumbnailSize = 200;
     private const int MaxConcurrentThumbnails = 16;
@@ -35,12 +38,14 @@ public class ImageLibraryScanner
         ILibraryRepository libraryRepository,
         IImageRepository imageRepository,
         ImageParser imageParser,
-        ITextEmbeddingGenerationService textEmbeddingGenerationService)
+        ITextEmbeddingGenerationService textEmbeddingGenerationService,
+        ToastManager toastManager)
     {
         _libraryRepository = libraryRepository;
         _imageRepository = imageRepository;
         _imageParser = imageParser;
         _textEmbeddingGenerationService = textEmbeddingGenerationService;
+        _toastManager = toastManager;
     }
 
     public void CancelScan(long libraryId)
@@ -155,7 +160,7 @@ public class ImageLibraryScanner
             throw;
         }
 
-        OnScanCompleted(library.Id, processedFiles);
+        OnScanCompleted(library.Id, processedFiles).FireAndForget();
         if (foundNewFiles)
             WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(library.Id));
         return;
@@ -210,7 +215,7 @@ public class ImageLibraryScanner
         ScanProgress?.Invoke(this, new ScanProgressEventArgs(libraryId, processedFiles, totalFiles));
     }
 
-    private void OnScanCompleted(long libraryId, int processedFiles)
+    private async Task OnScanCompleted(long libraryId, int processedFiles)
     {
         ScanCompleted?.Invoke(this, new ScanCompletedEventArgs(libraryId, processedFiles));
         
@@ -219,7 +224,7 @@ public class ImageLibraryScanner
         
         Debug.WriteLine($"Finished scanning library {libraryId}, checking for images without embeddings");
         // find and queue all images in the library that don't have embeddings
-        Task.Run(async () =>
+        await Task.Run(async () =>
         {
             try
             {
@@ -243,6 +248,14 @@ public class ImageLibraryScanner
             catch (Exception ex)
             {
                 Debug.Print($"Error queuing embeddings generation: {ex}");
+                // Dispatch to UI thread before showing toast
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => {
+                    _toastManager.CreateToast("Semantic search error")
+                        .WithContent($"Semantic search is enabled, but the indexing failed: {ex.Message}")
+                        .WithAction("Open Settings",
+                            () => WeakReferenceMessenger.Default.Send(new ShowSettingsMessage()))
+                        .ShowError();
+                });
             }
         });
     }

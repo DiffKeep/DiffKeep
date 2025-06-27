@@ -244,7 +244,11 @@ public partial class ImageGalleryViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _toastManager.CreateToast("Error searching images").WithContent(ex.Message).DismissOnClick().ShowError();
+            _toastManager.CreateToast("Error searching images")
+                .WithContent(ex.Message)
+                .WithAction("Open Settings",
+                    () => WeakReferenceMessenger.Default.Send(new ShowSettingsMessage()))
+                .ShowError();
             Debug.WriteLine(ex.Message);
         }
     }

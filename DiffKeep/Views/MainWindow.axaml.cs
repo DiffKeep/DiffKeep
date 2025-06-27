@@ -6,8 +6,12 @@ using System.Text.Json;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
+using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Extensions;
+using DiffKeep.Messages;
 using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
@@ -56,6 +60,12 @@ public partial class MainWindow : Window
         {
             vm.WindowWidth = Bounds.Width;
         }
+        
+        // Listen for messages to show the settings dialog
+        WeakReferenceMessenger.Default.Register<ShowSettingsMessage>(this, (r, m) =>
+        {
+            _showSettingsDialog();
+        });
     }
     
     protected override async void OnLoaded(RoutedEventArgs e)
@@ -178,6 +188,11 @@ public partial class MainWindow : Window
     }
     
     private async void ShowSettingsDialog(object? sender, RoutedEventArgs e)
+    {
+        _showSettingsDialog();
+    }
+
+    private async void _showSettingsDialog()
     {
         var settingsVm = Program.Services.GetRequiredService<SettingsViewModel>();
         var dialog = new SettingsWindow
