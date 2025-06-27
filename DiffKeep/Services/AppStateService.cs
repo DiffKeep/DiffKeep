@@ -4,6 +4,7 @@ using System.IO;
 using System.Text.Json;
 using Avalonia.Threading;
 using DiffKeep.Views;
+using Serilog;
 
 namespace DiffKeep.Services
 {
@@ -36,18 +37,17 @@ namespace DiffKeep.Services
                     var json = File.ReadAllText(_stateFilePath);
                     _currentState = JsonSerializer.Deserialize(json, JsonContext.Default.WindowState)
                         ?? new WindowState();
-                    Debug.WriteLine("Loaded window state");
-                    Debug.WriteLine($"Loaded left panel width: {_currentState.LeftPanelWidth}");
+                    Log.Debug("Loaded window state");
                 }
                 catch
                 {
-                    Debug.WriteLine("Failed to read windowstate");
+                    Log.Error("Failed to read windowstate");
                     _currentState = new WindowState();
                 }
             }
             else
             {
-                Debug.WriteLine("Windowstate not found");
+                Log.Warning("Windowstate file not found");
                 _currentState = new WindowState();
             }
 
@@ -63,8 +63,7 @@ namespace DiffKeep.Services
         {
             lock (_stateLock)
             {
-                Debug.WriteLine("Getting window state");
-                Debug.WriteLine($"Saved left panel width: {_currentState.LeftPanelWidth}");
+                Log.Debug("Getting window state");
                 // Return a copy to prevent external modification without going through SaveState
                 return (WindowState)_currentState.Clone();
             }
@@ -75,9 +74,7 @@ namespace DiffKeep.Services
             lock (_stateLock)
             {
                 var toSave = (WindowState)state.Clone();
-                Debug.WriteLine("Queuing window state save...");
-                Debug.WriteLine($"Passed left panel width: {toSave.LeftPanelWidth}");
-                Debug.WriteLine($"Current left panel width: {_currentState.LeftPanelWidth}");
+                Log.Debug("Queuing window state save...");
                 if (toSave.LeftPanelWidth == 0)
                 {
                     toSave.LeftPanelWidth = _currentState.LeftPanelWidth;
@@ -105,7 +102,7 @@ namespace DiffKeep.Services
                 stateToSave = (WindowState)_currentState.Clone(); // Create a copy for saving
             }
             
-            Debug.WriteLine("Performing actual window state save to disk");
+            Log.Debug("Performing actual window state save to disk");
             try
             {
                 var directory = Path.GetDirectoryName(_stateFilePath);
@@ -119,7 +116,7 @@ namespace DiffKeep.Services
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error saving state: {ex.Message}");
+                Log.Error("Error saving state: {ExMessage}", ex.Message);
                 // Ignore errors during save
             }
         }
@@ -128,7 +125,7 @@ namespace DiffKeep.Services
         {
             lock (_stateLock)
             {
-                Debug.WriteLine($"Updating info panel visibility to {isVisible}");
+                Log.Debug("Updating info panel visibility to {IsVisible}", isVisible);
                 _currentState.ImageViewerInfoPanelOpen = isVisible;
                 // We already have the lock, so we can call SaveState
                 // which will also acquire the lock, but that's okay with lock statement
@@ -140,7 +137,7 @@ namespace DiffKeep.Services
         {
             lock (_stateLock)
             {
-                Debug.WriteLine($"Getting info panel visibility: {_currentState.ImageViewerInfoPanelOpen}");
+                Log.Debug("Getting info panel visibility: {CurrentStateImageViewerInfoPanelOpen}", _currentState.ImageViewerInfoPanelOpen);
                 return _currentState.ImageViewerInfoPanelOpen;
             }
         }

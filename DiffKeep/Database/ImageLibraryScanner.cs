@@ -15,6 +15,7 @@ using DiffKeep.Models;
 using DiffKeep.Parsing;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using Serilog;
 using ShadUI.Toasts;
 
 namespace DiffKeep.Database;
@@ -80,8 +81,8 @@ public class ImageLibraryScanner
         var files = Directory.EnumerateFiles(library.Path, "*.png", SearchOption.AllDirectories);
         var totalFiles = Directory.GetFiles(library.Path, "*.png", SearchOption.AllDirectories).Length;
         var processedFiles = 0;
-        Debug.Print($"Scanning library {library.Id} ({library.Path})");
-        Debug.Print($"Found {totalFiles} files");
+        Log.Debug("Scanning library {LibraryId} ({LibraryPath})", library.Id, library.Path);
+        Log.Debug("Found {TotalFiles} files", totalFiles);
         var foundNewFiles = false;
 
         using var semaphore = new SemaphoreSlim(MaxConcurrentThumbnails);
@@ -121,12 +122,12 @@ public class ImageLibraryScanner
                                     imageBatch.Add(image);
                                     foundNewFiles = true;
                                 }
-                                Debug.Print($"Processed {file}");
+                                Log.Verbose("Processed {File}", file);
                             }
                         }
                         catch (Exception ex)
                         {
-                            Debug.Print($"Error processing file {file}: {ex}");
+                            Log.Error("Error processing file {File}: {Exception}", file, ex);
                         }
                         finally
                         {
@@ -139,7 +140,7 @@ public class ImageLibraryScanner
             }
             catch (Exception ex)
             {
-                Debug.Print($"Error processing file {file}: {ex.Message}");
+                Log.Error("Error processing file {File}: {ExMessage}", file, ex.Message);
             }
 
             processedFiles++;
@@ -156,7 +157,7 @@ public class ImageLibraryScanner
         }
         catch (Exception ex)
         {
-            Debug.Print($"Error during batch processing: {ex}");
+            Log.Error("Error during batch processing: {Exception}", ex);
             throw;
         }
 
@@ -171,7 +172,7 @@ public class ImageLibraryScanner
             {
                 var batchToProcess = imageBatch.ToList();
                 await _imageRepository.AddBatchAsync(batchToProcess);
-                Debug.Print($"Inserted batch of {batchToProcess.Count} images");
+                Log.Information("Inserted batch of {Count} images", batchToProcess.Count);
                 imageBatch.Clear();
             }
         }
@@ -184,7 +185,7 @@ public class ImageLibraryScanner
         var foundImages = dbImage as Image[] ?? dbImage.ToArray();
         if (foundImages.Length == 1)
         {
-            Debug.WriteLine($"Existing image found for {image?.Path}, updating image");
+            Log.Debug("Existing image found for {ImagePath}, updating image", image?.Path);
             var i = foundImages.First();
             if (image != null)
             {
@@ -194,7 +195,7 @@ public class ImageLibraryScanner
         }
         else
         {
-            Debug.WriteLine($"No previous image found for {image?.Path}, inserting image");
+            Log.Debug("No previous image found for {ImagePath}, inserting image", image?.Path);
             if (image != null) await _imageRepository.AddAsync(image);
             // get the image we just added, so we have the ID
             var addedImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
@@ -222,7 +223,7 @@ public class ImageLibraryScanner
         if (!Program.Settings.UseEmbeddings)
             return;
         
-        Debug.WriteLine($"Finished scanning library {libraryId}, checking for images without embeddings");
+        Log.Information("Finished scanning library {LibraryId}, checking for images without embeddings", libraryId);
         // find and queue all images in the library that don't have embeddings
         await Task.Run(async () =>
         {
@@ -231,7 +232,7 @@ public class ImageLibraryScanner
                 // Get all images from this library
                 var images = await _imageRepository.GetImagesWithoutEmbeddingsAsync(_textEmbeddingGenerationService.ModelName(), _textEmbeddingGenerationService.EmbeddingSize(), libraryId);
                 var imageArray = images as Image[] ?? images.ToArray();
-                Debug.WriteLine($"Found {imageArray.Length} images in library {libraryId} without embeddings");
+                Log.Information("Found {ImageArrayLength} images in library {LibraryId} without embeddings", imageArray.Length, libraryId);
             
                 // Filter for images that have a positive prompt but no embedding
                 foreach (var image in imageArray)
@@ -247,7 +248,7 @@ public class ImageLibraryScanner
             }
             catch (Exception ex)
             {
-                Debug.Print($"Error queuing embeddings generation: {ex}");
+                Log.Error("Error queuing embeddings generation: {Exception}", ex);
                 // Dispatch to UI thread before showing toast
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => {
                     _toastManager.CreateToast("Semantic search error")
@@ -265,7 +266,7 @@ public class ImageLibraryScanner
         var hash = await Hash(file);
         if (string.IsNullOrEmpty(hash))
         {
-            Debug.Print($"Failed to generate hash for file: {file}");
+            Log.Error("Failed to generate hash for file: {File}", file);
             return null;
         }
 
@@ -281,7 +282,7 @@ public class ImageLibraryScanner
             }
             catch (Exception ex)
             {
-                Debug.Print($"Failed to generate thumbnail for {file}: {ex.Message}");
+                Log.Error("Failed to generate thumbnail for {File}: {ExMessage}", file, ex.Message);
                 return null;
             }
         }

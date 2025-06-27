@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using LLama;
 using LLama.Common;
 using LLama.Native;
+using Serilog;
 
 namespace DiffKeep.Services;
 
@@ -29,7 +30,7 @@ public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenera
     {
         var fullModelPath = Path.Join(Program.DataPath, "models", modelPath);
         _isEmbeddingModel = isEmbeddingModel;
-        Debug.WriteLine($"Loading model: {fullModelPath}. EmbeddingModel: {_isEmbeddingModel}");
+        Log.Debug("Loading model: {FullModelPath}. EmbeddingModel: {IsEmbeddingModel}", fullModelPath, _isEmbeddingModel);
 
         var parameters = new ModelParams(fullModelPath)
         {
@@ -46,7 +47,7 @@ public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenera
 
         _loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
         _embedder = new LLamaEmbedder(_loadedModel, parameters);
-        Debug.WriteLine($"Loaded model: {fullModelPath}");
+        Log.Debug("Loaded model: {FullModelPath}", fullModelPath);
         _modelName = Path.GetFileNameWithoutExtension(fullModelPath);
     }
 

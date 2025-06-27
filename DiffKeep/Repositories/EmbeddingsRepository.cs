@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using DiffKeep.Database;
 using DiffKeep.Models;
 using Microsoft.Data.Sqlite;
+using Serilog;
 
 namespace DiffKeep.Repositories;
 
@@ -150,7 +151,7 @@ public class EmbeddingsRepository : IEmbeddingsRepository
         }
 
         var results = resultDict.Values.ToList();
-        Debug.WriteLine($"Search returned {results.Count} results with a limit of {limit}");
+        Log.Debug("Search returned {ResultsCount} results with a limit of {Limit}", results.Count, limit);
 
         return results;
     }

@@ -8,6 +8,7 @@ using DiffKeep.Extensions;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Microsoft.Extensions.DependencyInjection;
+using Serilog;
 using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
@@ -56,7 +57,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && LeftPanel.SelectedItem != null)
             {
-                Debug.WriteLine("Loading images for library called from main window");
+                Log.Debug("Loading images for library called from main window");
                 await Task.Delay(100);
                 ImageGallery.LoadImagesAsync(LeftPanel.SelectedItem).FireAndForget();
             }
@@ -70,7 +71,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     partial void OnLeftPanelWidthChanged(GridLength value)
     {
-        Debug.Print($"Left panel width is now {value}");
+        Log.Debug("Left panel width is now {GridLength}", value);
         // Calculate max width (50% of window width)
         double maxWidth = WindowWidth * 0.5;
 
@@ -95,7 +96,7 @@ public partial class MainWindowViewModel : ViewModelBase
     public void UpdateWindowSize(double width)
     {
         if (width <= 0) return;
-        Debug.Print($"Window width is now {width}");
+        Log.Debug("Window width is now {Width}", width);
         WindowWidth = width;
             
         // Check if current left panel width exceeds the new max width

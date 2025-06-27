@@ -17,6 +17,7 @@ using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using Serilog;
 using ShadUI.Toasts;
 using Image = DiffKeep.Models.Image;
 
@@ -106,7 +107,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         // Subscribe to library updated messages
         WeakReferenceMessenger.Default.Register<LibraryUpdatedMessage>(this, (r, m) =>
         {
-            Debug.WriteLine($"Received message for library updated for library ID {m.LibraryId}");
+            Log.Debug("Received message for library updated for library ID {MessageLibraryId}", m.LibraryId);
             if (_currentLibraryId == m.LibraryId || _currentLibraryId == null)
             {
                 LoadImagesAsync(null, true).FireAndForget();
@@ -116,7 +117,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         // Subscribe to image deleted messages
         WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
         {
-            Debug.WriteLine($"Gallery deleting from images {m.ImagePath}");
+            Log.Debug("Gallery deleting from images {MessageImagePath}", m.ImagePath);
             var imageToRemove = Images.FirstOrDefault(img => img.Path == m.ImagePath);
             if (imageToRemove is not null)
             {
@@ -161,7 +162,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             _currentName = item.Name;
         }
 
-        Debug.WriteLine($"Loading images for library {_currentLibraryId}, path: {_currentPath}");
+        Log.Debug("Loading images for library {CurrentLibraryId}, path: {CurrentPath}", _currentLibraryId, _currentPath);
         IsLoading = true;
 
         try
@@ -222,7 +223,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
                 if (ImagesCollectionChanged != null)
                 {
-                    Debug.WriteLine("Images collection changed");
+                    Log.Debug("Images collection changed");
                     ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
                 }
             });
@@ -236,7 +237,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
     [RelayCommand]
     private async Task SearchPrompts()
     {
-        Debug.WriteLine($"Searching images for {SearchText}");
+        Log.Debug("Searching images for {S}", SearchText);
         ResetScrollRequested?.Invoke();
         try
         {
@@ -249,7 +250,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 .WithAction("Open Settings",
                     () => WeakReferenceMessenger.Default.Send(new ShowSettingsMessage()))
                 .ShowError();
-            Debug.WriteLine(ex.Message);
+            Log.Error("Error searching for images: {ExMessage}", ex.Message);
         }
     }
 
@@ -263,7 +264,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
     [RelayCommand]
     private Task SortImagesAsync(ImageSortOption sortOption)
     {
-        Debug.WriteLine($"Sorting images by {sortOption}");
+        Log.Debug("Sorting images by {ImageSortOption}", sortOption);
         if (CurrentSortOption == sortOption) return Task.CompletedTask;
 
         CurrentSortOption = sortOption;
@@ -272,15 +273,15 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
     partial void OnCurrentSortOptionChanged(ImageSortOption value)
     {
-        Debug.WriteLine($"Current sort option changed to {value}");
+        Log.Debug("Current sort option changed to {ImageSortOption}", value);
         LoadImagesAsync(null).FireAndForget();
     }
 
     public async Task UpdateVisibleThumbnails(IEnumerable<ImageItemViewModel> visibleImages)
     {
         var visibleImageArray = visibleImages as ImageItemViewModel[] ?? visibleImages.ToArray();
-        Debug.WriteLine($"Updating visible thumbnails for {visibleImageArray.Count()} images");
-        Debug.WriteLine($"Size of thumbnails currently: {Thumbnails?.Count}");
+        Log.Debug("Updating visible thumbnails for {Count} images", visibleImageArray.Count());
+        Log.Debug("Size of thumbnails currently: {ThumbnailsCount}", Thumbnails?.Count);
         
         // Cancel any ongoing thumbnail generation
         _thumbnailCancellationTokenSource?.Cancel();
@@ -304,7 +305,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             if (Program.Settings.StoreThumbnails)
             {
                 // Database-stored thumbnail scenario
-                Debug.WriteLine("Fetching thumbnails from database");
+                Log.Debug("Fetching thumbnails from database");
                 var dbThumbnails = await _imageRepository
                     .GetThumbnailsByIdsAsync(visibleIds);
                 
@@ -335,7 +336,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 // Generate missing thumbnails
                 try
                 {
-                    Debug.WriteLine($"Generating thumbnails for {missingImages.Length} images");
+                    Log.Debug("Generating thumbnails for {MissingImagesLength} images", missingImages.Length);
                     await Parallel.ForEachAsync(
                         missingImages,
                         new ParallelOptions
@@ -373,22 +374,22 @@ public partial class ImageGalleryViewModel : ViewModelBase
                             }
                             else
                             {
-                                Debug.WriteLine($"Could not find image for path {image.Path}");
+                                Log.Debug("Could not find image for path {ImagePath}", image.Path);
                             }
                         });
                 }
                 catch (OperationCanceledException)
                 {
-                    Debug.WriteLine("Thumbnail generation was cancelled");
+                    Log.Debug("Thumbnail generation was cancelled");
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Error generating thumbnails: {ex.Message}");
+                    Log.Debug("Error generating thumbnails: {ExMessage}", ex.Message);
                 }
             }
         }, cancellationToken);
         
-        Debug.WriteLine($"Finished fetching thumbnails for {visibleImageArray.Length} images");
+        Log.Debug("Finished fetching thumbnails for {Length} images", visibleImageArray.Length);
     }
     
     private void CleanupThumbnails(object? state)
@@ -421,7 +422,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             
             if (keysToRemove.Count > 0)
             {
-                Debug.WriteLine($"Cleaning up {keysToRemove.Count} expired thumbnails");
+                Log.Debug("Cleaning up {Count} expired thumbnails", keysToRemove.Count);
                 
                 // Process removals in batches to reduce UI impact
                 const int batchSize = 10;
@@ -455,7 +456,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error during thumbnail cleanup: {ex.Message}");
+            Log.Debug("Error during thumbnail cleanup: {ExMessage}", ex.Message);
         }
         finally
         {
@@ -596,7 +597,7 @@ public partial class ImageItemViewModel : ViewModelBase
         }
         else
         {
-            Debug.WriteLine("Cound not get gallery view model when trying to update thumbnail");
+            Log.Error("Cound not get gallery view model when trying to update thumbnail");
         }
     }
 

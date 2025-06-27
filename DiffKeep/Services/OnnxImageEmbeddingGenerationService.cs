@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Newtonsoft.Json;
+using Serilog;
 
 namespace DiffKeep.Services;
 
@@ -70,20 +71,20 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
             _textEncoderSession = new InferenceSession(fullModelPath, sessionOptions);
 
             // Print model input and output information for debugging
-            Debug.WriteLine("Model Inputs:");
+            Log.Debug("Model Inputs:");
             foreach (var input in _textEncoderSession.InputMetadata)
             {
-                Debug.WriteLine($"  - Name: {input.Key}");
-                Debug.WriteLine($"    Type: {input.Value.ElementType}");
-                Debug.WriteLine($"    Shape: {string.Join(",", input.Value.Dimensions)}");
+                Log.Debug("  - Name: {InputKey}", input.Key);
+                Log.Debug("    Type: {ValueElementType}", input.Value.ElementType);
+                Log.Debug("    Shape: {Join}", string.Join(",", input.Value.Dimensions));
             }
 
-            Debug.WriteLine("Model Outputs:");
+            Log.Debug("Model Outputs:");
             foreach (var output in _textEncoderSession.OutputMetadata)
             {
-                Debug.WriteLine($"  - Name: {output.Key}");
-                Debug.WriteLine($"    Type: {output.Value.ElementType}");
-                Debug.WriteLine($"    Shape: {string.Join(",", output.Value.Dimensions)}");
+                Log.Debug("  - Name: {OutputKey}", output.Key);
+                Log.Debug("    Type: {ValueElementType}", output.Value.ElementType);
+                Log.Debug("    Shape: {Join}", string.Join(",", output.Value.Dimensions));
             }
         });
     }
@@ -97,15 +98,15 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
 
         return await Task.Run(() =>
         {
-            Console.WriteLine($"\n===== GENERATING EMBEDDING FOR: '{text}' =====");
+            Log.Verbose("===== GENERATING EMBEDDING FOR: '{Text}' =====", text);
 
             // Tokenize input text
             var tokenizedInput = _tokenizer.Tokenize(text, _maxTokens);
 
-            Console.WriteLine("\nFirst 10 token IDs:");
+            Log.Verbose("First 10 token IDs:");
             for (int i = 0; i < Math.Min(10, tokenizedInput.Length); i++)
             {
-                Console.WriteLine($"  [{i}]: {tokenizedInput[i]}");
+                Log.Verbose("  [{I}]: {L}", i, tokenizedInput[i]);
             }
 
             // Create input tensor for tokens
@@ -119,10 +120,10 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
                 attentionMask[i] = tokenizedInput[i] != 0 ? 1 : 0;
             }
 
-            Console.WriteLine("\nAttention mask (first 10 values):");
+            Log.Verbose("Attention mask (first 10 values):");
             for (int i = 0; i < Math.Min(10, attentionMask.Length); i++)
             {
-                Console.WriteLine($"  [{i}]: {attentionMask[i]}");
+                Log.Verbose("  [{I}]: {L}", i, attentionMask[i]);
             }
 
             var attentionMaskTensor = new DenseTensor<long>(attentionMask, new[] { 1, _maxTokens });
@@ -131,7 +132,7 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
             var pixelValues = new float[1 * 3 * 224 * 224]; // All zeros by default
             var pixelValuesTensor = new DenseTensor<float>(pixelValues, new[] { 1, 3, 224, 224 });
 
-            Console.WriteLine("\nUsing zero-filled pixel values");
+            Log.Verbose("Using zero-filled pixel values");
 
             // Create input data for the model
             var inputs = new List<NamedOnnxValue>
@@ -141,15 +142,15 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
                 NamedOnnxValue.CreateFromTensor("pixel_values", pixelValuesTensor)
             };
 
-            Console.WriteLine("\nRunning model inference...");
+            Log.Debug("Running model inference...");
 
             // Run inference
             using var outputs = _textEncoderSession.Run(inputs);
 
-            Console.WriteLine("\nModel outputs:");
+            Log.Verbose("Model outputs:");
             foreach (var output in outputs)
             {
-                Console.WriteLine($"  - {output.Name}");
+                Log.Verbose("  - {OutputName}", output.Name);
             }
 
             // Try different outputs to see if any of them contain text-specific embeddings
@@ -166,18 +167,18 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
                     throw new InvalidOperationException("Could not find any suitable embeddings in model output");
                 }
 
-                Console.WriteLine($"Using '{textEmbedsOutput.Name}' as embedding source");
+                Log.Debug("Using '{Name}' as embedding source", textEmbedsOutput.Name);
             }
 
             var textEmbedsTensor = textEmbedsOutput.AsTensor<float>();
 
-            Console.WriteLine($"\nText embedding shape: {string.Join("x", textEmbedsTensor.Dimensions.ToString())}");
+            Log.Verbose("Text embedding shape: {Join}", string.Join("x", textEmbedsTensor.Dimensions.ToString()));
 
             // Debug the embedding values
-            Console.WriteLine("\nFirst 10 embedding values:");
+            Log.Verbose("First 10 embedding values:");
             for (int i = 0; i < Math.Min(10, textEmbedsTensor.Dimensions[1]); i++)
             {
-                Console.WriteLine($"  [{i}]: {textEmbedsTensor[0, i]}");
+                Log.Verbose("  [{I}]: {F}", i, textEmbedsTensor[0, i]);
             }
 
             // Calculate L2 norm to verify normalization
@@ -188,7 +189,7 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
             }
 
             double l2Norm = Math.Sqrt(sumSquared);
-            Console.WriteLine($"\nL2 norm of embedding: {l2Norm}");
+            Log.Verbose("L2 norm of embedding: {L2Norm}", l2Norm);
 
             // Extract the embedding vector
             var embedding = new float[textEmbedsTensor.Dimensions[1]];
@@ -257,18 +258,18 @@ internal class ClipTokenizerHelper
 
         if (_debug)
         {
-            Console.WriteLine($"Loaded vocabulary with {_vocabDict.Count} tokens");
-            Console.WriteLine(
-                $"Start token ID: {(_vocabDict.TryGetValue(StartToken, out int startId) ? startId.ToString() : "Not found")}");
-            Console.WriteLine(
-                $"End token ID: {(_vocabDict.TryGetValue(EndToken, out int endId) ? endId.ToString() : "Not found")}");
+            Log.Verbose("Loaded vocabulary with {VocabDictCount} tokens", _vocabDict.Count);
+            Log.Verbose(
+                "Start token ID: {NotFound}", _vocabDict.TryGetValue(StartToken, out int startId) ? startId.ToString() : "Not found");
+            Log.Verbose(
+                "End token ID: {NotFound}", _vocabDict.TryGetValue(EndToken, out int endId) ? endId.ToString() : "Not found");
 
             // Print a few sample vocabulary items
-            Console.WriteLine("Sample vocabulary items:");
+            Log.Verbose("Sample vocabulary items:");
             int count = 0;
             foreach (var item in _vocabDict)
             {
-                Console.WriteLine($"  {item.Key}: {item.Value}");
+                Log.Verbose("  {ItemKey}: {ItemValue}", item.Key, item.Value);
                 if (++count >= 10) break;
             }
         }
@@ -289,19 +290,19 @@ internal class ClipTokenizerHelper
 
         if (_debug)
         {
-            Console.WriteLine($"Loaded {_merges.Count} merge rules");
+            Log.Verbose("Loaded {MergesCount} merge rules", _merges.Count);
             // Print a few sample merges
-            Console.WriteLine("Sample merge rules:");
+            Log.Verbose("Sample merge rules:");
             for (int i = 0; i < Math.Min(10, _merges.Count); i++)
             {
-                Console.WriteLine($"  {_merges[i].Item1} + {_merges[i].Item2}");
+                Log.Verbose("  {Item1} + {Item2}", _merges[i].Item1, _merges[i].Item2);
             }
         }
     }
 
     public long[] Tokenize(string text, int maxTokens)
     {
-        if (_debug) Console.WriteLine($"\nTokenizing text: '{text}'");
+        if (_debug) Log.Verbose("\nTokenizing text: '{Text}'", text);
 
         // Apply BPE tokenization
         var tokens = new List<int>();
@@ -310,7 +311,7 @@ internal class ClipTokenizerHelper
         if (_vocabDict.TryGetValue(StartToken, out int startTokenId))
         {
             tokens.Add(startTokenId);
-            if (_debug) Console.WriteLine($"Added start token: {startTokenId}");
+            if (_debug) Log.Verbose("Added start token: {StartTokenId}", startTokenId);
         }
 
         // CLIP tokenizer uses basic whitespace tokenization followed by BPE
@@ -319,23 +320,23 @@ internal class ClipTokenizerHelper
         text = System.Text.RegularExpressions.Regex.Replace(text, @"([.,!?()])", " $1 ");
         text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
 
-        if (_debug) Console.WriteLine($"Preprocessed text: '{text}'");
+        if (_debug) Log.Verbose("Preprocessed text: '{Text}'", text);
 
         // Tokenize text using BPE
         foreach (var word in text.Split(' '))
         {
             if (string.IsNullOrWhiteSpace(word)) continue;
 
-            if (_debug) Console.WriteLine($"Tokenizing word: '{word}'");
+            if (_debug) Log.Verbose("Tokenizing word: '{Word}'", word);
             var wordTokens = TokenizeBPE(word);
 
             if (_debug)
             {
-                Console.WriteLine($"Word '{word}' tokenized to {wordTokens.Count} tokens:");
+                Log.Verbose("Word '{Word}' tokenized to {WordTokensCount} tokens:", word, wordTokens.Count);
                 foreach (var t in wordTokens)
                 {
                     string tokenStr = _vocabDict.FirstOrDefault(x => x.Value == t).Key ?? "UNKNOWN";
-                    Console.WriteLine($"  {t} ({tokenStr})");
+                    Log.Verbose("  {I} ({TokenStr})", t, tokenStr);
                 }
             }
 
@@ -345,7 +346,7 @@ internal class ClipTokenizerHelper
             if (tokens.Count >= maxTokens - 1)
             {
                 tokens = tokens.Take(maxTokens - 1).ToList();
-                if (_debug) Console.WriteLine("Truncated tokens to fit max length");
+                if (_debug) Log.Verbose("Truncated tokens to fit max length");
                 break;
             }
         }
@@ -354,7 +355,7 @@ internal class ClipTokenizerHelper
         if (_vocabDict.TryGetValue(EndToken, out int endTokenId))
         {
             tokens.Add(endTokenId);
-            if (_debug) Console.WriteLine($"Added end token: {endTokenId}");
+            if (_debug) Log.Verbose("Added end token: {EndTokenId}", endTokenId);
         }
 
         // Pad to max tokens
@@ -366,17 +367,17 @@ internal class ClipTokenizerHelper
 
         if (_debug)
         {
-            Console.WriteLine($"Final token sequence (length {tokens.Count}, padded to {maxTokens}):");
+            Log.Verbose("Final token sequence (length {TokensCount}, padded to {MaxTokens}):", tokens.Count, maxTokens);
             for (int i = 0; i < maxTokens; i++)
             {
                 if (i < tokens.Count)
                 {
                     string tokenStr = _vocabDict.FirstOrDefault(x => x.Value == tokens[i]).Key ?? "UNKNOWN";
-                    Console.WriteLine($"  [{i}]: {result[i]} ({tokenStr})");
+                    Log.Verbose("  [{I}]: {L} ({TokenStr})", i, result[i], tokenStr);
                 }
                 else
                 {
-                    Console.WriteLine($"  [{i}]: {result[i]} (PADDING)");
+                    Log.Verbose("  [{I}]: {L} (PADDING)", i, result[i]);
                 }
             }
         }
@@ -386,7 +387,7 @@ internal class ClipTokenizerHelper
 
     private List<int> TokenizeBPE(string word)
     {
-        if (_debug) Console.WriteLine($"BPE tokenizing: '{word}'");
+        if (_debug) Log.Verbose("BPE tokenizing: '{Word}'", word);
 
         // CLIP uses a different BPE tokenization approach than what's implemented here
         // For CLIP, we should:
@@ -399,7 +400,7 @@ internal class ClipTokenizerHelper
 
         if (_vocabDict.TryGetValue(word, out int wordId))
         {
-            if (_debug) Console.WriteLine($"  Found word directly in vocabulary: {wordId}");
+            if (_debug) Log.Verbose("  Found word directly in vocabulary: {WordId}", wordId);
             return new List<int> { wordId };
         }
 
@@ -411,11 +412,11 @@ internal class ClipTokenizerHelper
             if (_vocabDict.TryGetValue(charStr, out int charId))
             {
                 result.Add(charId);
-                if (_debug) Console.WriteLine($"  Added character token for '{c}': {charId}");
+                if (_debug) Log.Verbose("  Added character token for '{C}': {CharId}", c, charId);
             }
             else
             {
-                if (_debug) Console.WriteLine($"  Character '{c}' not found in vocabulary");
+                if (_debug) Log.Verbose("  Character '{C}' not found in vocabulary", c);
                 // Try to find byte representation
                 byte[] bytes = Encoding.UTF8.GetBytes(charStr);
                 foreach (byte b in bytes)
@@ -424,7 +425,7 @@ internal class ClipTokenizerHelper
                     if (_vocabDict.TryGetValue(byteToken, out int byteId))
                     {
                         result.Add(byteId);
-                        if (_debug) Console.WriteLine($"  Added byte token for '{c}': {byteId} ({byteToken})");
+                        if (_debug) Log.Verbose("  Added byte token for '{C}': {ByteId} ({ByteToken})", c, byteId, byteToken);
                     }
                 }
             }

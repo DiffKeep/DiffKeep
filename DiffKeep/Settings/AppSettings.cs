@@ -1,5 +1,6 @@
 using System;
 using System.Text.Json.Serialization;
+using Serilog.Events;
 
 namespace DiffKeep.Settings;
 
@@ -15,6 +16,10 @@ public class AppSettingsWrapper
 
 public class AppSettings
 {
+    public bool LogToFile { get; set; } = true;
+    public bool LogToConsole { get; set; }
+    public bool LogToDebug { get; set; } = true;
+    public LogEventLevel LogLevel { get; set; }
     public string Theme { get; set; } = "Dark";
     public string Language { get; set; } = "en-US";
     public bool StoreThumbnails { get; set; } = false;

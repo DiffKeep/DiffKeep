@@ -9,6 +9,7 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Serilog;
 
 namespace DiffKeep.Services;
 
@@ -68,20 +69,20 @@ public class OnnxTextEmbeddingGenerationService : ITextEmbeddingGenerationServic
             _textEncoderSession = new InferenceSession(fullModelPath, sessionOptions);
 
             // Print model input and output information for debugging
-            Debug.WriteLine("Model Inputs:");
+            Log.Verbose("Model Inputs:");
             foreach (var input in _textEncoderSession.InputMetadata)
             {
-                Debug.WriteLine($"  - Name: {input.Key}");
-                Debug.WriteLine($"    Type: {input.Value.ElementType}");
-                Debug.WriteLine($"    Shape: {string.Join(",", input.Value.Dimensions)}");
+                Log.Verbose("  - Name: {InputKey}", input.Key);
+                Log.Verbose("    Type: {ValueElementType}", input.Value.ElementType);
+                Log.Verbose("    Shape: {Join}", string.Join(",", input.Value.Dimensions));
             }
 
-            Debug.WriteLine("Model Outputs:");
+            Log.Verbose("Model Outputs:");
             foreach (var output in _textEncoderSession.OutputMetadata)
             {
-                Debug.WriteLine($"  - Name: {output.Key}");
-                Debug.WriteLine($"    Type: {output.Value.ElementType}");
-                Debug.WriteLine($"    Shape: {string.Join(",", output.Value.Dimensions)}");
+                Log.Verbose("  - Name: {OutputKey}", output.Key);
+                Log.Verbose("    Type: {ValueElementType}", output.Value.ElementType);
+                Log.Verbose("    Shape: {Join}", string.Join(",", output.Value.Dimensions));
             }
         });
     }
@@ -281,14 +282,14 @@ internal class MpnetTokenizerHelper
             
             if (_debug)
             {
-                Debug.WriteLine($"Loaded vocabulary with {_vocab.Count} tokens");
+                Log.Verbose("Loaded vocabulary with {VocabCount} tokens", _vocab.Count);
                 
                 // Print a few sample vocabulary items
-                Debug.WriteLine("Sample vocabulary items:");
+                Log.Verbose("Sample vocabulary items:");
                 int count = 0;
                 foreach (var item in _vocab)
                 {
-                    Debug.WriteLine($"  {item.Key}: {item.Value}");
+                    Log.Verbose("  {ItemKey}: {ItemValue}", item.Key, item.Value);
                     if (++count >= 10) break;
                 }
             }
@@ -360,24 +361,24 @@ internal class MpnetTokenizerHelper
             
             if (_debug)
             {
-                Debug.WriteLine($"CLS token: {_clsToken} (ID: {_clsTokenId})");
-                Debug.WriteLine($"SEP token: {_sepToken} (ID: {_sepTokenId})");
-                Debug.WriteLine($"PAD token: {_padToken} (ID: {_padTokenId})");
-                Debug.WriteLine($"UNK token: {_unkToken} (ID: {_unkTokenId})");
-                Debug.WriteLine($"Lowercase: {_doLowerCase}");
-                Debug.WriteLine($"Continuing subword prefix: {_continuingSubwordPrefix}");
+                Log.Verbose("CLS token: {ClsToken} (ID: {ClsTokenId})", _clsToken, _clsTokenId);
+                Log.Verbose("SEP token: {SepToken} (ID: {SepTokenId})", _sepToken, _sepTokenId);
+                Log.Verbose("PAD token: {PadToken} (ID: {PadTokenId})", _padToken, _padTokenId);
+                Log.Verbose("UNK token: {UnkToken} (ID: {UnkTokenId})", _unkToken, _unkTokenId);
+                Log.Verbose("Lowercase: {DoLowerCase}", _doLowerCase);
+                Log.Verbose("Continuing subword prefix: {ContinuingSubwordPrefix}", _continuingSubwordPrefix);
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error initializing tokenizer: {ex}");
+            Log.Verbose("Error initializing tokenizer: {Exception}", ex);
             throw new InvalidOperationException("Failed to parse tokenizer config or vocabulary", ex);
         }
     }
 
     public (long[] InputIds, long[] AttentionMask, long[] TokenTypeIds) Tokenize(string text, int maxTokens)
     {
-        if (_debug) Debug.WriteLine($"\nTokenizing text: '{text}'");
+        if (_debug) Log.Verbose("Tokenizing text: '{Text}'", text);
 
         // Apply pre-processing
         if (_doLowerCase)
@@ -394,7 +395,7 @@ internal class MpnetTokenizerHelper
         inputIds[0] = _clsTokenId;
         attentionMask[0] = 1; // Attend to this token
         
-        if (_debug) Debug.WriteLine($"Added CLS token: {_clsToken} (ID: {_clsTokenId})");
+        if (_debug) Log.Verbose("Added CLS token: {ClsToken} (ID: {ClsTokenId})", _clsToken, _clsTokenId);
         
         // Tokenize and add tokens
         var tokens = new List<long>();
@@ -414,10 +415,10 @@ internal class MpnetTokenizerHelper
             
             if (_debug)
             {
-                Debug.WriteLine($"Word '{word}' tokenized to {wordTokens.Count} tokens:");
+                Log.Verbose("Word '{Word}' tokenized to {WordTokensCount} tokens:", word, wordTokens.Count);
                 foreach (var t in wordTokens)
                 {
-                    Debug.WriteLine($"  {t} ({GetTokenText(t)})");
+                    Log.Verbose("  {L} ({S})", t, GetTokenText(t));
                 }
             }
             
@@ -433,7 +434,7 @@ internal class MpnetTokenizerHelper
                 }
                 else
                 {
-                    if (_debug) Debug.WriteLine("Reached max tokens, truncating");
+                    if (_debug) Log.Verbose("Reached max tokens, truncating");
                     break;
                 }
             }
@@ -452,7 +453,7 @@ internal class MpnetTokenizerHelper
             attentionMask[tokenPosition] = 1;
             tokenPosition++;
             
-            if (_debug) Debug.WriteLine($"Added SEP token: {_sepToken} (ID: {_sepTokenId})");
+            if (_debug) Log.Verbose("Added SEP token: {SepToken} (ID: {SepTokenId})", _sepToken, _sepTokenId);
         }
         
         // Fill rest with padding
@@ -464,16 +465,16 @@ internal class MpnetTokenizerHelper
         
         if (_debug)
         {
-            Debug.WriteLine($"Final sequence (length {tokenPosition}, padded to {maxTokens}):");
+            Log.Verbose("Final sequence (length {TokenPosition}, padded to {MaxTokens}):", tokenPosition, maxTokens);
             for (int i = 0; i < maxTokens; i++)
             {
                 if (i < tokenPosition)
                 {
-                    Debug.WriteLine($"  [{i}]: {inputIds[i]} ({GetTokenText(inputIds[i])}) [Attention: {attentionMask[i]}]");
+                    Log.Verbose("  [{I}]: {InputId} ({S}) [Attention: {L}]", i, inputIds[i], GetTokenText(inputIds[i]), attentionMask[i]);
                 }
                 else
                 {
-                    Debug.WriteLine($"  [{i}]: {inputIds[i]} (PAD) [Attention: {attentionMask[i]}]");
+                    Log.Verbose("  [{I}]: {InputId} (PAD) [Attention: {L}]", i, inputIds[i], attentionMask[i]);
                 }
             }
         }

@@ -16,6 +16,7 @@ using DiffKeep.Extensions;
 using DiffKeep.Services;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Enums;
+using Serilog;
 using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
@@ -69,7 +70,7 @@ public partial class SettingsViewModel : ViewModelBase
     public void LoadCurrentSettings()
     {
         var settings = Program.Settings;
-        Debug.WriteLine($"Loading current settings for the window. StoreThumbnails: {settings.StoreThumbnails}");
+        Log.Debug("Loading current settings for the window. StoreThumbnails: {SettingsStoreThumbnails}", settings.StoreThumbnails);
         
         Theme = settings.Theme;
         Language = settings.Language;
@@ -201,6 +202,7 @@ public partial class SettingsViewModel : ViewModelBase
         {
             // Show error message
             _toastManager.CreateToast("Error downloading model").WithContent($"Could not download model: {ex.Message}").ShowError();
+            Log.Error("Could not download model: {ExMessage}", ex.Message);
         }
     }
     

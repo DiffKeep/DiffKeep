@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
+using Serilog;
 
 namespace DiffKeep.Database;
 
@@ -54,7 +55,7 @@ public static class DatabaseVersioning
 
         foreach (var resourceName in resourceNames)
         {
-            Debug.WriteLine($"Checking migration: {resourceName}");
+            Log.Debug("Checking migration: {ResourceName}", resourceName);
             // Extract version number from filename
             var fileName = resourceName.Split('.').Reverse().Skip(1).First();
             var version = int.Parse(fileName.Split('_')[0]);
@@ -62,7 +63,7 @@ public static class DatabaseVersioning
             if (version <= currentVersion)
                 continue;
             
-            Debug.WriteLine($"Applying migration: {version}");
+            Log.Warning("Applying migration: {Version}", version);
 
             await using var stream = assembly.GetManifestResourceStream(resourceName);
             using var reader = new StreamReader(stream!);

@@ -4,6 +4,7 @@ using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
+using Serilog;
 
 namespace DiffKeep.Database;
 
@@ -27,22 +28,22 @@ public class DatabaseConnectionFactory
         try
         {
             var fileInfo = new FileInfo(_extensionPath);
-            Debug.WriteLine($"Extension file permissions: {fileInfo.UnixFileMode}");
+            Log.Debug("Extension file permissions: {FileInfoUnixFileMode}", fileInfo.UnixFileMode);
             
             // Verify the file is readable
             using (var stream = File.OpenRead(_extensionPath))
             {
-                Debug.WriteLine("Extension file is readable");
+                Log.Verbose("Extension file is readable");
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error checking extension file: {ex}");
+            Log.Error("Error checking extension file: {Exception}", ex);
             throw;
         }
 
         
-        Debug.WriteLine($"vec0 extension found at {_extensionPath}");
+        Log.Information("vec0 extension found at {ExtensionPath}", _extensionPath);
         _initialized = false;
     }
 
@@ -52,7 +53,7 @@ public class DatabaseConnectionFactory
             return;
 
         await DatabaseVersioning.InitializeAsync(this);
-        Debug.WriteLine("Database initialized");
+        Log.Information("Database initialized");
         _initialized = true;
     }
     
@@ -73,13 +74,13 @@ public class DatabaseConnectionFactory
                 }
             }
         
-            Debug.WriteLine("vec0 extension is not loaded");
+            Log.Debug("vec0 extension is not loaded");
             return false;
 
         }
         catch (SqliteException e)
         {
-            Debug.WriteLine($"vec0 extension is not loaded: {e}");
+            Log.Error("vec0 extension is not loaded: {SqliteException}", e);
             return false;
         }
     }
@@ -97,10 +98,10 @@ public class DatabaseConnectionFactory
 
                 using (var command = connection.CreateCommand())
                 {
-                    Debug.WriteLine($"Loading extension from: {_extensionPath}");
+                    Log.Debug("Loading extension from: {ExtensionPath}", _extensionPath);
                     command.CommandText = $"SELECT load_extension('{_extensionPath}');";
                     command.ExecuteNonQuery();
-                    Debug.WriteLine("Extension loaded successfully");
+                    Log.Debug("Extension loaded successfully");
                 }
                 
                 // Apply PRAGMA settings
@@ -124,14 +125,14 @@ public class DatabaseConnectionFactory
             return connection;
         } catch (SqliteException ex)
         {
-            Debug.WriteLine($"SQLite error loading extension: {ex.Message}");
-            Debug.WriteLine($"SQLite error code: {ex.SqliteErrorCode}");
-            Debug.WriteLine($"SQLite extended error code: {ex.SqliteExtendedErrorCode}");
+            Log.Error("SQLite error loading extension: {ExMessage}", ex.Message);
+            Log.Error("SQLite error code: {ExSqliteErrorCode}", ex.SqliteErrorCode);
+            Log.Error("SQLite extended error code: {ExSqliteExtendedErrorCode}", ex.SqliteExtendedErrorCode);
                 
             throw;
         } catch (Exception ex)
         {
-            Debug.WriteLine($"Error initializing database connection: {ex}");
+            Log.Error("Error initializing database connection: {Exception}", ex);
             throw;
         }
     }

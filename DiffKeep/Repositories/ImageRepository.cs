@@ -10,6 +10,7 @@ using Microsoft.Data.Sqlite;
 using System.Diagnostics;
 using System.Linq;
 using DiffKeep.Services;
+using Serilog;
 
 namespace DiffKeep.Repositories;
 
@@ -109,7 +110,7 @@ private static Image ReadImage(SqliteDataReader reader)
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error loading thumbnail: {ex.Message}");
+                Log.Error("Error loading thumbnail: {ExMessage}", ex.Message);
                 image.Thumbnail = null;
             }
         }
@@ -455,7 +456,7 @@ private static Image ReadImage(SqliteDataReader reader)
         }
         catch (Exception ex)
         {
-            Debug.Print($"Error in batch insert: {ex}");
+            Log.Error("Error in batch insert: {Exception}", ex);
             transaction.Rollback();
             throw;
         }
@@ -555,7 +556,7 @@ private static Image ReadImage(SqliteDataReader reader)
 
     public async Task<IEnumerable<Image>> GetImagesWithoutEmbeddingsAsync(string modelName, int embeddingSize, long? libraryId = null)
     {
-        Debug.WriteLine($"Getting all images without embeddings for {modelName} with size {embeddingSize}");
+        Log.Debug("Getting all images without embeddings for {ModelName} with size {EmbeddingSize}", modelName, embeddingSize);
         var images = new List<Image>();
         await using var connection = CreateConnection();
         await using var command = connection.CreateCommand();

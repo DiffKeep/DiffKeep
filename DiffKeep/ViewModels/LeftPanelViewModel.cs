@@ -13,6 +13,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using DiffKeep.Services;
+using Serilog;
 using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
@@ -93,13 +94,13 @@ public partial class LeftPanelViewModel : ViewModelBase
     
     public async Task RefreshLibrariesAsync()
     {
-        Debug.WriteLine("Refreshing libraries");
+        Log.Debug("Refreshing libraries");
         await InitializeTreeItemsAsync();
     }
 
     private async Task InitializeTreeItemsAsync()
     {
-        Debug.WriteLine("Initializing libraries");
+        Log.Debug("Initializing libraries");
         var libraries = await _libraryRepository.GetAllAsync();
         
         // Create the top-level "Libraries" item
@@ -117,6 +118,7 @@ public partial class LeftPanelViewModel : ViewModelBase
                 _toastManager.CreateToast("Library Error")
                     .WithContent($"Library directory {library.Path} not found or inaccessible.")
                     .ShowError();
+                Log.Warning("Library directory {LibraryPath} not found or inaccessible.", library.Path);
                 continue;
             }
 
@@ -149,9 +151,9 @@ public partial class LeftPanelViewModel : ViewModelBase
         {
             if (libraryItem.Id == null)
                 return;
-            Debug.WriteLine($"Delaying start of scan for library {libraryItem.Name}");
+            Log.Debug("Delaying start of scan for library {LibraryItemName}", libraryItem.Name);
             await Task.Delay(1000);
-            Debug.WriteLine($"Starting library scan for library {libraryItem.Name}");
+            Log.Debug("Starting library scan for library {LibraryItemName}", libraryItem.Name);
             
             try
             {
@@ -178,11 +180,11 @@ public partial class LeftPanelViewModel : ViewModelBase
 
     public async Task RescanLibraryAsync(LibraryTreeItem libraryItem)
     {
-        Debug.WriteLine("Rescan library called");
+        Log.Debug("Rescan library called");
         if (libraryItem.IsScanning || libraryItem.Id == 0)
             return;
 
-        Debug.WriteLine("Rescaning library");
+        Log.Debug("Rescaning library");
         StartLibraryScan(libraryItem);
     }
 

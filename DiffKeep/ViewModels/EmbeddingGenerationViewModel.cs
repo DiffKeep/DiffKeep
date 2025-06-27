@@ -12,6 +12,7 @@ using DiffKeep.Messages;
 using DiffKeep.Models;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using Serilog;
 
 namespace DiffKeep.ViewModels;
 
@@ -113,7 +114,7 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
                         catch
                         {
                             // If batch save fails, log or handle the error as needed
-                            Debug.WriteLine("Failed to save batch after error");
+                            Log.Error("Failed to save batch after error");
                         }
                     }
                 }
@@ -130,7 +131,7 @@ public partial class EmbeddingsGenerationViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error while generating embedding: {ex.Message}");
+            Log.Error("Error while generating embedding: {ExMessage}", ex.Message);
         }
         finally
         {

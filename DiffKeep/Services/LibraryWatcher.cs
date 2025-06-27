@@ -9,6 +9,7 @@ using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Database;
 using DiffKeep.Messages;
 using DiffKeep.Repositories;
+using Serilog;
 
 namespace DiffKeep.Services;
 
@@ -40,7 +41,7 @@ public class LibraryWatcher
 
     ~LibraryWatcher()
     {
-        Debug.WriteLine($"Cleaning up LibraryWatched for {LibraryPath}");
+        Log.Debug("Cleaning up LibraryWatched for {S}", LibraryPath);
     }
 
     public async Task WatchLibrary()
@@ -59,7 +60,7 @@ public class LibraryWatcher
         watcher.IncludeSubdirectories = true;
         watcher.EnableRaisingEvents = true;
 
-        Debug.WriteLine($"Watching library {LibraryPath}");
+        Log.Debug("Watching library {S}", LibraryPath);
         try
         {
             await Task.Delay(Timeout.Infinite, _cancellationSource?.Token ?? CancellationToken.None);
@@ -96,7 +97,7 @@ public class LibraryWatcher
                 await Task.Delay(DebounceDelayMs, cts.Token);
 
                 // If we got here without cancellation, process the file
-                Debug.WriteLine($"Debounced event: {e.ChangeType} filename: {e.FullPath}");
+                Log.Debug("Debounced event: {WatcherChangeTypes} filename: {EFullPath}", e.ChangeType, e.FullPath);
 
                 // find out which libraries have this file in them
                 // Get all libraries
@@ -108,7 +109,7 @@ public class LibraryWatcher
 
                 foreach (var library in containingLibraries)
                 {
-                    Debug.WriteLine($"Detected that library {library.Path} contains image {e.FullPath}, creating or updating image");
+                    Log.Debug("Detected that library {Path} contains image {EFullPath}, creating or updating image", library.Path, e.FullPath);
                     await _imageLibraryScanner.CreateOrUpdateSingleFile(library.Id, e.FullPath);
                     await LibraryUpdated(library.Id);
                 }
@@ -126,7 +127,7 @@ public class LibraryWatcher
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error in OnChanged handler: {ex}");
+            Log.Error("Error in OnChanged handler: {Exception}", ex);
         }
     }
 
@@ -151,7 +152,7 @@ public class LibraryWatcher
                 await Task.Delay(LibraryUpdateDebounceMs, cts.Token);
 
                 // Send the library updated message
-                Debug.WriteLine($"Sending library update message for library ID {libraryId}");
+                Log.Debug("Sending library update message for library ID {L}", libraryId);
                 WeakReferenceMessenger.Default.Send(new LibraryUpdatedMessage(libraryId));
             }
             catch (OperationCanceledException)
@@ -167,13 +168,13 @@ public class LibraryWatcher
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error in LibraryUpdated: {ex}");
+            Log.Error("Error in LibraryUpdated: {Exception}", ex);
         }
 
     }
 
     private void OnError(object sender, ErrorEventArgs e)
     {
-        Debug.WriteLine($"error event: {e.GetException()}");
+        Log.Error("error event: {GetException}", e.GetException());
     }
 }

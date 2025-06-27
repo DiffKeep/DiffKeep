@@ -8,7 +8,6 @@ using Microsoft.Extensions.DependencyInjection;
 using DiffKeep.Settings;
 using System.Text.Json;
 using System.Threading.Tasks;
-using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Parsing;
@@ -17,7 +16,8 @@ using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using LLama.Native;
 using Microsoft.Data.Sqlite;
-using Microsoft.Extensions.DependencyInjection.Extensions;
+using Serilog;
+using Serilog.Events;
 using ShadUI.Toasts;
 
 namespace DiffKeep;
@@ -77,22 +77,25 @@ sealed class Program
 
         rootCommand.Invoke(args);
 
+
+
         try
         {
-            /*
             NativeLibraryConfig.All.WithLogCallback(delegate(LLamaLogLevel level, string message)
             {
-                Debug.WriteLine($"{level}: {message}");
+                Log.Debug("{LLamaLogLevel}: {Message}", level, message);
             });
-            */
             SetupConfiguration();
             BuildAvaloniaApp()
                 .StartWithClassicDesktopLifetime(args);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Error: {ex}");
-            Environment.Exit(1);
+            Log.Debug("Error: {Exception}", ex);
+        }
+        finally
+        {
+            Log.CloseAndFlush();
         }
     }
 
@@ -115,6 +118,49 @@ sealed class Program
         }
 
         ReloadConfiguration();
+        
+        // make sure the logs path exists
+        if (Settings.LogToFile)
+            Directory.CreateDirectory(Path.Combine(DataPath, "logs"));
+
+        var logConf = new LoggerConfiguration();
+        if (Settings.LogToConsole)
+            logConf.WriteTo.Console();
+        if (Settings.LogToDebug)
+            logConf.WriteTo.Debug();
+        if (Settings.LogToFile)
+            logConf.WriteTo.Async(
+                a => a.File(
+                    Path.Combine(DataPath, "logs", "log.txt"),
+                    rollingInterval: RollingInterval.Day)
+                );
+        switch (Settings.LogLevel)
+        {
+            case LogEventLevel.Verbose:
+                logConf.MinimumLevel.Verbose();
+                break;
+            case LogEventLevel.Debug:
+                logConf.MinimumLevel.Debug();
+                break;
+            case LogEventLevel.Information:
+                logConf.MinimumLevel.Information();
+                break;
+            case LogEventLevel.Warning:
+                logConf.MinimumLevel.Warning();
+                break;
+            case LogEventLevel.Error:
+                logConf.MinimumLevel.Error();
+                break;
+            case LogEventLevel.Fatal:
+                logConf.MinimumLevel.Fatal();
+                break;
+            default:    
+                logConf.MinimumLevel.Warning();
+                break;
+        }
+        
+        Log.Logger = logConf.CreateLogger();
+        Log.Information("Starting DiffKeep version {version}", GitVersion.FullVersion);
 
         ConfigureServices().FireAndForget();
     }

@@ -35,7 +35,7 @@ public class PngMetadataParser : IImageParser
 
     public ImageMetadata ParseImage(string filePath)
     {
-        Debug.Print($"Parsing PNG metadata for {filePath}");
+        Serilog.Log.Debug("Parsing PNG metadata for {FilePath}", filePath);
         using var image = Image.NewFromFile(filePath);
         
         // Collect all metadata chunks
@@ -44,7 +44,7 @@ public class PngMetadataParser : IImageParser
         // Get all fields that start with "png-" as these contain the PNG chunks
         foreach (var field in image.GetFields())
         {
-            //Debug.Print($"Found field: {field} with value: {image.Get(field)}");
+            Serilog.Log.Debug("Found field: {Field} with value: {Get}", field, image.Get(field));
             if (field.StartsWith("png-comment-"))
             {
                 // Format is "png-comment-0-{chunk name}" where the 0 will be incremented for each chunk

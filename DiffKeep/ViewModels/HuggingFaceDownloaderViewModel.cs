@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Serilog;
 
 namespace DiffKeep.ViewModels;
 
@@ -60,7 +61,7 @@ public partial class HuggingFaceDownloaderViewModel : ViewModelBase
         catch (Exception ex)
         {
             // Handle errors
-            Debug.WriteLine($"Download error: {ex.Message}");
+            Log.Error("Download error: {ExMessage}", ex.Message);
         }
         finally
         {

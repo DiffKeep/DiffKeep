@@ -15,6 +15,7 @@ using DiffKeep.Repositories;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Dto;
 using MsBox.Avalonia.Models;
+using Serilog;
 
 namespace DiffKeep.Services;
 
@@ -49,11 +50,10 @@ public class ImageService : IImageService
             });
 
             var result = await dialog.ShowWindowDialogAsync(parentWindow);
-            Debug.WriteLine($"Dialog result: {result}");
 
             if (result == "Cancel" || String.IsNullOrWhiteSpace(result))
             {
-                Debug.WriteLine("Image delete cancelled");
+                Log.Debug("Image delete cancelled");
                 return false;
             }
 
@@ -68,12 +68,12 @@ public class ImageService : IImageService
             // Delete the file from filesystem
             if (File.Exists(image.Path))
             {
-                Debug.WriteLine($"Deleting from filesystem image {image.Path}");
+                Log.Debug("Deleting from filesystem image {ImagePath}", image.Path);
                 File.Delete(image.Path);
             }
 
             // Delete from the database
-            Debug.WriteLine($"Deleting from database image {image.Id}");
+            Log.Debug("Deleting from database image {ImageId}", image.Id);
             await _imageRepository.DeleteAsync(image.Id);
 
             WeakReferenceMessenger.Default.Send(new ImageDeletedMessage(image.Path));
@@ -82,7 +82,7 @@ public class ImageService : IImageService
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error deleting image: {ex}");
+            Log.Error("Error deleting image: {Exception}", ex);
             var errorDialog =
                 MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the image: {ex.Message}");
             await errorDialog.ShowWindowDialogAsync(parentWindow);
@@ -107,11 +107,10 @@ public class ImageService : IImageService
         });
 
         var result = await dialog.ShowWindowDialogAsync(parentWindow);
-        Debug.WriteLine($"Dialog result: {result}");
 
         if (result == "Cancel" || String.IsNullOrWhiteSpace(result))
         {
-            Debug.WriteLine("Image delete cancelled");
+            Log.Debug("Image delete cancelled");
             return;
         }
 
@@ -122,7 +121,7 @@ public class ImageService : IImageService
                 // Delete the file from filesystem
                 if (File.Exists(image.Path))
                 {
-                    Debug.WriteLine($"Deleting from filesystem image {image.Path}");
+                    Log.Debug("Deleting from filesystem image {ImagePath}", image.Path);
                     File.Delete(image.Path);
 
                     WeakReferenceMessenger.Default.Send(new ImageDeletedMessage(image.Path));
@@ -130,13 +129,13 @@ public class ImageService : IImageService
             });
 
             // Delete from the database
-            Debug.WriteLine($"Deleting {images.Count} images from database");
+            Log.Debug("Deleting {ImagesCount} images from database", images.Count);
             await _imageRepository.DeleteAsync(images.Select(img => img.Id).ToArray()
             );
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error deleting images: {ex}");
+            Log.Error("Error deleting images: {Exception}", ex);
             var errorDialog =
                 MessageBoxManager.GetMessageBoxStandard("Error", $"Failed to delete the images: {ex.Message}");
             await errorDialog.ShowWindowDialogAsync(parentWindow);
@@ -168,7 +167,7 @@ public class ImageService : IImageService
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Error creating bitmap: {ex.Message}");
+                    Log.Error("Error creating bitmap: {ExMessage}", ex.Message);
                     _bufferPool.Return(stream);
                     return null;
                 }
@@ -180,7 +179,7 @@ public class ImageService : IImageService
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error generating thumbnail for {file}: {ex.Message}");
+                Log.Error("Error generating thumbnail for {File}: {ExMessage}", file, ex.Message);
                 return null;
             }
         });

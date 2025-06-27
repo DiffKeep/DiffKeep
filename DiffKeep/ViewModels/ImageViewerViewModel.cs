@@ -15,6 +15,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Messages;
 using DiffKeep.Services;
+using Serilog;
 
 namespace DiffKeep.ViewModels;
 
@@ -64,7 +65,7 @@ public partial class ImageViewerViewModel : ViewModelBase
         // Subscribe to image deleted messages
         WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
         {
-            Debug.WriteLine($"Gallery deleting from images {m.ImagePath}");
+            Log.Debug("Gallery deleting from images {MessageImagePath}", m.ImagePath);
             var imageToRemove = _allImages.FirstOrDefault(img => img.Path == m.ImagePath);
             if (imageToRemove is not null)
             {
@@ -82,16 +83,16 @@ public partial class ImageViewerViewModel : ViewModelBase
     [RelayCommand]
     private async Task CopyPrompt()
     {
-        Debug.Print("Copying prompt to clipboard");
+        Log.Debug("Copying prompt to clipboard");
         if (string.IsNullOrEmpty(GenerationPrompt)) return;
 
         if (App.Current.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            Debug.Print("Got desktop lifetime");
+            Log.Debug("Got desktop lifetime");
             var clipboard = TopLevel.GetTopLevel(desktop.MainWindow)?.Clipboard;
             if (clipboard != null)
             {
-                Debug.Print("Got clipboard");
+                Log.Debug("Got clipboard");
                 using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
                 try
                 {
@@ -101,32 +102,32 @@ public partial class ImageViewerViewModel : ViewModelBase
                     var completedTask = await Task.WhenAny(clipboardTask, timeoutTask);
                     if (completedTask == clipboardTask)
                     {
-                        Debug.Print($"Copied text: {GenerationPrompt}");
+                        Log.Debug("Copied text: {S}", GenerationPrompt);
                     }
                     else
                     {
-                        Debug.Print("Clipboard operation timed out, but may have succeeded");
+                        Log.Warning("Clipboard operation timed out, but may have succeeded");
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    Debug.Print("Clipboard operation timed out, but may have succeeded");
+                    Log.Warning("Clipboard operation timed out, but may have succeeded");
                 }
                 catch (Exception ex)
                 {
-                    Debug.Print($"Clipboard operation failed: {ex}");
+                    Log.Error("Clipboard operation failed: {Exception}", ex);
                 }
             }
             else
             {
-                Debug.Print("Clipboard was null");
+                Log.Error("Clipboard was null");
             }
         }
     }
 
     public async void LoadCurrentImage()
     {
-        Debug.Print($"Loading image {_currentIndex}");
+        Log.Debug("Loading image {CurrentIndex}", _currentIndex);
         if (_currentIndex < 0 || _currentIndex >= _allImages.Count)
         {
             return;
@@ -159,7 +160,7 @@ public partial class ImageViewerViewModel : ViewModelBase
         }
         catch (ArgumentOutOfRangeException ex)
         {
-            Debug.WriteLine($"Failed finding image index {_currentIndex}, trying again after pause");
+            Log.Debug("Failed finding image index {CurrentIndex}, trying again after pause", _currentIndex);
             await Task.Delay(100);
             currentImage = _allImages[_currentIndex];
         }
@@ -357,14 +358,14 @@ public partial class ImageViewerViewModel : ViewModelBase
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine($"Failed to open directory: {ex.Message}");
+                        Log.Error("Failed to open directory: {ExMessage}", ex.Message);
                     }
                 }
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error opening file in explorer: {ex.Message}");
+            Log.Error("Error opening file in explorer: {ExMessage}", ex.Message);
         }
     }
 

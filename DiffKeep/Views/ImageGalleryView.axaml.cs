@@ -16,6 +16,7 @@ using Avalonia.Layout;
 using Avalonia.Threading;
 using DiffKeep.Extensions;
 using DiffKeep.ViewModels;
+using Serilog;
 
 namespace DiffKeep.Views;
 
@@ -64,14 +65,14 @@ public partial class ImageGalleryView : UserControl
 
     private void SaveScrollPosition()
     {
-        Debug.WriteLine("SaveScrollPosition called");
+        Log.Debug("SaveScrollPosition called");
         if (_scrollViewer != null && _scrollViewer.Offset != null)
             _currentScrollPosition = _scrollViewer.Offset.Y;
     }
 
     private void RestoreScrollPosition()
     {
-        Debug.WriteLine("RestoreScrollPosition called");
+        Log.Debug("RestoreScrollPosition called");
         if (_scrollViewer != null && _scrollViewer.Offset != null)
             _scrollViewer.Offset = new Vector(0, _currentScrollPosition);
     }
@@ -80,7 +81,7 @@ public partial class ImageGalleryView : UserControl
     {
         if (e.PropertyName == nameof(ImageGalleryViewModel.Images))
         {
-            Debug.WriteLine("Images collection changed - updating scrollviewer");
+            Log.Debug("Images collection changed - updating scrollviewer");
             // Use dispatcher to ensure this runs after the UI has updated
             Dispatcher.UIThread.Post(() =>
             {
@@ -93,14 +94,14 @@ public partial class ImageGalleryView : UserControl
     {
         if (this.GetControl<ScrollViewer>("ScrollViewer") is ScrollViewer scrollViewer)
         {
-            Debug.WriteLine("Resetting scroll");
+            Log.Debug("Resetting scroll");
             scrollViewer.ScrollToHome();
         }
     }
     
     private void OnImagesCollectionChanged(object? sender, EventArgs e)
     {
-        Debug.WriteLine("Images collection changed - updating thumbnails");
+        Log.Debug("Images collection changed - updating thumbnails");
         Dispatcher.UIThread.Post(UpdateVisibleThumbnails, DispatcherPriority.Render);
     }
 
@@ -242,7 +243,7 @@ public partial class ImageGalleryView : UserControl
                 break;
             case Key.Down:
                 newIndex = currentIndex + columns;
-                Debug.WriteLine($"New index: {newIndex}, count: {vm.Images.Count}");
+                Log.Debug("New index: {NewIndex}, count: {ImagesCount}", newIndex, vm.Images.Count);
                 if (newIndex >= vm.Images.Count) newIndex = currentIndex;
                 break;
             case Key.PageUp:
@@ -381,7 +382,7 @@ public partial class ImageGalleryView : UserControl
 
     private void CalculateLayout()
     {
-        Debug.WriteLine("LayoutDebounceTimer_Tick called");
+        Log.Debug("LayoutDebounceTimer_Tick called");
         // Try to find any realized element
         Control? anyElement = null;
         var itemsCount = _itemsRepeater.ItemsSource.Cast<object>().Count();
@@ -392,7 +393,7 @@ public partial class ImageGalleryView : UserControl
         }
         if (anyElement != null)
         {
-            Debug.WriteLine("got an element, calculating");
+            Log.Debug("got an element, calculating");
             var containerWidth = _itemsRepeater.Bounds.Width;
             var itemWidth = anyElement.Bounds.Width;
             var itemHeight = anyElement.Bounds.Height;
@@ -408,7 +409,7 @@ public partial class ImageGalleryView : UserControl
             {
                 _columnCount = newColumnCount;
                 _effectiveItemHeight = newEffectiveItemHeight;
-                Debug.WriteLine($"Layout updated - Columns: {_columnCount}, Item height: {_effectiveItemHeight}");
+                Log.Debug("Layout updated - Columns: {ColumnCount}, Item height: {EffectiveItemHeight}", _columnCount, _effectiveItemHeight);
                 // update thumbnails
                 UpdateVisibleThumbnails();
             }
@@ -478,14 +479,14 @@ public partial class ImageGalleryView : UserControl
     private void ScrollDebounceTimer_Tick(object? sender, EventArgs e)
     {
         _scrollDebounceTimer?.Stop();
-        Debug.WriteLine("Scroll debounce timer fired");
+        Log.Debug("Scroll debounce timer fired");
         _lastThumbnailUpdatePosition = _scrollViewer?.Offset.Y ?? 0;
         UpdateVisibleThumbnails();
     }
 
     private void UpdateVisibleThumbnails()
     {
-        Debug.WriteLine("Updating visible thumbnails");
+        Log.Debug("Updating visible thumbnails");
         var visibleItems = GetVisibleItems();
         if (DataContext is ImageGalleryViewModel viewModel)
         {
@@ -523,7 +524,7 @@ public partial class ImageGalleryView : UserControl
 
     private void Image_OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        Debug.WriteLine("Image pressed");
+        Log.Debug("Image pressed");
         _pointerPressPosition = e.GetPosition(null);
         _isDragging = false;
         e.Handled = true;
@@ -541,13 +542,13 @@ public partial class ImageGalleryView : UserControl
         if (!_isDragging && distance > DragThreshold)
         {
             _isDragging = true;
-            Debug.WriteLine("Image drag started");
+            Log.Debug("Image drag started");
         
             if (sender is IDataContextProvider contextProvider && 
                 contextProvider.DataContext is ImageItemViewModel imageItem && 
                 !string.IsNullOrEmpty(imageItem.Path))
             {
-                Debug.WriteLine($"Dragging file {imageItem.Path} to clipboard...");
+                Log.Debug("Dragging file {ImageItemPath} to clipboard...", imageItem.Path);
                 var dataObject = new DataObject();
                 dataObject.Set(DataFormats.Files, new[] { imageItem.Path });
             
@@ -557,7 +558,7 @@ public partial class ImageGalleryView : UserControl
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Drag and drop operation failed: {ex}");
+                   Log.Error("Drag and drop operation failed: {Exception}", ex);
                 }
             }
         }

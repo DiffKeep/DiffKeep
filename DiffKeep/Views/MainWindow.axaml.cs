@@ -17,6 +17,7 @@ using DiffKeep.Messages;
 using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
+using Serilog;
 using Window = ShadUI.Controls.Window;
 
 namespace DiffKeep.Views;
@@ -61,14 +62,14 @@ public partial class MainWindow : Window
             // Apply left panel width when client size changes
             if (DataContext is MainWindowViewModel vm)
             {
-                Debug.WriteLine("Client size property triggered");
+                Log.Debug("Client size property triggered");
                 vm.WindowWidth = size.Width;
             
                 // If this is the initial size, also apply the panel width
                 var state = _appStateService.GetState();
                 if (state.LeftPanelOpen && state.LeftPanelWidth > 0)
                 {
-                    Debug.WriteLine($"Setting left panel width to {state.LeftPanelWidth}");
+                    Log.Debug("Setting left panel width to {StateLeftPanelWidth}", state.LeftPanelWidth);
                     vm.LeftPanelWidth = new GridLength(state.LeftPanelWidth);
                 }
 
@@ -132,7 +133,7 @@ public partial class MainWindow : Window
             {
                 if (DataContext is MainWindowViewModel vm && _canSaveState)
                 {
-                    Debug.WriteLine("Debounced layout updated - applying window size");
+                    Log.Debug("Debounced layout updated - applying window size");
                     vm.UpdateWindowSize(Bounds.Width);
                 }
             });
@@ -150,12 +151,12 @@ public partial class MainWindow : Window
             {
                 if (state.LeftPanelOpen)
                 {
-                    Debug.WriteLine($"Setting left panel width to {state.LeftPanelWidth}");
+                    Log.Debug("Setting left panel width to {StateLeftPanelWidth}", state.LeftPanelWidth);
                     vm.LeftPanelWidth = new GridLength(state.LeftPanelWidth);
                 }
                 else
                 {
-                    Debug.WriteLine($"Setting left panel width to 0 because it's closed right now.");
+                    Log.Debug("Setting left panel width to 0 because it's closed right now.");
                     vm.LeftPanelWidth = new GridLength(0);
                 }
 
