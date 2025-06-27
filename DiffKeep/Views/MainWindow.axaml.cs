@@ -6,9 +6,11 @@ using System.Text.Json;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Extensions;
 using DiffKeep.Messages;
@@ -27,6 +29,10 @@ public partial class MainWindow : Window
     );
     private readonly ILicenseService _licenseService;
     private readonly IAppStateService _appStateService;
+    private bool _canSaveState = false;
+    private CancellationTokenSource _layoutDebounceTokenSource;
+    private readonly TimeSpan _debounceDelay = TimeSpan.FromMilliseconds(100);
+
 
     
     public MainWindow()
@@ -42,9 +48,6 @@ public partial class MainWindow : Window
             Directory.CreateDirectory(directory);
         }
         
-        // Load and apply saved state
-        LoadWindowState();
-        
         this.GetObservable(WindowStateProperty).Subscribe(new AnonymousObserver<Avalonia.Controls.WindowState>(_ => 
             SaveWindowState()));
 
@@ -53,19 +56,36 @@ public partial class MainWindow : Window
             SaveWindowState();
         };
 
-        this.GetObservable(ClientSizeProperty).Subscribe(new AnonymousObserver<Size>(_ => 
-            SaveWindowState()));
-        // Set initial window size
-        if (DataContext is MainWindowViewModel vm)
+        this.GetObservable(ClientSizeProperty).Subscribe(new AnonymousObserver<Size>(size => 
         {
-            vm.WindowWidth = Bounds.Width;
-        }
+            // Apply left panel width when client size changes
+            if (DataContext is MainWindowViewModel vm)
+            {
+                Debug.WriteLine("Client size property triggered");
+                vm.WindowWidth = size.Width;
+            
+                // If this is the initial size, also apply the panel width
+                var state = _appStateService.GetState();
+                if (state.LeftPanelOpen && state.LeftPanelWidth > 0)
+                {
+                    Debug.WriteLine($"Setting left panel width to {state.LeftPanelWidth}");
+                    vm.LeftPanelWidth = new GridLength(state.LeftPanelWidth);
+                }
+
+                vm.CanSaveState = true;
+            }
+            _canSaveState = true;
+            SaveWindowState();
+        }));
         
         // Listen for messages to show the settings dialog
         WeakReferenceMessenger.Default.Register<ShowSettingsMessage>(this, (r, m) =>
         {
             _showSettingsDialog();
         });
+        
+        // Subscribe to the LayoutUpdated event
+        LayoutUpdated += OnLayoutUpdated;
     }
     
     protected override async void OnLoaded(RoutedEventArgs e)
@@ -88,6 +108,35 @@ public partial class MainWindow : Window
         }
 #endif
 
+    }
+    
+    private void OnLayoutUpdated(object? sender, EventArgs e)
+    {
+        DebounceLayoutUpdate();
+    }
+    
+    private void DebounceLayoutUpdate()
+    {
+        // Cancel previous debounce task if it exists
+        _layoutDebounceTokenSource?.Cancel();
+        _layoutDebounceTokenSource = new CancellationTokenSource();
+        var token = _layoutDebounceTokenSource.Token;
+        
+        // Start new debounce task
+        Task.Delay(_debounceDelay, token).ContinueWith(t => 
+        {
+            if (t.IsCanceled) return;
+            
+            // Execute on UI thread
+            Dispatcher.UIThread.Post(() => 
+            {
+                if (DataContext is MainWindowViewModel vm && _canSaveState)
+                {
+                    Debug.WriteLine("Debounced layout updated - applying window size");
+                    vm.UpdateWindowSize(Bounds.Width);
+                }
+            });
+        }, TaskScheduler.Default);
     }
 
     private void LoadWindowState()
@@ -147,7 +196,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (DataContext is MainWindowViewModel vm)
+            if (DataContext is MainWindowViewModel vm && _canSaveState)
             {
                 var state = _appStateService.GetState();
                 state.Width = Width;
@@ -170,12 +219,6 @@ public partial class MainWindow : Window
         {
             // If there's any error saving state, just ignore it
         }
-    }
-
-    protected override void OnClosing(WindowClosingEventArgs e)
-    {
-        //SaveWindowState();
-        base.OnClosing(e);
     }
     
     private async void ShowAboutDialog(object sender, RoutedEventArgs e)

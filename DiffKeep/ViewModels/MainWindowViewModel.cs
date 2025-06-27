@@ -22,10 +22,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     private GridLength _leftPanelWidth;
     [ObservableProperty]
-    private double _leftPanelMaxWidth;
+    private double _leftPanelMaxWidth = 500;
     [ObservableProperty]
     private double _leftPanelMinWidth;
     public LeftPanelViewModel LeftPanel { get; }
+    public bool CanSaveState = false;
     public ImageGalleryViewModel ImageGallery { get; }
     [ObservableProperty]
     private ToastManager _toastManager;
@@ -83,7 +84,7 @@ public partial class MainWindowViewModel : ViewModelBase
             LeftPanelWidth = value;
         }
 
-        if (LeftPanelWidth.Value > 0)
+        if (LeftPanelWidth.Value > 0 && CanSaveState)
         {
             var state = _appStateService.GetState();
             state.LeftPanelWidth = LeftPanelWidth.Value;
@@ -100,7 +101,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // Check if current left panel width exceeds the new max width
         double maxWidth = WindowWidth * 0.5;
         LeftPanelMaxWidth = maxWidth;
-        if (_leftPanelWidth.Value > maxWidth)
+        if (_leftPanelWidth.Value > maxWidth && CanSaveState)
         {
             LeftPanelWidth = new GridLength(maxWidth);
             var state = _appStateService.GetState();
@@ -117,6 +118,7 @@ public partial class MainWindowViewModel : ViewModelBase
         LeftPanelWidth = IsLeftPanelOpen ? new GridLength(state.LeftPanelWidth) : new GridLength(0);
         LeftPanelMinWidth = IsLeftPanelOpen ? 100 : 0;
         state.LeftPanelOpen = IsLeftPanelOpen;
-        _appStateService.SaveState(state);
+        if (CanSaveState)
+            _appStateService.SaveState(state);
     }
 }

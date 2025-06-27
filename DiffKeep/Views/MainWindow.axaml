@@ -57,8 +57,7 @@
     <Grid RowDefinitions="*">
         <Grid Grid.Row="0">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition
-                    Width="{Binding LeftPanelWidth, Mode=TwoWay}"
+                <ColumnDefinition Width="Auto"
                     MaxWidth="{Binding LeftPanelMaxWidth}"
                     MinWidth="{Binding LeftPanelMinWidth}"/>
                 <ColumnDefinition Width="3" />
