@@ -86,7 +86,7 @@ public class OnnxTextEmbeddingGenerationService : ITextEmbeddingGenerationServic
         });
     }
 
-    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text)
+    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text, bool isQuery = false)
     {
         if (_textEncoderSession == null)
         {
@@ -196,6 +196,13 @@ public class OnnxTextEmbeddingGenerationService : ITextEmbeddingGenerationServic
     }
 
     public string ModelName() => _modelName;
+
+    public bool ModelExists(string? modelFile = null)
+    {
+        modelFile ??= _modelName;
+        var fullModelPath = Path.Join(Program.DataPath, "models", modelFile);
+        return File.Exists(fullModelPath);
+    }
     
     public int EmbeddingSize() => _maxTokens;
 

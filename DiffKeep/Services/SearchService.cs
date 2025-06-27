@@ -53,7 +53,7 @@ public class SearchService
         long? libraryId = null, string? path = null, SearchTypeEnum searchType = SearchTypeEnum.Semantic)
     {
         // Generate embedding for the search text
-        var embeddings = await _textEmbeddingService.GenerateEmbeddingAsync(searchText);
+        var embeddings = await _textEmbeddingService.GenerateEmbeddingAsync(searchText, true);
         
         // Since GenerateEmbeddingAsync returns IReadOnlyList<float[]>, we'll use the first embedding
         // Typically for text embeddings, we expect a single embedding vector

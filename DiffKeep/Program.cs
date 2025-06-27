@@ -17,6 +17,8 @@ using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using LLama.Native;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using ShadUI.Toasts;
 
 namespace DiffKeep;
 
@@ -154,12 +156,9 @@ sealed class Program
 
 
         // Register repositories with the connection factory
-        services.AddSingleton<ILibraryRepository>(sp =>
-            new LibraryRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-        services.AddSingleton<IImageRepository>(sp =>
-            new ImageRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
-        services.AddSingleton<IEmbeddingsRepository>(sp =>
-            new EmbeddingsRepository(sp.GetRequiredService<DatabaseConnectionFactory>()));
+        services.AddSingleton<ILibraryRepository, LibraryRepository>();
+        services.AddSingleton<IImageRepository, ImageRepository>();
+        services.AddSingleton<IEmbeddingsRepository, EmbeddingsRepository>();
 
         // Register services
         services.AddSingleton<ImageParser>();
@@ -167,32 +166,24 @@ sealed class Program
         services.AddSingleton<ImageLibraryScanner>();
         services.AddSingleton<PngMetadataParser>();
         services.AddSingleton<ITextEmbeddingGenerationService, LlamaSharpTextTextEmbeddingGenerationService>();
-        services.AddSingleton<IImageService>(sp =>
-            new ImageService(sp.GetRequiredService<IImageRepository>())
-        );
+        services.AddSingleton<IImageService, ImageService>();
         services.AddSingleton<SearchService>();
         services.AddSingleton<ILicenseService, LicenseService>();
         services.AddSingleton<IAppStateService, AppStateService>();
+        services.AddSingleton<ToastManager>();
+        services.AddSingleton(Settings);
+        
+        // App settings
 
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
-        services.AddTransient<SettingsViewModel>(sp =>
-            new SettingsViewModel(
-                sp.GetRequiredService<ILibraryRepository>(),
-                sp.GetRequiredService<IImageRepository>(),
-                sp.GetRequiredService<IEmbeddingsRepository>(),
-                Settings
-            ));
+        services.AddTransient<SettingsViewModel>();
         services.AddSingleton<AboutWindowViewModel>();
-        services.AddSingleton<ImageGalleryViewModel>(sp =>
-            new ImageGalleryViewModel(
-                sp.GetRequiredService<IImageRepository>(),
-                sp.GetRequiredService<IImageService>(),
-                sp.GetRequiredService<SearchService>()
-            ));
+        services.AddSingleton<ImageGalleryViewModel>();
         services.AddSingleton<ImageViewerViewModel>();
         services.AddSingleton<LeftPanelViewModel>();
         services.AddSingleton<EmbeddingsGenerationViewModel>();
+        services.AddSingleton<HuggingFaceDownloaderViewModel>();
 
         Services = services.BuildServiceProvider();
     }

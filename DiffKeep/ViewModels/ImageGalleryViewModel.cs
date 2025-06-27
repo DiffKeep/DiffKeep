@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Media.Imaging;
@@ -15,6 +17,7 @@ using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using ShadUI.Toasts;
 using Image = DiffKeep.Models.Image;
 
 namespace DiffKeep.ViewModels;
@@ -24,16 +27,22 @@ public partial class ImageGalleryViewModel : ViewModelBase
     private readonly IImageRepository _imageRepository;
     private readonly IImageService _imageService;
     private readonly SearchService _searchService;
+    private readonly ToastManager _toastManager;
     private ObservableCollection<ImageItemViewModel> _images;
     private long? _currentLibraryId;
     private string? _currentPath;
     private string? _currentName;
-    public Dictionary<long, Bitmap?> Thumbnails;
+    public readonly ConcurrentDictionary<long, Bitmap?> Thumbnails = new();
+    private CancellationTokenSource? _thumbnailCancellationTokenSource;
+    private readonly ConcurrentDictionary<long, DateTime> _thumbnailLastVisibleTime = new();
+    private readonly TimeSpan _thumbnailRetentionTime = TimeSpan.FromSeconds(60);
+    private Timer? _thumbnailCleanupTimer;
+    private readonly object _thumbnailCleanupLock = new object();
+    private bool _isThumbnailCleanupRunning = false;
     public event EventHandler? ImagesCollectionChanged;
     public event Action? ResetScrollRequested;
     public event Action? SaveScrollPositionRequested;
     public event Action? RestoreScrollPositionRequested;
-
 
     [ObservableProperty] private ImageItemViewModel? _currentImage;
     private ImageItemViewModel? _previousCurrentImage;
@@ -54,8 +63,9 @@ public partial class ImageGalleryViewModel : ViewModelBase
         get => _images;
         set => SetProperty(ref _images, value);
     }
-    
+
     private ObservableCollection<SearchTypeEnum> _availableSearchTypes = new();
+
     public ObservableCollection<SearchTypeEnum> AvailableSearchTypes
     {
         get => _availableSearchTypes;
@@ -64,6 +74,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
 // Current selected search type
     private SearchTypeEnum _currentSearchType;
+
     public SearchTypeEnum CurrentSearchType
     {
         get => _currentSearchType;
@@ -71,17 +82,18 @@ public partial class ImageGalleryViewModel : ViewModelBase
     }
 
     public ImageGalleryViewModel(IImageRepository imageRepository, IImageService imageService,
-        SearchService searchService)
+        SearchService searchService, ToastManager toastManager)
     {
         _imageRepository = imageRepository;
         _imageService = imageService;
         _searchService = searchService;
+        _toastManager = toastManager;
         _images = new ObservableCollection<ImageItemViewModel>();
         _currentDirectory = "";
-        
+
         // Initialize available search types with at least FullText
         AvailableSearchTypes.Add(SearchTypeEnum.FullText);
-    
+
         // Set default search type
         CurrentSearchType = SearchTypeEnum.FullText;
 
@@ -97,7 +109,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
             Debug.WriteLine($"Received message for library updated for library ID {m.LibraryId}");
             if (_currentLibraryId == m.LibraryId || _currentLibraryId == null)
             {
-                LoadImagesAsync(null).FireAndForget();
+                LoadImagesAsync(null, true).FireAndForget();
             }
         });
 
@@ -132,9 +144,15 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 }
             }
         });
+
+        // load initial images
+        LoadImagesAsync(null).FireAndForget();
+        
+        // Start the thumbnail cleanup timer to run every 15 seconds
+        _thumbnailCleanupTimer = new Timer(CleanupThumbnails, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
     }
 
-    public async Task LoadImagesAsync(LibraryTreeItem? item)
+    public async Task LoadImagesAsync(LibraryTreeItem? item, bool preserveScroll = false)
     {
         if (item != null)
         {
@@ -153,7 +171,8 @@ public partial class ImageGalleryViewModel : ViewModelBase
                 IEnumerable<Image> dbImages;
                 if (!string.IsNullOrWhiteSpace(SearchText))
                 {
-                    dbImages = await _searchService.TextSearchImagesAsync(SearchText, _currentLibraryId, _currentPath, _currentSearchType);
+                    dbImages = await _searchService.TextSearchImagesAsync(SearchText, _currentLibraryId, _currentPath,
+                        _currentSearchType);
                 }
                 else if (_currentLibraryId == null)
                 {
@@ -175,7 +194,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
 
                 var viewModels = await Task.Run(() =>
                     dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());
-                if (Images != null && Images.Count > 0)
+                if (Images != null && Images.Count > 0 && preserveScroll)
                 {
                     await Dispatcher.UIThread.InvokeAsync(() => SaveScrollPositionRequested?.Invoke());
 
@@ -193,13 +212,19 @@ public partial class ImageGalleryViewModel : ViewModelBase
                     Images = new ObservableCollection<ImageItemViewModel>(viewModels);
                 }
 
-                // Clear selected images when loading new images
-                _selectedImages.Clear();
-                UpdateSelectedImagesCount();
+                // we don't want to mess with the selection if we are just loading some new images
+                if (!preserveScroll)
+                {
+                    // Clear selected images when loading new images
+                    _selectedImages.Clear();
+                    UpdateSelectedImagesCount();
+                }
 
                 if (ImagesCollectionChanged != null)
+                {
                     Debug.WriteLine("Images collection changed");
-                ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
+                    ImagesCollectionChanged.Invoke(this, EventArgs.Empty);
+                }
             });
         }
         finally
@@ -213,7 +238,15 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         Debug.WriteLine($"Searching images for {SearchText}");
         ResetScrollRequested?.Invoke();
-        await LoadImagesAsync(null);
+        try
+        {
+            await LoadImagesAsync(null);
+        }
+        catch (Exception ex)
+        {
+            _toastManager.CreateToast("Error searching images").WithContent(ex.Message).DismissOnClick().ShowError();
+            Debug.WriteLine(ex.Message);
+        }
     }
 
     [RelayCommand]
@@ -243,93 +276,190 @@ public partial class ImageGalleryViewModel : ViewModelBase
     {
         var visibleImageArray = visibleImages as ImageItemViewModel[] ?? visibleImages.ToArray();
         Debug.WriteLine($"Updating visible thumbnails for {visibleImageArray.Count()} images");
-
+        Debug.WriteLine($"Size of thumbnails currently: {Thumbnails?.Count}");
+        
+        // Cancel any ongoing thumbnail generation
+        _thumbnailCancellationTokenSource?.Cancel();
+        _thumbnailCancellationTokenSource = new CancellationTokenSource();
+        var cancellationToken = _thumbnailCancellationTokenSource.Token;
+        
+        // Get the current time once for all visible images
+        var now = DateTime.UtcNow;
+        
+        // Update the last visible time for all visible images
+        var visibleIds = new HashSet<long>();
+        foreach (var image in visibleImageArray)
+        {
+            visibleIds.Add(image.Id);
+            _thumbnailLastVisibleTime[image.Id] = now;
+        }
+        
         await Task.Run(async () =>
         {
             // Get thumbnails for visible items and some items ahead/behind
             if (Program.Settings.StoreThumbnails)
             {
                 // Database-stored thumbnail scenario
-                Thumbnails = await _imageRepository.GetThumbnailsByIdsAsync(visibleImageArray.Select(i => i.Id));
+                Debug.WriteLine("Fetching thumbnails from database");
+                var dbThumbnails = await _imageRepository
+                    .GetThumbnailsByIdsAsync(visibleIds);
+                
+                // Clear existing thumbnails and add new ones from the database
+                Thumbnails.Clear();
+                foreach (var kvp in dbThumbnails)
+                {
+                    Thumbnails.TryAdd(kvp.Key, kvp.Value);
+                }
+                
+                // Get the old keys before clearing
+                var oldKeys = Thumbnails.Keys.ToList();
+                
+                // Update all image items that previously had thumbnails
+                Dispatcher.UIThread.Post(() =>
+                {
+                    foreach (var image in Images.Where(i => oldKeys.Contains(i.Id)))
+                    {
+                        image.UpdateThumbnail();
+                    }
+                });
             }
             else
             {
                 // On-the-fly thumbnail generation scenario
-                var newThumbnails = new Dictionary<long, Bitmap?>();
-                var lockObject = new object();
-                var visibleIds = visibleImageArray.Select(i => i.Id).ToHashSet();
-
-                // First, copy still-visible thumbnails to the new dictionary
-                if (Thumbnails != null)
-                {
-                    foreach (var id in visibleIds)
-                    {
-                        if (Thumbnails.TryGetValue(id, out var existingThumbnail))
-                        {
-                            newThumbnails[id] = existingThumbnail;
-                        }
-                    }
-                }
-
+                var missingImages = visibleImageArray.Where(img => !Thumbnails.ContainsKey(img.Id)).ToArray();
+                
                 // Generate missing thumbnails
-                var missingImages = visibleImageArray.Where(img => !newThumbnails.ContainsKey(img.Id)).ToArray();
-
-                await Parallel.ForEachAsync(
-                    missingImages,
-                    new ParallelOptions
-                    {
-                        MaxDegreeOfParallelism = Environment.ProcessorCount
-                    },
-                    async (image, token) =>
-                    {
-                        if (image.Path != null)
-                        {
-                            var thumbnail = await ImageService.GenerateThumbnailAsync(
-                                image.Path,
-                                ImageLibraryScanner.ThumbnailSize);
-
-                            lock (lockObject)
-                            {
-                                newThumbnails[image.Id] = thumbnail;
-                            }
-
-                            image.UpdateThumbnail();
-                        }
-                    });
-
-                // Dispose old thumbnails that are no longer visible
-                if (Thumbnails != null)
-                {
-                    foreach (var kvp in Thumbnails)
-                    {
-                        if (!visibleIds.Contains(kvp.Key) && kvp.Value != null)
-                        {
-                            kvp.Value.Dispose();
-                        }
-                    }
-                }
-
-                // Assign the new dictionary
-                Thumbnails = newThumbnails;
-            }
-
-            // Get a snapshot of IDs to update
-            var imageIds = Images.Select(img => img.Id).ToList();
-
-            // Update each image by finding it in the collection at update time
-            foreach (var id in imageIds)
-            {
                 try
                 {
-                    var image = Images.FirstOrDefault(img => img.Id == id);
-                    image?.UpdateThumbnail();
+                    Debug.WriteLine($"Generating thumbnails for {missingImages.Length} images");
+                    await Parallel.ForEachAsync(
+                        missingImages,
+                        new ParallelOptions
+                        {
+                            MaxDegreeOfParallelism = Environment.ProcessorCount,
+                            CancellationToken = cancellationToken
+                        },
+                        async (image, token) =>
+                        {
+                            token.ThrowIfCancellationRequested();
+                            
+                            if (image.Path != null)
+                            {
+                                var thumbnail = await ImageService.GenerateThumbnailAsync(
+                                    image.Path,
+                                    ImageLibraryScanner.ThumbnailSize);
+                                
+                                // Check again if we're cancelled before adding to the collection
+                                if (!token.IsCancellationRequested)
+                                {
+                                    Dispatcher.UIThread.Post(() =>
+                                    {
+                                        // Update the Thumbnails dictionary immediately so it's available
+                                        Thumbnails[image.Id] = thumbnail;
+                                        
+                                        // Update UI for this image
+                                        image.UpdateThumbnail();
+                                    });
+                                }
+                                else
+                                {
+                                    // If cancelled, dispose the thumbnail we just created
+                                    thumbnail?.Dispose();
+                                }
+                            }
+                            else
+                            {
+                                Debug.WriteLine($"Could not find image for path {image.Path}");
+                            }
+                        });
+                }
+                catch (OperationCanceledException)
+                {
+                    Debug.WriteLine("Thumbnail generation was cancelled");
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Failed to update thumbnail for {id}:  {ex.Message}");
+                    Debug.WriteLine($"Error generating thumbnails: {ex.Message}");
                 }
             }
-        });
+        }, cancellationToken);
+        
+        Debug.WriteLine($"Finished fetching thumbnails for {visibleImageArray.Length} images");
+    }
+    
+    private void CleanupThumbnails(object? state)
+    {
+        // Prevent multiple cleanup operations from running simultaneously
+        if (_isThumbnailCleanupRunning || Thumbnails.IsEmpty)
+            return;
+            
+        lock (_thumbnailCleanupLock)
+        {
+            if (_isThumbnailCleanupRunning)
+                return;
+                
+            _isThumbnailCleanupRunning = true;
+        }
+        
+        try
+        {
+            var now = DateTime.UtcNow;
+            var keysToRemove = new List<long>();
+            
+            // Find expired thumbnails (not seen for at least the retention time)
+            foreach (var entry in _thumbnailLastVisibleTime)
+            {
+                if (now - entry.Value > _thumbnailRetentionTime)
+                {
+                    keysToRemove.Add(entry.Key);
+                }
+            }
+            
+            if (keysToRemove.Count > 0)
+            {
+                Debug.WriteLine($"Cleaning up {keysToRemove.Count} expired thumbnails");
+                
+                // Process removals in batches to reduce UI impact
+                const int batchSize = 10;
+                for (int i = 0; i < keysToRemove.Count; i += batchSize)
+                {
+                    var batch = keysToRemove.Skip(i).Take(batchSize);
+                    
+                    foreach (var key in batch)
+                    {
+                        // Remove the timestamp entry
+                        _thumbnailLastVisibleTime.TryRemove(key, out _);
+                        
+                        // Remove and dispose the thumbnail
+                        if (Thumbnails.TryRemove(key, out var bitmap))
+                        {
+                            bitmap?.Dispose();
+                            
+                            // Queue UI update at background priority
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                var affectedImage = Images.FirstOrDefault(img => img.Id == key);
+                                affectedImage?.UpdateThumbnail();
+                            }, DispatcherPriority.Background);
+                        }
+                    }
+                    
+                    // Small delay between batches to prevent UI freezes
+                    Thread.Sleep(10);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error during thumbnail cleanup: {ex.Message}");
+        }
+        finally
+        {
+            lock (_thumbnailCleanupLock)
+            {
+                _isThumbnailCleanupRunning = false;
+            }
+        }
     }
 
     public async Task DeleteImage(ImageItemViewModel image, Window parentWindow)
@@ -449,7 +579,21 @@ public partial class ImageItemViewModel : ViewModelBase
 
     public void UpdateThumbnail()
     {
-        Thumbnail = _galleryViewModel.TryGetTarget(out var gallery) ? gallery.Thumbnails?.GetValueOrDefault(Id) : null;
+        // Set new thumbnail (safely)
+        if (_galleryViewModel.TryGetTarget(out var gallery))
+        {
+            gallery.Thumbnails.TryGetValue(Id, out var newThumbnail);
+
+            // Only update if we have a valid thumbnail or need to clear it
+            if (newThumbnail != null)
+            {
+                Thumbnail = newThumbnail;
+            }
+        }
+        else
+        {
+            Debug.WriteLine("Cound not get gallery view model when trying to update thumbnail");
+        }
     }
 
     // Trigger property change notification for selection state

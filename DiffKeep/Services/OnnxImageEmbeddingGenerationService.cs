@@ -88,7 +88,7 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
         });
     }
 
-    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text)
+    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text, bool isQuery = false)
     {
         if (_textEncoderSession == null)
         {
@@ -203,6 +203,13 @@ public class OnnxImageEmbeddingGenerationService : ITextEmbeddingGenerationServi
 
 
     public string ModelName() => _modelName;
+
+    public bool ModelExists(string? modelFile = null)
+    {
+        modelFile ??= "clip.onnx";
+        var fullModelPath = Path.Join(Program.DataPath, "models", modelFile);
+        return File.Exists(fullModelPath);
+    }
     
     public int EmbeddingSize() => _maxTokens;
 

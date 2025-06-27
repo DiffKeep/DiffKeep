@@ -13,6 +13,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using DiffKeep.Services;
+using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
 
@@ -21,7 +22,9 @@ public partial class LeftPanelViewModel : ViewModelBase
     private readonly ILibraryRepository _libraryRepository;
     private readonly ImageLibraryScanner _imageLibraryScanner;
     private readonly LibraryWatcherService _libraryWatcherService;
+    private readonly ToastManager _toastManager;
     public EmbeddingsGenerationViewModel EmbeddingsGenerationViewModel { get; }
+    public HuggingFaceDownloaderViewModel HuggingFaceDownloaderViewModel { get; }
     private ObservableCollection<LibraryTreeItem> _items;
     [ObservableProperty]
     private LibraryTreeItem _selectedItem;
@@ -35,30 +38,22 @@ public partial class LeftPanelViewModel : ViewModelBase
         set => SetProperty(ref _items, value);
     }
 
-    public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner, LibraryWatcherService libraryWatcherService)
+    public LeftPanelViewModel(ILibraryRepository libraryRepository, ImageLibraryScanner imageLibraryScanner,
+        LibraryWatcherService libraryWatcherService, ToastManager toastManager)
     {
         _libraryRepository = libraryRepository;
         _imageLibraryScanner = imageLibraryScanner;
         _libraryWatcherService = libraryWatcherService;
+        _toastManager = toastManager;
         _items = new ObservableCollection<LibraryTreeItem>();
         EmbeddingsGenerationViewModel = App.GetService<EmbeddingsGenerationViewModel>();
+        HuggingFaceDownloaderViewModel = App.GetService<HuggingFaceDownloaderViewModel>();
 
         // Subscribe to scanner events
         _imageLibraryScanner.ScanProgress += OnScanProgress;
         _imageLibraryScanner.ScanCompleted += OnScanCompleted;
         
-        WaitInitializeAsync().FireAndForget();
-    }
-
-    public async Task WaitInitializeAsync()
-    {
-        await Dispatcher.UIThread.InvokeAsync(async () => 
-        {
-            // if we don't run this on the UI thread, it duplicates the libraries in the left pane,
-            // even though the task is immediately foisted onto another thread. don't ask me, but it works.
-            await Task.Run(InitializeTreeItemsAsync);
-        });
-
+        InitializeTreeItemsAsync().FireAndForget();
     }
 
     private void OnScanProgress(object? sender, ScanProgressEventArgs e)
@@ -118,7 +113,12 @@ public partial class LeftPanelViewModel : ViewModelBase
         foreach (var library in libraries)
         {
             if (!Directory.Exists(library.Path))
+            {
+                _toastManager.CreateToast("Library Error")
+                    .WithContent($"Library directory {library.Path} not found or inaccessible.")
+                    .ShowError();
                 continue;
+            }
 
             var libraryItem = new LibraryTreeItem
             {
@@ -135,6 +135,8 @@ public partial class LeftPanelViewModel : ViewModelBase
             librariesRoot.Children.Add(libraryItem);
         }
 
+        // Clear ou the items before adding the new root
+        Items.Clear();
         Items.Add(librariesRoot);
         
         // Auto-select the Libraries node

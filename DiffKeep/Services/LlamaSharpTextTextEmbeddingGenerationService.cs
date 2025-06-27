@@ -12,11 +12,14 @@ namespace DiffKeep.Services;
 
 public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenerationService
 {
-    private const string DefaultModel = "bge-small-en-v1.5.Q8_0.gguf";
+    private const string DefaultModel = "e5-base-v2.Q6_K.gguf";
     private LLamaWeights? _loadedModel;
     private LLamaEmbedder? _embedder;
     private LLamaContext? _context;
     private bool _isEmbeddingModel = true;
+    private bool _usePrepends = true;
+    private string _docPrepend = "passage: ";
+    private string _queryPrepend = "query: ";
     private ModelParams? _modelParams;
     private readonly SemaphoreSlim _modelLock = new SemaphoreSlim(1, 1);
     private readonly SemaphoreSlim _generatingLock = new SemaphoreSlim(1, 1);
@@ -52,6 +55,13 @@ public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenera
         return _modelName;
     }
 
+    public bool ModelExists(string? modelFile = null)
+    {
+        modelFile ??= DefaultModel;
+        var fullModelPath = Path.Join(Program.DataPath, "models", modelFile);
+        return File.Exists(fullModelPath);
+    }
+
     public int EmbeddingSize()
     {
         if (_embedder == null)
@@ -84,7 +94,7 @@ public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenera
         }
     }
 
-    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text)
+    public async Task<IReadOnlyList<float[]>> GenerateEmbeddingAsync(string text, bool isQuery = false)
     {
         if (_loadedModel == null)
         {
@@ -100,6 +110,14 @@ public class LlamaSharpTextTextEmbeddingGenerationService : ITextEmbeddingGenera
             {
                 _modelLock.Release();
             }
+        }
+
+        if (_usePrepends)
+        {
+            if (isQuery)
+                text = _queryPrepend + text;
+            else
+                text = _docPrepend + text;
         }
 
         await _generatingLock.WaitAsync();

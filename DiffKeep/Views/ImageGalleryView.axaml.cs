@@ -462,7 +462,7 @@ public partial class ImageGalleryView : UserControl
             {
                 _scrollDebounceTimer = new DispatcherTimer
                 {
-                    Interval = TimeSpan.FromMilliseconds(150)
+                    Interval = TimeSpan.FromMilliseconds(100)
                 };
                 _scrollDebounceTimer.Tick += ScrollDebounceTimer_Tick;
             }

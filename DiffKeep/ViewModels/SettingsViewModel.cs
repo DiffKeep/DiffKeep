@@ -1,3 +1,4 @@
+using System;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
@@ -12,8 +13,10 @@ using Avalonia.Controls.ApplicationLifetimes;
 using DiffKeep.Models;
 using DiffKeep.Repositories;
 using DiffKeep.Extensions;
+using DiffKeep.Services;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Enums;
+using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
 
@@ -22,6 +25,9 @@ public partial class SettingsViewModel : ViewModelBase
     private readonly ILibraryRepository _libraryRepository;
     private readonly IImageRepository _imageRepository;
     private readonly IEmbeddingsRepository _embeddingsRepository;
+    private readonly ITextEmbeddingGenerationService _textEmbeddingGenerationService;
+    private readonly HuggingFaceDownloaderViewModel _huggingFaceDownloaderViewModel;
+    private readonly ToastManager  _toastManager;
 
     [ObservableProperty]
     private string _theme;
@@ -29,6 +35,8 @@ public partial class SettingsViewModel : ViewModelBase
     private string _language;
     [ObservableProperty] private bool _storeThumbnails;
     [ObservableProperty] private bool _useEmbeddings;
+    [ObservableProperty] private bool _modelExists;
+    [ObservableProperty] private string? _modelName;
 
     public partial class LibraryItem : ObservableObject
     {
@@ -40,11 +48,18 @@ public partial class SettingsViewModel : ViewModelBase
 
     public ObservableCollection<LibraryItem> Libraries { get; }
 
-    public SettingsViewModel(ILibraryRepository libraryRepository, IImageRepository imageRepository, IEmbeddingsRepository embeddingsRepository, AppSettings settings)
+    public SettingsViewModel(ILibraryRepository libraryRepository, IImageRepository imageRepository,
+        IEmbeddingsRepository embeddingsRepository, AppSettings settings,
+        ITextEmbeddingGenerationService textEmbeddingGenerationService,
+        HuggingFaceDownloaderViewModel huggingFaceDownloaderViewModel,
+        ToastManager toastManager)
     {
         _libraryRepository = libraryRepository;
         _imageRepository = imageRepository;
         _embeddingsRepository = embeddingsRepository;
+        _textEmbeddingGenerationService = textEmbeddingGenerationService;
+        _huggingFaceDownloaderViewModel = huggingFaceDownloaderViewModel;
+        _toastManager = toastManager;
         _theme = settings.Theme;
         _language = settings.Language;
         Libraries = new ObservableCollection<LibraryItem>();
@@ -60,6 +75,8 @@ public partial class SettingsViewModel : ViewModelBase
         Language = settings.Language;
         StoreThumbnails = settings.StoreThumbnails;
         UseEmbeddings = settings.UseEmbeddings;
+        ModelExists = _textEmbeddingGenerationService.ModelExists();
+        ModelName = _textEmbeddingGenerationService.ModelName();
         LoadLibrariesAsync().FireAndForget();
     }
 
@@ -161,6 +178,29 @@ public partial class SettingsViewModel : ViewModelBase
                     item.Path = result;
                 }
             }
+        }
+    }
+
+    [RelayCommand]
+    private async Task DownloadModel()
+    {
+        const string huggingFaceUrl = "https://huggingface.co/mradermacher/e5-base-v2-GGUF/resolve/main/e5-base-v2.Q6_K.gguf?download=true";
+        const string modelFileName = "e5-base-v2.Q6_K.gguf";
+        // Set the destination path
+        string destinationPath = Path.Join(Program.DataPath, "models", modelFileName);
+        
+        try
+        {
+            // Start the download
+            await _huggingFaceDownloaderViewModel.StartDownload(huggingFaceUrl, destinationPath);
+            
+            // Update the model status after successful download
+            ModelExists = _textEmbeddingGenerationService.ModelExists();
+        }
+        catch (Exception ex)
+        {
+            // Show error message
+            _toastManager.CreateToast("Error downloading model").WithContent($"Could not download model: {ex.Message}").ShowError();
         }
     }
     

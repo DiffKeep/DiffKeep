@@ -8,6 +8,7 @@
         <entry key="DiffKeep/Views/AboutWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/EmbeddingGeneration.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/EmbeddingProgress.axaml" value="DiffKeep/DiffKeep.csproj" />
+        <entry key="DiffKeep/Views/HuggingFaceDownloader.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/ImageGalleryView.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/ImageViewerWindow.axaml" value="DiffKeep/DiffKeep.csproj" />
         <entry key="DiffKeep/Views/LeftPanel.axaml" value="DiffKeep/DiffKeep.csproj" />

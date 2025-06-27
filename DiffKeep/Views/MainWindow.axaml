@@ -1,35 +1,61 @@
-<Window xmlns="https://github.com/avaloniaui"
+<controls:Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:DiffKeep.ViewModels"
         xmlns:views="clr-namespace:DiffKeep.Views"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:converters="clr-namespace:DiffKeep.Converters"
+        xmlns:toasts="clr-namespace:ShadUI.Toasts;assembly=ShadUI"
+        xmlns:controls="clr-namespace:ShadUI.Controls;assembly=ShadUI"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="DiffKeep.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/diffkeep.ico"
+        IsMenuVisible="True"
+        Margin="0"
         Title="DiffKeep">
     <Window.Resources>
         <converters:BoolToStringConverter x:Key="BoolToStringConverter" />
     </Window.Resources>
+    <controls:Window.MenuItems>
+        <MenuItem Header="File">
+            <MenuItem
+                Click="ShowSettingsDialog"
+                Header="Settings">
+                <MenuItem.Icon>
+                    <LucideIcon VerticalAlignment="Center"  Kind="Settings" Size="18"></LucideIcon>
+                </MenuItem.Icon>
+            </MenuItem>
+            <MenuItem
+                Click="Exit"
+                Header="Exit">
+                <MenuItem.Icon>
+                    <LucideIcon Kind="DoorOpen" Size="20"></LucideIcon>
+                </MenuItem.Icon>
+            </MenuItem>
+        </MenuItem>
+        <MenuItem Header="Help">
+            <MenuItem
+                Header="About"
+                Click="ShowAboutDialog" />
+        </MenuItem>
+    </controls:Window.MenuItems>
+    <controls:Window.RightWindowTitleBarControls>
+        <Button
+            Width="30"
+            Height="30"
+            Background="{DynamicResource SidebarBackgroundColor}"
+            CornerRadius="{DynamicResource MdCornerRadius}"
+            ToolTip.Tip="Switch Theme">
+        </Button>
+    </controls:Window.RightWindowTitleBarControls>
 
     <Design.DataContext>
         <vm:MainWindowViewModel />
     </Design.DataContext>
 
-    <DockPanel>
-        <Menu DockPanel.Dock="Top">
-            <MenuItem Header="_File">
-                <MenuItem Header="_Settings" Click="ShowSettingsDialog" />
-                <MenuItem Header="E_xit" Click="Exit" />
-            </MenuItem>
-            <MenuItem Header="_Help">
-                <MenuItem Header="_About" Click="ShowAboutDialog" />
-            </MenuItem>
-        </Menu>
-
-        <Grid>
+    <Grid RowDefinitions="*">
+        <Grid Grid.Row="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition
                     Width="{Binding LeftPanelWidth, Mode=TwoWay}"
@@ -74,5 +100,11 @@
                 <views:ImageGalleryView DataContext="{Binding ImageGallery}" />
             </ContentControl>
         </Grid>
-    </DockPanel>
-</Window>
+        <toasts:ToastHost Grid.Row="0"
+                          Manager="{Binding ToastManager}"
+                          Position="BottomRight"
+                          HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch"
+                          ZIndex="1000" />
+    </Grid>
+</controls:Window>

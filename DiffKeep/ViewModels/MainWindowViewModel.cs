@@ -8,6 +8,7 @@ using DiffKeep.Extensions;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Microsoft.Extensions.DependencyInjection;
+using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
 
@@ -26,12 +27,13 @@ public partial class MainWindowViewModel : ViewModelBase
     private double _leftPanelMinWidth;
     public LeftPanelViewModel LeftPanel { get; }
     public ImageGalleryViewModel ImageGallery { get; }
+    [ObservableProperty]
+    private ToastManager _toastManager;
 
-
-
-    public MainWindowViewModel(IAppStateService appStateService)
+    public MainWindowViewModel(IAppStateService appStateService, ToastManager toastManager)
     {
         _appStateService = appStateService;
+        _toastManager = toastManager;
         LeftPanel = Program.Services.GetRequiredService<LeftPanelViewModel>();
         ImageGallery = Program.Services.GetRequiredService<ImageGalleryViewModel>();
         var state = _appStateService.GetState();

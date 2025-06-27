@@ -59,21 +59,55 @@
                     </Border>
                 </StackPanel>
 
-                <StackPanel Orientation="Horizontal" Spacing="5">
-                    <CheckBox Content="Use Embeddings" IsChecked="{Binding UseEmbeddings}"/>
-                    <Border Width="16" Height="16" 
-                            CornerRadius="8"
-                            BorderBrush="{DynamicResource SystemControlForegroundBaseMediumBrush}" 
-                            BorderThickness="1"
-                            VerticalAlignment="Center"
-                            ToolTip.Tip="Enable AI-powered image similarity search using embeddings">
-                        <TextBlock Text="?" 
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                   FontSize="10" 
-                                   HorizontalAlignment="Center" 
+                <StackPanel Spacing="10">
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <CheckBox Content="Use Embeddings" IsChecked="{Binding UseEmbeddings}"/>
+                        <Border Width="16" Height="16" 
+                                CornerRadius="8"
+                                BorderBrush="{DynamicResource SystemControlForegroundBaseMediumBrush}" 
+                                BorderThickness="1"
+                                VerticalAlignment="Center"
+                                ToolTip.Tip="Enable AI-powered image similarity search using embeddings">
+                            <TextBlock Text="?" 
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       FontSize="10" 
+                                       HorizontalAlignment="Center" 
+                                       VerticalAlignment="Center"/>
+                        </Border>
+                    </StackPanel>
+                    
+                    <!-- Model status and download button -->
+                    <Grid IsVisible="{Binding UseEmbeddings}" Margin="25,0,0,0" ColumnDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Column="0" 
+                                   Text="Model Status: " 
                                    VerticalAlignment="Center"/>
-                    </Border>
+    
+                        <TextBlock Grid.Column="1" 
+                                   VerticalAlignment="Center"
+                                   Text="Model is present"
+                                   IsVisible="{Binding ModelExists}"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                                   Margin="5,0,0,0"/>
+               
+                        <TextBlock Grid.Column="1" 
+                                   VerticalAlignment="Center"
+                                   Text="Model is not present"
+                                   IsVisible="{Binding !ModelExists}"
+                                   Foreground="{DynamicResource SystemErrorTextColor}"
+                                   Margin="5,0,0,0"/>
+    
+                        <Button Grid.Column="2" 
+                                Content="Download Model" 
+                                Command="{Binding DownloadModelCommand}"
+                                IsVisible="{Binding !ModelExists}"
+                                Margin="10,0,0,0"/>
+                    </Grid>
+                    
+                    <!-- Model name display -->
+                    <TextBlock Text="{Binding ModelName, StringFormat='Model: {0}'}" 
+                               Margin="25,0,0,0"/>
                 </StackPanel>
+
                 
                 <StackPanel>
                     <TextBlock Text="Libraries:"/>

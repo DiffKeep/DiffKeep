@@ -29,7 +29,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Avalonia" Version="11.3.0" />
+        <PackageReference Include="Avalonia" Version="11.3.1" />
         <PackageReference Include="Avalonia.Controls.ItemsRepeater" Version="11.1.5" />
         <PackageReference Include="Avalonia.Desktop" Version="11.3.0" />
         <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.0" />
@@ -38,7 +38,7 @@
             <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
             <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
         </PackageReference>
-        <PackageReference Include="Avalonia.Themes.Simple" Version="11.3.0" />
+        <PackageReference Include="Avalonia.Themes.Simple" Version="11.3.1" />
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.1" />
         <PackageReference Include="GitInfo" Version="3.5.0">
           <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -47,6 +47,7 @@
         <PackageReference Include="llamasharp" Version="0.24.0" />
         <PackageReference Include="llamasharp.backend.cpu" Version="0.24.0" />
         <PackageReference Include="llamasharp.backend.vulkan" Version="0.24.0" />
+        <PackageReference Include="Lucide.Avalonia" Version="0.1.34" />
         <PackageReference Include="MessageBox.Avalonia" Version="3.2.0" />
         <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.5" />
@@ -58,6 +59,7 @@
         <PackageReference Include="Microsoft.SemanticKernel" Version="1.56.0" />
         <PackageReference Include="NetVips" Version="3.0.1" />
         <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" />
+        <PackageReference Include="ShadUI" Version="0.0.7-preview.9" />
         <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
         <RuntimeHostConfigurationOption Include="System.Data.SqliteEnableNotifications" Value="true" />

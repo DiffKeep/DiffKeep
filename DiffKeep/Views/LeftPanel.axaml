@@ -8,6 +8,8 @@
     <DockPanel LastChildFill="True">
         <views:EmbeddingGeneration DockPanel.Dock="Bottom"
                                    DataContext="{Binding EmbeddingsGenerationViewModel}" />
+        <views:HuggingFaceDownloader DockPanel.Dock="Bottom"
+                                     DataContext="{Binding HuggingFaceDownloaderViewModel}" />
         
         <TreeView ItemsSource="{Binding Items}"
                   SelectedItem="{Binding SelectedItem}"

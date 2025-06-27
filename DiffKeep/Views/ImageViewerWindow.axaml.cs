@@ -8,6 +8,7 @@ using Avalonia.Interactivity;
 using DiffKeep.Services;
 
 namespace DiffKeep.Views;
+using Window = ShadUI.Controls.Window;
 
 public partial class ImageViewerWindow : Window
 {

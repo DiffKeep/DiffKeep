@@ -11,6 +11,7 @@ using Avalonia.Reactive;
 using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
+using Window = ShadUI.Controls.Window;
 
 namespace DiffKeep.Views;
 
