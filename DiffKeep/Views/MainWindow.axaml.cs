@@ -18,6 +18,7 @@ using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
+using ShadUI.Themes;
 using Window = ShadUI.Controls.Window;
 
 namespace DiffKeep.Views;
@@ -269,6 +270,7 @@ public class WindowState: ICloneable
     public double LeftPanelWidth { get; set; } = 150; // Default value
     public bool LeftPanelOpen { get; set; } = true;
     public bool ImageViewerInfoPanelOpen { get; set; } = false;
+    public ThemeMode Theme { get; set; } = ThemeMode.System;
     
     public object Clone()
     {
@@ -282,6 +284,7 @@ public class WindowState: ICloneable
             LeftPanelWidth = LeftPanelWidth,
             LeftPanelOpen = LeftPanelOpen,
             ImageViewerInfoPanelOpen = ImageViewerInfoPanelOpen,
+            Theme = Theme,
         };
     }
 }

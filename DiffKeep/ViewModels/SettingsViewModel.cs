@@ -31,8 +31,6 @@ public partial class SettingsViewModel : ViewModelBase
     private readonly ToastManager  _toastManager;
 
     [ObservableProperty]
-    private string _theme;
-    [ObservableProperty]
     private string _language;
     [ObservableProperty] private bool _storeThumbnails;
     [ObservableProperty] private bool _useEmbeddings;
@@ -61,7 +59,6 @@ public partial class SettingsViewModel : ViewModelBase
         _textEmbeddingGenerationService = textEmbeddingGenerationService;
         _huggingFaceDownloaderViewModel = huggingFaceDownloaderViewModel;
         _toastManager = toastManager;
-        _theme = settings.Theme;
         _language = settings.Language;
         Libraries = new ObservableCollection<LibraryItem>();
         LoadLibrariesAsync().FireAndForget();
@@ -72,7 +69,6 @@ public partial class SettingsViewModel : ViewModelBase
         var settings = Program.Settings;
         Log.Debug("Loading current settings for the window. StoreThumbnails: {SettingsStoreThumbnails}", settings.StoreThumbnails);
         
-        Theme = settings.Theme;
         Language = settings.Language;
         StoreThumbnails = settings.StoreThumbnails;
         UseEmbeddings = settings.UseEmbeddings;
@@ -94,10 +90,9 @@ public partial class SettingsViewModel : ViewModelBase
     [RelayCommand]
     private async Task Save()
     {
-        // Save theme and language to AppSettings
+        // Save settings to AppSettings
         var settings = new AppSettings
         {
-            Theme = Theme,
             Language = Language,
             StoreThumbnails = StoreThumbnails,
             UseEmbeddings = UseEmbeddings,

@@ -7,6 +7,7 @@
         xmlns:converters="clr-namespace:DiffKeep.Converters"
         xmlns:toasts="clr-namespace:ShadUI.Toasts;assembly=ShadUI"
         xmlns:controls="clr-namespace:ShadUI.Controls;assembly=ShadUI"
+        xmlns:converters1="clr-namespace:ShadUI.Demo.Converters"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="DiffKeep.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
@@ -45,8 +46,10 @@
             Width="30"
             Height="30"
             Background="{DynamicResource SidebarBackgroundColor}"
+            Command="{Binding SwitchThemeCommand}"
             CornerRadius="{DynamicResource MdCornerRadius}"
             ToolTip.Tip="Switch Theme">
+            <LucideIcon Kind="{Binding CurrentTheme, Converter={x:Static converters1:ThemeModeConverters.ToLucideIcon}}" />
         </Button>
     </controls:Window.RightWindowTitleBarControls>
 

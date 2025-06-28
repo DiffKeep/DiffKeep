@@ -23,17 +23,7 @@
         
         <ScrollViewer>
             <StackPanel Spacing="10">
-                <StackPanel>
-                    <TextBlock Text="Theme:"/>
-                    <ComboBox SelectedItem="{Binding Theme}">
-                        <ComboBox.Items>
-                            <x:String>Light</x:String>
-                            <x:String>Dark</x:String>
-                        </ComboBox.Items>
-                    </ComboBox>
-                </StackPanel>
-                
-                <StackPanel>
+                <StackPanel Spacing="5">
                     <TextBlock Text="Language:"/>
                     <ComboBox SelectedItem="{Binding Language}">
                         <ComboBox.Items>
@@ -45,34 +35,16 @@
                 
                 <StackPanel Orientation="Horizontal" Spacing="5">
                     <CheckBox Content="Store Thumbnails" IsChecked="{Binding StoreThumbnails}"/>
-                    <Border Width="16" Height="16" 
-                            CornerRadius="8"
-                            BorderBrush="{StaticResource SystemControlForegroundBaseMediumBrush}" 
-                            BorderThickness="1"
-                            VerticalAlignment="Center"
-                            ToolTip.Tip="Store image thumbnails to speed up browsing but uses more disk space">
-                        <TextBlock Text="?" 
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                   FontSize="10" 
-                                   HorizontalAlignment="Center" 
-                                   VerticalAlignment="Center"/>
+                    <Border ToolTip.Tip="Storing image thumbnails uses less CPU but more disk space, can be faster for some hardware">
+                        <LucideIcon Kind="CircleQuestionMark" Size="18"></LucideIcon>
                     </Border>
                 </StackPanel>
 
                 <StackPanel Spacing="10">
                     <StackPanel Orientation="Horizontal" Spacing="5">
-                        <CheckBox Content="Use Embeddings" IsChecked="{Binding UseEmbeddings}"/>
-                        <Border Width="16" Height="16" 
-                                CornerRadius="8"
-                                BorderBrush="{DynamicResource SystemControlForegroundBaseMediumBrush}" 
-                                BorderThickness="1"
-                                VerticalAlignment="Center"
-                                ToolTip.Tip="Enable AI-powered image similarity search using embeddings">
-                            <TextBlock Text="?" 
-                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                       FontSize="10" 
-                                       HorizontalAlignment="Center" 
-                                       VerticalAlignment="Center"/>
+                        <CheckBox Content="Use Semantic Search" IsChecked="{Binding UseEmbeddings}"/>
+                        <Border ToolTip.Tip="Enable local AI-powered image similarity search using embeddings">
+                            <LucideIcon Kind="CircleQuestionMark" Size="18"></LucideIcon>
                         </Border>
                     </StackPanel>
                     

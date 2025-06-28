@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Threading.Tasks;
+using Avalonia;
 using Avalonia.Controls;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -9,6 +10,7 @@ using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
+using ShadUI.Themes;
 using ShadUI.Toasts;
 
 namespace DiffKeep.ViewModels;
@@ -31,13 +33,18 @@ public partial class MainWindowViewModel : ViewModelBase
     public ImageGalleryViewModel ImageGallery { get; }
     [ObservableProperty]
     private ToastManager _toastManager;
+    [ObservableProperty]
+    private ThemeMode _currentTheme;
+    private ThemeWatcher _themeWatcher;
 
-    public MainWindowViewModel(IAppStateService appStateService, ToastManager toastManager)
+    public MainWindowViewModel(IAppStateService appStateService, ToastManager toastManager,
+        LeftPanelViewModel leftPanelViewModel, ImageGalleryViewModel imageGalleryViewModel)
     {
         _appStateService = appStateService;
         _toastManager = toastManager;
-        LeftPanel = Program.Services.GetRequiredService<LeftPanelViewModel>();
-        ImageGallery = Program.Services.GetRequiredService<ImageGalleryViewModel>();
+        _themeWatcher = new ThemeWatcher(Application.Current!);
+        LeftPanel = leftPanelViewModel;
+        ImageGallery = imageGalleryViewModel;
         var state = _appStateService.GetState();
         if (state.LeftPanelOpen)
         {
@@ -51,6 +58,9 @@ public partial class MainWindowViewModel : ViewModelBase
             _leftPanelMinWidth = 0;
             _isLeftPanelOpen = false;
         }
+        
+        // set current theme
+        SwitchTheme(state.Theme);
 
         // Subscribe to selection changes
         LeftPanel.PropertyChanged +=  async (s, e) =>
@@ -121,5 +131,28 @@ public partial class MainWindowViewModel : ViewModelBase
         state.LeftPanelOpen = IsLeftPanelOpen;
         if (CanSaveState)
             _appStateService.SaveState(state);
+    }
+    
+    [RelayCommand]
+    private void SwitchTheme(ThemeMode? mode = null)
+    {
+        if (mode == null)
+        {
+            CurrentTheme = CurrentTheme switch
+            {
+                ThemeMode.System => ThemeMode.Light,
+                ThemeMode.Light => ThemeMode.Dark,
+                _ => ThemeMode.System
+            };
+        }
+        else
+        {
+            CurrentTheme = mode.Value;
+        }
+
+        _themeWatcher.SwitchTheme(CurrentTheme);
+        var state =  _appStateService.GetState();
+        state.Theme = CurrentTheme;
+        _appStateService.SaveState(state);
     }
 }

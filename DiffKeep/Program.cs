@@ -18,6 +18,7 @@ using LLama.Native;
 using Microsoft.Data.Sqlite;
 using Serilog;
 using Serilog.Events;
+using ShadUI.Themes;
 using ShadUI.Toasts;
 
 namespace DiffKeep;
@@ -217,9 +218,9 @@ sealed class Program
         services.AddSingleton<ILicenseService, LicenseService>();
         services.AddSingleton<IAppStateService, AppStateService>();
         services.AddSingleton<ToastManager>();
-        services.AddSingleton(Settings);
         
         // App settings
+        services.AddSingleton(Settings);
 
         // Register view models
         services.AddSingleton<MainWindowViewModel>();
