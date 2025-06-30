@@ -1,0 +1,21 @@
+name: Discord Commit Notifications
+
+on:
+  push:
+    branches: [ main, master ]  # Specify which branches to monitor
+
+jobs:
+  discord-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetches all history for all branches and tags
+
+      - name: Discord Commits
+        uses: Sniddl/discord-commits@v1.6
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          template: "avatar-with-link"
+          include-extras: true
