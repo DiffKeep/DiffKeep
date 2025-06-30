@@ -1,0 +1,62 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:DiffKeep.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:extensions="clr-namespace:ShadUI.Extensions;assembly=ShadUI"
+        mc:Ignorable="d" d:DesignWidth="500" d:DesignHeight="450"
+        x:Class="DiffKeep.Views.FeedbackWindow"
+        x:DataType="vm:FeedbackViewModel"
+        Title="Send Feedback"
+        Width="550" MinWidth="400"
+        Height="500" MinHeight="500"
+        WindowStartupLocation="CenterOwner">
+    
+    <DockPanel Margin="20" VerticalSpacing="">
+        <StackPanel DockPanel.Dock="Bottom" 
+                    Orientation="Horizontal" 
+                    HorizontalAlignment="Right" 
+                    Spacing="10"
+                    Margin="0,10,0,0">
+            <Button Content="Send" Command="{Binding SendFeedbackCommand}"/>
+            <Button Content="Cancel" Click="OnCancelClick"/>
+        </StackPanel>
+        
+        <StackPanel Spacing="15">
+            <TextBlock Text="We value your feedback!" FontWeight="Bold" FontSize="16"/>
+            <TextBlock Text="Please share your thoughts, suggestions, or report any issues you've encountered." TextWrapping="Wrap"/>
+            
+            <StackPanel Spacing="5">
+                <TextBlock Text="Feedback Type:"/>
+                <ComboBox SelectedItem="{Binding FeedbackType}" Width="200" HorizontalAlignment="Left">
+                    <ComboBox.Items>
+                        <x:String>Suggestion</x:String>
+                        <x:String>Bug Report</x:String>
+                        <x:String>Question</x:String>
+                        <x:String>Other</x:String>
+                    </ComboBox.Items>
+                </ComboBox>
+            </StackPanel>
+            
+            <StackPanel Spacing="5">
+                <TextBlock Text="Your Message:"/>
+                <TextBox Text="{Binding FeedbackMessage}"
+                         extensions:ControlAssist.Height="120"
+                         AcceptsReturn="True" TextWrapping="Wrap" />
+            </StackPanel>
+            
+            <StackPanel Spacing="5">
+                <TextBlock Text="Contact Email (optional):"/>
+                <TextBox Text="{Binding ContactEmail}" Watermark="your@email.com"/>
+            </StackPanel>
+            
+            <CheckBox Content="Include system information to help diagnose issues" 
+                      IsChecked="{Binding IncludeSystemInfo}"/>
+                      
+            <TextBlock Text="{Binding StatusMessage}" 
+                       TextWrapping="Wrap"
+                       Foreground="{Binding StatusMessageColor}" 
+                       IsVisible="{Binding !!StatusMessage}"/>
+        </StackPanel>
+    </DockPanel>
+</Window>

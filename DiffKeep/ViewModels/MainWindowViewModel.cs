@@ -8,6 +8,7 @@ using DiffKeep.Database;
 using DiffKeep.Extensions;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
+using DiffKeep.Views;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
 using ShadUI.Themes;

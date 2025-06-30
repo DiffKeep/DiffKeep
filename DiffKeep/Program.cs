@@ -231,6 +231,7 @@ sealed class Program
         services.AddSingleton<LeftPanelViewModel>();
         services.AddSingleton<EmbeddingsGenerationViewModel>();
         services.AddSingleton<HuggingFaceDownloaderViewModel>();
+        services.AddSingleton<FeedbackViewModel>();
 
         Services = services.BuildServiceProvider();
     }

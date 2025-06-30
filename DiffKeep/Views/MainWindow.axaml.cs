@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
 using Avalonia.Threading;
+using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Extensions;
 using DiffKeep.Messages;
@@ -257,6 +258,17 @@ public partial class MainWindow : Window
     private void Exit(object? sender, RoutedEventArgs e)
     {
         Close();
+    }
+    
+    private async void SendFeedback(object? sender, RoutedEventArgs e)
+    {
+        var feedbackVm = Program.Services.GetRequiredService<FeedbackViewModel>();
+        var dialog = new FeedbackWindow()
+        {
+            DataContext = feedbackVm
+        };
+
+        await dialog.ShowDialog(this);
     }
 }
 
