@@ -17,12 +17,14 @@ No guarantee is made of suitability or stability. Please note the relevant part 
 - [x] Add multiple libraries
 - [x] Multi-select and delete images
 - [x] View raw and parsed generation metadata [limited to positive prompt only for now]
+- [x] Full-text search inside prompts
 - [x] Vector search image prompts. Prompt detection support for:
     - [x] Comfyui
     - [x] Automatic1111
     - [ ] Fooocus
     - [ ] CivitAI
     - _More to come_
+- [ ] Hybrid semantic and full test search (WIP)
 - [ ] AI-generated image descriptions (also exposed in vector search)
 - [ ] Image similarity search (search by image)
 - [ ] File drag and drop out support (DnD source), cross-platform
@@ -31,6 +33,9 @@ No guarantee is made of suitability or stability. Please note the relevant part 
     - [ ] Linux
         - [ ] X11
         - [ ] Wayland
+- [ ] File drag and drop in support (DnD target), cross-platform
+    - [ ] Image parsing in the viewer
+    - [ ] Search by image
 - [ ] Generation integration with image generation tools:
     - [ ] ComfyUI
     - [ ] Internal image generation?
