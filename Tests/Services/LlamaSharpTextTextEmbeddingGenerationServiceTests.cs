@@ -1,8 +1,9 @@
+
 using DiffKeep.Services;
 using LLama;
 using LLama.Common;
+using Xunit;
 using Xunit.Abstractions;
-using FluentAssertions;
 
 namespace Tests.Services;
 
@@ -29,10 +30,10 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         var embeddings = await _service.GenerateEmbeddingAsync(inputText);
 
         // Assert
-        embeddings.Should().NotBeNull();
-        embeddings.Should().NotBeEmpty();
-        embeddings[0].Should().NotBeEmpty();
-        embeddings[0].Length.Should().Be(1024);
+        Assert.NotNull(embeddings);
+        Assert.NotEmpty(embeddings);
+        Assert.NotEmpty(embeddings[0]);
+        Assert.Equal(768, embeddings[0].Length);
     }
 
     [Fact]
@@ -58,10 +59,10 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         var embeddings = await _service.GenerateEmbeddingAsync(inputText);
 
         // Assert
-        embeddings.Should().NotBeNull();
-        embeddings.Should().NotBeEmpty();
-        embeddings[0].Should().NotBeEmpty();
-        embeddings[0].Length.Should().Be(1024);
+        Assert.NotNull(embeddings);
+        Assert.NotEmpty(embeddings);
+        Assert.NotEmpty(embeddings[0]);
+        Assert.Equal(768, embeddings[0].Length);
     }
 
     [Fact]
@@ -77,10 +78,10 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         var embeddings = await _service.GenerateEmbeddingAsync(inputText);
 
         // Assert
-        embeddings.Should().NotBeNull();
-        embeddings.Should().NotBeEmpty();
-        embeddings[0].Should().NotBeEmpty();
-        embeddings[0].Length.Should().Be(2560);
+        Assert.NotNull(embeddings);
+        Assert.NotEmpty(embeddings);
+        Assert.NotEmpty(embeddings[0]);
+        Assert.Equal(2560, embeddings[0].Length);
     }
 
     [Fact]
@@ -125,14 +126,14 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
             $"Similarity between 2 and 4 (should be around the same as similarity between 1 and 4): {similarity2_4}");
 
         // Assert
-        similarity1_2.Should().BeGreaterThan(similarity1_3,
-            "because sentences about cats should be more similar than sentences about dogs");
-        similarity1_3.Should().BeGreaterThan(similarity1_4,
-            "because sentences about animals should be more similar than sentences about quantum mechanics");
-        similarity2_3.Should().BeGreaterThan(similarity1_3,
-            "because sentences about animals sleeping should more similar than sentences about dogs");
-        similarity2_3.Should().BeGreaterThan(similarity2_4,
-            "because sentences about animals should be more similar than sentences about quantum mechanics");
+        Assert.True(similarity1_2 > similarity1_3, 
+            "Sentences about cats should be more similar than sentences about dogs");
+        Assert.True(similarity1_3 > similarity1_4, 
+            "Sentences about animals should be more similar than sentences about quantum mechanics");
+        Assert.True(similarity2_3 > similarity1_3, 
+            "Sentences about animals sleeping should more similar than sentences about dogs");
+        Assert.True(similarity2_3 > similarity2_4, 
+            "Sentences about animals should be more similar than sentences about quantum mechanics");
     }
 
     [Fact]

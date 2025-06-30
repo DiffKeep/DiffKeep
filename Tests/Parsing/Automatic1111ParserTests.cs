@@ -1,6 +1,5 @@
 using System.Text.Json;
 using DiffKeep.Parsing;
-using FluentAssertions;
 using Xunit;
 
 namespace Tests.Parsing;
@@ -44,7 +43,7 @@ public class Automatic1111ParserTests
         var result = parser.ExtractPrompt(emptyParameters);
 
         // Assert
-        result.PositivePrompt.Should().BeNull();
-        result.NegativePrompt.Should().BeNull();
+        Assert.Null(result.PositivePrompt);
+        Assert.Null(result.NegativePrompt);
     }
 }

@@ -1,6 +1,5 @@
 using System.Text.Json;
 using DiffKeep.Parsing;
-using FluentAssertions;
 using Xunit;
 
 namespace Tests.Parsing;
@@ -51,6 +50,6 @@ public class ComfyUIParserTests
         var result = parser.ExtractPrompt(emptyWorkflow);
 
         // Assert
-        result.PositivePrompt.Should().BeNull();
+        Assert.Null(result.PositivePrompt);
     }
 }

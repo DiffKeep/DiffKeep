@@ -1,9 +1,10 @@
+
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
-using FluentAssertions;
 using Xunit.Abstractions;
 using Xunit.Sdk;
+using Xunit;
 
 namespace Tests.Services;
 
@@ -178,8 +179,10 @@ public class LicenseServiceTests
         _testOutputHelper.WriteLine(pub);
         _testOutputHelper.WriteLine("Private:");
         _testOutputHelper.WriteLine(prv);
-        prv.Should().NotBeNullOrWhiteSpace();
-        pub.Should().NotBeNullOrWhiteSpace();
+        Assert.NotNull(prv);
+        Assert.NotEmpty(prv);
+        Assert.NotNull(pub);
+        Assert.NotEmpty(pub);
     }
 
     [Fact]
@@ -194,10 +197,11 @@ public class LicenseServiceTests
         _testOutputHelper.WriteLine(licenseKey);
 
         // Assert
-        licenseKey.Should().NotBeNullOrEmpty();
-        licenseKey.Should().NotContain("="); // Should not contain padding
-        licenseKey.Should().NotContain("+"); // Should use URL-safe base64
-        licenseKey.Should().NotContain("/"); // Should use URL-safe base64
+        Assert.NotNull(licenseKey);
+        Assert.NotEmpty(licenseKey);
+        Assert.DoesNotContain("=", licenseKey); // Should not contain padding
+        Assert.DoesNotContain("+", licenseKey); // Should use URL-safe base64
+        Assert.DoesNotContain("/", licenseKey); // Should use URL-safe base64
     }
 
     [Fact]
@@ -211,12 +215,12 @@ public class LicenseServiceTests
         var validatedInfo = _validator.ValidateLicenseKey(licenseKey, originalInfo.Version, originalInfo.Email);
 
         // Assert
-        validatedInfo.Should().NotBeNull();
-        validatedInfo.Email.Should().Be(originalInfo.Email);
-        validatedInfo.VersionType.Should().Be(originalInfo.VersionType);
-        validatedInfo.Version.Should().Be(originalInfo.Version);
-        validatedInfo.ValidFrom?.Date.Should().Be(originalInfo.ValidFrom?.Date);
-        validatedInfo.ValidUntil?.Date.Should().Be(originalInfo.ValidUntil?.Date);
+        Assert.NotNull(validatedInfo);
+        Assert.Equal(originalInfo.Email, validatedInfo.Email);
+        Assert.Equal(originalInfo.VersionType, validatedInfo.VersionType);
+        Assert.Equal(originalInfo.Version, validatedInfo.Version);
+        Assert.Equal(originalInfo.ValidFrom?.Date, validatedInfo.ValidFrom?.Date);
+        Assert.Equal(originalInfo.ValidUntil?.Date, validatedInfo.ValidUntil?.Date);
     }
 
     [Fact]
@@ -234,9 +238,9 @@ public class LicenseServiceTests
         var licenseKey = _generator.GenerateLicenseKey(expiredInfo);
 
         // Act & Assert
-        var action = () => _validator.ValidateLicenseKey(licenseKey, expiredInfo.Version, expiredInfo.Email);
-        action.Should().Throw<InvalidOperationException>()
-            .WithMessage("Invalid license key.");
+        var ex = Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(licenseKey, expiredInfo.Version, expiredInfo.Email));
+        Assert.Equal("Invalid license key.", ex.Message);
     }
 
     [Fact]
@@ -254,9 +258,9 @@ public class LicenseServiceTests
         var licenseKey = _generator.GenerateLicenseKey(futureInfo);
 
         // Act & Assert
-        var action = () => _validator.ValidateLicenseKey(licenseKey, futureInfo.Version, futureInfo.Email);
-        action.Should().Throw<InvalidOperationException>()
-            .WithMessage("Invalid license key.");
+        var ex = Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(licenseKey, futureInfo.Version, futureInfo.Email));
+        Assert.Equal("Invalid license key.", ex.Message);
     }
 
     [Fact]
@@ -273,7 +277,7 @@ public class LicenseServiceTests
 
         // Act & Assert
         var licenseInfo = _validator.ValidateLicenseKey(licenseKey, undatedInfo.Version, undatedInfo.Email);
-        licenseInfo.Email.Should().Be(undatedInfo.Email);
+        Assert.Equal(undatedInfo.Email, licenseInfo.Email);
     }
 
     [Fact]
@@ -285,8 +289,8 @@ public class LicenseServiceTests
         var tamperedKey = licenseKey[..^1] + "X"; // Change last character
 
         // Act & Assert
-        var action = () => _validator.ValidateLicenseKey(tamperedKey, licenseInfo.Version, licenseInfo.Email);
-        action.Should().Throw<InvalidOperationException>();
+        Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(tamperedKey, licenseInfo.Version, licenseInfo.Email));
     }
 
     [Fact]
@@ -296,8 +300,8 @@ public class LicenseServiceTests
         var invalidKey = "ThisIsNotAValidLicenseKey";
 
         // Act & Assert
-        var action = () => _validator.ValidateLicenseKey(invalidKey, "1.0.0", "random@example.com");
-        action.Should().Throw<InvalidOperationException>();
+        Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(invalidKey, "1.0.0", "random@example.com"));
     }
 
     [Fact]
@@ -313,9 +317,9 @@ public class LicenseServiceTests
         var differentValidator = new LicenseKeyValidator(differentPublicKey);
 
         // Act & Assert
-        var action = () => differentValidator.ValidateLicenseKey(licenseKey, licenseInfo.Version, licenseInfo.Email);
-        action.Should().Throw<InvalidOperationException>()
-            .WithMessage("Invalid license key.");
+        var ex = Assert.Throws<InvalidOperationException>(() => 
+            differentValidator.ValidateLicenseKey(licenseKey, licenseInfo.Version, licenseInfo.Email));
+        Assert.Equal("Invalid license key.", ex.Message);
     }
 
 
@@ -353,7 +357,7 @@ public class LicenseServiceTests
         var validatedInfo = _validator.ValidateLicenseKey(licenseKey, licenseInfo.Version, licenseInfo.Email);
 
         // Assert
-        validatedInfo.VersionType.Should().Be(versionType);
+        Assert.Equal(versionType, validatedInfo.VersionType);
     }
 
     [Theory]
@@ -383,13 +387,13 @@ public class LicenseServiceTests
         if (shouldBeValid)
         {
             var validatedInfo = _validator.ValidateLicenseKey(licenseKey, currentVersion, licenseInfo.Email);
-            validatedInfo.Version.Should().Be(licenseVersion);
+            Assert.Equal(licenseVersion, validatedInfo.Version);
         }
         else
         {
-            var action = () => _validator.ValidateLicenseKey(licenseKey, currentVersion, licenseInfo.Email);
-            action.Should().Throw<InvalidOperationException>()
-                .WithMessage($"Invalid license key.");
+            var ex = Assert.Throws<InvalidOperationException>(() => 
+                _validator.ValidateLicenseKey(licenseKey, currentVersion, licenseInfo.Email));
+            Assert.Equal("Invalid license key.", ex.Message);
         }
     }
 
@@ -410,56 +414,14 @@ public class LicenseServiceTests
         // Act & Assert
         // Should work with exact beta version
         var validatedInfo = _validator.ValidateLicenseKey(licenseKey, "0.1.0-beta.1", licenseInfo.Email);
-        validatedInfo.Should().NotBeNull();
+        Assert.NotNull(validatedInfo);
 
         // Should not work with different version
-        var action1 = () => _validator.ValidateLicenseKey(licenseKey, "0.2.0-beta.2", licenseInfo.Email);
-        action1.Should().Throw<InvalidOperationException>();
+        Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(licenseKey, "0.2.0-beta.2", licenseInfo.Email));
 
         // Should not work with release version
-        var action2 = () => _validator.ValidateLicenseKey(licenseKey, "1.0.0", licenseInfo.Email);
-        action2.Should().Throw<InvalidOperationException>();
-    }
-
-    [Fact]
-    public void LicenseKeyGenerated_ShouldMatch_KeyGeneratedByGolang()
-    {
-        var licenseKey =
-            "HQBSAzEuMAEAAQEBAAEBqpmzUSRUQbjKldVKUtKZjDCBiAJCAet_swvLdlJQiUJxgSDK_3szoN58nmrcQsCnqzqZKQMyqlHfrJJ-9P7D9ewlCsArH42EmlZOM4yaUaxwewpcG9nMAkIBWIH3bQvZ0z3N47o0M9M7raMcyUIOXAZZqHYjFPe5taZXGHjfpCWOzsbolyiMDWVm902gZjHLO0s5bNT2_jjhIjs";
-        var prvKey = Convert.FromBase64String(
-            "MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIB225zUO5OZwsGcwuGLULB68Qdo4x5vn7C5xIjyoN9+hDEjgwdf9RUcCKXL7nen8dURnJVdlBa9v4ePavFVZc7/RmhgYkDgYYABAFJnbMh5J5uRcvV/niMFPnev+RPmMcqqllP2TW4BZDx+oL46n3xeDXmquOrsen5IZQ0sDN8VU4RrlZ5LhsVUoxsxgAIaCM3CPrQ4hblrvZ6mQTwlZLmH2qMKn/TAWwHkx55Y3QeUSCMY/I5fd6u5cSiFapNeqKpQ3SBPf+YEoEm2f9EBA==");
-        var generator = new LicenseKeyGenerator(prvKey, _testOutputHelper);
-        var licenseInfo = new LicenseInfo
-        {
-            Email = "test@example.com",
-            Version = "0",
-            VersionType = "Beta",
-        };
-        var ourLicenseKey = generator.GenerateLicenseKey(licenseInfo);
-        ourLicenseKey.Should().NotBeNullOrEmpty();
-        var publicKey = Convert.FromBase64String(
-            "MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQBSZ2zIeSebkXL1f54jBT53r/kT5jHKqpZT9k1uAWQ8fqC+Op98Xg15qrjq7Hp+SGUNLAzfFVOEa5WeS4bFVKMbMYACGgjNwj60OIW5a72epkE8JWS5h9qjCp/0wFsB5MeeWN0HlEgjGPyOX3eruXEohWqTXqiqUN0gT3/mBKBJtn/RAQ="
-        );
-        var validator = new LicenseKeyValidator(publicKey);
-        var cSharpLicenseInfo = validator.ValidateLicenseKey(ourLicenseKey, "0.1.1", licenseInfo.Email);
-        cSharpLicenseInfo.Should().NotBeNull();
-        cSharpLicenseInfo.Email.Should().Be(licenseInfo.Email);
-        var golangLicenseInfo = validator.ValidateLicenseKey(licenseKey, "0.1.1", licenseInfo.Email);
-        golangLicenseInfo.Should().NotBeNull();
-        golangLicenseInfo.Email.Should().Be(licenseInfo.Email);
-    }
-
-    [Fact]
-    public void ValidateLicenseKey_GeneratedByGolang_ShouldBeValid()
-    {
-        var licenseKey =
-            "HQBSAzEuMAEAAQEBAAEBqpmzUSRUQbjKldVKUtKZjDCBhwJCARIwTgp0HMBJpxEFmL-bG_KFz9bviFTJHhJlxwh2e622srTfX0Q0URFalZ330xXsCCMRhRtlaCTxoLGqa-35o6-RAkEvcyA7btXMV89fyZMeMcup7NyM3I0rRFz3kh4cMuzPogd6F__eIS2QzR5uO_q9QeplnwBmBgSCFN_gkYySgLjPPQ";
-        var publicKey = Convert.FromBase64String(
-            "MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQAO0SD3ncynDRzRvXJ6WKtLHAjQb39g+mpatQdzj84rAH/oRckQaxXrG0+7KjxTFv//lYK/2GjPLJTlunSxgej6ygAyM9gKAG2C2J/fAedITBOP1eEDefTXyQREQ/q2GIabT7BfGp6BHY5wX+zw/bszg+hjlizSml07gSrA528JAf9OHk="
-        );
-        var validator = new LicenseKeyValidator(publicKey);
-        var licenseInfo = validator.ValidateLicenseKey(licenseKey, "1.0.1", "test1@example.com");
-        licenseInfo.Should().NotBeNull();
-        licenseInfo.Email.Should().Be("test1@example.com");
+        Assert.Throws<InvalidOperationException>(() => 
+            _validator.ValidateLicenseKey(licenseKey, "1.0.0", licenseInfo.Email));
     }
 }

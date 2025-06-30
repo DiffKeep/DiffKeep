@@ -34,28 +34,7 @@
 	<s:String x:Key="/Default/CodeInspection/ExcludedFiles/FilesAndFoldersToSkip2/=7020124F_002D9FFC_002D4AC3_002D8F3D_002DAAB8E0240759_002Ff_003AVOption_002Ecs_002Fl_003A_002E_002E_003F_002E_002E_003F_002E_002E_003F_002E_002E_003Fhome_003Fqt_003F_002Econfig_003FJetBrains_003FRider2025_002E1_003Fresharper_002Dhost_003FDecompilerCache_003Fdecompiler_003Fdaa8d9c408cd4b4286bbef7e35f1a42e31c00_003Fdb_003Fe29ddfad_003FVOption_002Ecs/@EntryIndexedValue">ForceIncluded</s:String>
 	<s:String x:Key="/Default/CodeInspection/ExcludedFiles/FilesAndFoldersToSkip2/=7020124F_002D9FFC_002D4AC3_002D8F3D_002DAAB8E0240759_002Ff_003AWeakHashList_002Ecs_002Fl_003A_002E_002E_003F_002E_002E_003F_002E_002E_003F_002E_002E_003Fhome_003Fqt_003F_002Econfig_003FJetBrains_003FRider2025_002E1_003Fresharper_002Dhost_003FSourcesCache_003F7710ad4af8a98338e28125edfd58e196ad92feddc5b5448ce5754284b649_003FWeakHashList_002Ecs/@EntryIndexedValue">ForceIncluded</s:String>
 	<s:String x:Key="/Default/Environment/UnitTesting/UnitTestSessionStore/Sessions/=0ebaf611_002D7658_002D4cb7_002Db5a5_002Dbdb5a0fa67d9/@EntryIndexedValue">&lt;SessionState ContinuousTestingMode="0" IsActive="True" Name="ComfyUIParserTests" xmlns="urn:schemas-jetbrains-com:jetbrains-ut-session"&gt;
-  &lt;TestAncestor&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Parsing.ComfyUIParserTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Parsing.PngMetadataParserTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LlamaSharpEmbeddingGenerateServiceTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.TextServiceTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LicenseServiceTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Parsing.Automatic1111ParserTests&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxEmbeddingGenerationServiceTests.GenerateEmbeddingAsync_WithValidText_ShouldReturnEmbeddings&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxEmbeddingGenerationServiceTests.LoadModelAsync_WithValidPath_ShouldLoadSuccessfully&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxEmbeddingGenerationServiceTests.GenerateEmbedding_SimilarityTest&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxEmbeddingGenerationServiceTests.VerifySimilarityFunction&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxTextEmbeddingGenerationServiceTests.LoadModelAsync_WithValidPath_ShouldLoadSuccessfully&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxTextEmbeddingGenerationServiceTests.GenerateEmbeddingAsync_WithValidText_ShouldReturnEmbeddings&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxTextEmbeddingGenerationServiceTests.GenerateEmbedding_SimilarityTest&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxTextEmbeddingGenerationServiceTests.GenerateEmbedding_SimilarityPromptSearchTest&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.OnnxTextEmbeddingGenerationServiceTests.VerifySimilarityFunction&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LlamaSharpTextTextEmbeddingGenerationServiceTests.GenerateEmbedding_SimilarityTest&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Services.LlamaSharpTextTextEmbeddingGenerationServiceTests.GenerateEmbedding_SimilarityPromptSearchTest&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Repositories.EmbeddingRepositoryTests.AddAndGetImage_ShouldReturnSameImage&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Repositories.ImageRepositoryTests.AddAndGetImage_ShouldReturnSameImage&lt;/TestId&gt;
-    &lt;TestId&gt;xUnit::7EB0BC17-2A99-4941-9F75-0F0568387330::net9.0::Tests.Repositories.ImageRepositoryTests&lt;/TestId&gt;
-  &lt;/TestAncestor&gt;
+  &lt;Project Location="/dump/projects/csharp/DiffKeep/Tests" Presentation="&amp;lt;Tests&amp;gt;" /&gt;
 &lt;/SessionState&gt;</s:String>
 	
 	</wpf:ResourceDictionary>

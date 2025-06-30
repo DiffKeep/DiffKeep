@@ -1,5 +1,5 @@
 using DiffKeep.Services;
-using FluentAssertions;
+using Xunit;
 
 namespace Tests.Services;
 
@@ -12,7 +12,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(null!, 10);
 
         // Assert
-        result.Should().BeNull();
+        Assert.Null(result);
     }
 
     [Fact]
@@ -22,7 +22,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently("", 10);
 
         // Assert
-        result.Should().BeEmpty();
+        Assert.Empty(result);
     }
 
     [Fact]
@@ -35,7 +35,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 20);
 
         // Assert
-        result.Should().Be(text);
+        Assert.Equal(text, result);
     }
 
     [Fact]
@@ -48,7 +48,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 25);
 
         // Assert
-        result.Should().Be("This is one sentence.");
+        Assert.Equal("This is one sentence.", result);
     }
 
     [Fact]
@@ -61,7 +61,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 35);
 
         // Assert
-        result.Should().Be("First sentence! Second sentence?");
+        Assert.Equal("First sentence! Second sentence?", result);
     }
 
     [Fact]
@@ -74,7 +74,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 50);
 
         // Assert
-        result.Should().Be("This text has no sentence break, but has commas,");
+        Assert.Equal("This text has no sentence break, but has commas,", result);
     }
 
     [Fact]
@@ -87,7 +87,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 25);
 
         // Assert
-        result.Should().Be("This text has no");
+        Assert.Equal("This text has no", result);
     }
 
     [Fact]
@@ -100,7 +100,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 10);
 
         // Assert
-        result.Should().Be("ThisTextHa");
+        Assert.Equal("ThisTextHa", result);
     }
 
     [Fact]
@@ -113,7 +113,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 20);
 
         // Assert
-        result.Should().Be("    Indented text.");
+        Assert.Equal("    Indented text.", result);
     }
 
     [Fact]
@@ -126,7 +126,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 20);
 
         // Assert
-        result.Should().Be("Text with spaces");
+        Assert.Equal("Text with spaces", result);
     }
 
     [Fact]
@@ -139,7 +139,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 25);
 
         // Assert
-        result.Should().Be("This is a sentence...");
+        Assert.Equal("This is a sentence...", result);
     }
 
     [Fact]
@@ -152,7 +152,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 0);
 
         // Assert
-        result.Should().BeEmpty();
+        Assert.Empty(result);
     }
 
     [Fact]
@@ -165,7 +165,7 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, -5);
 
         // Assert
-        result.Should().BeEmpty();
+        Assert.Empty(result);
     }
 
     [Fact]
@@ -178,7 +178,6 @@ public class TextServiceTests
         var result = TextService.TruncateIntelligently(text, 20);
 
         // Assert
-        result.Should().Be(text);
+        Assert.Equal(text, result);
     }
-
 }
