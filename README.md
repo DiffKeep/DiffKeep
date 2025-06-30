@@ -20,11 +20,11 @@ No guarantee is made of suitability or stability. Please note the relevant part 
 - [x] Full-text search inside prompts
 - [x] Vector search image prompts. Prompt detection support for:
     - [x] Comfyui
-    - [x] Automatic1111
+    - [x] Automatic1111 (Needs more testing with newer versions)
     - [ ] Fooocus
     - [ ] CivitAI
     - _More to come_
-- [ ] Hybrid semantic and full test search (WIP)
+- [ ] Hybrid semantic and full text search (WIP)
 - [ ] AI-generated image descriptions (also exposed in vector search)
 - [ ] Image similarity search (search by image)
 - [ ] File drag and drop out support (DnD source), cross-platform
