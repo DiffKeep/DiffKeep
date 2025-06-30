@@ -392,7 +392,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         Log.Debug("Finished fetching thumbnails for {Length} images", visibleImageArray.Length);
     }
     
-    private void CleanupThumbnails(object? state)
+    private async void CleanupThumbnails(object? state)
     {
         // Prevent multiple cleanup operations from running simultaneously
         if (_isThumbnailCleanupRunning || Thumbnails.IsEmpty)
@@ -408,13 +408,28 @@ public partial class ImageGalleryViewModel : ViewModelBase
         
         try
         {
-            var now = DateTime.UtcNow;
-            var keysToRemove = new List<long>();
+            // Find the most recent thumbnail timestamp
+            DateTime mostRecentTimestamp = DateTime.MinValue;
+            foreach (var timestamp in _thumbnailLastVisibleTime.Values)
+            {
+                if (timestamp > mostRecentTimestamp)
+                {
+                    mostRecentTimestamp = timestamp;
+                }
+            }
+        
+            // If we have no timestamps at all, there's nothing to clean up
+            if (mostRecentTimestamp == DateTime.MinValue)
+                return;
             
-            // Find expired thumbnails (not seen for at least the retention time)
+            // Calculate the cutoff time as 5 seconds before the most recent activity
+            var cutoffTime = mostRecentTimestamp.AddSeconds(-5);
+            var keysToRemove = new List<long>();
+        
+            // Find thumbnails older than the cutoff time
             foreach (var entry in _thumbnailLastVisibleTime)
             {
-                if (now - entry.Value > _thumbnailRetentionTime)
+                if (entry.Value < cutoffTime)
                 {
                     keysToRemove.Add(entry.Key);
                 }
@@ -432,6 +447,12 @@ public partial class ImageGalleryViewModel : ViewModelBase
                     
                     foreach (var key in batch)
                     {
+                        // Remove the thumbnail from the image first, so the UI isn't trying to draw something that doesn't exist
+                        await Dispatcher.UIThread.InvokeAsync(() =>
+                        {
+                            var affectedImage = Images.FirstOrDefault(img => img.Id == key);
+                            affectedImage?.RemoveThumbnail();
+                        });
                         // Remove the timestamp entry
                         _thumbnailLastVisibleTime.TryRemove(key, out _);
                         
@@ -439,13 +460,6 @@ public partial class ImageGalleryViewModel : ViewModelBase
                         if (Thumbnails.TryRemove(key, out var bitmap))
                         {
                             bitmap?.Dispose();
-                            
-                            // Queue UI update at background priority
-                            Dispatcher.UIThread.Post(() =>
-                            {
-                                var affectedImage = Images.FirstOrDefault(img => img.Id == key);
-                                affectedImage?.UpdateThumbnail();
-                            }, DispatcherPriority.Background);
                         }
                     }
                     
@@ -599,6 +613,11 @@ public partial class ImageItemViewModel : ViewModelBase
         {
             Log.Error("Cound not get gallery view model when trying to update thumbnail");
         }
+    }
+
+    public void RemoveThumbnail()
+    {
+        Thumbnail = null;
     }
 
     // Trigger property change notification for selection state
