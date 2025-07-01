@@ -48,9 +48,20 @@ No guarantee is made of suitability or stability. Please note the relevant part 
 
 ## Development Notes
 
-Have to have LibVips installed for your platform
+You need to have LibVips installed for your platform:
 https://github.com/kleisauke/net-vips#install
 
+Create a file `DiffKeep/Settings/Secrets.cs` and fill it out like this:
+
+```csharp
+namespace DiffKeep.Settings;
+
+public class Secrets
+{
+    public readonly string FeedbackApiKey =
+        "api-key-here";
+}
+```
 
 ## Fair Use Notice
 
