@@ -69,6 +69,7 @@
         <PackageReference Include="ShadUI" Version="0.0.7-preview.9" />
         <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+        <PackageReference Include="system.management" Version="9.0.6" />
         <RuntimeHostConfigurationOption Include="System.Data.SqliteEnableNotifications" Value="true" />
     </ItemGroup>
 
