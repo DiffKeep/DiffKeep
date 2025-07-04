@@ -17,7 +17,7 @@ using DiffKeep.Services;
 using MsBox.Avalonia;
 using MsBox.Avalonia.Enums;
 using Serilog;
-using ShadUI.Toasts;
+using ShadUI;
 
 namespace DiffKeep.ViewModels;
 

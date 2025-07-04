@@ -2,7 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="DiffKeep.App"
              xmlns:local="using:DiffKeep"
-             xmlns:themes="clr-namespace:ShadUI.Themes;assembly=ShadUI"
+             xmlns:themes="clr-namespace:ShadUI;assembly=ShadUI"
              RequestedThemeVariant="Default">
 
     <Application.DataTemplates>

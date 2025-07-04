@@ -18,8 +18,9 @@ using DiffKeep.Messages;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Serilog;
-using ShadUI.Toasts;
+using ShadUI;
 using Image = DiffKeep.Models.Image;
+using Window = Avalonia.Controls.Window;
 
 namespace DiffKeep.ViewModels;
 

@@ -19,8 +19,8 @@ using DiffKeep.Services;
 using DiffKeep.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
-using ShadUI.Themes;
-using Window = ShadUI.Controls.Window;
+using ShadUI;
+using Window = ShadUI.Window;
 
 namespace DiffKeep.Views;
 
@@ -33,10 +33,8 @@ public partial class MainWindow : Window
     private readonly ILicenseService _licenseService;
     private readonly IAppStateService _appStateService;
     private bool _canSaveState = false;
-    private CancellationTokenSource _layoutDebounceTokenSource;
+    private CancellationTokenSource? _layoutDebounceTokenSource;
     private readonly TimeSpan _debounceDelay = TimeSpan.FromMilliseconds(100);
-
-
     
     public MainWindow()
     {
@@ -69,7 +67,7 @@ public partial class MainWindow : Window
             
                 // If this is the initial size, also apply the panel width
                 var state = _appStateService.GetState();
-                if (state.LeftPanelOpen && state.LeftPanelWidth > 0)
+                if (state is { LeftPanelOpen: true, LeftPanelWidth: > 0 })
                 {
                     Log.Debug("Setting left panel width to {StateLeftPanelWidth}", state.LeftPanelWidth);
                     vm.LeftPanelWidth = new GridLength(state.LeftPanelWidth);
@@ -95,22 +93,12 @@ public partial class MainWindow : Window
     {
         base.OnLoaded(e);
         LoadWindowState();
-        
-#if !SKIP_LICENSE_CHECK
-        if (!await _licenseService.CheckLicenseValidAsync())
-        {
-            var licenseWindow = new LicenseKeyWindow();
-            await licenseWindow.ShowDialog(this);
-        
-            // Check again after dialog closes
-            if (!await _licenseService.CheckLicenseValidAsync())
-            {
-                Close();
-                return;
-            }
-        }
-#endif
 
+        Program.Settings.IsRegistered = await _licenseService.CheckLicenseValidAsync();
+        if (DataContext is MainWindowViewModel vm)
+        {
+            vm.IsRegistered = Program.Settings.IsRegistered;
+        }
     }
     
     private void OnLayoutUpdated(object? sender, EventArgs e)

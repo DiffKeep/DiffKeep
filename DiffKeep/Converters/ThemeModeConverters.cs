@@ -1,9 +1,8 @@
 ﻿using System.Collections.Generic;
-using Avalonia.Controls;
 using Avalonia.Data.Converters;
-using ShadUI.Themes;
+using ShadUI;
 
-namespace ShadUI.Demo.Converters;
+namespace DiffKeep.Converters;
 
 public static class ThemeModeConverters
 {

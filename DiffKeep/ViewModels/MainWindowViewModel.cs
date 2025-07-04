@@ -11,31 +11,25 @@ using DiffKeep.Services;
 using DiffKeep.Views;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
-using ShadUI.Themes;
-using ShadUI.Toasts;
+using ShadUI;
+using ShadUI;
 
 namespace DiffKeep.ViewModels;
 
 public partial class MainWindowViewModel : ViewModelBase
 {
     private readonly IAppStateService _appStateService;
-    [ObservableProperty]
-    private bool _isLeftPanelOpen = true;
-    [ObservableProperty]
-    private double _windowWidth;
-    [ObservableProperty]
-    private GridLength _leftPanelWidth;
-    [ObservableProperty]
-    private double _leftPanelMaxWidth = 500;
-    [ObservableProperty]
-    private double _leftPanelMinWidth;
+    [ObservableProperty] private bool _isLeftPanelOpen = true;
+    [ObservableProperty] private double _windowWidth;
+    [ObservableProperty] private GridLength _leftPanelWidth;
+    [ObservableProperty] private double _leftPanelMaxWidth = 500;
+    [ObservableProperty] private double _leftPanelMinWidth;
     public LeftPanelViewModel LeftPanel { get; }
     public bool CanSaveState = false;
     public ImageGalleryViewModel ImageGallery { get; }
-    [ObservableProperty]
-    private ToastManager _toastManager;
-    [ObservableProperty]
-    private ThemeMode _currentTheme;
+    [ObservableProperty] private ToastManager _toastManager;
+    [ObservableProperty] private ThemeMode _currentTheme;
+    [ObservableProperty] private bool _isRegistered;
     private ThemeWatcher _themeWatcher;
 
     public MainWindowViewModel(IAppStateService appStateService, ToastManager toastManager,
@@ -59,12 +53,12 @@ public partial class MainWindowViewModel : ViewModelBase
             _leftPanelMinWidth = 0;
             _isLeftPanelOpen = false;
         }
-        
+
         // set current theme
         SwitchTheme(state.Theme);
 
         // Subscribe to selection changes
-        LeftPanel.PropertyChanged +=  async (s, e) =>
+        LeftPanel.PropertyChanged += async (s, e) =>
         {
             if (e.PropertyName == nameof(LeftPanelViewModel.SelectedItem) && LeftPanel.SelectedItem != null)
             {
@@ -74,7 +68,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
         };
     }
-    
+
     public void RefreshLibraries()
     {
         LeftPanel.RefreshLibrariesAsync().FireAndForget();
@@ -103,13 +97,13 @@ public partial class MainWindowViewModel : ViewModelBase
             _appStateService.SaveState(state);
         }
     }
-    
+
     public void UpdateWindowSize(double width)
     {
         if (width <= 0) return;
         Log.Debug("Window width is now {Width}", width);
         WindowWidth = width;
-            
+
         // Check if current left panel width exceeds the new max width
         double maxWidth = WindowWidth * 0.5;
         LeftPanelMaxWidth = maxWidth;
@@ -133,7 +127,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (CanSaveState)
             _appStateService.SaveState(state);
     }
-    
+
     [RelayCommand]
     private void SwitchTheme(ThemeMode? mode = null)
     {
@@ -152,7 +146,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         _themeWatcher.SwitchTheme(CurrentTheme);
-        var state =  _appStateService.GetState();
+        var state = _appStateService.GetState();
         state.Theme = CurrentTheme;
         _appStateService.SaveState(state);
     }

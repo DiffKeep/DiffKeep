@@ -14,7 +14,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using DiffKeep.Services;
 using Serilog;
-using ShadUI.Toasts;
+using ShadUI;
 
 namespace DiffKeep.ViewModels;
 

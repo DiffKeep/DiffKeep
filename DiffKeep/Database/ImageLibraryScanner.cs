@@ -16,7 +16,7 @@ using DiffKeep.Parsing;
 using DiffKeep.Repositories;
 using DiffKeep.Services;
 using Serilog;
-using ShadUI.Toasts;
+using ShadUI;
 
 namespace DiffKeep.Database;
 

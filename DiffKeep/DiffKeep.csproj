@@ -19,9 +19,6 @@
         <InformationalVersion>$(GitVersion_InformationalVersion)</InformationalVersion>
         <ApplicationIcon>Assets\diffkeep.ico</ApplicationIcon>
     </PropertyGroup>
-    <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
-        <DefineConstants>TRACE;DEBUG;SKIP_LICENSE_CHECK</DefineConstants>
-    </PropertyGroup>
 
     <ItemGroup>
         <AvaloniaResource Include="Assets\**" />
@@ -66,7 +63,7 @@
         <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
         <PackageReference Include="Serilog.Sinks.Debug" Version="3.0.0" />
         <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
-        <PackageReference Include="ShadUI" Version="0.0.7-preview.9" />
+        <PackageReference Include="ShadUI" Version="0.1.1" />
         <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
         <PackageReference Include="system.management" Version="9.0.6" />

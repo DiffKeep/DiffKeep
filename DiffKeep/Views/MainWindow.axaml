@@ -1,13 +1,11 @@
-<controls:Window xmlns="https://github.com/avaloniaui"
+<shadUi:Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:DiffKeep.ViewModels"
         xmlns:views="clr-namespace:DiffKeep.Views"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:converters="clr-namespace:DiffKeep.Converters"
-        xmlns:toasts="clr-namespace:ShadUI.Toasts;assembly=ShadUI"
-        xmlns:controls="clr-namespace:ShadUI.Controls;assembly=ShadUI"
-        xmlns:converters1="clr-namespace:ShadUI.Demo.Converters"
+        xmlns:shadUi="clr-namespace:ShadUI;assembly=ShadUI"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="DiffKeep.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
@@ -18,56 +16,56 @@
     <Window.Resources>
         <converters:BoolToStringConverter x:Key="BoolToStringConverter" />
     </Window.Resources>
-    <controls:Window.MenuItems>
-        <MenuItem Header="File">
-            <MenuItem
-                Click="ShowSettingsDialog"
-                Header="Settings">
-                <MenuItem.Icon>
-                    <LucideIcon VerticalAlignment="Center"  Kind="Settings" Size="18"></LucideIcon>
-                </MenuItem.Icon>
+    <shadUi:Window.MenuBarContent>
+        <Menu>
+            <MenuItem Header="File">
+                <MenuItem
+                    Click="ShowSettingsDialog"
+                    Header="Settings">
+                    <MenuItem.Icon>
+                        <LucideIcon VerticalAlignment="Center"  Kind="Settings" Size="18"></LucideIcon>
+                    </MenuItem.Icon>
+                </MenuItem>
+                <MenuItem
+                    Click="Exit"
+                    Header="Exit">
+                    <MenuItem.Icon>
+                        <LucideIcon Kind="DoorOpen" Size="20"></LucideIcon>
+                    </MenuItem.Icon>
+                </MenuItem>
             </MenuItem>
-            <MenuItem
-                Click="Exit"
-                Header="Exit">
-                <MenuItem.Icon>
-                    <LucideIcon Kind="DoorOpen" Size="20"></LucideIcon>
-                </MenuItem.Icon>
+            <MenuItem Header="Help">
+                <MenuItem
+                    Header="About"
+                    Click="ShowAboutDialog" />
             </MenuItem>
-        </MenuItem>
-        <MenuItem Header="Help">
-            <MenuItem
-                Header="About"
-                Click="ShowAboutDialog" />
-        </MenuItem>
-    </controls:Window.MenuItems>
-    <controls:Window.RightWindowTitleBarControls>
-        <Button
-            Width="30"
-            Height="30"
-            Background="{DynamicResource SidebarBackgroundColor}"
-            Click="SendFeedback"
-            CornerRadius="{DynamicResource MdCornerRadius}"
-            ToolTip.Tip="Send Feedback">
-            <LucideIcon Kind="MessageCircle" />
-        </Button>
-        <Button
-            Width="30"
-            Height="30"
-            Background="{DynamicResource SidebarBackgroundColor}"
-            Command="{Binding SwitchThemeCommand}"
-            CornerRadius="{DynamicResource MdCornerRadius}"
-            ToolTip.Tip="Switch Theme">
-            <LucideIcon Kind="{Binding CurrentTheme, Converter={x:Static converters1:ThemeModeConverters.ToLucideIcon}}" />
-        </Button>
-    </controls:Window.RightWindowTitleBarControls>
+        </Menu>
+    </shadUi:Window.MenuBarContent>
+    <shadUi:Window.RightWindowTitleBarContent>
+        <StackPanel Orientation="Horizontal">
+            <Button
+                Width="30"
+                Height="30"
+                Background="{DynamicResource SidebarBackgroundColor}"
+                Click="SendFeedback"
+                CornerRadius="{DynamicResource MdCornerRadius}"
+                ToolTip.Tip="Send Feedback">
+                <LucideIcon Kind="MessageCircle" />
+            </Button>
+            <Button
+                Width="30"
+                Height="30"
+                Background="{DynamicResource SidebarBackgroundColor}"
+                Command="{Binding SwitchThemeCommand}"
+                CornerRadius="{DynamicResource MdCornerRadius}"
+                ToolTip.Tip="Switch Theme">
+                <LucideIcon Kind="{Binding CurrentTheme, Converter={x:Static converters:ThemeModeConverters.ToLucideIcon}}" />
+            </Button>
+        </StackPanel>
+    </shadUi:Window.RightWindowTitleBarContent>
 
-    <Design.DataContext>
-        <vm:MainWindowViewModel />
-    </Design.DataContext>
-
-    <Grid RowDefinitions="*">
-        <Grid Grid.Row="0">
+    <Panel>
+        <Grid>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"
                     MaxWidth="{Binding LeftPanelMaxWidth}"
@@ -111,11 +109,11 @@
                 <views:ImageGalleryView DataContext="{Binding ImageGallery}" />
             </ContentControl>
         </Grid>
-        <toasts:ToastHost Grid.Row="0"
+        <shadUi:ToastHost
                           Manager="{Binding ToastManager}"
                           Position="BottomRight"
                           HorizontalAlignment="Stretch"
                           VerticalAlignment="Stretch"
                           ZIndex="1000" />
-    </Grid>
-</controls:Window>
+    </Panel>
+</shadUi:Window>

@@ -1,7 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using DiffKeep.ViewModels;
-using Window = ShadUI.Controls.Window;
+using Window = ShadUI.Window;
 
 namespace DiffKeep.Views;
 

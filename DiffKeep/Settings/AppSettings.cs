@@ -25,4 +25,5 @@ public class AppSettings
     public bool UseEmbeddings { get; set; } = false;
     public string? LicenseKey { get; set; }
     public string? Email { get; set; }
+    public bool IsRegistered { get; set; }
 }

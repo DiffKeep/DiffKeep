@@ -18,8 +18,7 @@ using LLama.Native;
 using Microsoft.Data.Sqlite;
 using Serilog;
 using Serilog.Events;
-using ShadUI.Themes;
-using ShadUI.Toasts;
+using ShadUI;
 
 namespace DiffKeep;
 
