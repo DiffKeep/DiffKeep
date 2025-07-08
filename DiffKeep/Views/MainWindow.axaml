@@ -75,8 +75,9 @@
             </Grid.ColumnDefinitions>
             
             <!-- Left Panel -->
-            <views:LeftPanel Grid.Column="0" DataContext="{Binding LeftPanel}"/>
-
+            <Border Grid.Column="0" IsVisible="{Binding IsLeftPanelOpen}">
+                <views:LeftPanel DataContext="{Binding LeftPanel}"/>
+            </Border>
             <GridSplitter 
                 Grid.Column="1"
                 Background="#66808080"
@@ -86,7 +87,7 @@
                 HorizontalAlignment="Left"
                 ResizeBehavior="PreviousAndNext" />
         
-            <!-- Toggle Button can be positioned absolutely -->
+            <!-- Toggle Button for Left Pane -->
             <Button
                 Grid.Column="1"
                 Width="24"
@@ -94,6 +95,7 @@
                 HorizontalAlignment="Left"
                 VerticalAlignment="Top"
                 ZIndex="1"
+                ToolTip.Tip="Toggle the left panel"
                 Command="{Binding ToggleLeftPanelCommand}">
                 <PathIcon
                     Data="{Binding IsLeftPanelOpen,
