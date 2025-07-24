@@ -26,6 +26,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # This allows the workflow to access tag info
+
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            # Extract version from tag (remove 'v' prefix)
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Default version for non-tag builds
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -48,28 +65,244 @@ jobs:
         run: dotnet restore
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build --configuration Release --no-restore -p:Version=${{ env.VERSION }}
 
       - name: Test
         run: dotnet test --configuration Release --no-build
 
-      - name: Publish
+      - name: Publish with native AOT
         run: |
           dotnet publish DiffKeep/DiffKeep.csproj -c Release -r ${{ matrix.rid }} \
           --self-contained true \
-          -p:PublishSingleFile=true \
-          -p:IncludeNativeLibrariesForSelfExtract=true \
-          -p:IncludeAllContentForSelfExtract=true \
-          -p:EnableCompressionInSingleFile=true \
+          -p:PublishAot=true \
+          -p:StripSymbols=true \
+          -p:InvariantGlobalization=true \
+          -p:UseSystemResourceKeys=true \
+          -p:IlcOptimizationPreference=Size \
+          -p:IlcFoldIdenticalMethodBodies=true \
+          -p:DebugType=None \
           -p:PublishTrimmed=true \
+          -p:TrimMode=full \
+          -p:Version=${{ env.VERSION }} \
           -o publish/${{ matrix.rid }}
         shell: bash
       
-      - name: Upload build artifacts
+      # Package all files into a single executable (for platforms that support it)
+      - name: Package as AppImage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Install AppImage tools
+          sudo apt-get update -y
+          sudo apt-get install -y fuse libfuse2 desktop-file-utils
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          
+          # Create AppDir structure
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          
+          # Copy files
+          cp -r publish/${{ matrix.rid }}/* AppDir/usr/bin/
+          cp DiffKeep/Assets/diffkeep.png AppDir/usr/share/icons/hicolor/256x256/apps/
+          
+          # Create desktop file
+          cat > AppDir/usr/share/applications/diffkeep.desktop << EOL
+          [Desktop Entry]
+          Name=DiffKeep
+          Exec=DiffKeep
+          Icon=diffkeep
+          Type=Application
+          Categories=Utility;
+          EOL
+          
+          # Create AppRun
+          cat > AppDir/AppRun << EOL
+          #!/bin/sh
+          SELF=\$(readlink -f "\$0")
+          HERE=\${SELF%/*}
+          export PATH="\${HERE}/usr/bin:\${PATH}"
+          export LD_LIBRARY_PATH="\${HERE}/usr/bin:\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
+          "\${HERE}/usr/bin/DiffKeep" "\$@"
+          EOL
+          
+          chmod +x AppDir/AppRun
+          
+          # Create AppImage
+          ./appimagetool AppDir DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage
+          
+          # Replace the original artifact
+          mkdir -p publish/appimage
+          mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage publish/appimage/
+        shell: bash
+
+      # For Windows, create a proper installer with upgrade support
+      - name: Create Windows installer
+        if: matrix.os == 'windows-latest'
+        run: |
+          # Install Inno Setup
+          choco install innosetup -y
+          
+          # Parse version components for Windows version info
+          $versionParts = "${{ env.VERSION }}".Split('.')
+          $majorVersion = $versionParts[0]
+          $minorVersion = if ($versionParts.Length -gt 1) { $versionParts[1] } else { "0" }
+          $patchVersion = if ($versionParts.Length -gt 2) { $versionParts[2] } else { "0" }
+          $buildVersion = if ($versionParts.Length -gt 3) { $versionParts[3] } else { "0" }
+          
+          # Remove any non-numeric text for version comparison
+          $majorVersion = $majorVersion -replace '[^\d]', ''
+          $minorVersion = $minorVersion -replace '[^\d]', ''
+          $patchVersion = $patchVersion -replace '[^\d]', ''
+          $buildVersion = $buildVersion -replace '[^\d]', ''
+          
+          # Set default values if empty
+          if ([string]::IsNullOrEmpty($majorVersion)) { $majorVersion = "0" }
+          if ([string]::IsNullOrEmpty($minorVersion)) { $minorVersion = "0" }
+          if ([string]::IsNullOrEmpty($patchVersion)) { $patchVersion = "0" }
+          if ([string]::IsNullOrEmpty($buildVersion)) { $buildVersion = "0" }
+          
+          # Create Inno Setup script with version from tag and proper upgrade handling
+          cat > installer.iss << EOL
+          #define MyAppName "DiffKeep"
+          #define MyAppVersion "${{ env.VERSION }}"
+          #define MyAppPublisher "Fifth Interactive"
+          #define MyAppURL "https://diffkeep.com"
+          #define MyAppExeName "DiffKeep.exe"
+          
+          [Setup]
+          AppId={{D5F30C0A-7A2A-4A5F-9AE5-B1C99A9D003A}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppVerName={#MyAppName} {#MyAppVersion}
+          VersionInfoVersion=$majorVersion.$minorVersion.$patchVersion.$buildVersion
+          AppPublisher={#MyAppPublisher}
+          AppPublisherURL={#MyAppURL}
+          AppSupportURL={#MyAppURL}
+          AppUpdatesURL={#MyAppURL}
+          DefaultDirName={autopf}\{#MyAppName}
+          DefaultGroupName={#MyAppName}
+          OutputBaseFilename=DiffKeep-${{ env.VERSION }}-setup
+          Compression=lzma
+          SolidCompression=yes
+          WizardStyle=modern
+          UninstallDisplayIcon={app}\{#MyAppExeName}
+          CloseApplications=yes
+          CloseApplicationsFilter=*.exe
+          
+          ; Automatically uninstall older version before installing new one
+          UsePreviousAppDir=yes
+          
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+          
+          [Files]
+          Source: "publish\\${{ matrix.rid }}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          
+          [Icons]
+          Name: "{group}\\{#MyAppName}"; Filename: "{app}\\{#MyAppExeName}"
+          Name: "{group}\\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
+          Name: "{autodesktop}\\{#MyAppName}"; Filename: "{app}\\{#MyAppExeName}"; Tasks: desktopicon
+          
+          [Run]
+          Filename: "{app}\\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+          
+          [InstallDelete]
+          ; Delete files from previous versions that might conflict
+          Type: filesandordirs; Name: "{app}\\*"
+          
+          [Registry]
+          ; Save installed version to registry
+          Root: HKLM; Subkey: "Software\\{#MyAppName}"; ValueType: string; ValueName: "Version"; ValueData: "{#MyAppVersion}"; Flags: uninsdeletekey
+          EOL
+          
+          # Build installer
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          
+          # Move the installer to a separate folder
+          mkdir -p publish/installer
+          mv Output/DiffKeep-${{ env.VERSION }}-setup.exe publish/installer/
+        shell: pwsh
+
+      # For macOS, create a .app bundle
+      - name: Create macOS App Bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          # Create app structure
+          mkdir -p DiffKeep.app/Contents/MacOS
+          mkdir -p DiffKeep.app/Contents/Resources
+          
+          # Copy files
+          cp -r publish/${{ matrix.rid }}/* DiffKeep.app/Contents/MacOS/
+          cp DiffKeep/Assets/diffkeep.icns DiffKeep.app/Contents/Resources/ || cp DiffKeep/Assets/diffkeep.png DiffKeep.app/Contents/Resources/
+          
+          # Create Info.plist
+          cat > DiffKeep.app/Contents/Info.plist << EOL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>DiffKeep</string>
+            <key>CFBundleIconFile</key>
+            <string>diffkeep</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fifth-interactive.diffkeep</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>DiffKeep</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ env.VERSION }}</string>
+            <key>CFBundleVersion</key>
+            <string>${{ env.VERSION }}</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOL
+          
+          # Create DMG
+          hdiutil create -volname DiffKeep-${{ env.VERSION }} -srcfolder DiffKeep.app -ov -format UDZO DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.dmg
+          
+          # Move the dmg to a separate folder
+          mkdir -p publish/dmg
+          mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.dmg publish/dmg/
+        shell: bash
+
+      - name: Upload build artifacts (Linux)
+        if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: diffkeep-${{ matrix.rid }}
-          path: publish/${{ matrix.rid }}
+          path: |
+            publish/${{ matrix.rid }}
+            publish/appimage
+          retention-days: 7
+
+      - name: Upload build artifacts (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffkeep-${{ matrix.rid }}
+          path: |
+            publish/${{ matrix.rid }}
+            publish/installer
+          retention-days: 7
+
+      - name: Upload build artifacts (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffkeep-${{ matrix.rid }}
+          path: |
+            publish/${{ matrix.rid }}
+            publish/dmg
           retention-days: 7
 
   create-release:
@@ -78,17 +311,43 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            # Extract version from tag (remove 'v' prefix)
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Default version for non-tag builds
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Using version: $VERSION"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      - name: Create release zip files
+      - name: Create release zip files and prepare release assets
         run: |
+          # Create basic zip files for raw outputs
           for dir in diffkeep-*/; do
-            zip -r "${dir%/}.zip" "$dir"
+            if [ -d "${dir}" ]; then
+              zip -r "${dir%/}-raw-${{ env.VERSION }}.zip" "$dir"
+            fi
           done
+          
+          # Find and prepare platform-specific packages
+          find . -name "*.AppImage" -exec cp {} . \;
+          find . -name "*.dmg" -exec cp {} . \;
+          find . -name "*.exe" -type f -path "*/installer/*" -exec cp {} . \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: diffkeep-*.zip
+          files: |
+            *.zip
+            *.AppImage
+            *.dmg
+            *.exe
           generate_release_notes: true
