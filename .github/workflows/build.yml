@@ -10,7 +10,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
         include:
           - os: ubuntu-latest
             rid: linux-x64
@@ -87,7 +87,6 @@ jobs:
           -o publish/${{ matrix.rid }}
         shell: bash
       
-      # Package all files into a single executable (for platforms that support it)
       # Download appimagetool separately
       - name: Download AppImage tools (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -96,6 +95,13 @@ jobs:
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           echo "AppImage tool downloaded successfully"
+        shell: bash
+        
+      - name: Install FUSE dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse libfuse2
         shell: bash
 
       # Create AppDir structure as a separate step
@@ -154,39 +160,34 @@ jobs:
           echo "AppRun file created successfully"
         shell: bash
 
-      # Run appimagetool separately
-      - name: Create AppImage (Linux)
+      # Create both tar.gz and attempt AppImage
+      - name: Create Linux packages (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          # Create tar.gz archive
+          tar -czvf DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz -C publish/${{ matrix.rid }} .
+          echo "Created tar.gz archive"
+          
+          # Make directory for the package
+          mkdir -p publish/package
+          cp DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz publish/package/
+          
           # Print the content of AppDir for debugging
           echo "AppDir contents:"
           find AppDir -type f | sort
 
-          # Make appimagetool executable without FUSE
-          export APPIMAGE_EXTRACT_AND_RUN=1
-
-          # Check appimagetool version
-          ./appimagetool --version || echo "Failed to get appimagetool version"
-
-          # Create a tar.gz backup first
-          tar -czvf DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz -C publish/${{ matrix.rid }} .
-          echo "Created backup tar.gz archive"
-
-          # Run appimagetool with verbose output
+          # Try to create AppImage
           ./appimagetool --verbose AppDir DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage || {
-            echo "AppImage creation failed, using tar.gz as fallback"
-            # If AppImage creation fails, we'll still have the tar.gz
-            mkdir -p publish/package
-            mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz publish/package/
-            exit 0
+            echo "AppImage creation failed, but tar.gz is still available"
           }
-
-          # Create directory for AppImage if successful
-          mkdir -p publish/appimage
-          mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage publish/appimage/
-          echo "AppImage created successfully"
+          
+          # If AppImage was created, move it to the package directory
+          if [ -f "DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage" ]; then
+            mkdir -p publish/appimage
+            cp DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage publish/appimage/
+            echo "AppImage created successfully"
+          fi
         shell: bash
-      
       
       # For Windows, create a proper installer with upgrade support
       - name: Create Windows installer
@@ -273,7 +274,7 @@ jobs:
           
           # Write the content to installer.iss file
           Set-Content -Path "installer.iss" -Value $innoSetupContent
-  
+          
           # Build installer
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           
@@ -364,6 +365,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - name: Get version from tag
@@ -379,10 +382,18 @@ jobs:
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Using version: $VERSION"
-
+  
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-
+  
+      - name: Debug available files
+        run: |
+          echo "Listing all available files:"
+          find . -type f -name "*.AppImage" || echo "No AppImage files found"
+          find . -type f -name "*.tar.gz" || echo "No tar.gz files found"
+          find . -type f -name "*.dmg" || echo "No DMG files found"
+          find . -type f -name "*.exe" || echo "No EXE files found"
+  
       - name: Create release zip files and prepare release assets
         run: |
           # Create basic zip files for raw outputs
@@ -392,17 +403,24 @@ jobs:
             fi
           done
           
-          # Find and prepare platform-specific packages
-          find . -name "*.AppImage" -exec cp {} . \;
-          find . -name "*.dmg" -exec cp {} . \;
-          find . -name "*.exe" -type f -path "*/installer/*" -exec cp {} . \;
-
+          # Copy all potential release files to the current directory
+          find . -name "*.AppImage" -exec cp {} . \; || true
+          find . -name "*.tar.gz" -exec cp {} . \; || true
+          find . -name "*.dmg" -exec cp {} . \; || true
+          find . -name "*.exe" -type f -path "*/installer/*" -exec cp {} . \; || true
+          
+          echo "Files ready for release:"
+          ls -la *.zip *.AppImage *.tar.gz *.dmg *.exe 2>/dev/null || echo "No files found"
+  
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             *.zip
-            *.AppImage
+            *.tar.gz
             *.dmg
             *.exe
+            *.AppImage
+          fail_on_unmatched_files: false
           generate_release_notes: true
