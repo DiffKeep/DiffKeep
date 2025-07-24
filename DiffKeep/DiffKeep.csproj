@@ -25,6 +25,7 @@
         <TrimmerRootDescriptor Include="Roots.xml" />
     </ItemGroup>
 
+    <!-- Common packages for all platforms -->
     <ItemGroup>
         <PackageReference Include="Avalonia" Version="11.3.1" />
         <PackageReference Include="Avalonia.Controls.ItemsRepeater" Version="11.1.5" />
@@ -51,15 +52,8 @@
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.5" />
         <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.5" />
-        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
-        <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.22.0" />
         <PackageReference Include="Microsoft.SemanticKernel" Version="1.56.0" />
         <PackageReference Include="NetVips" Version="3.0.1" />
-        <PackageReference Include="NetVips.Native.linux-arm64" Version="8.17.1" />
-        <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" />
-        <PackageReference Include="NetVips.Native.osx-arm64" Version="8.17.1" />
-        <PackageReference Include="NetVips.Native.osx-x64" Version="8.17.1" />
-        <PackageReference Include="NetVips.Native.win-x64" Version="8.17.0.1" />
         <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
         <PackageReference Include="Serilog" Version="4.3.0" />
         <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
@@ -71,6 +65,26 @@
         <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
         <PackageReference Include="system.management" Version="9.0.6" />
         <RuntimeHostConfigurationOption Include="System.Data.SqliteEnableNotifications" Value="true" />
+    </ItemGroup>
+
+    <!-- Platform-specific packages -->
+    <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) Or '$(RuntimeIdentifier)' == 'win-x64'">
+        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
+        <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.22.0" />
+        <PackageReference Include="NetVips.Native.win-x64" Version="8.17.0.1" />
+    </ItemGroup>
+
+    <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) Or '$(RuntimeIdentifier)' == 'linux-x64' Or '$(RuntimeIdentifier)' == 'linux-arm64'">
+        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
+        <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.22.0" />
+        <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'X64')" />
+        <PackageReference Include="NetVips.Native.linux-arm64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'linux-arm64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'Arm64')" />
+    </ItemGroup>
+
+    <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX')) Or '$(RuntimeIdentifier)' == 'osx-x64' Or '$(RuntimeIdentifier)' == 'osx-arm64'">
+        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
+        <PackageReference Include="NetVips.Native.osx-x64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'osx-x64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'X64')" />
+        <PackageReference Include="NetVips.Native.osx-arm64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'osx-arm64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'Arm64')" />
     </ItemGroup>
 
     <ItemGroup>
@@ -117,11 +131,5 @@
 
     <ItemGroup>
         <EmbeddedResource Include="Scripts/*.sql" />
-    </ItemGroup>
-
-    <ItemGroup>
-      <Reference Include="Newtonsoft.Json">
-        <HintPath>..\..\..\..\..\home\qt\.nuget\packages\newtonsoft.json\13.0.1\lib\netstandard2.0\Newtonsoft.Json.dll</HintPath>
-      </Reference>
     </ItemGroup>
 </Project>
