@@ -54,8 +54,17 @@ jobs:
         run: dotnet test --configuration Release --no-build
 
       - name: Publish
-        run: dotnet publish DiffKeep/DiffKeep.csproj -c Release -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=true -o publish/${{ matrix.rid }}
-
+        run: |
+          dotnet publish DiffKeep/DiffKeep.csproj -c Release -r ${{ matrix.rid }} \
+          --self-contained true \
+          -p:PublishSingleFile=true \
+          -p:IncludeNativeLibrariesForSelfExtract=true \
+          -p:IncludeAllContentForSelfExtract=true \
+          -p:EnableCompressionInSingleFile=true \
+          -p:PublishTrimmed=true \
+          -o publish/${{ matrix.rid }}
+        shell: bash
+      
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
