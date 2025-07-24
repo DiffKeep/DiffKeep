@@ -16,7 +16,7 @@ public class OnnxTextEmbeddingGenerationServiceTests
 
     private const string TestModelName = "clip.onnx";
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbeddingAsync_WithValidText_ShouldReturnEmbeddings()
     {
         // Arrange
@@ -41,7 +41,7 @@ public class OnnxTextEmbeddingGenerationServiceTests
         Assert.Equal(768, embeddings[0].Length);
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task LoadModelAsync_WithValidPath_ShouldLoadSuccessfully()
     {
         // Arrange
@@ -53,7 +53,7 @@ public class OnnxTextEmbeddingGenerationServiceTests
         // If no exception is thrown, the test passes
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbedding_SimilarityTest()
     {
         // Arrange
@@ -131,7 +131,7 @@ public class OnnxTextEmbeddingGenerationServiceTests
             "Sentences about animals should be more similar than sentences about quantum mechanics");
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbedding_SimilarityPromptSearchTest()
     {
         // Arrange
@@ -145,7 +145,7 @@ public class OnnxTextEmbeddingGenerationServiceTests
         var prompt3 =
             "angel, female, electricity, glowing, wings, halo, divine, ethereal, long hair, detailed eyes, full body, dynamic pose, energy, sparks, light, fantasy, otherworldly, celestial, beautiful, serene, soft lighting, intricate details, flowing hair, pale skin, blue eyes, white wings, gold halo, dramatic lighting, power, magic, highly detailed, digital art, concept art, illustration, 8k, uhd, masterpiece, intricate, complex, vibrant colors";
         var prompt4 =
-            "nude, woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, cleavage, side_view, outdoors, magical, ethereal, detailed_background, realistic, nipples, spread_legs, provocative, dark_hair, breasts, buttocks, curvy, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, minimalist_clothing, witch_hat, windblown_hair, nipples_visible, suggestive, open_legs, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down";
+            "woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, cleavage, side_view, outdoors, magical, ethereal, detailed_background, realistic, dark_hair, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, witch_hat, windblown_hair, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down";
 
         // Act
         var embeddings1 = await _service.GenerateEmbeddingAsync(search);

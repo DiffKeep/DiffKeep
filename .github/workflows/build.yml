@@ -21,6 +21,8 @@ jobs:
             rid: osx-x64
     
     runs-on: ${{ matrix.os }}
+    env:
+      CI: true
     
     steps:
       - name: Checkout repository

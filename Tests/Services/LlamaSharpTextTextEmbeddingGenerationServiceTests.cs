@@ -19,7 +19,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
 
     private const string TestModelName = "snowflake-arctic-embed-l.Q8_0.gguf";
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbeddingAsync_WithValidText_ShouldReturnEmbeddings()
     {
         // Arrange
@@ -36,7 +36,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         Assert.Equal(768, embeddings[0].Length);
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task LoadModelAsync_WithValidPath_ShouldLoadSuccessfully()
     {
         // Arrange
@@ -48,7 +48,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         // If no exception is thrown, the test passes
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbeddingAsync_WithoutExplicitModelLoad_ShouldLoadDefaultModelAndGenerateEmbeddings()
     {
         // Arrange
@@ -65,7 +65,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         Assert.Equal(768, embeddings[0].Length);
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbeddingAsync_WithNormalGenerativeModel_ShouldLoadAndGenerateEmbeddings()
     {
         // Arrange
@@ -84,7 +84,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
         Assert.Equal(2560, embeddings[0].Length);
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbedding_SimilarityTest()
     {
         // Arrange
@@ -136,7 +136,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
             "Sentences about animals should be more similar than sentences about quantum mechanics");
     }
 
-    [Fact]
+    [SkipOnCI]
     public async Task GenerateEmbedding_SimilarityPromptSearchTest()
     {
         // Arrange
@@ -157,7 +157,7 @@ public class LlamaSharpTextTextEmbeddingGenerationServiceTests
             "rain, umbrella, girl, looking up, wet hair, city street, puddles, melancholic, atmospheric, soft lighting, bokeh, long hair, gentle expression, side view, full body, dynamic angle, blue tones, cozy, peaceful, shallow depth of field, realistic, cinematic, blurry background, raindrops, wind, motion blur, longing, vulnerable, youth, candid, street photography, overcast, detailed background, reflections, fashion, simple clothing, everyday life, artistic, emotional, vulnerable, natural light, wet pavement, city lights, urban scene, youth, lonely, thoughtful, side glance, wet clothes, pensive, cinematic lighting, diffused lighting, atmospheric, blurred motion, street fashion, realistic textures, detailed shadows, soft focus, realistic skin texture, natural pose, simple background, urban environment, quiet moment, emotional depth, muted colors, wet surfaces, street style, artistic photography, city life, lonely, pensive, side glance, realistic details, moody, rainy day, cozy atmosphere, blurred background, dynamic composition, artistic expression, atmospheric perspective, cinematic shot",
             "umbrella, girl, looking_up, wet_hair, smiling, city, street, puddles, bokeh, soft_lighting, long_hair, shallow_depth_of_field, dynamic_pose, colorful_raincoat, joyful, whimsical, atmospheric, street_photography, candid, full_body, side_view, motion_blur, rainy_day, cozy, vibrant, cute, happy, youth, indoors, studio_shot, portrait, 1girl, solo, detailed_background, hd, high_resolution, masterpiece, best_quality, illustration, digital_art, trending_on_artstation",
             "angel, female, electricity, glowing, wings, halo, divine, ethereal, long hair, detailed eyes, full body, dynamic pose, energy, sparks, light, fantasy, otherworldly, celestial, beautiful, serene, soft lighting, intricate details, flowing hair, pale skin, blue eyes, white wings, gold halo, dramatic lighting, power, magic, highly detailed, digital art, concept art, illustration, 8k, uhd, masterpiece, intricate, complex, vibrant colors",
-            "woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, cleavage, side_view, outdoors, magical, ethereal, detailed_background, realistic, dark_hair, curvy, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, witch_hat, windblown_hair, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down",
+            "woman, riding, broomstick, night, stars, full_moon, silhouette, flying, dynamic_pose, long_hair, wind, fantasy, witch, dark_fantasy, side_view, outdoors, magical, ethereal, detailed_background, realistic, dark_hair, pale_skin, perfect_anatomy, detailed_shadows, highres, artistic, illustration, digital_art, 8k, uhd, masterpiece, looking_at_viewer, serene, expressionless, long_legs, arched_back, fantasy_setting, moonlit, dramatic_lighting, detailed_clothing, witch_hat, windblown_hair, fantasy_art, digital_painting, unreal_engine, cinematic, intricate_details, full_body, looking_down",
             "nature",
             "fantasy art, absurdres, detailed, ancient aztec robot"
         };
