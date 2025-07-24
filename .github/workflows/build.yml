@@ -104,7 +104,7 @@ jobs:
           sudo apt-get install -y fuse libfuse2
         shell: bash
 
-      # Create AppDir structure as a separate step
+      # Create AppDir structure and copy icon files
       - name: Create AppDir structure (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -112,20 +112,24 @@ jobs:
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-
+          
           # Copy files
           cp -r publish/${{ matrix.rid }}/* AppDir/usr/bin/
-
-          # Check if the icon exists
+          
+          # Check if the icon exists and copy it to multiple locations
           if [ -f "DiffKeep/Assets/diffkeep.png" ]; then
+            # Copy to standard location
             cp DiffKeep/Assets/diffkeep.png AppDir/usr/share/icons/hicolor/256x256/apps/
-            echo "Icon copied successfully"
+          
+            # Also copy directly to AppDir root (required by appimagetool)
+            cp DiffKeep/Assets/diffkeep.png AppDir/
+          
+            echo "Icon copied to multiple locations:"
+            find AppDir -name "diffkeep.png" -ls
           else
             echo "Warning: Icon file not found at DiffKeep/Assets/diffkeep.png"
-            # Create a placeholder icon
-            convert -size 256x256 xc:transparent AppDir/usr/share/icons/hicolor/256x256/apps/diffkeep.png || echo "Failed to create placeholder icon"
           fi
-
+          
           echo "AppDir structure created successfully"
         shell: bash
 
