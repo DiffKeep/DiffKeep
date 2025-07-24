@@ -93,7 +93,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           # Download appimagetool directly without installing dependencies
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           echo "AppImage tool downloaded successfully"
         shell: bash
