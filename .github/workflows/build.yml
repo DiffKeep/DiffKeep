@@ -91,9 +91,7 @@ jobs:
       - name: Package as AppImage (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # Install AppImage tools
-          sudo apt-get update -y
-          sudo apt-get install -y fuse libfuse2 desktop-file-utils
+          # Download appimagetool directly without installing dependencies
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           
@@ -127,6 +125,9 @@ jobs:
           EOL
           
           chmod +x AppDir/AppRun
+          
+          # Make appimagetool executable without FUSE
+          export APPIMAGE_EXTRACT_AND_RUN=1
           
           # Create AppImage
           ./appimagetool AppDir DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage
