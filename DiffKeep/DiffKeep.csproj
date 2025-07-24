@@ -69,20 +69,15 @@
 
     <!-- Platform-specific packages -->
     <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) Or '$(RuntimeIdentifier)' == 'win-x64'">
-        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
-        <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.22.0" />
         <PackageReference Include="NetVips.Native.win-x64" Version="8.17.0.1" />
     </ItemGroup>
 
     <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) Or '$(RuntimeIdentifier)' == 'linux-x64' Or '$(RuntimeIdentifier)' == 'linux-arm64'">
-        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
-        <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.22.0" />
         <PackageReference Include="NetVips.Native.linux-x64" Version="8.16.1" Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'X64')" />
         <PackageReference Include="NetVips.Native.linux-arm64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'linux-arm64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'Arm64')" />
     </ItemGroup>
 
     <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX')) Or '$(RuntimeIdentifier)' == 'osx-x64' Or '$(RuntimeIdentifier)' == 'osx-arm64'">
-        <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
         <PackageReference Include="NetVips.Native.osx-x64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'osx-x64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'X64')" />
         <PackageReference Include="NetVips.Native.osx-arm64" Version="8.17.1" Condition="'$(RuntimeIdentifier)' == 'osx-arm64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'Arm64')" />
     </ItemGroup>
