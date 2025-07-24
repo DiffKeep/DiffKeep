@@ -97,7 +97,7 @@ jobs:
           echo "AppImage tool downloaded successfully"
         shell: bash
         
-      - name: Install FUSE dependencies
+      - name: Install FUSE dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
@@ -133,7 +133,18 @@ jobs:
       - name: Create desktop and AppRun files (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # Create desktop file
+          # Create desktop file directly in the AppDir root (alternative location)
+          cat > AppDir/diffkeep.desktop << EOL
+          [Desktop Entry]
+          Name=DiffKeep
+          Exec=DiffKeep
+          Icon=diffkeep
+          Type=Application
+          Categories=Utility;
+          EOL
+          
+          # Also create it in the standard location
+          mkdir -p AppDir/usr/share/applications
           cat > AppDir/usr/share/applications/diffkeep.desktop << EOL
           [Desktop Entry]
           Name=DiffKeep
@@ -142,10 +153,11 @@ jobs:
           Type=Application
           Categories=Utility;
           EOL
-
-          echo "Desktop file created successfully:"
-          cat AppDir/usr/share/applications/diffkeep.desktop
-
+          
+          # Verify desktop files exist
+          echo "Desktop files:"
+          find AppDir -name "*.desktop" -ls
+          
           # Create AppRun
           cat > AppDir/AppRun << EOL
           #!/bin/sh
@@ -155,7 +167,7 @@ jobs:
           export LD_LIBRARY_PATH="\${HERE}/usr/bin:\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
           "\${HERE}/usr/bin/DiffKeep" "\$@"
           EOL
-
+          
           chmod +x AppDir/AppRun
           echo "AppRun file created successfully"
         shell: bash
@@ -399,7 +411,7 @@ jobs:
           # Create basic zip files for raw outputs
           for dir in diffkeep-*/; do
             if [ -d "${dir}" ]; then
-              zip -r "${dir%/}-raw-${{ env.VERSION }}.zip" "$dir"
+              zip -r "${dir%/}-portable-${{ env.VERSION }}.zip" "$dir"
             fi
           done
           
