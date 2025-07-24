@@ -178,25 +178,38 @@ public class ImageLibraryScanner
         }
     }
 
-    public async Task CreateOrUpdateSingleFile(long libraryId, string filePath)
+    public async Task<bool> CreateOrUpdateSingleFile(long libraryId, string filePath)
     {
         var dbImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
         var image = await CreateImageFromFile(filePath, libraryId);
         var foundImages = dbImage as Image[] ?? dbImage.ToArray();
+        var changed = false;
+        
         if (foundImages.Length == 1)
         {
             Log.Debug("Existing image found for {ImagePath}, updating image", image?.Path);
-            var i = foundImages.First();
-            if (image != null)
+            var existingImage = foundImages.First();
+            if (image != null && existingImage.Hash != image.Hash)
             {
-                image.Id = i.Id;
+                Log.Debug("Image hash changed from {OldHash} to {NewHash}", existingImage.Hash, image.Hash);
+                image.Id = existingImage.Id;
                 await _imageRepository.UpdateAsync(image);
+                changed = true;
+            }
+            else
+            {
+                Log.Debug("Image {ImagePath} is unchanged", image?.Path);
             }
         }
-        else
+        else if (foundImages.Length == 0)
         {
             Log.Debug("No previous image found for {ImagePath}, inserting image", image?.Path);
-            if (image != null) await _imageRepository.AddAsync(image);
+            if (image != null)
+            {
+                await _imageRepository.AddAsync(image);
+                changed = true;
+            }
+            
             // get the image we just added, so we have the ID
             var addedImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
             if (addedImage.Count() == 1)
@@ -204,11 +217,17 @@ public class ImageLibraryScanner
                 image.Id = addedImage.First().Id;
             }
         }
+        else
+        {
+            Log.Error("More than one image found for {ImagePath} !!", image?.Path);
+        }
 
-        if (Program.Settings.UseEmbeddings && image is { Id: not 0, PositivePrompt: not null })
+        if (Program.Settings.UseEmbeddings && image is { Id: not 0, PositivePrompt: not null } && changed)
         {
             WeakReferenceMessenger.Default.Send(new GenerateEmbeddingMessage(image.Id, EmbeddingSource.PositivePrompt, image.PositivePrompt));
         }
+        
+        return changed;
     }
 
     private void OnScanProgress(long libraryId, int processedFiles, int totalFiles)

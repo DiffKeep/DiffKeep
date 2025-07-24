@@ -22,6 +22,7 @@ public class LibraryWatcher
     private readonly CancellationTokenSource? _cancellationSource;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _debounceDictionary;
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _debounceLibraryDictionary;
+    private readonly ConcurrentDictionary<string, Task> _runningImageTasks;
     private const int DebounceDelayMs = 1000;
     private const int LibraryUpdateDebounceMs = 3000; // 1 second debounce for library updates
 
@@ -37,6 +38,7 @@ public class LibraryWatcher
         _cancellationSource = new CancellationTokenSource();
         _debounceDictionary = new ConcurrentDictionary<string, CancellationTokenSource>();
         _debounceLibraryDictionary = new ConcurrentDictionary<long, CancellationTokenSource>();
+        _runningImageTasks = new ConcurrentDictionary<string, Task>();
     }
 
     ~LibraryWatcher()
@@ -110,8 +112,9 @@ public class LibraryWatcher
                 foreach (var library in containingLibraries)
                 {
                     Log.Debug("Detected that library {Path} contains image {EFullPath}, creating or updating image", library.Path, e.FullPath);
-                    await _imageLibraryScanner.CreateOrUpdateSingleFile(library.Id, e.FullPath);
-                    await LibraryUpdated(library.Id);
+                    
+                    // Process the image file with concurrency control
+                    await ProcessImageFileAsync(library.Id, e.FullPath);
                 }
             }
             catch (OperationCanceledException)
@@ -129,6 +132,50 @@ public class LibraryWatcher
         {
             Log.Error("Error in OnChanged handler: {Exception}", ex);
         }
+    }
+    
+    private async Task ProcessImageFileAsync(long libraryId, string filePath)
+    {
+        // Create a unique key for this library + file combination
+        string taskKey = $"{libraryId}:{filePath}";
+        
+        // If a task for this file is already running, just wait for it to complete
+        if (_runningImageTasks.TryGetValue(taskKey, out var existingTask))
+        {
+            Log.Debug("Waiting for existing task to complete for {FilePath}", filePath);
+            try
+            {
+                await existingTask;
+                return; // The image was already processed by the existing task
+            }
+            catch (Exception ex)
+            {
+                // If the existing task failed, we'll try again
+                Log.Warning("Existing task for {FilePath} failed: {Exception}", filePath, ex);
+                _runningImageTasks.TryRemove(taskKey, out _);
+            }
+        }
+        
+        // Create a new task for processing this file
+        var processingTask = Task.Run(async () =>
+        {
+            try
+            {
+                var changed = await _imageLibraryScanner.CreateOrUpdateSingleFile(libraryId, filePath);
+                if (changed) await LibraryUpdated(libraryId);
+            }
+            finally
+            {
+                // Remove this task from the dictionary when done
+                _runningImageTasks.TryRemove(taskKey, out _);
+            }
+        });
+        
+        // Add the task to our tracking dictionary
+        _runningImageTasks.TryAdd(taskKey, processingTask);
+        
+        // Wait for the task to complete
+        await processingTask;
     }
 
     private async Task LibraryUpdated(long libraryId)

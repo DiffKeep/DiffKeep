@@ -8,10 +8,18 @@ Join our Discord to discuss DiffKeep or ask questions: https://discord.gg/hGCQJA
 
 ### Beta Status
 
+***DiffKeep is completely free while in beta.***
+
 Note: DiffKeep is currently in a Beta state. Some features may be incomplete or missing, and there may be bugs or crashes.
 No guarantee is made of suitability or stability. Please note the relevant part of the license in LICENSE.md.
 
+Once DiffKeep is considered stable and feature-complete enough to exit beta status, it will transition to a freemium model,
+where the essential features will be free, such as full-text search, but advanced features such as semantic and hybrid search will
+require a license.
+
 ## Feature Roadmap
+
+*Roughly in order of priority.* 
 
 - [x] Display images by folder or date
 - [x] Add multiple libraries
@@ -24,6 +32,8 @@ No guarantee is made of suitability or stability. Please note the relevant part 
     - [ ] Fooocus
     - [ ] CivitAI
     - _More to come_
+- [ ] Project view to see all images related to a named project
+- [ ] Tags and favorites
 - [ ] Hybrid semantic and full text search (WIP)
 - [ ] AI-generated image descriptions (also exposed in vector search)
 - [ ] Image similarity search (search by image)
@@ -41,8 +51,6 @@ No guarantee is made of suitability or stability. Please note the relevant part 
     - [ ] Internal image generation?
 - [ ] LiveGrid - Generate grids live in any dimension, save generated images with grid data, export any 2 dimensions to a "grid" image
 - [ ] Use of "Processes" to generate and modify images in steps without leaving DiffKeep
-- [ ] Project view to see all images related to a named project
-- [ ] Tags and favorites
 - [ ] Integration with CivitAI if possible (see [CivitAI](https://github.com/civitai/civitai))
     - Currently (according to their wiki), this integration may be very limited in scope. Eventually I would like to enable posting images directly from DiffKeep.
 
@@ -62,6 +70,8 @@ public class Secrets
         "api-key-here";
 }
 ```
+
+This is the API key used to send feedback.
 
 ## Fair Use Notice
 
