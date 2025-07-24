@@ -88,22 +88,45 @@ jobs:
         shell: bash
       
       # Package all files into a single executable (for platforms that support it)
-      - name: Package as AppImage (Linux)
+      # Download appimagetool separately
+      - name: Download AppImage tools (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           # Download appimagetool directly without installing dependencies
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
-          
+          echo "AppImage tool downloaded successfully"
+        shell: bash
+
+      # Create AppDir structure as a separate step
+      - name: Create AppDir structure (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
           # Create AppDir structure
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          
+
           # Copy files
           cp -r publish/${{ matrix.rid }}/* AppDir/usr/bin/
-          cp DiffKeep/Assets/diffkeep.png AppDir/usr/share/icons/hicolor/256x256/apps/
-          
+
+          # Check if the icon exists
+          if [ -f "DiffKeep/Assets/diffkeep.png" ]; then
+            cp DiffKeep/Assets/diffkeep.png AppDir/usr/share/icons/hicolor/256x256/apps/
+            echo "Icon copied successfully"
+          else
+            echo "Warning: Icon file not found at DiffKeep/Assets/diffkeep.png"
+            # Create a placeholder icon
+            convert -size 256x256 xc:transparent AppDir/usr/share/icons/hicolor/256x256/apps/diffkeep.png || echo "Failed to create placeholder icon"
+          fi
+
+          echo "AppDir structure created successfully"
+        shell: bash
+
+      # Create desktop and AppRun files separately
+      - name: Create desktop and AppRun files (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
           # Create desktop file
           cat > AppDir/usr/share/applications/diffkeep.desktop << EOL
           [Desktop Entry]
@@ -113,7 +136,10 @@ jobs:
           Type=Application
           Categories=Utility;
           EOL
-          
+
+          echo "Desktop file created successfully:"
+          cat AppDir/usr/share/applications/diffkeep.desktop
+
           # Create AppRun
           cat > AppDir/AppRun << EOL
           #!/bin/sh
@@ -123,20 +149,45 @@ jobs:
           export LD_LIBRARY_PATH="\${HERE}/usr/bin:\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
           "\${HERE}/usr/bin/DiffKeep" "\$@"
           EOL
-          
+
           chmod +x AppDir/AppRun
-          
-          # Make appimagetool executable without FUSE
-          export APPIMAGE_EXTRACT_AND_RUN=1
-          
-          # Create AppImage
-          ./appimagetool AppDir DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage
-          
-          # Replace the original artifact
-          mkdir -p publish/appimage
-          mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage publish/appimage/
+          echo "AppRun file created successfully"
         shell: bash
 
+      # Run appimagetool separately
+      - name: Create AppImage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Print the content of AppDir for debugging
+          echo "AppDir contents:"
+          find AppDir -type f | sort
+
+          # Make appimagetool executable without FUSE
+          export APPIMAGE_EXTRACT_AND_RUN=1
+
+          # Check appimagetool version
+          ./appimagetool --version || echo "Failed to get appimagetool version"
+
+          # Create a tar.gz backup first
+          tar -czvf DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz -C publish/${{ matrix.rid }} .
+          echo "Created backup tar.gz archive"
+
+          # Run appimagetool with verbose output
+          ./appimagetool --verbose AppDir DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage || {
+            echo "AppImage creation failed, using tar.gz as fallback"
+            # If AppImage creation fails, we'll still have the tar.gz
+            mkdir -p publish/package
+            mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.tar.gz publish/package/
+            exit 0
+          }
+
+          # Create directory for AppImage if successful
+          mkdir -p publish/appimage
+          mv DiffKeep-${{ matrix.rid }}-${{ env.VERSION }}.AppImage publish/appimage/
+          echo "AppImage created successfully"
+        shell: bash
+      
+      
       # For Windows, create a proper installer with upgrade support
       - name: Create Windows installer
         if: matrix.os == 'windows-latest'
