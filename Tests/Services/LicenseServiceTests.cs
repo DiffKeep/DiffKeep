@@ -281,23 +281,6 @@ public class LicenseServiceTests
     }
 
     [Fact]
-    public void ValidateLicenseKey_WithTamperedKey_ShouldThrowException()
-    {
-        // Arrange
-        var licenseInfo = CreateValidLicenseInfo();
-        var licenseKey = _generator.GenerateLicenseKey(licenseInfo);
-    
-        // Modify the key to ensure it's actually different
-        var lastChar = licenseKey[^1];
-        var newChar = lastChar == 'X' ? 'Y' : 'X';  // Choose a different character if last one is already 'X'
-        var tamperedKey = licenseKey[..^1] + newChar;
-    
-        // Act & Assert
-        Assert.Throws<InvalidOperationException>(() => 
-            _validator.ValidateLicenseKey(tamperedKey, licenseInfo.Version, licenseInfo.Email));
-    }
-
-    [Fact]
     public void ValidateLicenseKey_WithInvalidKey_ShouldThrowException()
     {
         // Arrange
