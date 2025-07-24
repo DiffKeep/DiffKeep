@@ -36,9 +36,9 @@ jobs:
           cat > DiffKeep/Settings/Secrets.cs << 'EOL'
           namespace DiffKeep.Settings;
 
-          public class Secrets
+          public static class Secrets
           {
-              public readonly string FeedbackApiKey = "${{ secrets.FEEDBACK_API_KEY }}";
+              public const string FeedbackApiKey = "${{ secrets.FEEDBACK_API_KEY }}";
           }
           EOL
         shell: bash

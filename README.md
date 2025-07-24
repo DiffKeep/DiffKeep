@@ -64,10 +64,9 @@ Create a file `DiffKeep/Settings/Secrets.cs` and fill it out like this:
 ```csharp
 namespace DiffKeep.Settings;
 
-public class Secrets
+public static class Secrets
 {
-    public readonly string FeedbackApiKey =
-        "api-key-here";
+    public const string FeedbackApiKey = "api-key-here";
 }
 ```
 
