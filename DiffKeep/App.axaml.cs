@@ -1,15 +1,15 @@
 using System;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
-using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
 using System.Linq;
+using System.Reflection;
 using Avalonia.Controls;
 using Avalonia.Markup.Xaml;
-using Avalonia.Platform;
 using DiffKeep.ViewModels;
 using DiffKeep.Views;
 using Microsoft.Extensions.DependencyInjection;
+using Serilog;
 
 namespace DiffKeep;
 
@@ -36,10 +36,24 @@ public partial class App : Application
                 DataContext = Services.GetRequiredService<MainWindowViewModel>()
             };
             // Set window icon
-            if (desktop.MainWindow.PlatformImpl != null)
+            try
             {
-                var iconAsset = AssetLoader.Open(new Uri("avares://DiffKeep/Assets/diffkeep.ico"));
-                desktop.MainWindow.Icon = new WindowIcon(iconAsset);
+                var assembly = Assembly.GetExecutingAssembly();
+                using var iconStream = assembly.GetManifestResourceStream("DiffKeep.Assets.diffkeep.ico");
+                if (iconStream != null)
+                {
+                    var bitmap = new Avalonia.Media.Imaging.Bitmap(iconStream);
+                    desktop.MainWindow.Icon = new WindowIcon(bitmap);
+                    Log.Information("Successfully loaded application icon from embedded resource");
+                }
+                else
+                {
+                    Log.Error("Could not load application icon from embedded resource");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to load application icon");
             }
 
         }

@@ -1,8 +1,6 @@
 using System;
-using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
-using System.Text.Json;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Serialization;
@@ -11,9 +9,7 @@ using System.Threading.Tasks;
 using Avalonia.Interactivity;
 using Avalonia.Reactive;
 using Avalonia.Threading;
-using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
-using DiffKeep.Extensions;
 using DiffKeep.Messages;
 using DiffKeep.Services;
 using DiffKeep.ViewModels;

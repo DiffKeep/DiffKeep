@@ -21,8 +21,7 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <AvaloniaResource Include="Assets\**" />
-        <TrimmerRootDescriptor Include="Roots.xml" />
+        <EmbeddedResource Include="Assets\diffkeep.ico" />
     </ItemGroup>
 
     <!-- Common packages for all platforms -->

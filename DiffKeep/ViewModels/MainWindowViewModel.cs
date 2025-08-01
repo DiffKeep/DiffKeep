@@ -107,7 +107,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // Check if current left panel width exceeds the new max width
         double maxWidth = WindowWidth * 0.5;
         LeftPanelMaxWidth = maxWidth;
-        if (_leftPanelWidth.Value > maxWidth && CanSaveState)
+        if (LeftPanelWidth.Value > maxWidth && CanSaveState)
         {
             LeftPanelWidth = new GridLength(maxWidth);
             var state = _appStateService.GetState();
