@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using System.CommandLine;
 using System.Diagnostics;
+using System.Linq;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using DiffKeep.Settings;
@@ -40,6 +41,13 @@ sealed class Program
     [STAThread]
     public static void Main(string[] args)
     {
+        // Check for version flag before setting up the command
+        if (args.Any(arg => arg is "--version" or "-v"))
+        {
+            Console.WriteLine($"DiffKeep version {GitVersion.FullVersion}");
+            return; // Exit early
+        }
+        
         var dataPathOption = new Option<string>(
             new[] { "--datapath", "-d" },
             () => DefaultDataPath,

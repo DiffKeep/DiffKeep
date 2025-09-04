@@ -1,9 +1,9 @@
-<Window xmlns="https://github.com/avaloniaui"
+<shadUi:Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:DiffKeep.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        xmlns:extensions="clr-namespace:ShadUI;assembly=ShadUI"
+        xmlns:shadUi="clr-namespace:ShadUI;assembly=ShadUI"
         mc:Ignorable="d" d:DesignWidth="500" d:DesignHeight="450"
         x:Class="DiffKeep.Views.FeedbackWindow"
         x:DataType="vm:FeedbackViewModel"
@@ -41,7 +41,7 @@
             <StackPanel Spacing="5">
                 <TextBlock Text="Your Message:"/>
                 <TextBox Text="{Binding FeedbackMessage}"
-                         extensions:ControlAssist.Height="120"
+                         shadUi:ControlAssist.Height="120"
                          AcceptsReturn="True" TextWrapping="Wrap" />
             </StackPanel>
             
@@ -59,4 +59,4 @@
                        IsVisible="{Binding !!StatusMessage}"/>
         </StackPanel>
     </DockPanel>
-</Window>
+</shadUi:Window>

@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using DiffKeep.ViewModels;
+using Window = ShadUI.Window;
 
 namespace DiffKeep.Views
 {
