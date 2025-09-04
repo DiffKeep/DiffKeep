@@ -69,11 +69,10 @@ public partial class ImageViewerViewModel : ViewModelBase
             var imageToRemove = _allImages.FirstOrDefault(img => img.Path == m.ImagePath);
             if (imageToRemove is not null)
             {
-                if (_allImages[_currentIndex].Id == imageToRemove.Id)
-                {
-                    NavigateNextOrPrevious();
-                }
+                // if the image removed is the one we are currently on, we will need to reload
+                bool reload = _allImages[_currentIndex].Id == imageToRemove.Id && _allImages[_currentIndex].Path == imageToRemove.Path;
                 _allImages.Remove(imageToRemove);
+                if (reload) LoadCurrentImage();
             }
         });
         
