@@ -9,14 +9,18 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Messages;
 using DiffKeep.Services;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Serilog;
 using ShadUI;
+using JsonSerializer = Newtonsoft.Json.JsonSerializer;
 using Window = Avalonia.Controls.Window;
 
 namespace DiffKeep.ViewModels;
@@ -189,8 +193,27 @@ public partial class ImageViewerViewModel : ViewModelBase
 
             DetectedTool = result.Tool?.ToString() ?? "Unknown Tool";
             GenerationPrompt = result.PositivePrompt ?? "No prompt found";
-            RawMetadata = result.RawMetadata?.ToList() ?? new List<KeyValuePair<string, string?>>
-                { new("Error", "No metadata found") };
+            var formattedMetadata = new List<KeyValuePair<string, string?>>();
+            if (result.RawMetadata != null)
+            {
+                foreach (var item in result.RawMetadata)
+                {
+                    if (IsJsonString(item.Value))
+                    {
+                        formattedMetadata.Add(new KeyValuePair<string, string?>(
+                            item.Key, 
+                            FormatJsonString(item.Value)));
+                    }
+                    else
+                    {
+                        formattedMetadata.Add(item);
+                    }
+                }
+            }
+            
+            RawMetadata = formattedMetadata.Count > 0 ? formattedMetadata : 
+                new List<KeyValuePair<string, string?>> { new("Error", "No metadata found") };
+
         }
         catch (Exception ex)
         {
@@ -198,6 +221,52 @@ public partial class ImageViewerViewModel : ViewModelBase
             GenerationPrompt = "Error extracting prompt";
             RawMetadata = new List<KeyValuePair<string, string?>>
                 { new("Error", $"Error parsing metadata: {ex.Message}") };
+        }
+    }
+    
+    /// <summary>
+    /// Checks if a string is a valid JSON string
+    /// </summary>
+    private bool IsJsonString(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return false;
+        
+        value = value.Trim();
+        if (!(value.StartsWith("{") && value.EndsWith("}")) && 
+            !(value.StartsWith("[") && value.EndsWith("]")))
+            return false;
+
+        try
+        {
+            // Try to parse it as JSON to validate
+            JsonDocument.Parse(value);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Formats a JSON string to be more readable
+    /// </summary>
+    private string FormatJsonString(string? json)
+    {
+        if (string.IsNullOrEmpty(json)) return string.Empty;
+
+        try
+        {
+            // Parse the JSON
+            var parsedJson = JToken.Parse(json);
+            
+            // Format it with indentation
+            return parsedJson.ToString(Formatting.Indented);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug("Failed to format JSON: {Error}", ex.Message);
+            return json; // Return the original string if formatting fails
         }
     }
 
