@@ -6,6 +6,7 @@ using System.Collections.ObjectModel;
 using Avalonia;
 using Avalonia.Interactivity;
 using DiffKeep.Services;
+using ShadUI;
 
 namespace DiffKeep.Views;
 using Window = ShadUI.Window;
@@ -31,7 +32,7 @@ public partial class ImageViewerWindow : Window
 
     public ImageViewerWindow(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage) : this()
     {
-        DataContext = new ImageViewerViewModel(images, currentImage, App.GetService<IImageService>(), App.GetService<IAppStateService>());
+        DataContext = new ImageViewerViewModel(images, currentImage, App.GetService<IImageService>(), App.GetService<IAppStateService>(), App.GetService<ToastManager>());
 
         KeyDown += ImageViewerWindow_KeyDown;
 

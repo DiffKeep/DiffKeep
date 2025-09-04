@@ -16,6 +16,8 @@ using CommunityToolkit.Mvvm.Messaging;
 using DiffKeep.Messages;
 using DiffKeep.Services;
 using Serilog;
+using ShadUI;
+using Window = Avalonia.Controls.Window;
 
 namespace DiffKeep.ViewModels;
 
@@ -25,6 +27,7 @@ public partial class ImageViewerViewModel : ViewModelBase
     private readonly IImageParser _imageParser;
     private readonly IImageService _imageService;
     private readonly IAppStateService _appStateService;
+    private readonly ToastManager _toastManager;
     private int _currentIndex;
 
     [ObservableProperty] private Bitmap? _imageSource;
@@ -52,12 +55,13 @@ public partial class ImageViewerViewModel : ViewModelBase
     [ObservableProperty] private string _fileSize = string.Empty;
 
     public ImageViewerViewModel(ObservableCollection<ImageItemViewModel> images, ImageItemViewModel currentImage,
-        IImageService imageService, IAppStateService appStateService)
+        IImageService imageService, IAppStateService appStateService, ToastManager toastManager)
     {
         _allImages = images;
         _currentIndex = images.IndexOf(currentImage);
         _imageService = imageService;
         _appStateService = appStateService;
+        _toastManager = toastManager;
         _imageParser = new ImageParser(); // Composite parser that handles all formats
 
         IsInfoPanelVisible = _appStateService.GetInfoPanelVisibility();
@@ -132,22 +136,32 @@ public partial class ImageViewerViewModel : ViewModelBase
             return;
         }
 
-        var currentItem = _allImages[_currentIndex];
-        ImageSource?.Dispose();
-        ImageSource = new Bitmap(currentItem.Path);
-        // get the file name from the path
-        ImageName = Path.GetFileName(currentItem.Path);
-        ImageFilePath = currentItem.Path;
+        try
+        {
+            var currentItem = _allImages[_currentIndex];
+            ImageSource?.Dispose();
+            ImageSource = new Bitmap(currentItem.Path);
+            // get the file name from the path
+            ImageName = Path.GetFileName(currentItem.Path);
+            ImageFilePath = currentItem.Path;
 
-        // Add file info
-        var fileInfo = new FileInfo(currentItem.Path);
-        FileSize = $"{fileInfo.Length / 1024:N0} KB";
-        ImageDimensions = $"{ImageSource.PixelSize.Width} × {ImageSource.PixelSize.Height}";
+            // Add file info
+            var fileInfo = new FileInfo(currentItem.Path);
+            FileSize = $"{fileInfo.Length / 1024:N0} KB";
+            ImageDimensions = $"{ImageSource.PixelSize.Width} × {ImageSource.PixelSize.Height}";
 
-        HasPrevious = _currentIndex > 0;
-        HasNext = _currentIndex < _allImages.Count - 1;
+            HasPrevious = _currentIndex > 0;
+            HasNext = _currentIndex < _allImages.Count - 1;
 
-        await LoadImageMetadataAsync();
+            await LoadImageMetadataAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Failed loading image: {Error}", ex.Message);
+            _toastManager.CreateToast("Image loading error")
+                .WithContent($"The requested image could not be loaded: {ex.Message}")
+                .ShowError();
+        }
     }
 
     public async Task<bool> DeleteCurrentImage(Window parentWindow)
