@@ -55,6 +55,14 @@ public partial class ImageViewerWindow : Window
                 vm.NavigateNextCommand.Execute(null);
                 e.Handled = true;
                 break;
+            case Key.Home:
+                vm.NavigateToFirstCommand.Execute(null);
+                e.Handled = true;
+                break;
+            case Key.End:
+                vm.NavigateToLastCommand.Execute(null);
+                e.Handled = true;
+                break;
             case Key.Escape:
                 Close();
                 e.Handled = true;

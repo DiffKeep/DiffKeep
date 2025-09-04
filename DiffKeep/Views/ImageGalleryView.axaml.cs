@@ -246,6 +246,12 @@ public partial class ImageGalleryView : UserControl
                 Log.Debug("New index: {NewIndex}, count: {ImagesCount}", newIndex, vm.Images.Count);
                 if (newIndex >= vm.Images.Count) newIndex = currentIndex;
                 break;
+            case Key.Home:
+                newIndex = 0; // Jump to the first image
+                break;
+            case Key.End:
+                newIndex = vm.Images.Count - 1; // Jump to the last image
+                break;
             case Key.PageUp:
                 if (_scrollViewer != null)
                 {

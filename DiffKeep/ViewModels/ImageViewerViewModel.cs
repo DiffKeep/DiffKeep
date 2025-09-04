@@ -289,6 +289,26 @@ public partial class ImageViewerViewModel : ViewModelBase
             LoadCurrentImage();
         }
     }
+    
+    [RelayCommand]
+    private void NavigateToFirst()
+    {
+        if (_allImages.Count > 0 && _currentIndex != 0)
+        {
+            _currentIndex = 0;
+            LoadCurrentImage();
+        }
+    }
+
+    [RelayCommand]
+    private void NavigateToLast()
+    {
+        if (_allImages.Count > 0 && _currentIndex != _allImages.Count - 1)
+        {
+            _currentIndex = _allImages.Count - 1;
+            LoadCurrentImage();
+        }
+    }
 
     /// <summary>
     /// Attempts to navigate to the next image. If not available, navigates to the previous.
