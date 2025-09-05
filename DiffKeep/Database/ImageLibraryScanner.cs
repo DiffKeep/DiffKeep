@@ -84,6 +84,10 @@ public class ImageLibraryScanner
         Log.Debug("Scanning library {LibraryId} ({LibraryPath})", library.Id, library.Path);
         Log.Debug("Found {TotalFiles} files", totalFiles);
         var foundNewFiles = false;
+        
+        // Get all images currently in the database for this library
+        var dbImages = await _imageRepository.GetByLibraryIdAsync(library.Id);
+        var dbImagePaths = new HashSet<string>(dbImages.Select(img => img.Path), StringComparer.OrdinalIgnoreCase);
 
         using var semaphore = new SemaphoreSlim(MaxConcurrentThumbnails);
         var imageBatch = new List<Image>();
@@ -94,6 +98,9 @@ public class ImageLibraryScanner
             if (cancellationToken.IsCancellationRequested)
                 break;
 
+            // Remove this file from the set of database images (it still exists)
+            dbImagePaths.Remove(file);
+            
             try
             {
                 if (imageBatch.Count >= BatchSize)
@@ -154,6 +161,22 @@ public class ImageLibraryScanner
 
             // Process any remaining images in the final batch
             await ProcessBatchAsync();
+            
+            // Clean up images in DB that no longer exist on disk
+            if (dbImagePaths.Count > 0)
+            {
+                var imageIdsToDelete = dbImages
+                    .Where(img => dbImagePaths.Contains(img.Path))
+                    .Select(img => img.Id)
+                    .ToArray();
+                
+                if (imageIdsToDelete.Length > 0)
+                {
+                    await _imageRepository.DeleteAsync(imageIdsToDelete);
+                    Log.Information("Removed {Count} deleted images from library {LibraryId}", imageIdsToDelete.Length, library.Id);
+                    foundNewFiles = true; // Trigger library update message
+                }
+            }
         }
         catch (Exception ex)
         {
