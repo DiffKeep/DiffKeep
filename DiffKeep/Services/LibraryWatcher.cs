@@ -50,7 +50,7 @@ public class LibraryWatcher
     {
         using var watcher = new FileSystemWatcher(LibraryPath);
 
-        watcher.NotifyFilter = NotifyFilters.LastWrite;
+        watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName;
 
         watcher.Changed += OnChanged;
         watcher.Created += OnChanged;

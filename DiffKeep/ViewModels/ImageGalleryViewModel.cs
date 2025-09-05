@@ -63,7 +63,13 @@ public partial class ImageGalleryViewModel : ViewModelBase
     public ObservableCollection<ImageItemViewModel> Images
     {
         get => _images;
-        set => SetProperty(ref _images, value);
+        set
+        {
+            _images.CollectionChanged -= OnImagesCollectionChanged;
+            SetProperty(ref _images, value);
+            _images.CollectionChanged += OnImagesCollectionChanged;
+            UpdateImagesCount();
+        }
     }
 
     private ObservableCollection<SearchTypeEnum> _availableSearchTypes = new();
@@ -74,7 +80,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         set => SetProperty(ref _availableSearchTypes, value);
     }
 
-// Current selected search type
+    // Current selected search type
     private SearchTypeEnum _currentSearchType;
 
     public SearchTypeEnum CurrentSearchType
@@ -91,6 +97,7 @@ public partial class ImageGalleryViewModel : ViewModelBase
         _searchService = searchService;
         _toastManager = toastManager;
         _images = new ObservableCollection<ImageItemViewModel>();
+        _images.CollectionChanged += OnImagesCollectionChanged;
         _currentDirectory = "";
 
         // Initialize available search types with at least FullText
@@ -153,6 +160,17 @@ public partial class ImageGalleryViewModel : ViewModelBase
         // Start the thumbnail cleanup timer to run every 15 seconds
         _thumbnailCleanupTimer = new Timer(CleanupThumbnails, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
     }
+    
+    private void OnImagesCollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        UpdateImagesCount();
+    }
+
+    private void UpdateImagesCount()
+    {
+        TotalCount = Images.Count;
+        ImagesCount = $"({TotalCount} images)";
+    }
 
     public async Task LoadImagesAsync(LibraryTreeItem? item, bool preserveScroll = false)
     {
@@ -189,10 +207,6 @@ public partial class ImageGalleryViewModel : ViewModelBase
                     dbImages = await _imageRepository.GetByLibraryIdAndPathAsync(_currentLibraryId.Value,
                         _currentPath, CurrentSortOption);
                 }
-
-                TotalCount = dbImages.Count();
-
-                ImagesCount = $"({TotalCount} images)";
 
                 var viewModels = await Task.Run(() =>
                     dbImages.Select(image => new ImageItemViewModel(image, this)).ToList());

@@ -73,7 +73,7 @@ public partial class ImageViewerViewModel : ViewModelBase
         // Subscribe to image deleted messages
         WeakReferenceMessenger.Default.Register<ImageDeletedMessage>(this, (r, m) =>
         {
-            Log.Debug("Gallery deleting from images {MessageImagePath}", m.ImagePath);
+            Log.Debug("Viewer deleting from images {MessageImagePath}", m.ImagePath);
             var imageToRemove = _allImages.FirstOrDefault(img => img.Path == m.ImagePath);
             if (imageToRemove is not null)
             {

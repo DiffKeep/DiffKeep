@@ -204,9 +204,28 @@ public class ImageLibraryScanner
     public async Task<bool> CreateOrUpdateSingleFile(long libraryId, string filePath)
     {
         var dbImage = await _imageRepository.GetByLibraryIdAndPathAsync(libraryId, filePath);
-        var image = await CreateImageFromFile(filePath, libraryId);
         var foundImages = dbImage as Image[] ?? dbImage.ToArray();
         var changed = false;
+
+        // Check if the file still exists
+        if (!File.Exists(filePath))
+        {
+            // File was deleted, remove from database if it exists
+            if (foundImages.Length > 0)
+            {
+                Log.Debug("File {FilePath} was deleted, removing from database", filePath);
+                // TODO: send a toast about the deleted file
+                foreach (var existingImage in foundImages)
+                {
+                    await _imageRepository.DeleteAsync(existingImage.Id);
+                WeakReferenceMessenger.Default.Send(new ImageDeletedMessage(filePath));
+                }
+            }
+            return changed;
+        }
+
+        // File exists, proceed with normal create/update logic
+        var image = await CreateImageFromFile(filePath, libraryId);
         
         if (foundImages.Length == 1)
         {
