@@ -6,6 +6,19 @@ Manage your AI-generated images with ease. Sort, filter, search, delete, and org
 
 Join our Discord to discuss DiffKeep or ask questions: https://discord.gg/hGCQJArtZY
 
+### Current Status
+
+My time is currently being absorbed by real life, and I don't have as much to spare for DiffKeep as I would like.
+I plan to get back to working on DiffKeep more regularly, but I don't know yet when that will be.
+
+DiffKeep is stable and works with basic functionality as outlined in the checkboxes below. I use it regularly for my own images.
+
+There are [builds available](https://github.com/DiffKeep/DiffKeep/releases), but they have not been tested extensively.
+I don't have a Mac, so I have no idea if the MacOS version works at all, but the Linux and Windows builds should work.
+If you run into any problems, please create an issue and let me know.
+
+![DiffKeep - AI Generated Art Manager](resources/diffkeep.jpeg "DiffKeep Screenshot")
+
 ### Beta Status
 
 ***DiffKeep is completely free while in beta.***
