@@ -80,8 +80,19 @@ public class PngMetadataParser : IImageParser
                 // If it doesn't start with { or [, it's likely a plain text prompt
                 if (!value.StartsWith("{") && !value.StartsWith("["))
                 {
-                    if (value.StartsWith("\"") && value.EndsWith("\""))
-                        value = value[1..^1];
+                    try
+                    {
+                        // Parse as a JSON string to automatically handle unescaping (e.g., \" becomes ", \n becomes newline)
+                        value = JsonDocument.Parse(value).RootElement.GetString();
+                    }
+                    catch
+                    {
+                        // Fallback if parsing fails: strip quotes and manually replace common escapes
+                        value = value[1..^1]
+                            .Replace("\\\"", "\"")
+                            .Replace("\\n", "\n")
+                            .Replace("\\r", "\r");
+                    }
                     result.PositivePrompt = value;
                     return result;
                 }
