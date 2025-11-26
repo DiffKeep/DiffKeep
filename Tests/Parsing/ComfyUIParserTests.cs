@@ -19,8 +19,9 @@ public class ComfyUIParserTests
 
         // Act
         var extractedPrompt = parser.ExtractPrompt(promptData).PositivePrompt;
-
+        
         // Assert
+        Assert.NotNull(extractedPrompt);
         if (extractedPrompt.StartsWith("IMAGE:"))
         {
             Assert.Equal("IMAGE: image.png", extractedPrompt);

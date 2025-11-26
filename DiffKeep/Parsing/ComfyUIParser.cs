@@ -157,7 +157,7 @@ public class ComfyUIParser : IPromptParser
             }
 
             // Follow inputs in priority order
-            string[] inputPriority = { "SDXL_TUPLE", "CONDITIONING", "IMAGE", "LATENT", "*" };
+            string[] inputPriority = { "SDXL_TUPLE", "GUIDER", "CONDITIONING", "IMAGE", "LATENT", "*" };
             foreach (var inputType in inputPriority)
             {
                 var nextNodeId = FollowInput(currentNode, inputType);
