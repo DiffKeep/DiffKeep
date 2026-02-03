@@ -12,6 +12,8 @@ using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
+using CommunityToolkit.Mvvm.Messaging;
+using DiffKeep.Messages;
 using DiffKeep.Services;
 using Serilog;
 using ShadUI;
@@ -54,7 +56,59 @@ public partial class LeftPanelViewModel : ViewModelBase
         _imageLibraryScanner.ScanProgress += OnScanProgress;
         _imageLibraryScanner.ScanCompleted += OnScanCompleted;
         
+        // Subscribe to library updated messages
+        WeakReferenceMessenger.Default.Register<LibraryUpdatedMessage>(this, (r, m) =>
+        {
+            Log.Debug("Received message for library updated for library ID {MessageLibraryId}", m.LibraryId);
+            CheckLibraryUpdated(m.LibraryId);
+        });
+        
         InitializeTreeItemsAsync().FireAndForget();
+    }
+
+    private void CheckLibraryUpdated(long messageLibraryId)
+    {
+        // Check if the library has a new folder as a result of being updated; if so, update the tree
+        var libraryItem = FindLibraryItem(messageLibraryId);
+        if (libraryItem is { Path: not null })
+        {
+            CheckLibraryChildren(libraryItem);
+        }
+    }
+
+    private void CheckLibraryChildren(LibraryTreeItem libraryItem)
+    {
+        if (libraryItem.Path is null) return;
+        try
+        {
+            var directories = Directory.GetDirectories(libraryItem.Path)
+                .OrderBy(Path.GetFileName)
+                .ToArray();
+            foreach (var directory in directories)
+            {
+                if (libraryItem.Children.Any(c => c.Path == directory))
+                    continue;
+                
+                // we are missing this directory - add it
+                var childItem = new LibraryTreeItem
+                {
+                    Id = libraryItem.Id,
+                    Name = Path.GetFileName(directory),
+                    Path = directory,
+                    IsLibrary = false,
+                };
+                libraryItem.Children.Add(childItem);
+            }
+
+            foreach (var childItem in libraryItem.Children)
+            {
+                CheckLibraryChildren(childItem);
+            }
+        }
+        catch
+        {
+            // skip directories we can't access
+        }
     }
 
     private void OnScanProgress(object? sender, ScanProgressEventArgs e)
