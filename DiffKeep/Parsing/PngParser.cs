@@ -100,7 +100,36 @@ public class PngMetadataParser : IImageParser
 
             // If we get here, we didn't find any non-JSON prompts, so try parsing JSON
             var parser = Parsers[tool];
-    
+
+            // --- Special case: ComfyUI image but also includes A1111-compatible "parameters" ---
+            // Prefer A1111 parameters parsing for prompt/negative prompt if it looks like A1111 metadata.
+            var parametersEntry = metadataChunks.FirstOrDefault(m => m.Key == "parameters");
+            if (parametersEntry.Value != null && result.Tool == GenerationTool.ComfyUI)
+            {
+                var parametersValue = parametersEntry.Value;
+                if (parametersValue.Contains("Steps:", StringComparison.OrdinalIgnoreCase) ||
+                    parametersValue.Contains("Sampler:", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var a1111Parser = Parsers[GenerationTool.Automatic1111];
+                        var prompts = a1111Parser.ExtractPrompt(parametersValue);
+
+                        if (!string.IsNullOrWhiteSpace(prompts.PositivePrompt) ||
+                            !string.IsNullOrWhiteSpace(prompts.NegativePrompt))
+                        {
+                            result.PositivePrompt = prompts.PositivePrompt;
+                            result.NegativePrompt = prompts.NegativePrompt;
+                            return result;
+                        }
+                    }
+                    catch
+                    {
+                        // Invalid A1111 parameters, fall back to normal ComfyUI parsing
+                    }
+                }
+            }
+
             var workflowEntry = metadataChunks.FirstOrDefault(m => m.Key == "workflow");
             if (workflowEntry.Value != null)
             {
@@ -117,7 +146,7 @@ public class PngMetadataParser : IImageParser
                     // Invalid JSON in workflow, continue
                 }
             }
-            var parametersEntry = metadataChunks.FirstOrDefault(m => m.Key == "parameters");
+
             if (parametersEntry.Value != null && result.Tool == GenerationTool.Automatic1111)
             {
                 try

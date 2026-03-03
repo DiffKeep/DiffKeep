@@ -4,11 +4,10 @@ using Xunit;
 namespace Tests.Parsing;
 public class PngMetadataParserTests
 {
-    private const string ExpectedPrompt = "this is the prompt text! it has lots of cool stuff in it";
-
     [Theory]
     [InlineData("comfyui-test.png", GenerationTool.ComfyUI)]
     [InlineData("automatic1111-test.png", GenerationTool.Automatic1111)]
+    [InlineData("comfyui-with-parameters-test.png", GenerationTool.ComfyUI)]
     //[InlineData("fooocus-test.png", GenerationTool.Fooocus)]
     public void ParseImage_DetectsCorrectTool(string imageFile, GenerationTool expectedTool)
     {
@@ -55,6 +54,21 @@ public class PngMetadataParserTests
         // Assert
         Assert.StartsWith("8k beautiful elegant angel woman", metadata.PositivePrompt);
         Assert.StartsWith("BadDream FastNegativeEmbedding ((crossed", metadata.NegativePrompt);
+    }
+    
+    [Fact]
+    public void ParseImage_ForComfyUI_WithParameters_ExtractsExpectedPrompt()
+    {
+        // Arrange
+        var imagePath = Path.Combine(GetArtifactDirectory(), "comfyui-with-parameters-test.png");
+        var parser = new PngMetadataParser();
+
+        // Act
+        var metadata = parser.ParseImage(imagePath);
+
+        // Assert
+        Assert.StartsWith("An expressionist dark portrait of a horned demon woman", metadata.PositivePrompt);
+        Assert.Empty(metadata.NegativePrompt);
     }
 
     [Fact]
