@@ -1,113 +1,51 @@
 const std = @import("std");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
 pub fn build(b: *std.Build) !void {
-    // Get git version or commit hash
     const git_version = get_git_version(b.allocator, b.graph.io) catch "dev";
 
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
-
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create a module for build options
     const options = b.addOptions();
     options.addOption([]const u8, "version", git_version);
-
-    const exe = b.addExecutable(.{
-        .name = "DiffKeep",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = optimize != .Debug,
-        }),
-    });
-
-    // Add the options module
-    exe.root_module.addOptions("build_options", options);
-
-    const clap = b.dependency("clap", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("clap", clap.module("clap"));
 
     const known_folders = b.dependency("known_folders", .{
         .target = target,
         .optimize = optimize,
     }).module("known-folders");
-    exe.root_module.addImport("known-folders", known_folders);
 
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
-
-    // This *creates* a Run step in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
-
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build run`
-    // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
-
-    // *** GUI (dvui + SDL3) ***
+    // *** dvui / SDL3 ***
     const dvui_dep = b.dependency("dvui", .{
         .target = target,
         .optimize = optimize,
         .backend = .sdl3,
     });
 
-    const gui_exe = b.addExecutable(.{
-        .name = "DiffKeep-gui",
-        .root_module = b.addModule("DiffKeepApp", .{
+    // *** Main executable ***
+    const exe = b.addExecutable(.{
+        .name = "DiffKeep",
+        .root_module = b.addModule("App", .{
             .target = target,
             .optimize = optimize,
             .root_source_file = b.path("src/app.zig"),
         }),
     });
-    gui_exe.root_module.strip = optimize != .Debug;
-    gui_exe.root_module.addOptions("build_options", options);
-    gui_exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
-    gui_exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
-    gui_exe.root_module.link_libcpp = true;
+    exe.root_module.strip = optimize != .Debug;
+    exe.root_module.addOptions("build_options", options);
+    exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
+    exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
+    exe.root_module.addImport("known-folders", known_folders);
+    exe.root_module.link_libcpp = true;
 
-    const gui_install = b.addInstallArtifact(gui_exe, .{});
-    const gui_step = b.step("gui", "Build the GUI");
-    gui_step.dependOn(&gui_install.step);
+    b.installArtifact(exe);
 
-    const run_gui_cmd = b.addRunArtifact(gui_exe);
-    run_gui_cmd.step.dependOn(&gui_install.step);
-    if (b.args) |args| run_gui_cmd.addArgs(args);
-    const run_gui_step = b.step("run-gui", "Run the GUI");
-    run_gui_step.dependOn(&run_gui_cmd.step);
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run DiffKeep");
+    run_step.dependOn(&run_cmd.step);
 
     // *** sqlite ***
-    // Create a module for the SQLite C sources
     const sqlite_c_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -144,7 +82,6 @@ pub fn build(b: *std.Build) !void {
         .root_module = sqlite_c_module,
     });
 
-    // Link SQLite with our executable
     exe.root_module.linkLibrary(sqlite_lib);
     exe.root_module.addIncludePath(b.path("lib/sqlite"));
     exe.root_module.addIncludePath(b.path("lib/sqlite-vec"));
@@ -183,24 +120,10 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.linkLibrary(vips_helper_lib);
     exe.root_module.addImport("vips", vips_module);
 
-    // llamacpp
+    // *** llama ***
     try addLlama(b, exe);
 
-    const test_full_directory_exe = b.addExecutable(.{
-        .name = "test_full_directory",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_parse_all_in_dir.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_test_full_directory = b.addRunArtifact(test_full_directory_exe);
-    if (b.args) |args| {
-        run_test_full_directory.addArgs(args);
-    }
-
-    const test_full_directory_step = b.step("test_full_directory", "Run the parser on all files in directory");
-    test_full_directory_step.dependOn(&run_test_full_directory.step);
+    // *** Dev/research tools (not part of the GUI, useful for data pipeline work) ***
 
     const parse_threads_exe = b.addExecutable(.{
         .name = "test_parse_threads",
@@ -220,22 +143,6 @@ pub fn build(b: *std.Build) !void {
     const parse_threads_step = b.step("parse_threads", "Concurrently parse PNG metadata across a directory tree");
     parse_threads_step.dependOn(&run_parse_threads.step);
 
-    const get_workflow_exe = b.addExecutable(.{
-        .name = "get_workflow",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/get_workflow_chunk.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const get_workflow = b.addRunArtifact(get_workflow_exe);
-    if (b.args) |args| {
-        get_workflow.addArgs(args);
-    }
-
-    const get_workflow_step = b.step("get_workflow", "Get the workflow chunk from a single PNG file");
-    get_workflow_step.dependOn(&get_workflow.step);
-
     const test_embed_exe = b.addExecutable(.{
         .name = "test_embed",
         .root_module = b.createModule(.{
@@ -248,9 +155,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(test_embed_exe);
     const run_test_embed = b.addRunArtifact(test_embed_exe);
     run_test_embed.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_test_embed.addArgs(args);
-    }
+    if (b.args) |args| run_test_embed.addArgs(args);
     const test_embed_step = b.step("test_embed", "Test embedding generation with a GGUF model");
     test_embed_step.dependOn(&run_test_embed.step);
 
@@ -334,17 +239,12 @@ fn addLlama(b: *std.Build, exe: anytype) !void {
     llama_cpp.addIncludePath(dep.path("ggml/include"));
 
     const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
-    // b9048+ tarballs unpack to a flat directory (zig strips the llama-bNNNN/ prefix)
     const bin_path = bin.path(".");
 
     exe.root_module.addLibraryPath(bin_path);
     exe.root_module.linkSystemLibrary("llama", .{});
     exe.root_module.linkSystemLibrary("ggml", .{});
 
-    // Copy shared libraries to the output directory.
-    // libggml-cpu-x64.so is the generic CPU backend; the arch-specific variants
-    // (alderlake, cannonlake, etc.) are dlopen'd at runtime for dispatch — install
-    // them all so the runtime can pick the best one.
     const libs_to_install = [_][]const u8{
         "libllama.so",
         "libggml.so",
@@ -358,16 +258,12 @@ fn addLlama(b: *std.Build, exe: anytype) !void {
         b.getInstallStep().dependOn(&step.step);
     }
 
-    // Install GPU backend plugins. ggml loads these at runtime via dlopen and
-    // calls ggml_backend_score() on each to pick the best available backend.
-    // Plugins whose runtime dependencies are missing (no CUDA driver, no Vulkan
-    // loader, no ROCm) are silently skipped — CPU fallback always works.
     const os = target.result.os.tag;
     if (os == .linux) {
         const gpu_plugins = .{
-            .{ "llama_cpp_linux_vulkan", "libggml-vulkan.so" }, // NVIDIA + AMD + Intel
-            .{ "llama_cpp_linux_rocm",   "libggml-hip.so"    }, // AMD via ROCm
-            .{ "llama_cpp_linux_sycl",   "libggml-sycl.so"   }, // Intel Arc via oneAPI
+            .{ "llama_cpp_linux_vulkan", "libggml-vulkan.so" },
+            .{ "llama_cpp_linux_rocm",   "libggml-hip.so"   },
+            .{ "llama_cpp_linux_sycl",   "libggml-sycl.so"  },
         };
         inline for (gpu_plugins) |plugin| {
             const pkg_name = plugin[0];
@@ -413,7 +309,6 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
     exe.root_module.addLibraryPath(bin_path);
     exe.root_module.linkSystemLibrary("mtmd", .{});
 
-    // Install libmtmd.so alongside the binary.
     const step = b.addInstallBinFile(bin_path.path(b, "libmtmd.so"), "libmtmd.so");
     b.getInstallStep().dependOn(&step.step);
 
@@ -423,7 +318,6 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
     exe.root_module.addImport("mtmd", mtmd_zig);
 }
 
-// Get git version or commit hash, and append (DIRTY) if the working tree is not clean
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const version_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "describe", "--tags", "--always" } });
     defer allocator.free(version_result.stdout);

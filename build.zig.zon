@@ -17,8 +17,8 @@
     // internet connectivity.
     .dependencies = .{
         .dvui = .{
-            .url = "git+https://github.com/foxnne/dvui-dev#3fea718de58591ed5df9372e6d1b30c9ef4feeef",
-            .hash = "dvui-0.5.0-dev-AQFJmSsK3wDLFqpi9tQ9xVC-xkAtQE0JAY1B4-o1Ey0M",
+            .url = "git+https://github.com/david-vanderson/dvui#14703fa6d6fea0c608886b5ce2071ef49323c8c0",
+            .hash = "dvui-0.5.0-dev-AQFJmbHY9QA1qvhf_l3RPazRT7QOF0pGjLtU4amMq2F-",
         },
         .llama_cpp = .{
             .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9048.tar.gz",
@@ -38,10 +38,6 @@
             .optional = true,
             .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-x64.tar.gz",
             .hash = "N-V-__8AAHatcwLEIVRuflEdmWeiMTDCc8LITSOe6LZ1WZHd",
-        },
-        .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
-            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
         .known_folders = .{
             .url = "git+https://github.com/ziglibs/known-folders.git#207c34a16e4365edc20d92c7892f962b3bed46e8",
