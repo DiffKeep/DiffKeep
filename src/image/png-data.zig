@@ -26,11 +26,13 @@ pub const Chunk = struct {
 pub const PngParser = struct {
     allocator: std.mem.Allocator,
     chunks: std.ArrayList(Chunk),
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) PngParser {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !PngParser {
         return .{
             .allocator = allocator,
-            .chunks = std.ArrayList(Chunk).init(allocator),
+            .chunks = try std.ArrayList(Chunk).initCapacity(allocator, 512),
+            .io = io,
         };
     }
 
@@ -38,19 +40,19 @@ pub const PngParser = struct {
         for (self.chunks.items) |*chunk| {
             chunk.deinit(self.allocator);
         }
-        self.chunks.deinit();
+        self.chunks.deinit(self.allocator);
     }
 
     /// Parse a PNG file and extract all chunks
     pub fn parseFile(self: *PngParser, file_path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(file_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(self.io,file_path, .{});
+        defer file.close(self.io);
 
-        const file_size = try file.getEndPos();
+        const file_size = try file.length(self.io);
         const buffer = try self.allocator.alloc(u8, file_size);
         defer self.allocator.free(buffer);
 
-        const bytes_read = try file.readAll(buffer);
+        const bytes_read = try file.readPositionalAll(self.io, buffer, 0);
         if (bytes_read != file_size) {
             return error.IncompleteRead;
         }
@@ -60,7 +62,7 @@ pub const PngParser = struct {
 
     /// Parse a PNG from a reader stream
     pub fn parseStream(self: *PngParser, reader: anytype) !void {
-        var buffer = std.ArrayList(u8).init(self.allocator);
+        var buffer = try std.ArrayList(u8).initCapacity(self.allocator, 512);
         defer buffer.deinit();
         try reader.readAllArrayList(&buffer, std.math.maxInt(usize));
 
@@ -73,13 +75,12 @@ pub const PngParser = struct {
         for (self.chunks.items) |*chunk| chunk.deinit(self.allocator);
         self.chunks.clearRetainingCapacity();
 
-        var stream = std.io.fixedBufferStream(buffer);
-        var buffered_reader = stream.reader();
+        var reader: std.Io.Reader = .fixed(buffer);
 
         // Check PNG signature
         const png_signature = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
         var signature: [8]u8 = undefined;
-        try buffered_reader.readNoEof(&signature);
+        try reader.readSliceAll(&signature);
 
         if (!std.mem.eql(u8, &signature, &png_signature)) {
             return error.InvalidPngSignature;
@@ -88,22 +89,22 @@ pub const PngParser = struct {
         // Read chunks until IEND
         while (true) {
             // Read chunk length (4 bytes, big endian)
-            const length = try buffered_reader.readInt(u32, .big);
+            const length = try reader.takeInt(u32, .big);
 
             // Read chunk type (4 bytes)
             var chunk_type: [4]u8 = undefined;
-            try buffered_reader.readNoEof(&chunk_type);
+            try reader.readSliceAll(&chunk_type);
 
             // Allocate and read chunk data
             const data = try self.allocator.alloc(u8, length);
             errdefer self.allocator.free(data);
-            try buffered_reader.readNoEof(data);
+            try reader.readSliceAll(data);
 
             // Read CRC (4 bytes)
-            const crc = try buffered_reader.readInt(u32, .big);
+            const crc = try reader.takeInt(u32, .big);
 
             // Store the chunk
-            try self.chunks.append(.{
+            try self.chunks.append(self.allocator, .{
                 .length = length,
                 .type = chunk_type,
                 .data = data,
@@ -118,31 +119,31 @@ pub const PngParser = struct {
     }
 
     /// Get all tEXt chunks
-    pub fn getTExtChunks(self: *const PngParser) []const Chunk {
-        var result = std.ArrayList(Chunk).init(self.allocator);
-        defer result.deinit();
+    pub fn getTExtChunks(self: *const PngParser) ![]const Chunk {
+        var result = try std.ArrayList(Chunk).initCapacity(self.allocator, 25);
+        defer result.deinit(self.allocator);
 
         for (self.chunks.items) |chunk| {
             if (std.mem.eql(u8, &chunk.type, &ChunkType.tEXt)) {
-                result.append(chunk) catch continue;
+                result.append(self.allocator, chunk) catch continue;
             }
         }
 
-        return result.toOwnedSlice() catch &[_]Chunk{};
+        return result.toOwnedSlice(self.allocator) catch &[_]Chunk{};
     }
 
     /// Get all iTXt chunks
-    pub fn getITxtChunks(self: *const PngParser) []const Chunk {
-        var result = std.ArrayList(Chunk).init(self.allocator);
-        defer result.deinit();
+    pub fn getITxtChunks(self: *const PngParser) ![]const Chunk {
+        var result = try std.ArrayList(Chunk).initCapacity(self.allocator, 25);
+        defer result.deinit(self.allocator);
 
         for (self.chunks.items) |chunk| {
             if (std.mem.eql(u8, &chunk.type, &ChunkType.iTXt)) {
-                result.append(chunk) catch continue;
+                result.append(self.allocator, chunk) catch continue;
             }
         }
 
-        return result.toOwnedSlice() catch &[_]Chunk{};
+        return result.toOwnedSlice(self.allocator) catch &[_]Chunk{};
     }
 
     /// Parse an iTXt chunk into its components
@@ -263,7 +264,7 @@ test "parse PNG and extract tEXt chunks" {
     const testing = std.testing;
     const test_file_path = "test-artifacts/chunk-data.png"; // Adjust path as needed
 
-    var parser = PngParser.init(testing.allocator);
+    var parser = try PngParser.init(testing.allocator);
     defer parser.deinit();
 
     try parser.parseFile(test_file_path);

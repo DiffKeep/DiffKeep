@@ -20,24 +20,26 @@ pub const VecResult = struct { id: i64, distance: f32 };
 
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     db_path: []const u8,
     connections: std.ArrayList(Database),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator, db_path: []const u8, init_pool_size: usize) !ConnectionPool {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, init_pool_size: usize) !ConnectionPool {
         var pool = ConnectionPool{
             .allocator = allocator,
+            .io = io,
             .db_path = try allocator.dupe(u8, db_path),
-            .connections = std.ArrayList(Database).init(allocator),
-            .mutex = .{},
+            .connections = .empty,
+            .mutex = std.Io.Mutex.init,
         };
         errdefer pool.deinit();
 
         // Create the initial connections
-        try pool.connections.ensureTotalCapacity(init_pool_size);
+        try pool.connections.ensureTotalCapacity(allocator, init_pool_size);
         for (0..init_pool_size) |_| {
             const db = try Database.open(allocator, db_path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX);
-            try pool.connections.append(db);
+            try pool.connections.append(allocator, db);
         }
 
         return pool;
@@ -47,29 +49,29 @@ pub const ConnectionPool = struct {
         for (self.connections.items) |*conn| {
             conn.close();
         }
-        self.connections.deinit();
+        self.connections.deinit(self.allocator);
         self.allocator.free(self.db_path);
     }
 
     pub fn acquire(self: *ConnectionPool) !Database {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         log.debug("Current pool size: {d}", .{self.connections.items.len});
 
         if (self.connections.items.len == 0) {
             // Create a new connection if pool is empty
             const db = try Database.open(self.allocator, self.db_path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX);
-            try self.connections.append(db);
+            try self.connections.append(self.allocator, db);
         }
 
         return self.connections.pop().?;
     }
 
     pub fn release(self: *ConnectionPool, db: *Database) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        try self.connections.append(db.*);
+        try self.connections.append(self.allocator, db.*);
     }
 };
 

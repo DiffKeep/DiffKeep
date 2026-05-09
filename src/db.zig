@@ -21,8 +21,8 @@ pub const VectorDb = struct {
     allocator: std.mem.Allocator,
     pool: sqlite.ConnectionPool,
 
-    pub fn init(allocator: std.mem.Allocator, path: []const u8) !VectorDb {
-        var pool = try sqlite.ConnectionPool.init(allocator, path, 16);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !VectorDb {
+        var pool = try sqlite.ConnectionPool.init(allocator, io, path, 16);
         errdefer pool.deinit();
 
         var db = try pool.acquire();
@@ -155,55 +155,68 @@ pub const VectorDb = struct {
     }
 
     pub fn findOrCreateImage(self: *VectorDb, library_id: u64, image_path: []const u8) !models.Image {
-        // First check if the image already exists by checking the path
-        {
-            var stmt = self.db.statements.find_image;
-            try stmt.reset();
 
-            try stmt.bind(1, library_id);
-            try stmt.bind(2, image_path);
-
-            if (try stmt.step()) {
-                // Image found, return it
-                log.debug("Found existing image, id {d}\n", .{stmt.columnInt64(0)});
-                return models.Image{
-                    .id = @intCast(stmt.columnInt64(0)),
-                    .libraryId = @intCast(stmt.columnInt64(1)),
-                    .libraryPath = try self.allocator.dupe(u8, stmt.columnText(2)),
-                    .creationDate = try self.allocator.dupe(u8, stmt.columnText(3)),
-                    .positivePromptText = if (stmt.columnIsNull(4)) null else try self.allocator.dupe(u8, stmt.columnText(4)),
-                    .negativePromptText = if (stmt.columnIsNull(5)) null else try self.allocator.dupe(u8, stmt.columnText(5)),
-                    .generatedDescription = if (stmt.columnIsNull(6)) null else try self.allocator.dupe(u8, stmt.columnText(6)),
-                    .thumbnail = if (stmt.columnIsNull(7)) null else try self.allocator.dupe(u8, stmt.columnBlob(7)),
-                    .hash = if (stmt.columnIsNull(8)) null else try self.allocator.dupe(u8, stmt.columnText(8)),
-                };
-            }
-        }
-
-        // Image not found, create a new entry
-        {
-            var stmt = self.db.statements.insert_image;
-            try stmt.reset();
-
-            try stmt.bind(1, library_id);
-            try stmt.bind(2, image_path);
-
-            _ = try stmt.step();
-            log.debug("Created new image for {s}\n", .{image_path});
-        }
-
-        // Return the new image object
+        // Temporarally return a fake image object to avoid the db hit
         return models.Image{
-            .id = @intCast(self.db.getLastInsertRowID()),
+            .id = 1,
             .libraryId = library_id,
             .libraryPath = try self.allocator.dupe(u8, image_path),
-            .creationDate = try self.allocator.dupe(u8, try self.getCurrentTimestamp()),
+            .creationDate = "2024-03-21 15:30:45",
             .positivePromptText = null,
             .negativePromptText = null,
             .generatedDescription = null,
             .thumbnail = null,
             .hash = null,
         };
+        // First check if the image already exists by checking the path
+        // {
+        //     var stmt = self.db.statements.find_image;
+        //     try stmt.reset();
+        //
+        //     try stmt.bind(1, library_id);
+        //     try stmt.bind(2, image_path);
+        //
+        //     if (try stmt.step()) {
+        //         // Image found, return it
+        //         log.debug("Found existing image, id {d}\n", .{stmt.columnInt64(0)});
+        //         return models.Image{
+        //             .id = @intCast(stmt.columnInt64(0)),
+        //             .libraryId = @intCast(stmt.columnInt64(1)),
+        //             .libraryPath = try self.allocator.dupe(u8, stmt.columnText(2)),
+        //             .creationDate = try self.allocator.dupe(u8, stmt.columnText(3)),
+        //             .positivePromptText = if (stmt.columnIsNull(4)) null else try self.allocator.dupe(u8, stmt.columnText(4)),
+        //             .negativePromptText = if (stmt.columnIsNull(5)) null else try self.allocator.dupe(u8, stmt.columnText(5)),
+        //             .generatedDescription = if (stmt.columnIsNull(6)) null else try self.allocator.dupe(u8, stmt.columnText(6)),
+        //             .thumbnail = if (stmt.columnIsNull(7)) null else try self.allocator.dupe(u8, stmt.columnBlob(7)),
+        //             .hash = if (stmt.columnIsNull(8)) null else try self.allocator.dupe(u8, stmt.columnText(8)),
+        //         };
+        //     }
+        // }
+        //
+        // // Image not found, create a new entry
+        // {
+        //     var stmt = self.db.statements.insert_image;
+        //     try stmt.reset();
+        //
+        //     try stmt.bind(1, library_id);
+        //     try stmt.bind(2, image_path);
+        //
+        //     _ = try stmt.step();
+        //     log.debug("Created new image for {s}\n", .{image_path});
+        // }
+        //
+        // // Return the new image object
+        // return models.Image{
+        //     .id = @intCast(self.db.getLastInsertRowID()),
+        //     .libraryId = library_id,
+        //     .libraryPath = try self.allocator.dupe(u8, image_path),
+        //     .creationDate = try self.allocator.dupe(u8, try self.getCurrentTimestamp()),
+        //     .positivePromptText = null,
+        //     .negativePromptText = null,
+        //     .generatedDescription = null,
+        //     .thumbnail = null,
+        //     .hash = null,
+        // };
     }
 
     pub fn saveImage(self: *VectorDb, image: *const models.Image) !void {

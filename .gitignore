@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+zig-pkg/
 Models/
 /.idea/libraries/Zig_SDK.xml
 /.idea/ZigBrains.iml

@@ -1,141 +1,138 @@
 const std = @import("std");
-const flags = @import("flags");
 const db = @import("db.zig");
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
 const LibraryParser = @import("parse/parse_library.zig").LibraryParser;
 const PngParser = @import("image/png-data.zig").PngParser;
 const llama = @import("llama.zig");
 const cmdFlags = @import("cmd_flags.zig");
-const zstbi = @import("zstbi");
+const vips = @import("vips");
 const util = @import("util.zig");
+const clap = @import("clap");
+const known_folders = @import("known-folders");
 
 const build_options = @import("build_options");
 
-const log = if (@import("builtin").target.os.tag == .windows)
-    struct {
-        pub fn output(comptime fmt: []const u8, args: anytype) !void {
-            // On Windows GUI, write to a log file instead
-            const log_file = try std.fs.cwd().createFile("debug.log", .{});
-            defer log_file.close();
-            try log_file.writer().print(fmt, args);
-        }
-        pub fn log(comptime fmt: []const u8, args: anytype) !void {
-            return .output(fmt, args);
-        }
-    }
-else
-    struct {
-        pub fn output(comptime fmt: []const u8, args: anytype) !void {
-            // output to stdout
-            try std.io.getStdOut().writer().print(fmt, args);
-        }
-        pub fn log(comptime fmt: []const u8, args: anytype) !void {
-            // output to stderr
-            try std.io.getStdErr().writer().print(fmt, args);
-        }
-    };
-
 // Modify the main function where you initialize the database
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    var allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\-v, --version          Display the version and exit.
+        \\-p, --parse <str>      Parse a file.
+        \\-c, --config <str>     Specify a config file. Default is known folders.
+        \\
+    );
 
-    const options = flags.parseOrExit(args, "stablekeepr", cmdFlags.Flags, .{
-        // Use the `colors` option to provide a colorscheme for the error/help messages.
-        // Specifying this as empty: `.colors = .{}` will disable colors.
-        // Each field is a list of type `std.io.tty.Color`.
-        .colors = &.{
-            .error_label = &.{ .bright_red, .bold },
-            .command_name = &.{.bright_green},
-            .header = &.{ .yellow, .bold },
-            .usage = &.{.dim},
-        },
-    });
+    // Initialize our diagnostics, which can be used for reporting useful errors.
+    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
+    // care about the extra information `Diagnostics` provides.
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        // Report useful error and exit.
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
 
-    if (options.version == true) {
-        try log.output("Version: {s}\n", .{build_options.version});
+
+    if (res.args.version != 0) {
+        std.log.info("Version: {s}\n", .{build_options.version});
         return;
     }
 
-    if (options.parse_file != null) {
-        try log.output("Parsing file: {?s}\n", .{options.parse_file});
-        const file = try std.fs.cwd().openFile(options.parse_file orelse "", .{});
-        defer file.close();
+    if (res.args.parse) |parse_file| {
+        std.log.info("Parsing file: {s}\n", .{parse_file});
+        const file = try std.Io.Dir.cwd().openFile(init.io, parse_file, .{});
+        defer file.close(init.io);
         // parse the file to get the prompt
-        var parser = PngParser.init(allocator);
+        var parser = try PngParser.init(allocator, init.io);
         defer parser.deinit();
         var comfy_parser = ComfyParser.init(allocator);
-        const file_size = file.getEndPos() catch {
-            try log.output("Failed getting file size of {?s}\n", .{options.parse_file});
+        const file_size = file.length(init.io) catch {
+            std.log.info("Failed getting file size of {s}\n", .{parse_file});
             return;
         };
         const buffer = allocator.alloc(u8, file_size) catch {
-            try log.output("OOM error reading file {?s}\n", .{options.parse_file});
+            std.log.info("OOM error reading file {s}\n", .{parse_file});
             return;
         };
         defer allocator.free(buffer);
-        _ = file.read(buffer) catch {
-            try log.output("error reading file into buffer: {?s}\n", .{options.parse_file});
+        _ = file.readPositionalAll(init.io, buffer, 0) catch {
+            std.log.info("error reading file into buffer: {s}\n", .{parse_file});
             return;
         };
         parser.parseBuffer(buffer) catch {
-            try log.output("error parsing reading file {?s}\n", .{options.parse_file});
+            std.log.info("error parsing reading file {s}\n", .{parse_file});
             return;
         };
 
-        var found_prompt: ?[]const u8 = null;
-        defer if (found_prompt != null) allocator.free(found_prompt.?);
-
-        const text_chunks = parser.getTExtChunks();
+        const text_chunks = try parser.getTExtChunks();
         defer allocator.free(text_chunks);
         for (text_chunks) |chunk| {
             var content = parser.parseTExtChunk(chunk) catch return;
             defer content.deinit(allocator);
 
             if (std.mem.eql(u8, content.keyword, "workflow")) {
-                const prompt = comfy_parser.parseWorkflow(content.text) catch return;
-                defer if (prompt != null) allocator.free(prompt.?);
-
-                if (prompt) |p| {
-                    found_prompt = try allocator.dupe(u8, p);
+                var maybe_result = comfy_parser.parseWorkflow(content.text) catch return;
+                if (maybe_result) |*result| {
+                    defer result.deinit(allocator);
+                    if (result.positive_prompt) |p| std.log.info("Prompt: {s}\n", .{p});
+                    if (result.negative_prompt) |p| std.log.info("Negative: {s}\n", .{p});
+                    if (result.model) |m| std.log.info("Model: {s}\n", .{m});
+                    if (result.steps) |s| std.log.info("Steps: {d}\n", .{s});
+                    if (result.cfg) |c| std.log.info("CFG: {d}\n", .{c});
+                    if (result.seed) |s| std.log.info("Seed: {d}\n", .{s});
+                    if (result.sampler) |s| std.log.info("Sampler: {s}\n", .{s});
+                    if (result.scheduler) |s| std.log.info("Scheduler: {s}\n", .{s});
+                    if (result.loras) |loras| {
+                        for (loras) |lora| std.log.info("LoRA: {s}\n", .{lora});
+                    }
                 } else {
-                    try log.output("Found workflow chunk but prompt is null in {?s}\n", .{options.parse_file});
+                    std.log.info("Found workflow chunk but could not extract prompt from {s}\n", .{parse_file});
                 }
             }
-        }
-
-        if (found_prompt) |prompt| {
-            try log.output("Prompt: {s}\n", .{prompt});
         }
 
         return;
     }
 
+    // get the config path
+    var config_path: ?[]const u8 = null;
+    if (res.args.config) |config| {
+        config_path = try allocator.dupe(u8, config);
+    } else {
+        config_path = try known_folders.getPath(init.io, allocator, init.environ_map, .local_configuration);
+        if (config_path == null) {
+            return error.UnableToGetConfigPath;
+        }
+    }
+    defer allocator.free(config_path.?);
+
     // Initialize the vector database with the appropriate path
-    const db_path = try util.getDataPath(allocator, &options, "diffkeep.db");
+    const db_path = try util.getDataPath(allocator, init.io, config_path.?, "diffkeep.db");
     defer allocator.free(db_path);
 
-    try log.output("Using database at: {s}\n", .{db_path});
+    std.log.info("Using database at: {s}\n", .{db_path});
 
-    var vector_db = try db.VectorDb.init(allocator, db_path);
+    var vector_db = try db.VectorDb.init(allocator, init.io, db_path);
     defer vector_db.deinit();
 
-    zstbi.init(allocator);
-    defer zstbi.deinit();
+    try vips.init();
+    defer vips.deinit();
 
     // create / get the library
     const library_path = "/home/qt/genai/comfyui/output/2025/04/";
     const id = try vector_db.storeLibrary(library_path);
 
     // parse the library
-    var lib_parser = try LibraryParser.init(allocator, &vector_db, &options, id, library_path);
+    var lib_parser = try LibraryParser.init(allocator, &vector_db, id, library_path);
     defer lib_parser.deinit();
-    try lib_parser.parse();
-    try log.output("Done parsing!\n", .{});
+    try lib_parser.parse(init.io);
+    std.log.info("Done parsing!\n", .{});
 }
 
 // Helper function to get or create an image ID

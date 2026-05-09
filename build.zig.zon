@@ -16,36 +16,48 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .flags = .{
-            .url = "git+https://github.com/n0s4/flags/#0e2491d8e6d2be38dc0c2ce8e103469886e468bb",
-            .hash = "flags-0.10.0-a_9h3kR2AABNAfaPGRyOOGmWsfv12Hk6JQPTX4MM446s",
+        .dvui = .{
+            .url = "git+https://github.com/foxnne/dvui-dev#3fea718de58591ed5df9372e6d1b30c9ef4feeef",
+            .hash = "dvui-0.5.0-dev-AQFJmSsK3wDLFqpi9tQ9xVC-xkAtQE0JAY1B4-o1Ey0M",
         },
         .llama_cpp = .{
-            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b5223.tar.gz",
-            .hash = "N-V-__8AACaGJAScvd5tTU6cY3_dN_J-kZaOo6ZamCR-G3cm",
+            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9048.tar.gz",
+            .hash = "N-V-__8AABJr7QjlB5fAyP4Pp5P97tqAFrc8THsBD8YnsNee",
         },
         .llama_cpp_macos = .{
             .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b5223/llama-b5223-bin-macos-arm64.zip",
-            .hash = "N-V-__8AAFXGFwQYbE12yX1iRZHf5PRC-jOeF8eqfIufKnJf",
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-macos-arm64.tar.gz",
+            .hash = "N-V-__8AAC4FngH7d5PYlpEm1HQ9t9netMnweSY4eb1Npxdl",
         },
         .llama_cpp_windows = .{
             .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b5223/llama-b5223-bin-win-avx2-x64.zip",
-            .hash = "N-V-__8AAEi2pAKlcGARxW8xx8XtWVbSY2q6jRRe39ReAauA",
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-win-cpu-x64.zip",
+            .hash = "N-V-__8AADj24gL6bz8_LCDBX5ajDq9TlwZjLiYtcZT9OD6y",
         },
         .llama_cpp_linux = .{
             .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b5223/llama-b5223-bin-ubuntu-x64.zip",
-            .hash = "N-V-__8AABCbTgQWuhq1cE3rBTSyHSYhgB06eaS7yu6eQGxd",
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-x64.tar.gz",
+            .hash = "N-V-__8AAHatcwLEIVRuflEdmWeiMTDCc8LITSOe6LZ1WZHd",
         },
-        .zstbi = .{
-            .url = "git+https://github.com/zig-gamedev/zstbi#094c4bba5cdbec167d3f6aaa98cccccd5c99145f",
-            .hash = "zstbi-0.11.0-dev-L0Ea_-eVBwCl8RYA98PhLDw3Fhw5k7FJOHSMDKWDOvqx",
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
-        .zul = .{
-            .url = "git+https://github.com/karlseguin/zul.git#007aa7c4ed77272416c8111f4ce403e86abd56d3",
-            .hash = "zul-0.0.0-1oDotyJMBwBli3UBm47WYeNZSMNni_DbkT-jTtDpowDW",
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders.git#207c34a16e4365edc20d92c7892f962b3bed46e8",
+            .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
+        },
+        .llama_cpp_linux_vulkan = .{
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-vulkan-x64.tar.gz",
+            .hash = "N-V-__8AAO49FQa9-gn72-mboQ2U4PCLLM4T0rhZKdVWhQQZ",
+        },
+        .llama_cpp_linux_rocm = .{
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-rocm-7.2-x64.tar.gz",
+            .hash = "N-V-__8AAA6AxCR54pKzYq-CjTj95cmDHDK5r3fTsXxi-sEx",
+        },
+        .llama_cpp_linux_sycl = .{
+            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-sycl-fp16-x64.tar.gz",
+            .hash = "N-V-__8AAL5tbgiKr4fpDFg2QFNqlHAoqkaQ0qnw3wNtVbzy",
         },
     },
     .paths = .{

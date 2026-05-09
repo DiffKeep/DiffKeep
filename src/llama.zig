@@ -1,6 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.llama);
+
+fn nanoNow() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+}
 const util = @import("util.zig");
 const cmdFlags = @import("cmd_flags.zig");
 
@@ -31,25 +37,34 @@ pub const PoolOptions = struct {
     flash_attn: bool = false,
     mlock: bool = false,
     pooling_type: i32 = 1,
+    /// Forward all llama.cpp log output. When false (default), only
+    /// warnings and errors are forwarded; debug/info spam is suppressed.
+    llama_verbose: bool = false,
 };
 
 /// A single-model, single-context, thread-safe pool.
 pub const Pool = struct {
     allocator: std.mem.Allocator = undefined,
     options: PoolOptions,
-    sem: std.Thread.Semaphore = .{ .permits = 1 },
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     model: ?Model = null,
     context: ?Context = null,
 
     /// Initializes the pool.
     pub fn init(allocator: std.mem.Allocator, options: PoolOptions) Pool {
         const H = struct {
-            fn trampoline(_: c.enum_ggml_log_level, data: [*c]const u8, _: ?*anyopaque) callconv(.C) void {
-                log.debug("{s}", .{std.mem.trimRight(u8, std.mem.span(data), &.{'\n'})});
+            var verbose: bool = false;
+            fn trampoline(level: c.enum_ggml_log_level, data: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
+                const msg = std.mem.trimEnd(u8, std.mem.span(data), &.{'\n'});
+                if (level == c.GGML_LOG_LEVEL_ERROR) return log.err("{s}", .{msg});
+                if (level == c.GGML_LOG_LEVEL_WARN)  return log.warn("{s}", .{msg});
+                if (verbose) log.debug("{s}", .{msg});
             }
         };
+        H.verbose = options.llama_verbose;
 
         c.llama_backend_init();
+        c.ggml_backend_load_all();
         c.llama_log_set(H.trampoline, null);
 
         return .{
@@ -66,8 +81,10 @@ pub const Pool = struct {
 
     /// Resets the pool.
     pub fn reset(self: *Pool, options: PoolOptions) void {
-        self.sem.wait();
-        defer self.sem.post();
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer self.locked.store(false, .release);
 
         if (self.context) |*context| {
             context.deinit();
@@ -86,8 +103,12 @@ pub const Pool = struct {
     /// after use. This function is thread-safe. Fails if the context is busy
     /// for more than `timeout` milliseconds.
     pub fn get(self: *Pool, model_path: []const u8, timeout: u64) !*Context {
-        self.sem.timedWait(timeout * std.time.ns_per_ms) catch return error.ContextBusy;
-        errdefer self.sem.post();
+        const deadline = nanoNow() + @as(i64, @intCast(timeout)) * std.time.ns_per_ms;
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            if (nanoNow() > deadline) return error.ContextBusy;
+            std.atomic.spinLoopHint();
+        }
+        errdefer self.locked.store(false, .release);
 
         if (self.model == null or !std.mem.eql(u8, self.model.?.path, model_path)) {
             // Reset if the model has changed.
@@ -106,9 +127,12 @@ pub const Pool = struct {
     fn modelParams(self: *Pool) c.llama_model_params {
         var params = c.llama_model_default_params();
 
-        // It seems Metal never worked on Intel-based macs.
+        // Metal never worked on Intel macs; on all other platforms use n_gpu_layers
+        // if set, otherwise default to 999 (offload everything) on Apple Silicon
+        // where Metal is always available, and 0 elsewhere.
         // see https://github.com/ggerganov/llama.cpp/issues/3423#issuecomment-1745511586
-        params.n_gpu_layers = @intCast(if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) (self.options.n_gpu_layers orelse 999) else 0);
+        const default_gpu_layers: u32 = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) 999 else 0;
+        params.n_gpu_layers = @intCast(self.options.n_gpu_layers orelse default_gpu_layers);
         params.use_mlock = self.options.mlock;
 
         return params;
@@ -124,7 +148,7 @@ pub const Pool = struct {
         params.embeddings = self.options.embeddings;
         params.n_threads = @intCast(self.options.n_threads orelse cpu_count);
         params.n_threads_batch = @intCast(self.options.n_threads_batch orelse self.options.n_threads orelse cpu_count);
-        params.flash_attn = self.options.flash_attn;
+        params.flash_attn_type = if (self.options.flash_attn) c.LLAMA_FLASH_ATTN_TYPE_ENABLED else c.LLAMA_FLASH_ATTN_TYPE_AUTO;
         params.pooling_type = self.options.pooling_type;
 
         return params;
@@ -133,7 +157,7 @@ pub const Pool = struct {
     /// Releases the context so that it can be used by other threads.
     pub fn release(self: *Pool, ctx: *Context) void {
         if (ctx == &self.context.?) {
-            self.sem.post();
+            self.locked.store(false, .release);
         }
     }
 };
@@ -150,7 +174,7 @@ pub const Model = struct {
         defer allocator.free(pathZ);
 
         // Load the model
-        const ptr = c.llama_load_model_from_file(pathZ.ptr, params) orelse return error.InvalidModel;
+        const ptr = c.llama_model_load_from_file(pathZ.ptr, params) orelse return error.InvalidModel;
 
         return .{
             .allocator = allocator,
@@ -198,7 +222,7 @@ pub const Model = struct {
 
     /// Deinitializes the model.
     pub fn deinit(self: *Model) void {
-        c.llama_free_model(self.ptr);
+        c.llama_model_free(self.ptr);
         self.allocator.free(self.path);
     }
 
@@ -233,8 +257,8 @@ pub const Model = struct {
     }
 
     /// Tokenizes the input and appends the tokens to the given list.
-    pub fn tokenize(self: *const Model, tokens: *std.ArrayList(Token), input: []const u8, special: bool) !void {
-        try tokens.ensureUnusedCapacity(input.len / 2);
+    pub fn tokenize(self: *const Model, allocator: std.mem.Allocator, tokens: *std.ArrayList(Token), input: []const u8, special: bool) !void {
+        try tokens.ensureUnusedCapacity(allocator, input.len / 2);
         var slice: []Token = tokens.items[tokens.items.len..];
         slice.len = tokens.capacity - tokens.items.len;
 
@@ -244,15 +268,15 @@ pub const Model = struct {
             @intCast(input.len),
             slice.ptr,
             @intCast(slice.len),
-            c.llama_add_bos_token(c.llama_model_get_vocab(self.ptr)),
+            c.llama_vocab_get_add_bos(c.llama_model_get_vocab(self.ptr)),
             special,
         );
 
         if (n_tokens >= 0) {
             tokens.items.len += @intCast(n_tokens);
         } else {
-            try tokens.ensureUnusedCapacity(@intCast(-n_tokens));
-            return self.tokenize(tokens, input, special);
+            try tokens.ensureUnusedCapacity(allocator, @intCast(-n_tokens));
+            return self.tokenize(allocator, tokens, input, special);
         }
     }
 
@@ -279,30 +303,30 @@ pub const Model = struct {
 };
 
 pub const Context = struct {
+    allocator: std.mem.Allocator,
     model: *Model,
     params: c.llama_context_params,
     ptr: *c.llama_context,
     sampler: *c.llama_sampler,
-    tokens: std.ArrayList(Token),
+    tokens: std.ArrayList(Token) = .empty,
     n_past: usize = 0,
-    candidates: std.ArrayList(c.llama_token_data),
-    buf: std.ArrayList(u8),
+    candidates: std.ArrayList(c.llama_token_data) = .empty,
+    buf: std.ArrayList(u8) = .empty,
 
     /// Initializes the context.
     pub fn init(allocator: std.mem.Allocator, model: *Model, params: c.struct_llama_context_params) !Context {
-        var candidates = std.ArrayList(c.llama_token_data).init(allocator);
-        errdefer candidates.deinit();
+        var candidates: std.ArrayList(c.llama_token_data) = .empty;
+        errdefer candidates.deinit(allocator);
 
-        try candidates.resize(@intCast(c.llama_vocab_n_tokens(c.llama_model_get_vocab(model.ptr))));
+        try candidates.resize(allocator, @intCast(c.llama_vocab_n_tokens(c.llama_model_get_vocab(model.ptr))));
 
         return .{
+            .allocator = allocator,
             .model = model,
             .params = params,
             .ptr = c.llama_new_context_with_model(model.ptr, params) orelse return error.UnexpectedError,
             .sampler = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()),
-            .tokens = std.ArrayList(Token).init(allocator),
             .candidates = candidates,
-            .buf = std.ArrayList(u8).init(allocator),
         };
     }
 
@@ -310,33 +334,40 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         c.llama_sampler_free(self.sampler);
         c.llama_free(self.ptr);
-        self.tokens.deinit();
-        self.candidates.deinit();
-        self.buf.deinit();
+        self.tokens.deinit(self.allocator);
+        self.candidates.deinit(self.allocator);
+        self.buf.deinit(self.allocator);
     }
 
     /// Prepares the context for inference.
     pub fn prepare(self: *Context, prompt: []const u8, params: SamplingParams) !void {
-        var tokens = std.ArrayList(Token).init(self.model.allocator);
-        errdefer tokens.deinit();
+        var tokens: std.ArrayList(Token) = .empty;
+        errdefer tokens.deinit(self.allocator);
 
-        try self.model.tokenize(&tokens, prompt, true);
+        try self.model.tokenize(self.allocator, &tokens, prompt, true);
         self.buf.shrinkRetainingCapacity(0);
+
+        // Encoder-only models (BERT-style) require the full sequence every time —
+        // bidirectional attention can't reuse a partial KV cache from a previous prompt.
+        const is_encoder_only = c.llama_model_has_encoder(self.model.ptr) and
+            !c.llama_model_has_decoder(self.model.ptr);
 
         // Find the common part and set n_past accordingly.
         var n_past: usize = 0;
 
-        for (0..@min(self.tokens.items.len, tokens.items.len)) |i| {
-            if (self.tokens.items[i] != tokens.items[i]) break;
-            n_past = i;
+        if (!is_encoder_only) {
+            for (0..@min(self.tokens.items.len, tokens.items.len)) |i| {
+                if (self.tokens.items[i] != tokens.items[i]) break;
+                n_past = i;
+            }
         }
 
         // Remove the past tokens from the KV cache.
-        if (!c.llama_kv_cache_seq_rm(self.ptr, 0, @intCast(n_past), -1)) {
-            _ = c.llama_kv_cache_clear(self.ptr);
+        const mem = c.llama_get_memory(self.ptr);
+        if (!c.llama_memory_seq_rm(mem, 0, @intCast(n_past), -1)) {
+            c.llama_memory_clear(mem, true);
         }
 
-        log.debug("{} tokens, n_past = {}", .{ tokens.items.len, n_past });
 
         c.llama_sampler_free(self.sampler);
         self.sampler = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params());
@@ -348,7 +379,7 @@ pub const Context = struct {
         c.llama_sampler_chain_add(self.sampler, c.llama_sampler_init_temp(params.temperature));
         c.llama_sampler_chain_add(self.sampler, c.llama_sampler_init_dist(@intCast(params.seed)));
 
-        self.tokens.deinit();
+        self.tokens.deinit(self.allocator);
         self.tokens = tokens;
         self.n_past = n_past;
     }
@@ -363,21 +394,17 @@ pub const Context = struct {
     /// Does nothing if the context is already up-to-date.
     /// Returns the number of tokens evaluated.
     pub fn evalOnce(self: *Context) !usize {
-        log.debug("Running one step", .{});
         const n_eval = @min(
             @as(usize, @intCast(self.params.n_batch)),
             self.tokens.items.len - self.n_past,
         );
-        log.debug("n_eval: {d}", .{n_eval});
 
         if (n_eval > 0) {
             if (c.llama_model_has_encoder(self.model.ptr) and !c.llama_model_has_decoder(self.model.ptr)) {
-                log.debug("Running encode", .{});
                 if (c.llama_encode(self.ptr, c.llama_batch_get_one(&self.tokens.items[self.n_past], @intCast(n_eval))) != 0) {
                     return error.FailedToEval;
                 }
             } else if (!c.llama_model_has_encoder(self.model.ptr) and c.llama_model_has_decoder(self.model.ptr)) {
-                log.debug("Running decode", .{});
                 if (c.llama_decode(self.ptr, c.llama_batch_get_one(&self.tokens.items[self.n_past], @intCast(n_eval))) != 0) {
                     return error.FailedToEval;
                 }
@@ -403,7 +430,7 @@ pub const Context = struct {
         }
 
         const start = self.buf.items.len;
-        try self.buf.appendSlice(buf[0..@intCast(n)]);
+        try self.buf.appendSlice(self.allocator, buf[0..@intCast(n)]);
         return self.buf.items[start..];
     }
 
@@ -419,13 +446,12 @@ pub const Context = struct {
             self.tokens.items.len = cutoff;
             self.n_past = 0;
 
-            log.debug("truncated input to {}", .{cutoff});
         }
 
         try self.eval();
 
         const token = try self.sampleToken() orelse return null;
-        try self.tokens.append(token);
+        try self.tokens.append(self.allocator, token);
         return token;
     }
 
@@ -527,50 +553,49 @@ const grammar = struct {
 
 /// Create an embedding from a prompt string using the LLM
 pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, ctx: *Context, prompt: []const u8, ctx_size: u32) !std.ArrayList([]const f32) {
-    // Prepare the context with our prompt
-    try ctx.prepare(prompt, .{
-        .seed = 0,
-        .temperature = 0.0, // Use 0 temperature for deterministic embeddings
-    });
-    var prompts = std.ArrayList([]const u8).init(allocator);
-    defer prompts.deinit();
+    // Count tokens without preparing the context (avoid polluting KV cache state).
+    var count_tokens: std.ArrayList(Token) = .empty;
+    defer count_tokens.deinit(allocator);
+    try ctx.model.tokenize(allocator, &count_tokens, prompt, true);
 
-    if (ctx.tokens.items.len > ctx_size) {
+    var prompts: std.ArrayList([]const u8) = .empty;
+    const prompts_owns_strings = count_tokens.items.len > ctx_size;
+    defer {
+        if (prompts_owns_strings) {
+            for (prompts.items) |p| allocator.free(p);
+        }
+        prompts.deinit(allocator);
+    }
+
+    if (prompts_owns_strings) {
         // need to split the prompt into pieces
         try chunkByTokens(allocator, prompt, ctx, ctx_size, &prompts);
     } else {
-        // put the single prompt into prompts
-        const duped_prompt = try allocator.dupe(u8, prompt);
-        try prompts.append(duped_prompt);
+        // put the single prompt into prompts (no dupe — we don't own it)
+        try prompts.append(allocator, prompt);
     }
 
     // loop over each prompt segment and generate an embedding
-    var embeddings = std.ArrayList([]const f32).init(allocator);
+    var embeddings: std.ArrayList([]const f32) = .empty;
     for (prompts.items) |p| {
-        // Prepare the context with our prompt
+        // Prepare and run — one prepare per chunk, no double-prepare.
         try ctx.prepare(p, .{
             .seed = 0,
-            .temperature = 0.0, // Use 0 temperature for deterministic embeddings
+            .temperature = 0.0,
         });
         // Run the model to get embeddings
         try ctx.eval();
 
         // Get the embedding size from the model
         const n_embd = @as(usize, @intCast(c.llama_model_n_embd(ctx.model.ptr)));
-        log.debug("Embedding size from model: {d}", .{n_embd});
         const embedding = try allocator.alloc(f32, n_embd);
         errdefer allocator.free(embedding);
 
-        // Log out the pooling type.
-        log.debug("Pooling type: {d}", .{c.llama_pooling_type(ctx.ptr)});
-
-        const embd = c.llama_get_embeddings(ctx.ptr);
-        if (embd != null) {
-            // Copy the embedding data
-            @memcpy(embedding, embd[0..n_embd]);
-        } else {
+        // Try seq embedding first (mean/cls pooling), fall back to raw
+        const embd = c.llama_get_embeddings_seq(ctx.ptr, 0) orelse
+            c.llama_get_embeddings(ctx.ptr) orelse
             return error.EmbeddingFailed;
-        }
+        @memcpy(embedding, embd[0..n_embd]);
 
         // Normalize the embedding (L2 norm)
         var sum_squared: f32 = 0.0;
@@ -585,7 +610,7 @@ pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, ctx: *Context, pr
             }
         }
 
-        try embeddings.append(embedding);
+        try embeddings.append(allocator, embedding);
     }
 
     return embeddings;
@@ -593,8 +618,8 @@ pub fn createEmbeddingFromPrompt(allocator: std.mem.Allocator, ctx: *Context, pr
 
 fn chunkByTokens(allocator: std.mem.Allocator, text: []const u8, ctx: *Context, max_tokens: usize, output_list: *std.ArrayList([]const u8)) !void {
     var start: usize = 0;
-    var token_chunk = std.ArrayList(Token).init(allocator);
-    defer token_chunk.deinit();
+    var token_chunk: std.ArrayList(Token) = .empty;
+    defer token_chunk.deinit(allocator);
     while (start < text.len) {
         var end = start;
         var token_count: usize = 0;
@@ -607,8 +632,8 @@ fn chunkByTokens(allocator: std.mem.Allocator, text: []const u8, ctx: *Context, 
             // Count tokens in this segment
             const segment = text[end..next_boundary];
             // Clear the token chunk before each use
-            token_chunk.clearAndFree();
-            try ctx.model.tokenize(&token_chunk, segment, false);
+            token_chunk.clearAndFree(allocator);
+            try ctx.model.tokenize(allocator, &token_chunk, segment, false);
             const segment_tokens = token_chunk.items.len;
 
             // If adding this segment would exceed our limit, stop
@@ -624,17 +649,13 @@ fn chunkByTokens(allocator: std.mem.Allocator, text: []const u8, ctx: *Context, 
         // Create the chunk
         if (end > start) {
             const chunk = try allocator.dupe(u8, text[start..end]);
-            defer allocator.free(chunk);
-            try output_list.append(chunk);
-            log.debug("Chunk: {s}", .{chunk});
+            try output_list.append(allocator, chunk);
             start = end;
         } else {
             // Fallback if we can't make progress (single token too large)
             end = @min(start + 100, text.len);
             const chunk = try allocator.dupe(u8, text[start..end]);
-            defer allocator.free(chunk);
-            try output_list.append(chunk);
-            log.debug("Chunk: {s}", .{chunk});
+            try output_list.append(allocator, chunk);
             start = end;
         }
     }
