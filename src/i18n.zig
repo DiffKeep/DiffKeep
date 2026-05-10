@@ -23,6 +23,8 @@ pub const Strings = struct {
 
     settings_config_dir: [:0]const u8,
     settings_model_path: [:0]const u8,
+
+    status_bar_image_count: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -46,6 +48,8 @@ pub const en: Strings = .{
 
     .settings_config_dir = "Config directory",
     .settings_model_path = "Embedding model",
+
+    .status_bar_image_count = "Images: "
 };
 
 pub var active: *const Strings = &en;
