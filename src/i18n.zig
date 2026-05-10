@@ -3,8 +3,6 @@ const std = @import("std");
 // All strings are sentinel-terminated so they work with both dvui labels ([]const u8)
 // and APIs that require [:0]const u8 (e.g. window title, file dialogs).
 pub const Strings = struct {
-    window_title: [:0]const u8,
-
     nav_library: [:0]const u8,
     nav_search: [:0]const u8,
     nav_settings: [:0]const u8,
