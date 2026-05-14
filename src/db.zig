@@ -16,41 +16,105 @@ pub const SearchResult = struct {
     }
 };
 
+// Each entry is applied in order; never edit existing entries, only append.
+const migrations = [_][]const u8{
+    // v1: libraries table
+    \\CREATE TABLE libraries (
+    \\  id INTEGER PRIMARY KEY,
+    \\  path TEXT UNIQUE NOT NULL
+    \\) STRICT;
+    ,
+    // v2: images table with full parse metadata.
+    // loras is stored as a JSON array of strings.
+    \\CREATE TABLE images (
+    \\  id INTEGER PRIMARY KEY,
+    \\  library_id INTEGER NOT NULL,
+    \\  library_path TEXT NOT NULL,
+    \\  creation_date TEXT DEFAULT CURRENT_TIMESTAMP,
+    \\  hash TEXT,
+    \\  thumbnail BLOB,
+    \\  positive_prompt_text TEXT,
+    \\  negative_prompt_text TEXT,
+    \\  generated_description TEXT,
+    \\  model TEXT,
+    \\  cfg REAL,
+    \\  steps INTEGER,
+    \\  seed INTEGER,
+    \\  sampler TEXT,
+    \\  scheduler TEXT,
+    \\  loras TEXT,
+    \\  FOREIGN KEY (library_id) REFERENCES libraries(id) ON DELETE CASCADE
+    \\) STRICT;
+    ,
+    // v3: embedding tables (2048-dim). vec0 virtual tables are not STRICT.
+    \\CREATE VIRTUAL TABLE image_embeddings USING vec0(vector float[2048]);
+    \\CREATE VIRTUAL TABLE positive_prompt_embeddings USING vec0(vector float[2048]);
+    ,
+};
+
+// setupSchema runs all pending migrations and bootstraps any remaining tables
+// on a dedicated raw connection so that pool connections (which call
+// prepareStatements on open) always find a complete schema.
+fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
+    const c = sqlite.c;
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    var raw: ?*c.sqlite3 = null;
+    if (c.sqlite3_open_v2(path_z, &raw, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null) != c.SQLITE_OK)
+        return error.DatabaseOpenFailed;
+    defer _ = c.sqlite3_close(raw);
+    const db = raw.?;
+
+    var err_msg: [*c]u8 = null;
+    if (c.sqlite3_vec_init(db, &err_msg, null) != c.SQLITE_OK) {
+        if (err_msg != null) c.sqlite3_free(err_msg);
+        return error.VecExtensionFailed;
+    }
+
+    _ = c.sqlite3_exec(db, "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;", null, null, null);
+
+    // Determine current schema version
+    var ver_stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &ver_stmt, null);
+    _ = c.sqlite3_step(ver_stmt);
+    const version: usize = @intCast(c.sqlite3_column_int64(ver_stmt, 0));
+    _ = c.sqlite3_finalize(ver_stmt);
+
+    // Apply any pending migrations
+    for (migrations[version..], version..) |sql, idx| {
+        _ = c.sqlite3_exec(db, "BEGIN", null, null, null);
+        err_msg = null;
+        if (c.sqlite3_exec(db, sql.ptr, null, null, &err_msg) != c.SQLITE_OK) {
+            if (err_msg != null) {
+                log.err("migration {d} failed: {s}", .{ idx + 1, err_msg });
+                c.sqlite3_free(err_msg);
+            }
+            _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+            return error.MigrationFailed;
+        }
+        var buf: [64]u8 = undefined;
+        const pragma = try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d}", .{idx + 1});
+        _ = c.sqlite3_exec(db, pragma.ptr, null, null, null);
+        _ = c.sqlite3_exec(db, "COMMIT", null, null, null);
+        log.info("applied migration {d}", .{idx + 1});
+    }
+
+}
+
 pub const VectorDb = struct {
     db: sqlite.Database,
     allocator: std.mem.Allocator,
     pool: sqlite.ConnectionPool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !VectorDb {
+        try setupSchema(allocator, path);
+
         var pool = try sqlite.ConnectionPool.init(allocator, io, path, 16);
         errdefer pool.deinit();
 
-        var db = try pool.acquire();
-
-        // Initialize the database
-
-        try db.exec(
-            \\CREATE TABLE IF NOT EXISTS libraries (
-            \\  id INTEGER PRIMARY KEY,
-            \\  path TEXT UNIQUE NOT NULL
-            \\) STRICT;
-            \\CREATE TABLE IF NOT EXISTS images (
-            \\  id INTEGER PRIMARY KEY,
-            \\  library_path TEXT NOT NULL,
-            \\  library_id INTEGER,
-            \\  creation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            \\  positive_prompt_text TEXT,
-            \\  negative_prompt_text TEXT,
-            \\  generated_description TEXT,
-            \\  thumbnail BLOB,
-            \\  hash TEXT,
-            \\  FOREIGN KEY (library_id) REFERENCES libraries(id) ON DELETE CASCADE
-            \\) STRICT;
-        );
-
-        // Create vector tables
-        try db.createVectorTable("image_embeddings", 1024);
-        try db.createVectorTable("positive_prompt_embeddings", 1024);
+        const db = try pool.acquire();
 
         return VectorDb{
             .db = db,
@@ -112,14 +176,14 @@ pub const VectorDb = struct {
     pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, embedding: []const f32, positive: bool) !void {
         var stmt: sqlite.PreparedStatement = undefined;
         if (positive) {
-            stmt = try self.db.prepare("INSERT OR REPLACE INTO positive_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 1024))");
+            stmt = try self.db.prepare("INSERT OR REPLACE INTO positive_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 2048))");
         } else {
-            stmt = try self.db.prepare("INSERT OR REPLACE INTO negative_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 1024))");
+            stmt = try self.db.prepare("INSERT OR REPLACE INTO negative_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 2048))");
         }
         defer stmt.deinit();
 
         try stmt.bind(1, image_id);
-        try stmt.bindBlob(2, std.mem.sliceAsBytes(embedding[0..1024]));
+        try stmt.bindBlob(2, std.mem.sliceAsBytes(embedding[0..2048]));
 
         _ = try stmt.step();
     }

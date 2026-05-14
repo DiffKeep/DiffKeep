@@ -5,12 +5,16 @@ const known_folders = @import("known-folders");
 
 const build_options = @import("build_options");
 const i18n = @import("i18n.zig");
+const db_mod = @import("db.zig");
+const config_mod = @import("config.zig");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
 const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
 
-// Config directory: set from --config/-c flag, otherwise resolved from known folders.
-var g_config_dir: ?[]const u8 = null;
+// Path to the config file: set from --config/-c flag, otherwise resolved from known folders.
+var g_config: ?[]const u8 = null;
+var g_cfg: config_mod.Config = .{};
+var g_db: ?db_mod.VectorDb = null;
 
 // Panel split ratios, stored here so dvui uses our values as the source of truth.
 var g_left_ratio: f32 = 0.22;
@@ -38,7 +42,7 @@ fn appStart() dvui.App.StartOptions {
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
                 if (it.next()) |val| {
-                    g_config_dir = init.gpa.dupe(u8, val) catch null;
+                    g_config = std.fs.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch null;
                 }
             }
         }
@@ -55,15 +59,40 @@ fn appStart() dvui.App.StartOptions {
 fn appInit(win: *dvui.Window) !void {
     _ = win;
 
-    if (g_config_dir == null) {
-        if (dvui.App.main_init) |init| {
-            g_config_dir = try known_folders.getPath(init.io, init.gpa, init.environ_map, .local_configuration);
+    if (dvui.App.main_init) |init| {
+        if (g_config == null) {
+            if (try known_folders.getPath(init.io, init.gpa, init.environ_map, .local_configuration)) |config_dir| {
+                defer init.gpa.free(config_dir);
+                g_config = try std.fs.path.join(init.gpa, &.{ config_dir, "DiffKeep", "DiffKeep.cfg"});
+            }
+        }
+
+        if (g_config) |cfg_path| {
+            g_cfg = try config_mod.load(init.gpa, init.io, cfg_path);
+        }
+
+        const db_path = blk: {
+            if (g_cfg.data_path) |p| {
+                break :blk try init.gpa.dupe(u8, p);
+            }
+            if (try known_folders.getPath(init.io, init.gpa, init.environ_map, .data)) |data_base| {
+                defer init.gpa.free(data_base);
+                var data_dir = try std.Io.Dir.openDirAbsolute(init.io, data_base, .{});
+                defer data_dir.close(init.io);
+                try data_dir.createDirPath(init.io, "DiffKeep");
+                break :blk try std.fs.path.join(init.gpa, &.{ data_base, "DiffKeep", "diffkeep.db" });
+            }
+            break :blk null;
+        };
+        if (db_path) |p| {
+            defer init.gpa.free(p);
+            g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
         }
     }
 
     std.log.info("DiffKeep {s} — config: {s}", .{
         build_options.version,
-        g_config_dir orelse "(none)",
+        g_config orelse "(none)",
     });
 
     try dvui.addFont("NotoSansCJK", noto_cjk_bytes, null);
@@ -77,8 +106,18 @@ fn appInit(win: *dvui.Window) !void {
 }
 
 fn appDeinit() void {
+    if (g_db) |*database| {
+        database.deinit();
+        database.pool.deinit();
+    }
     if (dvui.App.main_init) |init| {
-        if (g_config_dir) |dir| init.gpa.free(dir);
+        if (g_config) |cfg_path| {
+            config_mod.save(g_cfg, init.io, cfg_path) catch |err| {
+                std.log.warn("failed to save config: {}", .{err});
+            };
+            init.gpa.free(cfg_path);
+        }
+        g_cfg.deinit(init.gpa);
     }
 }
 
