@@ -323,6 +323,27 @@ pub const VectorDb = struct {
         _ = try stmt.step();
     }
 
+    pub fn removeLibrary(self: *VectorDb, path: []const u8) !void {
+        var stmt = try self.db.prepare("DELETE FROM libraries WHERE path = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, path);
+        _ = try stmt.step();
+    }
+
+    pub fn listLibraries(self: *VectorDb, allocator: std.mem.Allocator) ![][]const u8 {
+        var stmt = try self.db.prepare("SELECT path FROM libraries ORDER BY id");
+        defer stmt.deinit();
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |p| allocator.free(p);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
     // Helper method to get current timestamp in the format used by the database
     fn getCurrentTimestamp(self: *VectorDb) ![]const u8 {
         var stmt = try self.db.prepare("SELECT CURRENT_TIMESTAMP");
