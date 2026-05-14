@@ -13,9 +13,9 @@ pub const Config = struct {
     window_x: ?i32 = null,
     window_y: ?i32 = null,
 
-    thumbnails_in_db: bool = true,
-    prompt_embeddings: bool = true,
-    image_embeddings: bool = true,
+    thumbnails_in_db: bool = false,
+    prompt_embeddings: bool = false,
+    image_embeddings: bool = false,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.data_path) |p| allocator.free(p);

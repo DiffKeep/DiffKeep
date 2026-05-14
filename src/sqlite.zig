@@ -223,11 +223,11 @@ pub const Database = struct {
         try self.exec(
             \\PRAGMA journal_mode = WAL;
             \\PRAGMA synchronous = NORMAL;
-            \\PRAGMA cache_size = -2000; -- Use 2MB of memory for cache
+            \\PRAGMA cache_size = -2000;
             \\PRAGMA page_size = 4096;
-            \\PRAGMA mmap_size = 268435456; -- Use memory-mapped I/O (256MB)
+            \\PRAGMA mmap_size = 8388608;
             \\PRAGMA temp_store = MEMORY;
-            \\PRAGMA busy_timeout = 5000; -- Wait up to 5 seconds when database is locked
+            \\PRAGMA busy_timeout = 5000;
             \\PRAGMA foreign_keys = ON
         );
 
@@ -246,7 +246,7 @@ pub const Database = struct {
             .insert_library = try db.prepare("INSERT INTO libraries (path) VALUES (?)"),
             .find_image = try db.prepare(
                 \\SELECT id, library_id, library_path, creation_date, positive_prompt_text,
-                \\       negative_prompt_text, generated_description, thumbnail, hash
+                \\       negative_prompt_text, generated_description, thumbnail, hash, mtime
                 \\FROM images
                 \\WHERE library_id = ? AND library_path = ?
             ),
@@ -260,7 +260,8 @@ pub const Database = struct {
                 \\    negative_prompt_text = ?,
                 \\    generated_description = ?,
                 \\    thumbnail = ?,
-                \\    hash = ?
+                \\    hash = ?,
+                \\    mtime = ?
                 \\WHERE id = ?
             ),
         };

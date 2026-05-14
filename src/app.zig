@@ -7,6 +7,8 @@ const build_options = @import("build_options");
 const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
 const config_mod = @import("config.zig");
+const library_manager_mod = @import("library_manager.zig");
+const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
@@ -17,7 +19,12 @@ var g_config: ?[]const u8 = null;
 var g_cfg: config_mod.Config = .{};
 var g_db: ?db_mod.VectorDb = null;
 
+var g_library_manager: ?library_manager_mod.LibraryManager = null;
 var g_library_dialog_open: bool = false;
+var g_settings_open: bool = false;
+var g_db_stats: ?db_mod.DbStats = null;
+const ScanSnapshot = struct { thumbnails_in_db: bool = false, prompt_embeddings: bool = false, image_embeddings: bool = false };
+var g_settings_scan_snapshot: ScanSnapshot = .{};
 var g_pending_library_buf: [4096]u8 = undefined;
 var g_pending_library_len: usize = 0;
 var g_libraries: std.ArrayList([]const u8) = .empty;
@@ -115,8 +122,20 @@ fn appInit(win: *dvui.Window) !void {
             const paths = db.listLibraries(init.gpa) catch &[_][]const u8{};
             defer init.gpa.free(paths);
             try g_libraries.appendSlice(init.gpa, paths);
+
+            // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s
+            // concurrent task receives &g_library_manager.? (stable global address)
+            // rather than a pointer to a stack-local that becomes dangling after appInit returns.
+            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings);
+            if (g_library_manager) |*mgr| {
+                mgr.scanAllLibraries(init.io) catch |err| {
+                    std.log.warn("startup scan queue failed: {}", .{err});
+                };
+            }
         }
     }
+
+    try vips_mod.init();
 
     std.log.info("DiffKeep {s} — config: {s}", .{
         build_options.version,
@@ -134,6 +153,10 @@ fn appInit(win: *dvui.Window) !void {
 }
 
 fn appDeinit() void {
+    vips_mod.deinit();
+    if (dvui.App.main_init) |init| {
+        if (g_library_manager) |*mgr| mgr.deinit(init.io);
+    }
     if (g_db) |*database| {
         database.deinit();
         database.pool.deinit();
@@ -257,6 +280,163 @@ fn panelHandle(
     }
 }
 
+const BytesFmt = struct { value: f64, unit: []const u8 };
+
+fn fmtBytes(bytes: i64) BytesFmt {
+    const b: f64 = @floatFromInt(if (bytes < 0) 0 else bytes);
+    if (b >= 1024 * 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0 * 1024.0), .unit = "GB" };
+    if (b >= 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0), .unit = "MB" };
+    if (b >= 1024) return .{ .value = b / 1024.0, .unit = "KB" };
+    return .{ .value = b, .unit = "B" };
+}
+
+fn settingsModal() !void {
+    var float = dvui.floatingWindow(@src(), .{
+        .modal = true,
+        .open_flag = &g_settings_open,
+        .resize = .none,
+    }, .{
+        .min_size_content = .{ .w = 560, .h = 0 },
+    });
+    defer float.deinit();
+    float.autoSize();
+    float.dragAreaSet(dvui.Rect.Physical{});
+
+    var content = dvui.box(@src(), .{}, .{
+        .expand = .both,
+        .padding = .all(16),
+    });
+    defer content.deinit();
+
+    dvui.label(@src(), "Settings", .{}, .{ .font = bold, .margin = .{ .h = 12 } });
+
+    {
+        var cols = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer cols.deinit();
+
+        // ── Left column: config toggles ───────────────────────────────────
+        {
+            var left = dvui.box(@src(), .{}, .{
+                .expand = .both,
+                .min_size_content = .{ .w = 240, .h = 0 },
+                .padding = .{ .w = 16 },
+            });
+            defer left.deinit();
+
+            dvui.label(@src(), "Scan", .{}, .{ .font = bold, .margin = .{ .h = 8 } });
+            _ = dvui.checkbox(@src(), &g_cfg.thumbnails_in_db, "Store thumbnails in database", .{ .margin = .{ .h = 6 } });
+            _ = dvui.checkbox(@src(), &g_cfg.prompt_embeddings, "Generate prompt embeddings", .{ .margin = .{ .h = 6 } });
+            _ = dvui.checkbox(@src(), &g_cfg.image_embeddings, "Generate image embeddings", .{ .margin = .{ .h = 6 } });
+
+            dvui.label(@src(), "Data path", .{}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
+            if (g_cfg.data_path) |p| {
+                dvui.label(@src(), "{s}", .{p}, .{});
+            } else {
+                dvui.label(@src(), "(default XDG data directory)", .{}, .{});
+            }
+        }
+
+        // ── Right column: DB overview ─────────────────────────────────────
+        {
+            var right = dvui.box(@src(), .{}, .{
+                .expand = .both,
+                .min_size_content = .{ .w = 240, .h = 0 },
+                .padding = .{ .x = 16 },
+            });
+            defer right.deinit();
+
+            dvui.label(@src(), "Database", .{}, .{ .font = bold, .margin = .{ .h = 8 } });
+
+            if (g_db_stats) |stats| {
+                const total = fmtBytes(stats.total_bytes);
+                dvui.label(@src(), "Total size: {d:.1} {s}", .{ total.value, total.unit }, .{ .margin = .{ .h = 10 } });
+
+                // Thumbnails
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .expand = .horizontal,
+                        .margin = .{ .h = 6 },
+                    });
+                    defer row.deinit();
+                    const tb = fmtBytes(stats.thumbnail_bytes);
+                    dvui.label(@src(), "Thumbnails: {d} ({d:.1} {s})", .{ stats.thumbnail_count, tb.value, tb.unit }, .{
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                    });
+                    if (dvui.button(@src(), "Clear", .{}, .{
+                        .gravity_y = 0.5,
+                        .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                        .corner_radius = dvui.Rect.all(4),
+                    })) {
+                        if (g_db) |*db| {
+                            db.clearThumbnails() catch {};
+                            g_db_stats = db.getStats() catch null;
+                        }
+                    }
+                }
+
+                // Prompt embeddings
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .expand = .horizontal,
+                        .margin = .{ .h = 6 },
+                    });
+                    defer row.deinit();
+                    const pe = fmtBytes(stats.prompt_embedding_count * 2048 * 4);
+                    dvui.label(@src(), "Prompt embeddings: {d} ({d:.1} {s})", .{ stats.prompt_embedding_count, pe.value, pe.unit }, .{
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                    });
+                    if (dvui.button(@src(), "Clear", .{}, .{
+                        .gravity_y = 0.5,
+                        .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                        .corner_radius = dvui.Rect.all(4),
+                    })) {
+                        if (g_db) |*db| {
+                            db.clearPromptEmbeddings() catch {};
+                            g_db_stats = db.getStats() catch null;
+                        }
+                    }
+                }
+
+                // Image embeddings
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .expand = .horizontal,
+                        .margin = .{ .h = 6 },
+                    });
+                    defer row.deinit();
+                    const ie = fmtBytes(stats.image_embedding_count * 2048 * 4);
+                    dvui.label(@src(), "Image embeddings: {d} ({d:.1} {s})", .{ stats.image_embedding_count, ie.value, ie.unit }, .{
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                    });
+                    if (dvui.button(@src(), "Clear", .{}, .{
+                        .gravity_y = 0.5,
+                        .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                        .corner_radius = dvui.Rect.all(4),
+                    })) {
+                        if (g_db) |*db| {
+                            db.clearImageEmbeddings() catch {};
+                            g_db_stats = db.getStats() catch null;
+                        }
+                    }
+                }
+            } else {
+                dvui.label(@src(), "(no database)", .{}, .{});
+            }
+        }
+    }
+
+    {
+        var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .margin = .{ .y = 12 } });
+        defer btn_row.deinit();
+        if (dvui.button(@src(), "Close", .{}, .{ .margin = .all(4) })) {
+            g_settings_open = false;
+        }
+    }
+}
+
 fn frame() !dvui.App.Result {
     for (dvui.events()) |*e| {
         if (e.evt == .window and e.evt.window.action == .close) return .close;
@@ -268,7 +448,9 @@ fn frame() !dvui.App.Result {
         g_pending_library_len = 0;
         if (dvui.App.main_init) |init| {
             const duped = try init.gpa.dupe(u8, path);
-            if (g_db) |*db| {
+            if (g_library_manager) |*mgr| {
+                _ = mgr.addLibrary(init.io, duped) catch {};
+            } else if (g_db) |*db| {
                 _ = db.storeLibrary(duped) catch {};
             }
             try g_libraries.append(init.gpa, duped);
@@ -460,14 +642,60 @@ fn frame() !dvui.App.Result {
         });
         defer statusbar.deinit();
 
-        dvui.label(@src(), "{s}{d}/{d}", .{ i18n.t(.status_bar_image_count), 0, 0 }, .{ .gravity_y = 0.5 });
+        if (g_library_manager) |*mgr| {
+            if (mgr.isScanActive()) {
+                _ = dvui.spinner(@src(), .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 12, .h = 12 },
+                });
+                dvui.label(@src(), "scanning… {d} files", .{mgr.filesScanned()}, .{
+                    .gravity_y = 0.5,
+                    .margin = .{ .x = 4 },
+                });
+            } else {
+                dvui.label(@src(), "{d} images", .{0}, .{ .gravity_y = 0.5 });
+            }
+        } else {
+            dvui.label(@src(), "no database", .{}, .{ .gravity_y = 0.5 });
+        }
         _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-        _ = dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
+        if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
             .min_size_content = .{ .w = 14, .h = 14 },
             .gravity_y = 0.5,
             .padding = dvui.Rect.all(3),
             .margin = .{ .w = 2 },
-        });
+        })) {
+            g_settings_open = !g_settings_open;
+            if (g_settings_open) {
+                if (g_db) |*db| g_db_stats = db.getStats() catch null;
+                g_settings_scan_snapshot = .{
+                    .thumbnails_in_db = g_cfg.thumbnails_in_db,
+                    .prompt_embeddings = g_cfg.prompt_embeddings,
+                    .image_embeddings = g_cfg.image_embeddings,
+                };
+            }
+        }
+    }
+
+    // ── Settings modal ────────────────────────────────────────────────────────
+    const settings_was_open = g_settings_open;
+    if (g_settings_open) try settingsModal();
+    if (settings_was_open and !g_settings_open) {
+        const changed = g_cfg.thumbnails_in_db != g_settings_scan_snapshot.thumbnails_in_db or
+            g_cfg.prompt_embeddings != g_settings_scan_snapshot.prompt_embeddings or
+            g_cfg.image_embeddings != g_settings_scan_snapshot.image_embeddings;
+        if (changed) {
+            if (g_library_manager) |*mgr| {
+                mgr.thumbnails_in_db = g_cfg.thumbnails_in_db;
+                mgr.prompt_embeddings = g_cfg.prompt_embeddings;
+                mgr.image_embeddings = g_cfg.image_embeddings;
+                if (dvui.App.main_init) |init| {
+                    mgr.scanAllLibraries(init.io) catch |err| {
+                        std.log.warn("rescan after config change: {}", .{err});
+                    };
+                }
+            }
+        }
     }
 
     // ── Library removal confirmation modal ────────────────────────────────────
@@ -503,7 +731,11 @@ fn frame() !dvui.App.Result {
                     g_confirm_remove_idx = null;
                     if (dvui.App.main_init) |init| {
                         const removed = g_libraries.orderedRemove(idx);
-                        if (g_db) |*db| _ = db.removeLibrary(removed) catch {};
+                        if (g_library_manager) |*mgr| {
+                            mgr.removeLibrary(removed) catch {};
+                        } else if (g_db) |*db| {
+                            _ = db.removeLibrary(removed) catch {};
+                        }
                         init.gpa.free(removed);
                     }
                 }

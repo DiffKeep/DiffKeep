@@ -3,6 +3,21 @@ const sqlite = @import("sqlite");
 const models = @import("models.zig");
 const log = std.log.scoped(.db);
 
+pub const DbStats = struct {
+    total_bytes: i64 = 0,
+    thumbnail_count: i64 = 0,
+    thumbnail_bytes: i64 = 0,
+    prompt_embedding_count: i64 = 0,
+    image_embedding_count: i64 = 0,
+};
+
+pub const ImageMeta = struct {
+    id: u64,
+    mtime: ?i64,
+    has_thumbnail: bool,
+    seen: bool = false,
+};
+
 /// Result struct for vector searches
 pub const SearchResult = struct {
     id: u64,
@@ -49,6 +64,12 @@ const migrations = [_][]const u8{
     // v3: embedding tables (2048-dim). vec0 virtual tables are not STRICT.
     \\CREATE VIRTUAL TABLE image_embeddings USING vec0(vector float[2048]);
     \\CREATE VIRTUAL TABLE positive_prompt_embeddings USING vec0(vector float[2048]);
+    ,
+    // v4: mtime for fast change detection — stat before hashing.
+    \\ALTER TABLE images ADD COLUMN mtime INTEGER;
+    ,
+    // v5: index for fast per-library path lookups during scan
+    \\CREATE INDEX IF NOT EXISTS idx_images_library_path ON images (library_id, library_path);
     ,
 };
 
@@ -107,11 +128,13 @@ pub const VectorDb = struct {
     db: sqlite.Database,
     allocator: std.mem.Allocator,
     pool: sqlite.ConnectionPool,
+    io: std.Io,
+    db_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !VectorDb {
         try setupSchema(allocator, path);
 
-        var pool = try sqlite.ConnectionPool.init(allocator, io, path, 16);
+        var pool = try sqlite.ConnectionPool.init(allocator, io, path, 4);
         errdefer pool.deinit();
 
         const db = try pool.acquire();
@@ -120,6 +143,7 @@ pub const VectorDb = struct {
             .db = db,
             .pool = pool,
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -138,14 +162,20 @@ pub const VectorDb = struct {
     }
 
     pub fn storeImageEmbedding(self: *VectorDb, id: usize, embedding: []const f32) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         try self.db.insertVector("image_embeddings", id, embedding);
     }
 
     pub fn findSimilarImages(self: *VectorDb, query_embedding: []const f32, limit: usize) !std.ArrayList(sqlite.VecResult) {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         return try self.db.searchNearestVectors("image_embeddings", query_embedding, limit);
     }
 
     pub fn storeLibrary(self: *VectorDb, library_path: []const u8) !u32 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         // First, try to find if the library already exists
         {
             var stmt = self.db.statements.find_library;
@@ -174,6 +204,8 @@ pub const VectorDb = struct {
 
     /// Store a prompt embedding in the database
     pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, embedding: []const f32, positive: bool) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         var stmt: sqlite.PreparedStatement = undefined;
         if (positive) {
             stmt = try self.db.prepare("INSERT OR REPLACE INTO positive_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 2048))");
@@ -190,6 +222,8 @@ pub const VectorDb = struct {
 
     /// Find similar images based on a prompt embedding
     pub fn findSimilarPrompts(self: *VectorDb, query_embedding: [*]const f32, limit: usize) !std.ArrayList(SearchResult) {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         var results = std.ArrayList(SearchResult).init(self.allocator);
         errdefer results.deinit();
 
@@ -218,112 +252,75 @@ pub const VectorDb = struct {
         return results;
     }
 
-    pub fn findOrCreateImage(self: *VectorDb, library_id: u64, image_path: []const u8) !models.Image {
+    /// Caller owns all Image string fields; free with image.deinit(allocator).
+    pub fn findOrCreateImage(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, image_path: []const u8) !models.Image {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        {
+            var stmt = self.db.statements.find_image;
+            try stmt.reset();
+            try stmt.bind(1, library_id);
+            try stmt.bind(2, image_path);
+            if (try stmt.step()) {
+                log.debug("found existing image id={d} {s}", .{ stmt.columnInt64(0), image_path });
+                return models.Image{
+                    .id = @intCast(stmt.columnInt64(0)),
+                    .libraryId = @intCast(stmt.columnInt64(1)),
+                    .libraryPath = try allocator.dupe(u8, stmt.columnText(2)),
+                    .creationDate = try allocator.dupe(u8, stmt.columnText(3)),
+                    .positivePromptText = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
+                    .negativePromptText = if (stmt.columnIsNull(5)) null else try allocator.dupe(u8, stmt.columnText(5)),
+                    .generatedDescription = if (stmt.columnIsNull(6)) null else try allocator.dupe(u8, stmt.columnText(6)),
+                    .thumbnail = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnBlob(7)),
+                    .hash = if (stmt.columnIsNull(8)) null else try allocator.dupe(u8, stmt.columnText(8)),
+                    .mtime = if (stmt.columnIsNull(9)) null else stmt.columnInt64(9),
+                };
+            }
+        }
 
-        // Temporarally return a fake image object to avoid the db hit
+        {
+            var stmt = self.db.statements.insert_image;
+            try stmt.reset();
+            try stmt.bind(1, library_id);
+            try stmt.bind(2, image_path);
+            _ = try stmt.step();
+            log.debug("created new image {s}", .{image_path});
+        }
+
         return models.Image{
-            .id = 1,
+            .id = @intCast(self.db.getLastInsertRowID()),
             .libraryId = library_id,
-            .libraryPath = try self.allocator.dupe(u8, image_path),
-            .creationDate = "2024-03-21 15:30:45",
+            .libraryPath = try allocator.dupe(u8, image_path),
+            .creationDate = try allocator.dupe(u8, try self.getCurrentTimestamp(allocator)),
             .positivePromptText = null,
             .negativePromptText = null,
             .generatedDescription = null,
             .thumbnail = null,
             .hash = null,
+            .mtime = null,
         };
-        // First check if the image already exists by checking the path
-        // {
-        //     var stmt = self.db.statements.find_image;
-        //     try stmt.reset();
-        //
-        //     try stmt.bind(1, library_id);
-        //     try stmt.bind(2, image_path);
-        //
-        //     if (try stmt.step()) {
-        //         // Image found, return it
-        //         log.debug("Found existing image, id {d}\n", .{stmt.columnInt64(0)});
-        //         return models.Image{
-        //             .id = @intCast(stmt.columnInt64(0)),
-        //             .libraryId = @intCast(stmt.columnInt64(1)),
-        //             .libraryPath = try self.allocator.dupe(u8, stmt.columnText(2)),
-        //             .creationDate = try self.allocator.dupe(u8, stmt.columnText(3)),
-        //             .positivePromptText = if (stmt.columnIsNull(4)) null else try self.allocator.dupe(u8, stmt.columnText(4)),
-        //             .negativePromptText = if (stmt.columnIsNull(5)) null else try self.allocator.dupe(u8, stmt.columnText(5)),
-        //             .generatedDescription = if (stmt.columnIsNull(6)) null else try self.allocator.dupe(u8, stmt.columnText(6)),
-        //             .thumbnail = if (stmt.columnIsNull(7)) null else try self.allocator.dupe(u8, stmt.columnBlob(7)),
-        //             .hash = if (stmt.columnIsNull(8)) null else try self.allocator.dupe(u8, stmt.columnText(8)),
-        //         };
-        //     }
-        // }
-        //
-        // // Image not found, create a new entry
-        // {
-        //     var stmt = self.db.statements.insert_image;
-        //     try stmt.reset();
-        //
-        //     try stmt.bind(1, library_id);
-        //     try stmt.bind(2, image_path);
-        //
-        //     _ = try stmt.step();
-        //     log.debug("Created new image for {s}\n", .{image_path});
-        // }
-        //
-        // // Return the new image object
-        // return models.Image{
-        //     .id = @intCast(self.db.getLastInsertRowID()),
-        //     .libraryId = library_id,
-        //     .libraryPath = try self.allocator.dupe(u8, image_path),
-        //     .creationDate = try self.allocator.dupe(u8, try self.getCurrentTimestamp()),
-        //     .positivePromptText = null,
-        //     .negativePromptText = null,
-        //     .generatedDescription = null,
-        //     .thumbnail = null,
-        //     .hash = null,
-        // };
     }
 
     pub fn saveImage(self: *VectorDb, image: *const models.Image) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         var stmt = self.db.statements.update_image;
         try stmt.reset();
 
-        // Handle nullable text fields
-        if (image.positivePromptText) |text| {
-            try stmt.bind(1, text);
-        } else {
-            try stmt.bindNull(1);
-        }
-
-        if (image.negativePromptText) |text| {
-            try stmt.bind(2, text);
-        } else {
-            try stmt.bindNull(2);
-        }
-
-        if (image.generatedDescription) |text| {
-            try stmt.bind(3, text);
-        } else {
-            try stmt.bindNull(3);
-        }
-
-        if (image.thumbnail) |thumb| {
-            try stmt.bindBlob(4, thumb);
-        } else {
-            try stmt.bindNull(4);
-        }
-
-        if (image.hash) |hash| {
-            try stmt.bind(5, hash);
-        } else {
-            try stmt.bindNull(5);
-        }
-
-        try stmt.bind(6, image.id);
+        if (image.positivePromptText) |text| try stmt.bind(1, text) else try stmt.bindNull(1);
+        if (image.negativePromptText) |text| try stmt.bind(2, text) else try stmt.bindNull(2);
+        if (image.generatedDescription) |text| try stmt.bind(3, text) else try stmt.bindNull(3);
+        if (image.thumbnail) |thumb| try stmt.bindBlob(4, thumb) else try stmt.bindNull(4);
+        if (image.hash) |hash| try stmt.bind(5, hash) else try stmt.bindNull(5);
+        if (image.mtime) |mt| try stmt.bind(6, mt) else try stmt.bindNull(6);
+        try stmt.bind(7, image.id);
 
         _ = try stmt.step();
     }
 
     pub fn removeLibrary(self: *VectorDb, path: []const u8) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare("DELETE FROM libraries WHERE path = ?");
         defer stmt.deinit();
         try stmt.bind(1, path);
@@ -331,6 +328,8 @@ pub const VectorDb = struct {
     }
 
     pub fn listLibraries(self: *VectorDb, allocator: std.mem.Allocator) ![][]const u8 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare("SELECT path FROM libraries ORDER BY id");
         defer stmt.deinit();
         var list: std.ArrayList([]const u8) = .empty;
@@ -344,15 +343,136 @@ pub const VectorDb = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    // Helper method to get current timestamp in the format used by the database
-    fn getCurrentTimestamp(self: *VectorDb) ![]const u8 {
+    /// Returns all image paths for a library, sorted — used for startup merge-join reconciliation.
+    pub fn listImagePaths(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64) ![][]const u8 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT library_path FROM images WHERE library_id = ? ORDER BY library_path",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |p| allocator.free(p);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Single-query prefetch of all image metadata for a library.
+    /// Returns a map keyed by library_path (caller-owned; free each key then call deinit).
+    pub fn prefetchLibraryImages(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64) !std.StringHashMap(ImageMeta) {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var map = std.StringHashMap(ImageMeta).init(allocator);
+        errdefer {
+            var it = map.keyIterator();
+            while (it.next()) |k| allocator.free(k.*);
+            map.deinit();
+        }
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime, (thumbnail IS NOT NULL) FROM images WHERE library_id = ?",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            const has_thumbnail = stmt.columnInt64(3) != 0;
+            try map.put(path, .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail });
+        }
+        return map;
+    }
+
+    pub fn deleteImageByPath(self: *VectorDb, library_id: u64, path: []const u8) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "DELETE FROM images WHERE library_id = ? AND library_path = ?",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        try stmt.bind(2, path);
+        _ = try stmt.step();
+    }
+
+    fn getCurrentTimestamp(self: *VectorDb, allocator: std.mem.Allocator) ![]const u8 {
         var stmt = try self.db.prepare("SELECT CURRENT_TIMESTAMP");
         defer stmt.deinit();
 
         if (try stmt.step()) {
-            return try self.allocator.dupe(u8, stmt.columnText(0));
+            return try allocator.dupe(u8, stmt.columnText(0));
         }
 
         return error.FailedToGetTimestamp;
+    }
+
+    pub fn getStats(self: *VectorDb) !DbStats {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stats = DbStats{};
+
+        {
+            var stmt = try self.db.prepare("PRAGMA page_count");
+            defer stmt.deinit();
+            if (try stmt.step()) stats.total_bytes = stmt.columnInt64(0);
+        }
+        {
+            var stmt = try self.db.prepare("PRAGMA page_size");
+            defer stmt.deinit();
+            if (try stmt.step()) stats.total_bytes *= stmt.columnInt64(0);
+        }
+        {
+            var stmt = try self.db.prepare(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(thumbnail)), 0) FROM images WHERE thumbnail IS NOT NULL",
+            );
+            defer stmt.deinit();
+            if (try stmt.step()) {
+                stats.thumbnail_count = stmt.columnInt64(0);
+                stats.thumbnail_bytes = stmt.columnInt64(1);
+            }
+        }
+        {
+            var stmt = try self.db.prepare("SELECT COUNT(*) FROM positive_prompt_embeddings");
+            defer stmt.deinit();
+            if (try stmt.step()) stats.prompt_embedding_count = stmt.columnInt64(0);
+        }
+        {
+            var stmt = try self.db.prepare("SELECT COUNT(*) FROM image_embeddings");
+            defer stmt.deinit();
+            if (try stmt.step()) stats.image_embedding_count = stmt.columnInt64(0);
+        }
+
+        return stats;
+    }
+
+    pub fn clearThumbnails(self: *VectorDb) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("UPDATE images SET thumbnail = NULL");
+        defer stmt.deinit();
+        _ = try stmt.step();
+    }
+
+    pub fn clearPromptEmbeddings(self: *VectorDb) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("DELETE FROM positive_prompt_embeddings");
+        defer stmt.deinit();
+        _ = try stmt.step();
+    }
+
+    pub fn clearImageEmbeddings(self: *VectorDb) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("DELETE FROM image_embeddings");
+        defer stmt.deinit();
+        _ = try stmt.step();
     }
 };

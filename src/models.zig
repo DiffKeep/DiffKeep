@@ -20,6 +20,7 @@ pub const Image = struct {
     generatedDescription: ?[]const u8,
     thumbnail: ?[]u8,
     hash: ?[]const u8,
+    mtime: ?i64,
 
     pub fn deinit(self: *Image, allocator: std.mem.Allocator) void {
         allocator.free(self.libraryPath);
