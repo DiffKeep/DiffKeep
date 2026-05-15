@@ -268,9 +268,6 @@ pub const GridState = struct {
         self.queue_cond.signal(self.io);
     }
 
-    /// Render the image grid.  Opens its own scroll area using vertical=.given
-    /// so the full content height is never reported as min_size.h to the parent
-    /// layout (which would push the statusbar off-screen).
     pub fn render(self: *GridState) void {
         const n = self.images.items.len;
         const ts = self.thumbSize();
@@ -279,9 +276,9 @@ pub const GridState = struct {
 
         const scale = dvui.windowNaturalScale();
 
-        // Use the previous frame's viewport width to estimate total_h before
-        // opening the scroll area (needed to pre-set virtual_size.h so the
-        // scrollbar decision is roughly right on first paint).
+        // Estimate virtual_size.h from the previous frame's viewport width so
+        // the scroll area can make the right scrollbar decision before we know
+        // the exact column count.
         {
             const prev_w = self.scroll_info.viewport.w;
             const est_cols: usize = if (prev_w > 1)
@@ -291,19 +288,29 @@ pub const GridState = struct {
             const est_rows: usize = if (n == 0) 0 else (n + est_cols - 1) / est_cols;
             self.scroll_info.virtual_size.h = @as(f32, @floatFromInt(est_rows)) * cell_h;
         }
+        // Reset virtual_size.w to 0 so the scroll area never shows a phantom
+        // horizontal scrollbar when avail_w changes between frames.
+        self.scroll_info.virtual_size.w = 0;
         self.scroll_info.vertical = .given;
-        self.scroll_info.horizontal = .none;
+        // horizontal=.given: SC.deinit() does nothing for width, so it reports
+        // only its ~5px default min_size.w instead of the full content width.
+        // This prevents the grid from inflating min_size.w into the outer row's
+        // layout, which was causing the sidebars to be squeezed out.
+        self.scroll_info.horizontal = .given;
 
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll_info }, .{ .expand = .both });
         defer scroll.deinit();
 
-        // Read avail_w from the INNER clip — this is the scroll container's
-        // actual viewport width after the scrollbar (if any) has taken its
-        // share.  Using the outer clip would count the scrollbar's column
-        // as available space, causing cells to overflow and the right panel
-        // to be displaced.
+        // After the scroll area opens, SC.init() has written the true content
+        // width into viewport.w and set the clip.  Read avail_w from the clip
+        // (the scroll container's actual viewport, after any scrollbar).
         const clip = dvui.clipGet();
         const avail_w = clip.w / scale;
+
+        // Set virtual_size.w so rectFor places children at the correct width.
+        // With horizontal=.given the SC never sets this itself; maxw in rectFor
+        // = max(virtual_size.w, viewport.w) = max(avail_w, avail_w) = avail_w.
+        self.scroll_info.virtual_size.w = avail_w;
 
         if (avail_w < 1) return;
 
@@ -311,9 +318,6 @@ pub const GridState = struct {
         const total_rows: usize = if (n == 0) 0 else (n + cols - 1) / cols;
         const total_h = @as(f32, @floatFromInt(total_rows)) * cell_h;
 
-        // Keep virtual_size.h in sync with the actual column count.  If it
-        // changed (e.g. after the first frame when we had a 1-col estimate),
-        // request a re-render so the scrollbar size corrects itself.
         if (total_h != self.scroll_info.virtual_size.h) {
             self.scroll_info.virtual_size.h = total_h;
             dvui.refresh(null, @src(), scroll.data().id);
@@ -377,10 +381,6 @@ pub const GridState = struct {
             var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .id_extra = row,
                 .expand = .horizontal,
-                // Cap reported min_size.w to avail_w so the ratchet in
-                // dvui.minSize() cannot inflate it beyond the scroll
-                // container's content width (which breaks the outer layout).
-                .max_size_content = .{ .w = avail_w, .h = dvui.max_float_safe },
             });
             defer hrow.deinit();
             for (0..cols) |col| {
