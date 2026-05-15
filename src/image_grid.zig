@@ -274,11 +274,8 @@ pub const GridState = struct {
         const cell_w = ts + gap;
         const cell_h = ts + label_h + gap;
 
-        const scale = dvui.windowNaturalScale();
-
-        // Estimate virtual_size.h from the previous frame's viewport width so
-        // the scroll area can make the right scrollbar decision before we know
-        // the exact column count.
+        // Estimate virtual height before opening so the scrollbar decision is
+        // right on the first paint.  Uses the previous frame's viewport width.
         {
             const prev_w = self.scroll_info.viewport.w;
             const est_cols: usize = if (prev_w > 1)
@@ -288,30 +285,23 @@ pub const GridState = struct {
             const est_rows: usize = if (n == 0) 0 else (n + est_cols - 1) / est_cols;
             self.scroll_info.virtual_size.h = @as(f32, @floatFromInt(est_rows)) * cell_h;
         }
-        // Reset virtual_size.w to 0 so the scroll area never shows a phantom
-        // horizontal scrollbar when avail_w changes between frames.
+        // Keep virtual_size.w at 0 so SA never shows a phantom horizontal bar.
         self.scroll_info.virtual_size.w = 0;
         self.scroll_info.vertical = .given;
-        // horizontal=.given: SC.deinit() does nothing for width, so it reports
-        // only its ~5px default min_size.w instead of the full content width.
-        // This prevents the grid from inflating min_size.w into the outer row's
-        // layout, which was causing the sidebars to be squeezed out.
+        // horizontal=.given keeps SC from reporting content width as min_size.w,
+        // which would inflate the grid's footprint in the outer row and squeeze
+        // the sidebars.  With .given, SC reports its ~5px default instead.
         self.scroll_info.horizontal = .given;
 
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll_info }, .{ .expand = .both });
         defer scroll.deinit();
 
-        // After the scroll area opens, SC.init() has written the true content
-        // width into viewport.w and set the clip.  Read avail_w from the clip
-        // (the scroll container's actual viewport, after any scrollbar).
-        const clip = dvui.clipGet();
-        const avail_w = clip.w / scale;
-
-        // Set virtual_size.w so rectFor places children at the correct width.
-        // With horizontal=.given the SC never sets this itself; maxw in rectFor
-        // = max(virtual_size.w, viewport.w) = max(avail_w, avail_w) = avail_w.
+        // SC.init() has written the actual viewport dimensions into scroll_info.
+        // avail_w comes from the clip (viewport width in logical pixels after
+        // any vertical scrollbar has taken its slice).
+        const avail_w = dvui.clipGet().w / dvui.windowNaturalScale();
+        // Tell SC the virtual width so rectFor uses the right maxw.
         self.scroll_info.virtual_size.w = avail_w;
-
         if (avail_w < 1) return;
 
         const cols: usize = @max(1, @as(usize, @intFromFloat(@floor(avail_w / cell_w))));
@@ -323,28 +313,21 @@ pub const GridState = struct {
             dvui.refresh(null, @src(), scroll.data().id);
         }
 
-        const row_h_phys = cell_h * scale;
-
-        // Distribute remaining horizontal space as equal margins around each cell.
-        const h_margin = (avail_w - @as(f32, @floatFromInt(cols)) * ts) / @as(f32, @floatFromInt(cols)) / 2.0;
-
-        // Marker widget at content top to measure scroll offset
-        var marker = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 0, .h = 0 } });
-        const marker_y = marker.data().rectScale().r.y;
-        marker.deinit();
-
-        const rel_top = clip.y - marker_y;
-        const rel_bot = clip.y + clip.h - marker_y;
-
-        const first_row = @as(usize, @intCast(@max(
+        // viewport.y / viewport.h are the scroll position and visible height in
+        // logical pixels — no marker widget needed to derive these.
+        const scroll_y = self.scroll_info.viewport.y;
+        const scroll_h = self.scroll_info.viewport.h;
+        const first_row: usize = @intCast(@max(
             0,
-            @as(i64, @intFromFloat(@floor(rel_top / row_h_phys))) - 1,
-        )));
-        const last_row = @min(
+            @as(i64, @intFromFloat(@floor(scroll_y / cell_h))) - 1,
+        ));
+        const last_row: usize = @min(
             total_rows,
-            @as(usize, @intFromFloat(@ceil(rel_bot / row_h_phys))) + 1,
+            @as(usize, @intFromFloat(@ceil((scroll_y + scroll_h) / cell_h))) + 1,
         );
         const visible_rows = if (last_row > first_row) last_row - first_row else 1;
+
+        const h_margin = (avail_w - @as(f32, @floatFromInt(cols)) * ts) / @as(f32, @floatFromInt(cols)) / 2.0;
 
         // Prefetch zone: N screens above and below the viewport
         const buf_rows = visible_rows * prefetch_screens;
