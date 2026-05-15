@@ -21,6 +21,13 @@ pub const Image = struct {
     thumbnail: ?[]u8,
     hash: ?[]const u8,
     mtime: ?i64,
+    model: ?[]const u8 = null,
+    sampler: ?[]const u8 = null,
+    scheduler: ?[]const u8 = null,
+    cfg: ?f64 = null,
+    steps: ?i64 = null,
+    seed: ?i64 = null,
+    loras: ?[]const u8 = null, // newline-separated list
 
     pub fn deinit(self: *Image, allocator: std.mem.Allocator) void {
         allocator.free(self.libraryPath);
@@ -30,6 +37,10 @@ pub const Image = struct {
         if (self.generatedDescription) |d| allocator.free(d);
         if (self.thumbnail) |t| allocator.free(t);
         if (self.hash) |h| allocator.free(h);
+        if (self.model) |m| allocator.free(m);
+        if (self.sampler) |s| allocator.free(s);
+        if (self.scheduler) |s| allocator.free(s);
+        if (self.loras) |l| allocator.free(l);
     }
 
     pub fn generate_thumbnail(self: *Image, _: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {

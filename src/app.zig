@@ -6,6 +6,7 @@ const known_folders = @import("known-folders");
 const build_options = @import("build_options");
 const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
+const png_mod = @import("image/png-data.zig");
 const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
 const image_grid_mod = @import("image_grid.zig");
@@ -50,6 +51,10 @@ var g_pending_library_buf: [4096]u8 = undefined;
 var g_pending_library_len: usize = 0;
 var g_libraries: std.ArrayList([]const u8) = .empty;
 var g_confirm_remove_idx: ?usize = null;
+
+// Right-panel detail: tracks the currently-displayed image so we only re-query on change.
+var g_detail_id: ?u64 = null;
+var g_detail: ?db_mod.ImageDetails = null;
 
 fn libraryFolderCallback(_: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
     g_library_dialog_open = false;
@@ -226,6 +231,10 @@ fn appDeinit() void {
         database.deinit();
         database.pool.deinit();
     }
+    if (g_detail) |*d| {
+        if (dvui.App.main_init) |init| d.deinit(init.gpa);
+        g_detail = null;
+    }
     if (dvui.App.main_init) |init| {
         if (g_config) |cfg_path| {
             config_mod.save(g_cfg, init.io, cfg_path) catch |err| {
@@ -345,8 +354,33 @@ fn panelHandle(
         });
     }
 
-    const tip: []const u8 = if (collapsed) "Click to expand" else "Click to collapse · Drag to resize";
+    const tip = if (collapsed) i18n.t(.pane_click_to_expand) else i18n.t(.pane_drag_to_resize);
     dvui.tooltip(@src(), .{ .active_rect = h.data().rectScale().r, .delay = 500_000 }, "{s}", .{tip}, .{});
+}
+
+/// Read PNG image dimensions from the IHDR chunk (first 24 bytes of a PNG file).
+fn parsePngDims(buf: []const u8) ?struct { w: u32, h: u32 } {
+    if (buf.len < 24) return null;
+    const sig = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
+    if (!std.mem.eql(u8, buf[0..8], &sig)) return null;
+    if (!std.mem.eql(u8, buf[12..16], "IHDR")) return null;
+    const w: u32 = (@as(u32, buf[16]) << 24) | (@as(u32, buf[17]) << 16) |
+                   (@as(u32, buf[18]) << 8)  | @as(u32, buf[19]);
+    const h: u32 = (@as(u32, buf[20]) << 24) | (@as(u32, buf[21]) << 16) |
+                   (@as(u32, buf[22]) << 8)  | @as(u32, buf[23]);
+    return .{ .w = w, .h = h };
+}
+
+/// Try to parse `text` as JSON and return a pretty-printed copy; returns null if
+/// the text is not valid JSON or allocation fails. Caller owns the returned slice.
+fn prettyJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
+    defer parsed.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit(); // no-op after toOwnedSlice; cleans up on error paths
+    var js: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
+    js.write(parsed.value) catch return null;
+    return aw.toOwnedSlice() catch null;
 }
 
 const BytesFmt = struct { value: f64, unit: []const u8 };
@@ -531,7 +565,8 @@ fn openDeleteDialog(grid: *const image_grid_mod.GridState, force: bool) void {
     if (count == 0) return;
 
     g_delete_dialog_count = count;
-    g_delete_dialog_force = force;
+    // Items already in the trash can only be permanently deleted, never re-trashed.
+    g_delete_dialog_force = force or (grid.view_mode == .trash);
 
     // Snapshot the filename for the single-file label.
     if (count == 1) {
@@ -588,7 +623,7 @@ fn settingsModal() !void {
     });
     defer content.deinit();
 
-    dvui.label(@src(), "Settings", .{}, .{ .font = bold, .margin = .{ .h = 12 } });
+    dvui.label(@src(), "{s}", .{i18n.t(.settings_heading)}, .{ .font = bold, .margin = .{ .h = 12 } });
 
     {
         var cols = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
@@ -603,13 +638,13 @@ fn settingsModal() !void {
             });
             defer left.deinit();
 
-            dvui.label(@src(), "Scan", .{}, .{ .font = bold, .margin = .{ .h = 8 } });
-            _ = dvui.checkbox(@src(), &g_cfg.thumbnails_in_db, "Store thumbnails in database", .{ .margin = .{ .h = 6 } });
-            _ = dvui.checkbox(@src(), &g_cfg.prompt_embeddings, "Generate prompt embeddings", .{ .margin = .{ .h = 6 } });
-            _ = dvui.checkbox(@src(), &g_cfg.image_embeddings, "Generate image embeddings", .{ .margin = .{ .h = 6 } });
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_scan_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
+            _ = dvui.checkbox(@src(), &g_cfg.thumbnails_in_db, i18n.t(.settings_thumbnails_in_db), .{ .margin = .{ .h = 6 } });
+            _ = dvui.checkbox(@src(), &g_cfg.prompt_embeddings, i18n.t(.settings_prompt_embeddings), .{ .margin = .{ .h = 6 } });
+            _ = dvui.checkbox(@src(), &g_cfg.image_embeddings, i18n.t(.settings_image_embeddings), .{ .margin = .{ .h = 6 } });
 
-            dvui.label(@src(), "Trash", .{}, .{ .font = bold, .margin = .{ .y = 16, .h = 8 } });
-            _ = dvui.checkbox(@src(), &g_cfg.trash_enabled, "Enable trash (30-day auto-purge)", .{ .margin = .{ .h = 6 } });
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_trash_section)}, .{ .font = bold, .margin = .{ .y = 16, .h = 8 } });
+            _ = dvui.checkbox(@src(), &g_cfg.trash_enabled, i18n.t(.settings_trash_enable), .{ .margin = .{ .h = 6 } });
             if (g_cfg.trash_enabled) {
                 if (g_trash_stats) |ts| {
                     const tb = fmtBytes(ts.total_bytes);
@@ -622,7 +657,7 @@ fn settingsModal() !void {
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
-                    if (dvui.button(@src(), "Empty Trash", .{}, .{
+                    if (dvui.button(@src(), i18n.t(.settings_empty_trash), .{}, .{
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
@@ -653,11 +688,11 @@ fn settingsModal() !void {
                 }
             }
 
-            dvui.label(@src(), "Data path", .{}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path)}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
             if (g_cfg.data_path) |p| {
                 dvui.label(@src(), "{s}", .{p}, .{});
             } else {
-                dvui.label(@src(), "(default XDG data directory)", .{}, .{});
+                dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path_default)}, .{});
             }
         }
 
@@ -670,11 +705,11 @@ fn settingsModal() !void {
             });
             defer right.deinit();
 
-            dvui.label(@src(), "Database", .{}, .{ .font = bold, .margin = .{ .h = 8 } });
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_database_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
 
             if (g_db_stats) |stats| {
                 const total = fmtBytes(stats.total_bytes);
-                dvui.label(@src(), "Total size: {d:.1} {s}", .{ total.value, total.unit }, .{ .margin = .{ .h = 10 } });
+                dvui.label(@src(), "{s}{d:.1} {s}", .{ i18n.t(.settings_db_total_size_label), total.value, total.unit }, .{ .margin = .{ .h = 10 } });
 
                 // Thumbnails
                 {
@@ -684,11 +719,11 @@ fn settingsModal() !void {
                     });
                     defer row.deinit();
                     const tb = fmtBytes(stats.thumbnail_bytes);
-                    dvui.label(@src(), "Thumbnails: {d} ({d:.1} {s})", .{ stats.thumbnail_count, tb.value, tb.unit }, .{
+                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_thumbnails_label), stats.thumbnail_count, tb.value, tb.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
-                    if (dvui.button(@src(), "Clear", .{}, .{
+                    if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
@@ -708,11 +743,11 @@ fn settingsModal() !void {
                     });
                     defer row.deinit();
                     const pe = fmtBytes(stats.prompt_embedding_count * 2048 * 4);
-                    dvui.label(@src(), "Prompt embeddings: {d} ({d:.1} {s})", .{ stats.prompt_embedding_count, pe.value, pe.unit }, .{
+                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_prompt_embeddings_label), stats.prompt_embedding_count, pe.value, pe.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
-                    if (dvui.button(@src(), "Clear", .{}, .{
+                    if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
@@ -732,11 +767,11 @@ fn settingsModal() !void {
                     });
                     defer row.deinit();
                     const ie = fmtBytes(stats.image_embedding_count * 2048 * 4);
-                    dvui.label(@src(), "Image embeddings: {d} ({d:.1} {s})", .{ stats.image_embedding_count, ie.value, ie.unit }, .{
+                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_image_embeddings_label), stats.image_embedding_count, ie.value, ie.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
-                    if (dvui.button(@src(), "Clear", .{}, .{
+                    if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
@@ -748,7 +783,7 @@ fn settingsModal() !void {
                     }
                 }
             } else {
-                dvui.label(@src(), "(no database)", .{}, .{});
+                dvui.label(@src(), "{s}", .{i18n.t(.settings_db_no_database)}, .{});
             }
         }
     }
@@ -756,7 +791,7 @@ fn settingsModal() !void {
     {
         var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .margin = .{ .y = 12 } });
         defer btn_row.deinit();
-        if (dvui.button(@src(), "Close", .{}, .{ .margin = .all(4) })) {
+        if (dvui.button(@src(), i18n.t(.action_close), .{}, .{ .margin = .all(4) })) {
             g_settings_open = false;
         }
     }
@@ -776,7 +811,7 @@ fn deleteConfirmDialog() !void {
     defer content.deinit();
 
     const permanent = g_delete_dialog_force or !g_cfg.trash_enabled;
-    const title: []const u8 = if (permanent) "Delete permanently?" else "Move to Trash?";
+    const title = if (permanent) i18n.t(.confirm_delete_title) else i18n.t(.confirm_trash_title);
     dvui.label(@src(), "{s}", .{title}, .{ .font = bold, .margin = .{ .h = 8 } });
 
     if (g_delete_dialog_count == 1) {
@@ -789,15 +824,12 @@ fn deleteConfirmDialog() !void {
     var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
     defer btn_row.deinit();
 
-    if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .all(4) })) {
+    if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
         g_delete_dialog_open = false;
     }
 
     if (g_delete_dialog_count == 1) {
-        const skip_label: []const u8 = if (permanent)
-            "Delete, don't ask again"
-        else
-            "Move to Trash, don't ask again";
+        const skip_label = if (permanent) i18n.t(.confirm_delete_no_ask) else i18n.t(.confirm_trash_no_ask);
         if (dvui.button(@src(), skip_label, .{}, .{ .margin = .all(4) })) {
             g_delete_dialog_open = false;
             if (permanent) g_skip_permanent_delete_confirm = true
@@ -811,7 +843,7 @@ fn deleteConfirmDialog() !void {
         }
     }
 
-    const confirm_label: []const u8 = if (permanent) "Delete" else "Move to Trash";
+    const confirm_label = if (permanent) i18n.t(.confirm_delete) else i18n.t(.confirm_move_to_trash);
     if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
         g_delete_dialog_open = false;
         if (g_grid) |*grid| {
@@ -970,16 +1002,20 @@ fn frame() !dvui.App.Result {
                     .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
                 }));
                 defer lib_hdr.deinit();
-                if (dvui.clickedEx(lib_hdr.data(), .{})) |_| {
-                    if (g_grid) |*grid| {
-                        if (grid.view_mode != .library) {
-                            grid.view_mode = .library;
-                            if (g_db) |*db| grid.reloadImages(db) catch {};
+                {
+                    var lbl_area = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+                    defer lbl_area.deinit();
+                    if (dvui.clickedEx(lbl_area.data(), .{})) |_| {
+                        if (g_grid) |*grid| {
+                            if (grid.view_mode != .library) {
+                                grid.view_mode = .library;
+                                if (g_db) |*db| grid.reloadImages(db) catch {};
+                            }
                         }
                     }
+                    dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
+                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 }
-                dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
-                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 if (dvui.buttonIcon(@src(), "add library", dvui.entypo.plus, .{}, .{}, .{
                     .min_size_content = .{ .w = 12, .h = 12 },
                     .gravity_y = 0.5,
@@ -1057,7 +1093,7 @@ fn frame() !dvui.App.Result {
                         }
                     }
                 }
-                dvui.label(@src(), "Trash", .{}, .{ .font = bold, .gravity_y = 0.5 });
+                dvui.label(@src(), "{s}", .{i18n.t(.sidebar_trash)}, .{ .font = bold, .gravity_y = 0.5 });
                 if (g_trash_stats) |ts| {
                     _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                     dvui.label(@src(), "{d}", .{ts.count}, .{ .gravity_y = 0.5 });
@@ -1073,6 +1109,7 @@ fn frame() !dvui.App.Result {
             defer grid_area.deinit();
 
             if (g_grid) |*grid| {
+                grid.trash_enabled = g_cfg.trash_enabled;
                 grid.render();
             } else {
                 dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });
@@ -1083,38 +1120,280 @@ fn frame() !dvui.App.Result {
 
         // ── Right: metadata panel ─────────────────────────────────────────
         if (g_right_w >= 2) {
+            // Refresh detail when the focused image changes.
+            const focused_id: ?u64 = if (g_grid) |*grid|
+                if (grid.focused_idx) |fi|
+                    (if (fi < grid.images.items.len) grid.images.items[fi].id else null)
+                else null
+            else null;
+
+            if (focused_id != g_detail_id) {
+                if (g_detail) |*d| {
+                    if (dvui.App.main_init) |init| d.deinit(init.gpa);
+                    g_detail = null;
+                }
+                g_detail_id = focused_id;
+                if (focused_id) |fid| {
+                    if (g_db) |*db| {
+                        if (dvui.App.main_init) |init| {
+                            if (db.getImageDetails(init.gpa, fid) catch null) |det| {
+                                g_detail = det;
+                                const img_path = g_detail.?.library_path;
+                                // File size (best-effort).
+                                if (std.Io.Dir.cwd().openFile(init.io, img_path, .{})) |f| {
+                                    defer f.close(init.io);
+                                    if (f.length(init.io)) |sz| {
+                                        g_detail.?.file_size = @intCast(sz);
+                                    } else |_| {}
+                                } else |_| {}
+                                // PNG dims + raw text chunks (best-effort).
+                                var maybe_parser: ?png_mod.PngParser = png_mod.PngParser.init(init.gpa, init.io) catch null;
+                                if (maybe_parser) |*parser| {
+                                    defer parser.deinit();
+                                    if (parser.parseFile(img_path)) |_| {
+                                        // Dims from IHDR chunk.
+                                        for (parser.chunks.items) |pc| {
+                                            if (std.mem.eql(u8, &pc.type, &png_mod.ChunkType.IHDR) and pc.data.len >= 8) {
+                                                g_detail.?.width = std.mem.readInt(u32, pc.data[0..4], .big);
+                                                g_detail.?.height = std.mem.readInt(u32, pc.data[4..8], .big);
+                                                break;
+                                            }
+                                        }
+                                        // Raw text chunks.
+                                        var raw_list: std.ArrayList(db_mod.RawChunk) = .empty;
+                                        const text_chunks = parser.getTExtChunks() catch &[_]png_mod.Chunk{};
+                                        defer init.gpa.free(text_chunks);
+                                        for (text_chunks) |tc| {
+                                            const c = parser.parseTExtChunk(tc) catch continue;
+                                            const kw = c.keyword;
+                                            const raw_text = c.text;
+                                            const maybe_pretty = prettyJson(init.gpa, raw_text);
+                                            const display = maybe_pretty orelse raw_text;
+                                            if (maybe_pretty != null) init.gpa.free(raw_text);
+                                            raw_list.append(init.gpa, .{
+                                                .keyword = kw,
+                                                .display_text = display,
+                                                .is_json = maybe_pretty != null,
+                                            }) catch {
+                                                init.gpa.free(kw);
+                                                init.gpa.free(display);
+                                            };
+                                        }
+                                        const itxt_chunks = parser.getITxtChunks() catch &[_]png_mod.Chunk{};
+                                        defer init.gpa.free(itxt_chunks);
+                                        for (itxt_chunks) |tc| {
+                                            var c = parser.parseITxtChunk(tc) catch continue;
+                                            if (c.compressed) { c.deinit(init.gpa); continue; }
+                                            const kw = c.keyword;
+                                            const raw_text = c.text;
+                                            init.gpa.free(c.language);
+                                            init.gpa.free(c.translated_keyword);
+                                            const maybe_pretty = prettyJson(init.gpa, raw_text);
+                                            const display = maybe_pretty orelse raw_text;
+                                            if (maybe_pretty != null) init.gpa.free(raw_text);
+                                            raw_list.append(init.gpa, .{
+                                                .keyword = kw,
+                                                .display_text = display,
+                                                .is_json = maybe_pretty != null,
+                                            }) catch {
+                                                init.gpa.free(kw);
+                                                init.gpa.free(display);
+                                            };
+                                        }
+                                        if (raw_list.items.len > 0) {
+                                            if (raw_list.toOwnedSlice(init.gpa)) |sl| {
+                                                g_detail.?.raw_chunks = sl;
+                                                g_detail.?.raw_chunks_owned = true;
+                                            } else |_| {
+                                                for (raw_list.items) |*rc| {
+                                                    init.gpa.free(rc.keyword);
+                                                    init.gpa.free(rc.display_text);
+                                                }
+                                                raw_list.deinit(init.gpa);
+                                            }
+                                        }
+                                    } else |_| {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             var meta = dvui.box(@src(), .{}, .{
                 .min_size_content = .{ .w = g_right_w, .h = 0 },
+                .max_size_content = .{ .w = g_right_w, .h = 0 },
                 .expand = .vertical,
                 .background = true,
             });
             defer meta.deinit();
 
+            // Header: filename of the focused image.
             {
                 var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
                     .expand = .horizontal,
                     .padding = .{ .x = 8, .y = 6 },
                 });
                 defer header.deinit();
-                dvui.label(@src(), "(image title)", .{}, .{ .font = bold });
+                const title: []const u8 = if (g_grid) |*grid|
+                    if (grid.focused_idx) |fi|
+                        (if (fi < grid.images.items.len) grid.images.items[fi].filename else "")
+                    else ""
+                else "";
+                if (title.len > 0) {
+                    var tl = dvui.textLayout(@src(), .{}, .{
+                        .font = bold,
+                        .expand = .horizontal,
+                        .background = false,
+                    });
+                    tl.addText(title, .{});
+                    tl.deinit();
+                } else {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_no_image)}, .{ .font = bold });
+                }
             }
 
             var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
             defer scroll.deinit();
 
-            // TODO: metadata fields for selected image
-            const lp: dvui.Options = .{ .padding = .{ .x = 8, .y = 2 } };
-            const bp: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 2 } };
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_model)},   bp);
-            dvui.label(@src(), "(model)",   .{}, lp);
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_sampler)}, bp);
-            dvui.label(@src(), "(sampler)", .{}, lp);
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_steps)},   bp);
-            dvui.label(@src(), "(steps)",   .{}, lp);
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_size)},    bp);
-            dvui.label(@src(), "(size)",    .{}, lp);
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_seed)},    bp);
-            dvui.label(@src(), "(seed)",    .{}, lp);
+            if (g_detail) |d| {
+                // Bold section header style.
+                const bp: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 4, .h = 0 } };
+                // Value for block (multi-line) fields — uses textLayout for wrapping.
+                const lp: dvui.Options = .{
+                    .padding = .{ .x = 8, .y = 2, .h = 6 },
+                    .expand = .horizontal,
+                    .background = false,
+                };
+                // Value for compact single-line fields inside horizontal rows.
+                const sp: dvui.Options = .{
+                    .padding = .{ .x = 8, .y = 2, .h = 6 },
+                    .expand = .horizontal,
+                };
+
+                // ── Prompts (block, wrapping) ────────────────────────────────
+                if (d.positive_prompt_text) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_prompt)}, bp);
+                    var tl = dvui.textLayout(@src(), .{}, lp);
+                    tl.addText(v, .{});
+                    tl.deinit();
+                }
+                if (d.negative_prompt_text) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_negative_prompt)}, bp);
+                    var tl = dvui.textLayout(@src(), .{}, lp);
+                    tl.addText(v, .{});
+                    tl.deinit();
+                }
+
+                // ── Model (block) ────────────────────────────────────────────
+                if (d.model) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_model)}, bp);
+                    var tl = dvui.textLayout(@src(), .{}, lp);
+                    tl.addText(v, .{});
+                    tl.deinit();
+                }
+
+                // ── Sampler + Scheduler (side by side) ───────────────────────
+                if (d.sampler != null or d.scheduler != null) {
+                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+                    defer hrow.deinit();
+                    if (d.sampler) |v| {
+                        var sampler_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer sampler_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_sampler)}, bp);
+                        dvui.label(@src(), "{s}", .{v}, sp);
+                    }
+                    if (d.scheduler) |v| {
+                        var scheduler_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer scheduler_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_scheduler)}, bp);
+                        dvui.label(@src(), "{s}", .{v}, sp);
+                    }
+                }
+
+                // ── CFG / Steps / Seed (compact row) ────────────────────────
+                if (d.cfg != null or d.steps != null or d.seed != null) {
+                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+                    defer hrow.deinit();
+                    if (d.cfg) |v| {
+                        var cfg_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer cfg_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_cfg)}, bp);
+                        dvui.label(@src(), "{d:.1}", .{v}, sp);
+                    }
+                    if (d.steps) |v| {
+                        var steps_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer steps_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_steps)}, bp);
+                        dvui.label(@src(), "{d}", .{v}, sp);
+                    }
+                    if (d.seed) |v| {
+                        var seed_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer seed_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_seed)}, bp);
+                        dvui.label(@src(), "{d}", .{v}, sp);
+                    }
+                }
+
+                // ── Resolution + File Size (compact row) ─────────────────────
+                if (d.width != null or d.file_size != null) {
+                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+                    defer hrow.deinit();
+                    if (d.width) |w| {
+                        if (d.height) |h| {
+                            var res_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                            defer res_col.deinit();
+                            dvui.label(@src(), "{s}", .{i18n.t(.detail_resolution)}, bp);
+                            dvui.label(@src(), "{d}\u{00d7}{d}", .{ w, h }, sp);
+                        }
+                    }
+                    if (d.file_size) |sz| {
+                        const fb = fmtBytes(sz);
+                        var size_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                        defer size_col.deinit();
+                        dvui.label(@src(), "{s}", .{i18n.t(.detail_size)}, bp);
+                        dvui.label(@src(), "{d:.1} {s}", .{ fb.value, fb.unit }, sp);
+                    }
+                }
+
+                // ── LoRAs (block) ────────────────────────────────────────────
+                if (d.loras) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_loras)}, bp);
+                    var tl = dvui.textLayout(@src(), .{}, lp);
+                    tl.addText(v, .{});
+                    tl.deinit();
+                }
+
+                // ── Trashed / Path / Date (single-line rows) ─────────────────
+                if (d.trashed_at) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_trashed_at)}, bp);
+                    dvui.label(@src(), "{s}", .{v}, sp);
+                }
+                dvui.label(@src(), "{s}", .{i18n.t(.detail_path)}, bp);
+                {
+                    var tl = dvui.textLayout(@src(), .{}, lp);
+                    tl.addText(d.library_path, .{});
+                    tl.deinit();
+                }
+                if (d.creation_date) |v| {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_date)}, bp);
+                    dvui.label(@src(), "{s}", .{v}, sp);
+                }
+
+                // ── Raw metadata (collapsible per chunk) ─────────────────────
+                if (d.raw_chunks.len > 0) {
+                    dvui.label(@src(), "{s}", .{i18n.t(.detail_raw_metadata)}, bp);
+                    for (d.raw_chunks, 0..) |rc, ci| {
+                        if (dvui.expander(@src(), rc.keyword, .{ .default_expanded = false }, .{ .expand = .horizontal, .id_extra = ci })) {
+                            var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .id_extra = ci }));
+                            tl.addText(rc.display_text, .{});
+                            tl.deinit();
+                        }
+                    }
+                }
+            } else if (focused_id != null) {
+                dvui.label(@src(), "(loading…)", .{}, .{ .padding = .all(8) });
+            }
         }
     }
 
@@ -1141,7 +1420,7 @@ fn frame() !dvui.App.Result {
                 dvui.label(@src(), "{d} images", .{0}, .{ .gravity_y = 0.5 });
             }
         } else {
-            dvui.label(@src(), "no database", .{}, .{ .gravity_y = 0.5 });
+            dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
         }
         _ = dvui.spacer(@src(), .{ .expand = .horizontal });
         if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
@@ -1204,7 +1483,7 @@ fn frame() !dvui.App.Result {
             });
             defer content.deinit();
 
-            dvui.label(@src(), "Remove library?", .{}, .{ .font = bold, .margin = .{ .h = 6 } });
+            dvui.label(@src(), "{s}", .{i18n.t(.library_remove_title)}, .{ .font = bold, .margin = .{ .h = 6 } });
             dvui.label(@src(), "{s}", .{name}, .{});
             dvui.label(@src(), "{s}", .{path}, .{ .margin = .{ .h = 14 } });
 
@@ -1212,10 +1491,10 @@ fn frame() !dvui.App.Result {
                 var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
                 defer btn_row.deinit();
 
-                if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .all(4) })) {
+                if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
                     g_confirm_remove_idx = null;
                 }
-                if (dvui.button(@src(), "Remove", .{}, .{ .margin = .all(4) })) {
+                if (dvui.button(@src(), i18n.t(.action_remove), .{}, .{ .margin = .all(4) })) {
                     g_confirm_remove_idx = null;
                     if (dvui.App.main_init) |init| {
                         const removed = g_libraries.orderedRemove(idx);
@@ -1225,6 +1504,9 @@ fn frame() !dvui.App.Result {
                             _ = db.removeLibrary(removed) catch {};
                         }
                         init.gpa.free(removed);
+                        if (g_grid) |*grid| {
+                            if (g_db) |*db| grid.reloadImages(db) catch {};
+                        }
                     }
                 }
             }

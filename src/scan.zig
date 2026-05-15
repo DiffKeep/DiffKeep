@@ -6,6 +6,22 @@ const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
 const log = std.log.scoped(.scan);
 
+/// Join a slice of lora names into a single newline-separated string.
+fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]const u8 {
+    const items = loras orelse return null;
+    if (items.len == 0) return null;
+    var total: usize = 0;
+    for (items) |l| total += l.len + 1;
+    const buf = allocator.alloc(u8, total - 1) catch return null;
+    var pos: usize = 0;
+    for (items, 0..) |l, i| {
+        @memcpy(buf[pos .. pos + l.len], l);
+        pos += l.len;
+        if (i < items.len - 1) { buf[pos] = '\n'; pos += 1; }
+    }
+    return buf;
+}
+
 pub const ScanStats = struct {
     added: u32 = 0,
     updated: u32 = 0,
@@ -251,7 +267,7 @@ fn processFile(ctx: ScanCtx) void {
     // Notify the grid of new images immediately so they appear without waiting
     // for the full scan to complete.
     if (is_new) {
-        if (ctx.notifier) |n| n.push(ctx.io, ctx.allocator, image.id, ctx.path, current_mtime);
+        if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
     }
 
     // Read file into arena buffer.
@@ -293,6 +309,8 @@ fn processFile(ctx: ScanCtx) void {
     for (text_chunks) |chunk| {
         var content = png_parser.parseTExtChunk(chunk) catch continue;
         defer content.deinit(aa);
+        if (std.mem.eql(u8, content.keyword, "parameters") and a1111_text == null)
+            a1111_text = aa.dupe(u8, content.text) catch null;
         if (std.mem.eql(u8, content.keyword, "prompt") and prompt_text == null)
             prompt_text = aa.dupe(u8, content.text) catch null;
         if (std.mem.eql(u8, content.keyword, "workflow") and workflow_text == null)
@@ -343,6 +361,17 @@ fn processFile(ctx: ScanCtx) void {
     image.positivePromptText = if (result.positive_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
     if (image.negativePromptText) |p| ctx.allocator.free(p);
     image.negativePromptText = if (result.negative_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
+    if (image.model) |m| ctx.allocator.free(m);
+    image.model = if (result.model) |m| ctx.allocator.dupe(u8, m) catch null else null;
+    if (image.sampler) |s| ctx.allocator.free(s);
+    image.sampler = if (result.sampler) |s| ctx.allocator.dupe(u8, s) catch null else null;
+    if (image.scheduler) |s| ctx.allocator.free(s);
+    image.scheduler = if (result.scheduler) |s| ctx.allocator.dupe(u8, s) catch null else null;
+    image.cfg = result.cfg;
+    image.steps = result.steps;
+    image.seed = result.seed;
+    if (image.loras) |l| ctx.allocator.free(l);
+    image.loras = lorasToString(ctx.allocator, result.loras);
     if (image.hash) |h| ctx.allocator.free(h);
     image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
     image.mtime = current_mtime;

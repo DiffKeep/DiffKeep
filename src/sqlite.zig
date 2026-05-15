@@ -246,7 +246,8 @@ pub const Database = struct {
             .insert_library = try db.prepare("INSERT INTO libraries (path) VALUES (?)"),
             .find_image = try db.prepare(
                 \\SELECT id, library_id, library_path, creation_date, positive_prompt_text,
-                \\       negative_prompt_text, generated_description, thumbnail, hash, mtime
+                \\       negative_prompt_text, generated_description, thumbnail, hash, mtime,
+                \\       model, sampler, scheduler, cfg, steps, seed, loras
                 \\FROM images
                 \\WHERE library_id = ? AND library_path = ?
             ),
@@ -261,7 +262,14 @@ pub const Database = struct {
                 \\    generated_description = ?,
                 \\    thumbnail = ?,
                 \\    hash = ?,
-                \\    mtime = ?
+                \\    mtime = ?,
+                \\    model = ?,
+                \\    sampler = ?,
+                \\    scheduler = ?,
+                \\    cfg = ?,
+                \\    steps = ?,
+                \\    seed = ?,
+                \\    loras = ?
                 \\WHERE id = ?
             ),
         };

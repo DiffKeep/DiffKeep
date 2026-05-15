@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const vips = @import("vips");
 const notifier_mod = @import("notifier.zig");
+const i18n = @import("i18n.zig");
 
 pub const ImageNotifier = notifier_mod.ImageNotifier;
 
@@ -126,15 +127,18 @@ pub const GridState = struct {
     view_mode: ViewMode = .library,
     selection: std.AutoHashMap(u64, void), // set of selected image IDs
     focused_idx: ?usize = null,            // keyboard cursor position (grid index)
+    scroll_to_focused: bool = false,       // set by keyboard nav; cleared after one viewport adjustment
     anchor_idx: ?usize = null,             // shift-select range anchor
     thumb_fraction: f32 = 0.25, // 0..1 maps to thumb_size_min..thumb_size_max (~140px default)
     sort_mode: SortMode = .date,
     sort_dir: SortDir = .desc,  // newest first by default
     sort_seed: u64 = 0,
-    // Pending actions — set by key handlers, consumed by app.zig each frame
+    // Pending actions — set by key handlers / context menu, consumed by app.zig each frame
     delete_requested: bool = false,
-    delete_force: bool = false,   // true = Shift+Delete: skip trash, go straight to permanent delete
+    delete_force: bool = false,   // true = Shift+Delete or "Delete Permanently": skip trash
     restore_requested: bool = false,
+    // Mirrored from config so renderItem can condition the context menu label
+    trash_enabled: bool = true,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
         var state = GridState{
@@ -200,7 +204,7 @@ pub const GridState = struct {
         self.queued.deinit();
 
         self.loader_db.deinit();
-        self.notifier.deinit(self.allocator);
+        self.notifier.deinit();
         self.selection.deinit();
 
         for (self.incoming.items) |e| self.allocator.free(e.path);
@@ -429,6 +433,7 @@ pub const GridState = struct {
                             const new_fi: usize = if (raw < 0) 0
                                                   else @min(@as(usize, @intCast(raw)), n - 1);
                             self.focused_idx = new_fi;
+                            self.scroll_to_focused = true;
 
                             if (ke.mod.shift()) {
                                 // Extend range from anchor to new position.
@@ -490,16 +495,19 @@ pub const GridState = struct {
             }
         }
 
-        // ── Scroll to keep focused item visible ──────────────────────────────
-        if (self.focused_idx) |fi| {
-            const row = fi / cols;
-            const item_top = @as(f32, @floatFromInt(row)) * cell_h;
-            const item_bot = item_top + cell_h;
-            const vp_h = self.scroll_info.viewport.h;
-            if (item_top < self.scroll_info.viewport.y) {
-                self.scroll_info.viewport.y = item_top;
-            } else if (item_bot > self.scroll_info.viewport.y + vp_h) {
-                self.scroll_info.viewport.y = item_bot - vp_h;
+        // ── Scroll to keep focused item visible (keyboard nav only) ─────────
+        if (self.scroll_to_focused) {
+            if (self.focused_idx) |fi| {
+                const row = fi / cols;
+                const item_top = @as(f32, @floatFromInt(row)) * cell_h;
+                const item_bot = item_top + cell_h;
+                const vp_h = self.scroll_info.viewport.h;
+                if (item_top < self.scroll_info.viewport.y) {
+                    self.scroll_info.viewport.y = item_top;
+                } else if (item_bot > self.scroll_info.viewport.y + vp_h) {
+                    self.scroll_info.viewport.y = item_bot - vp_h;
+                }
+                self.scroll_to_focused = false;
             }
         }
 
@@ -593,6 +601,45 @@ pub const GridState = struct {
             .color_border = border_color,
         });
         defer cell.deinit();
+
+        // ── Context menu (right-click) ────────────────────────────────────
+        {
+            const ctext = dvui.context(@src(), .{ .rect = cell.data().borderRectScale().r }, .{ .id_extra = idx });
+            defer ctext.deinit();
+
+            if (ctext.activePoint()) |cp| {
+                // If the right-clicked item is not already in the selection, select only it.
+                if (!self.selection.contains(entry.id)) {
+                    self.selection.clearRetainingCapacity();
+                    self.selection.put(entry.id, {}) catch {};
+                    self.anchor_idx = idx;
+                    self.focused_idx = idx;
+                }
+
+                var fm = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{ .id_extra = idx });
+                defer fm.deinit();
+
+                if (self.view_mode == .library) {
+                    if (self.trash_enabled) {
+                        if (dvui.menuItemLabel(@src(), i18n.t(.context_send_to_trash), .{}, .{ .expand = .horizontal }) != null) {
+                            fm.close();
+                            self.delete_requested = true;
+                            self.delete_force = false;
+                        }
+                    }
+                } else { // .trash
+                    if (dvui.menuItemLabel(@src(), i18n.t(.context_restore_from_trash), .{}, .{ .expand = .horizontal }) != null) {
+                        fm.close();
+                        self.restore_requested = true;
+                    }
+                }
+                if (dvui.menuItemLabel(@src(), i18n.t(.context_delete_permanently), .{}, .{ .expand = .horizontal }) != null) {
+                    fm.close();
+                    self.delete_requested = true;
+                    self.delete_force = true;
+                }
+            }
+        }
 
         if (dvui.clickedEx(cell.data(), .{})) |click_evt| {
             // Route subsequent key events to the grid container.

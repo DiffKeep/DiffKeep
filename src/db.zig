@@ -23,6 +23,53 @@ pub const ImageMeta = struct {
     seen: bool = false,
 };
 
+/// A single raw PNG text chunk (tEXt or iTXt), as shown in the detail panel.
+pub const RawChunk = struct {
+    keyword: []const u8,
+    display_text: []const u8, // pretty-printed JSON or raw text
+    is_json: bool,
+};
+
+/// Full metadata for a single image, used by the detail panel.
+pub const ImageDetails = struct {
+    id: u64,
+    library_path: []const u8,
+    creation_date: ?[]const u8,
+    positive_prompt_text: ?[]const u8,
+    negative_prompt_text: ?[]const u8,
+    model: ?[]const u8,
+    cfg: ?f64,
+    steps: ?i64,
+    seed: ?i64,
+    sampler: ?[]const u8,
+    scheduler: ?[]const u8,
+    loras: ?[]const u8,
+    trashed_at: ?[]const u8, // formatted by SQLite as "YYYY-MM-DD HH:MM:SS"
+    // Populated from file-system after DB query, not stored in DB.
+    width: ?u32 = null,
+    height: ?u32 = null,
+    file_size: ?i64 = null,
+    raw_chunks: []RawChunk = &.{},
+    raw_chunks_owned: bool = false,
+
+    pub fn deinit(self: *ImageDetails, allocator: std.mem.Allocator) void {
+        allocator.free(self.library_path);
+        if (self.creation_date) |s| allocator.free(s);
+        if (self.positive_prompt_text) |s| allocator.free(s);
+        if (self.negative_prompt_text) |s| allocator.free(s);
+        if (self.model) |s| allocator.free(s);
+        if (self.sampler) |s| allocator.free(s);
+        if (self.scheduler) |s| allocator.free(s);
+        if (self.loras) |s| allocator.free(s);
+        if (self.trashed_at) |s| allocator.free(s);
+        for (self.raw_chunks) |c| {
+            allocator.free(c.keyword);
+            allocator.free(c.display_text);
+        }
+        if (self.raw_chunks_owned) allocator.free(self.raw_chunks);
+    }
+};
+
 /// Result struct for vector searches
 pub const SearchResult = struct {
     id: u64,
@@ -285,6 +332,13 @@ pub const VectorDb = struct {
                     .thumbnail = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnBlob(7)),
                     .hash = if (stmt.columnIsNull(8)) null else try allocator.dupe(u8, stmt.columnText(8)),
                     .mtime = if (stmt.columnIsNull(9)) null else stmt.columnInt64(9),
+                    .model = if (stmt.columnIsNull(10)) null else try allocator.dupe(u8, stmt.columnText(10)),
+                    .sampler = if (stmt.columnIsNull(11)) null else try allocator.dupe(u8, stmt.columnText(11)),
+                    .scheduler = if (stmt.columnIsNull(12)) null else try allocator.dupe(u8, stmt.columnText(12)),
+                    .cfg = if (stmt.columnIsNull(13)) null else stmt.columnDouble(13),
+                    .steps = if (stmt.columnIsNull(14)) null else stmt.columnInt64(14),
+                    .seed = if (stmt.columnIsNull(15)) null else stmt.columnInt64(15),
+                    .loras = if (stmt.columnIsNull(16)) null else try allocator.dupe(u8, stmt.columnText(16)),
                 };
             }
         }
@@ -324,7 +378,14 @@ pub const VectorDb = struct {
         if (image.thumbnail) |thumb| try stmt.bindBlob(4, thumb) else try stmt.bindNull(4);
         if (image.hash) |hash| try stmt.bind(5, hash) else try stmt.bindNull(5);
         if (image.mtime) |mt| try stmt.bind(6, mt) else try stmt.bindNull(6);
-        try stmt.bind(7, image.id);
+        if (image.model) |v| try stmt.bind(7, v) else try stmt.bindNull(7);
+        if (image.sampler) |v| try stmt.bind(8, v) else try stmt.bindNull(8);
+        if (image.scheduler) |v| try stmt.bind(9, v) else try stmt.bindNull(9);
+        if (image.cfg) |v| try stmt.bind(10, v) else try stmt.bindNull(10);
+        if (image.steps) |v| try stmt.bind(11, v) else try stmt.bindNull(11);
+        if (image.seed) |v| try stmt.bind(12, v) else try stmt.bindNull(12);
+        if (image.loras) |v| try stmt.bind(13, v) else try stmt.bindNull(13);
+        try stmt.bind(14, image.id);
 
         _ = try stmt.step();
     }
@@ -639,5 +700,75 @@ pub const VectorDb = struct {
             return try allocator.dupe(u8, stmt.columnBlob(0));
         }
         return null;
+    }
+
+    /// Fetch full metadata for a single image by ID. Returns null if not found.
+    pub fn getImageDetails(self: *VectorDb, allocator: std.mem.Allocator, id: u64) !?ImageDetails {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            \\SELECT library_path, creation_date, positive_prompt_text, negative_prompt_text,
+            \\       model, cfg, steps, seed, sampler, scheduler, loras,
+            \\       DATETIME(trashed_at, 'unixepoch')
+            \\FROM images WHERE id = ?
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        if (!try stmt.step()) return null;
+
+        const library_path = try allocator.dupe(u8, stmt.columnText(0));
+        errdefer allocator.free(library_path);
+
+        const creation_date: ?[]const u8 = if (stmt.columnIsNull(1)) null else
+            try allocator.dupe(u8, stmt.columnText(1));
+        errdefer if (creation_date) |s| allocator.free(s);
+
+        const positive_prompt_text: ?[]const u8 = if (stmt.columnIsNull(2)) null else
+            try allocator.dupe(u8, stmt.columnText(2));
+        errdefer if (positive_prompt_text) |s| allocator.free(s);
+
+        const negative_prompt_text: ?[]const u8 = if (stmt.columnIsNull(3)) null else
+            try allocator.dupe(u8, stmt.columnText(3));
+        errdefer if (negative_prompt_text) |s| allocator.free(s);
+
+        const model: ?[]const u8 = if (stmt.columnIsNull(4)) null else
+            try allocator.dupe(u8, stmt.columnText(4));
+        errdefer if (model) |s| allocator.free(s);
+
+        const cfg: ?f64 = if (stmt.columnIsNull(5)) null else stmt.columnDouble(5);
+        const steps: ?i64 = if (stmt.columnIsNull(6)) null else stmt.columnInt64(6);
+        const seed: ?i64 = if (stmt.columnIsNull(7)) null else stmt.columnInt64(7);
+
+        const sampler: ?[]const u8 = if (stmt.columnIsNull(8)) null else
+            try allocator.dupe(u8, stmt.columnText(8));
+        errdefer if (sampler) |s| allocator.free(s);
+
+        const scheduler: ?[]const u8 = if (stmt.columnIsNull(9)) null else
+            try allocator.dupe(u8, stmt.columnText(9));
+        errdefer if (scheduler) |s| allocator.free(s);
+
+        const loras: ?[]const u8 = if (stmt.columnIsNull(10)) null else
+            try allocator.dupe(u8, stmt.columnText(10));
+        errdefer if (loras) |s| allocator.free(s);
+
+        const trashed_at: ?[]const u8 = if (stmt.columnIsNull(11)) null else
+            try allocator.dupe(u8, stmt.columnText(11));
+        errdefer if (trashed_at) |s| allocator.free(s);
+
+        return ImageDetails{
+            .id = id,
+            .library_path = library_path,
+            .creation_date = creation_date,
+            .positive_prompt_text = positive_prompt_text,
+            .negative_prompt_text = negative_prompt_text,
+            .model = model,
+            .cfg = cfg,
+            .steps = steps,
+            .seed = seed,
+            .sampler = sampler,
+            .scheduler = scheduler,
+            .loras = loras,
+            .trashed_at = trashed_at,
+        };
     }
 };
