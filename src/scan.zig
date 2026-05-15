@@ -3,6 +3,7 @@ const db_mod = @import("db.zig");
 const png_mod = @import("image/png-data.zig");
 const comfy_mod = @import("parse/comfy.zig");
 const models = @import("models.zig");
+const notifier_mod = @import("notifier.zig");
 const log = std.log.scoped(.scan);
 
 pub const ScanStats = struct {
@@ -25,6 +26,7 @@ const ScanCtx = struct {
     prompt_embeddings: bool,
     image_embeddings: bool,
     precomputed_mtime: i64,
+    notifier: ?*notifier_mod.ImageNotifier,
 };
 
 const AtomicStats = struct {
@@ -45,11 +47,12 @@ const AtomicStats = struct {
 pub const LibraryScanner = struct {
     allocator: std.mem.Allocator,
     db: *db_mod.VectorDb,
+    notifier: ?*notifier_mod.ImageNotifier,
 
-    pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb) LibraryScanner {
+    pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb, notifier: ?*notifier_mod.ImageNotifier) LibraryScanner {
         // c_allocator (glibc malloc) is used throughout because processFile tasks
         // run on concurrent OS threads — the GPA is not thread-safe.
-        return .{ .allocator = std.heap.c_allocator, .db = db };
+        return .{ .allocator = std.heap.c_allocator, .db = db, .notifier = notifier };
     }
 
     pub fn deinit(_: *LibraryScanner) void {}
@@ -195,6 +198,7 @@ pub const LibraryScanner = struct {
                 .prompt_embeddings = prompt_embeddings,
                 .image_embeddings = image_embeddings,
                 .precomputed_mtime = current_mtime,
+                .notifier = self.notifier,
             }}) catch |err| {
                 log.warn("spawn {s}: {}", .{ std.fs.path.basename(full_path), err });
                 self.allocator.free(full_path);
@@ -243,6 +247,12 @@ fn processFile(ctx: ScanCtx) void {
         }
     }
     const is_new = image.hash == null;
+
+    // Notify the grid of new images immediately so they appear without waiting
+    // for the full scan to complete.
+    if (is_new) {
+        if (ctx.notifier) |n| n.push(ctx.io, ctx.allocator, image.id, ctx.path);
+    }
 
     // Read file into arena buffer.
     var file = std.Io.Dir.cwd().openFile(ctx.io, ctx.path, .{}) catch return;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const db_mod = @import("db.zig");
 const scan_mod = @import("scan.zig");
+const notifier_mod = @import("notifier.zig");
 const log = std.log.scoped(.library_manager);
 
 const ScanRequest = struct {
@@ -23,8 +24,9 @@ pub const LibraryManager = struct {
     thumbnails_in_db: bool,
     prompt_embeddings: bool,
     image_embeddings: bool,
+    notifier: ?*notifier_mod.ImageNotifier,
 
-    pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool) LibraryManager {
+    pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool, notifier: ?*notifier_mod.ImageNotifier) LibraryManager {
         return .{
             .allocator = allocator,
             .db = db,
@@ -37,6 +39,7 @@ pub const LibraryManager = struct {
             .thumbnails_in_db = thumbnails_in_db,
             .prompt_embeddings = prompt_embeddings,
             .image_embeddings = image_embeddings,
+            .notifier = notifier,
         };
     }
 
@@ -131,7 +134,7 @@ fn drainQueue(manager: *LibraryManager, io: std.Io) void {
         const req = maybe_req orelse break;
         defer manager.allocator.free(req.library_path);
 
-        var scanner = scan_mod.LibraryScanner.init(manager.allocator, manager.db);
+        var scanner = scan_mod.LibraryScanner.init(manager.allocator, manager.db, manager.notifier);
         defer scanner.deinit();
         _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
             log.err("scan {s}: {}", .{ std.fs.path.basename(req.library_path), err });

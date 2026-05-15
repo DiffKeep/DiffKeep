@@ -9,22 +9,37 @@ void diffkeep_vips_shutdown(void) {
     vips_shutdown();
 }
 
-int diffkeep_thumbnail_to_png(
+void diffkeep_vips_thread_shutdown(void) {
+    vips_thread_shutdown();
+}
+
+int diffkeep_thumbnail_to_jpeg(
     const char *filename,
-    int max_dimension,
+    int size,
     void **buf,
     size_t *len
 ) {
     VipsImage *thumb = NULL;
 
-    if (vips_thumbnail(filename, &thumb, max_dimension,
-            "height", max_dimension,
+    if (vips_thumbnail(filename, &thumb, size,
+            "height", size,
             "size", VIPS_SIZE_DOWN,
             NULL) != 0) {
         return -1;
     }
 
-    if (vips_image_write_to_buffer(thumb, ".png", buf, len, NULL) != 0) {
+    /* Flatten alpha before JPEG encoding */
+    if (vips_image_hasalpha(thumb)) {
+        VipsImage *flat = NULL;
+        if (vips_flatten(thumb, &flat, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = flat;
+    }
+
+    if (vips_image_write_to_buffer(thumb, ".jpg[Q=85,strip]", buf, len, NULL) != 0) {
         g_object_unref(thumb);
         return -1;
     }

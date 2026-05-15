@@ -8,6 +8,7 @@ const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
 const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
+const image_grid_mod = @import("image_grid.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 
@@ -20,6 +21,14 @@ var g_cfg: config_mod.Config = .{};
 var g_db: ?db_mod.VectorDb = null;
 
 var g_library_manager: ?library_manager_mod.LibraryManager = null;
+var g_grid: ?image_grid_mod.GridState = null;
+var g_wakeup_event_type: u32 = 0;
+
+fn wakeupFrame() void {
+    var ev: SDLBackend.c.SDL_Event = std.mem.zeroes(SDLBackend.c.SDL_Event);
+    ev.type = g_wakeup_event_type;
+    _ = SDLBackend.c.SDL_PushEvent(&ev);
+}
 var g_library_dialog_open: bool = false;
 var g_settings_open: bool = false;
 var g_db_stats: ?db_mod.DbStats = null;
@@ -118,24 +127,37 @@ fn appInit(win: *dvui.Window) !void {
             g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
         }
 
+        // VIPS must be initialized before any worker threads start calling vips_thumbnail.
+        try vips_mod.init();
+
         if (g_db) |*db| {
             const paths = db.listLibraries(init.gpa) catch &[_][]const u8{};
             defer init.gpa.free(paths);
             try g_libraries.appendSlice(init.gpa, paths);
 
+            // Register a custom SDL event so the worker thread can wake the render loop
+            // when a thumbnail is ready (dvui only renders on input otherwise).
+            g_wakeup_event_type = SDLBackend.c.SDL_RegisterEvents(1);
+
+            // Init grid before library manager so we can pass the notifier pointer.
+            // Grid must be at its final global address before startWorker() is called.
+            g_grid = try image_grid_mod.GridState.init(init.io, init.gpa, db, g_cfg.thumbnails_in_db, wakeupFrame);
+            if (g_grid) |*grid| try grid.startWorker();
+
             // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s
             // concurrent task receives &g_library_manager.? (stable global address)
             // rather than a pointer to a stack-local that becomes dangling after appInit returns.
-            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings);
+            const notifier = if (g_grid) |*grid| &grid.notifier else null;
+            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings, notifier);
             if (g_library_manager) |*mgr| {
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
                 };
             }
         }
+    } else {
+        try vips_mod.init();
     }
-
-    try vips_mod.init();
 
     std.log.info("DiffKeep {s} — config: {s}", .{
         build_options.version,
@@ -153,10 +175,12 @@ fn appInit(win: *dvui.Window) !void {
 }
 
 fn appDeinit() void {
-    vips_mod.deinit();
+    // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
         if (g_library_manager) |*mgr| mgr.deinit(init.io);
     }
+    if (g_grid) |*grid| grid.deinit();
+    vips_mod.deinit();
     if (g_db) |*database| {
         database.deinit();
         database.pool.deinit();
@@ -443,6 +467,9 @@ fn frame() !dvui.App.Result {
         if (e.evt == .app and e.evt.app.action == .quit) return .close;
     }
 
+    // Drain new images from scan threads and update thumbnail cache
+    if (g_grid) |*grid| grid.update();
+
     if (g_pending_library_len > 0) {
         const path = g_pending_library_buf[0..g_pending_library_len];
         g_pending_library_len = 0;
@@ -497,6 +524,16 @@ fn frame() !dvui.App.Result {
         _ = dvui.button(@src(), "aspect: 1:1 \u{25bc}", .{}, chip.override(.{ .id_extra = 2 }));
         _ = dvui.button(@src(), "date: 30d \u{25bc}", .{}, chip.override(.{ .id_extra = 3 }));
         _ = dvui.button(@src(), "+ filter", .{}, chip.override(.{ .id_extra = 4 }));
+
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+        // Thumbnail size slider
+        if (g_grid) |*grid| {
+            _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction }, .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 80, .h = 16 },
+            });
+        }
     }
 
     // ── Content row: [left panel] [handle] [center] [handle] [right panel] ──
@@ -587,11 +624,11 @@ fn frame() !dvui.App.Result {
             var grid_area = dvui.box(@src(), .{}, .{ .expand = .both });
             defer grid_area.deinit();
 
-            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
-            defer scroll.deinit();
-
-            // TODO: image grid
-            dvui.label(@src(), "(image grid)", .{}, .{ .padding = .all(8) });
+            if (g_grid) |*grid| {
+                grid.render();
+            } else {
+                dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });
+            }
         }
 
         panelHandle(@src(), .right, &g_right_w, &g_right_w_open, right_w_min, right_w_max);

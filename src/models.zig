@@ -41,6 +41,6 @@ pub const Image = struct {
         const terminated_path = try allocator.dupeZ(u8, path);
         defer allocator.free(terminated_path);
 
-        self.thumbnail = try vips.thumbnailToPng(allocator, terminated_path, 256);
+        self.thumbnail = try vips.thumbnailToJpeg(allocator, terminated_path, 320);
     }
 };

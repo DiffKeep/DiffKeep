@@ -153,6 +153,7 @@ pub const VectorDb = struct {
             .db = try self.pool.acquire(),
             .pool = self.pool,
             .allocator = self.allocator,
+            .io = self.io,
         };
     }
 
@@ -474,5 +475,43 @@ pub const VectorDb = struct {
         var stmt = try self.db.prepare("DELETE FROM image_embeddings");
         defer stmt.deinit();
         _ = try stmt.step();
+    }
+
+    pub const GridEntry = struct {
+        id: u64,
+        path: []const u8, // heap-allocated; caller owns
+    };
+
+    /// Returns all images ordered by id. Used to populate the grid on startup.
+    pub fn listAllImages(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT id, library_path FROM images ORDER BY id");
+        defer stmt.deinit();
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            try list.append(allocator, .{ .id = id, .path = path });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Fetches the thumbnail BLOB for one image. Returns null if none stored.
+    /// Intended for the grid's loader worker thread on a dedicated connection —
+    /// does NOT acquire db_mutex, so never call this on the shared db connection.
+    pub fn getThumbnailBytes(self: *VectorDb, allocator: std.mem.Allocator, id: u64) !?[]u8 {
+        var stmt = try self.db.prepare("SELECT thumbnail FROM images WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        if (try stmt.step()) {
+            if (stmt.columnIsNull(0)) return null;
+            return try allocator.dupe(u8, stmt.columnBlob(0));
+        }
+        return null;
     }
 };
