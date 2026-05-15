@@ -3,6 +3,11 @@ const sqlite = @import("sqlite");
 const models = @import("models.zig");
 const log = std.log.scoped(.db);
 
+pub const TrashStats = struct {
+    count: i64 = 0,
+    total_bytes: i64 = 0,
+};
+
 pub const DbStats = struct {
     total_bytes: i64 = 0,
     thumbnail_count: i64 = 0,
@@ -70,6 +75,11 @@ const migrations = [_][]const u8{
     ,
     // v5: index for fast per-library path lookups during scan
     \\CREATE INDEX IF NOT EXISTS idx_images_library_path ON images (library_id, library_path);
+    ,
+    // v6: soft-delete (trash) support
+    \\ALTER TABLE images ADD COLUMN trashed_at INTEGER;
+    \\ALTER TABLE images ADD COLUMN trash_name TEXT;
+    \\ALTER TABLE images ADD COLUMN trash_file_size INTEGER;
     ,
 };
 
@@ -376,7 +386,7 @@ pub const VectorDb = struct {
             map.deinit();
         }
         var stmt = try self.db.prepare(
-            "SELECT id, library_path, mtime, (thumbnail IS NOT NULL) FROM images WHERE library_id = ?",
+            "SELECT id, library_path, mtime, (thumbnail IS NOT NULL) FROM images WHERE library_id = ? AND trashed_at IS NULL",
         );
         defer stmt.deinit();
         try stmt.bind(1, library_id);
@@ -479,15 +489,17 @@ pub const VectorDb = struct {
 
     pub const GridEntry = struct {
         id: u64,
-        path: []const u8, // heap-allocated; caller owns
+        path: []const u8,       // heap-allocated; caller owns
         mtime: ?i64,
+        trashed_at: ?i64 = null,
+        trash_name: ?[]const u8 = null, // heap-allocated; caller owns (only set for trash entries)
     };
 
-    /// Returns all images ordered by id. Used to populate the grid on startup.
+    /// Returns all non-trashed images ordered by id. Used to populate the grid on startup.
     pub fn listAllImages(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare("SELECT id, library_path, mtime FROM images ORDER BY id");
+        var stmt = try self.db.prepare("SELECT id, library_path, mtime FROM images WHERE trashed_at IS NULL ORDER BY id");
         defer stmt.deinit();
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
@@ -501,6 +513,118 @@ pub const VectorDb = struct {
             try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
         }
         return list.toOwnedSlice(allocator);
+    }
+
+    /// Move an image to the trash: record trashed_at, trash_name, and file_size.
+    pub fn trashImage(self: *VectorDb, id: u64, trash_name: []const u8, file_size: i64, trashed_at: i64) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "UPDATE images SET trashed_at = ?, trash_name = ?, trash_file_size = ? WHERE id = ?",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, trashed_at);
+        try stmt.bind(2, trash_name);
+        try stmt.bind(3, file_size);
+        try stmt.bind(4, id);
+        _ = try stmt.step();
+    }
+
+    /// Restore a trashed image: clear trashed_at, trash_name, trash_file_size.
+    pub fn restoreImage(self: *VectorDb, id: u64) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "UPDATE images SET trashed_at = NULL, trash_name = NULL, trash_file_size = NULL WHERE id = ?",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        _ = try stmt.step();
+    }
+
+    /// Permanently delete an image row from the DB.
+    pub fn deleteImage(self: *VectorDb, id: u64) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("DELETE FROM images WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        _ = try stmt.step();
+    }
+
+    /// Returns all trashed images ordered by trashed_at descending.
+    pub fn listTrashImages(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime, trashed_at, trash_name FROM images WHERE trashed_at IS NOT NULL ORDER BY trashed_at DESC",
+        );
+        defer stmt.deinit();
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| {
+                allocator.free(e.path);
+                if (e.trash_name) |tn| allocator.free(tn);
+            }
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            const trashed_at: ?i64 = if (stmt.columnIsNull(3)) null else stmt.columnInt64(3);
+            const trash_name: ?[]const u8 = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4));
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime, .trashed_at = trashed_at, .trash_name = trash_name });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn getTrashStats(self: *VectorDb) !TrashStats {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(trash_file_size), 0) FROM images WHERE trashed_at IS NOT NULL",
+        );
+        defer stmt.deinit();
+        if (try stmt.step()) {
+            return .{ .count = stmt.columnInt64(0), .total_bytes = stmt.columnInt64(1) };
+        }
+        return .{};
+    }
+
+    /// Deletes all DB rows for trash entries older than cutoff_timestamp.
+    /// Returns the list of trash_names so the caller can delete the files from disk.
+    /// Caller must free each string and the slice itself.
+    pub fn purgeExpiredTrash(self: *VectorDb, allocator: std.mem.Allocator, cutoff_timestamp: i64) ![][]const u8 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (names.items) |n| allocator.free(n);
+            names.deinit(allocator);
+        }
+        {
+            var stmt = try self.db.prepare(
+                "SELECT trash_name FROM images WHERE trashed_at IS NOT NULL AND trashed_at <= ?",
+            );
+            defer stmt.deinit();
+            try stmt.bind(1, cutoff_timestamp);
+            while (try stmt.step()) {
+                if (!stmt.columnIsNull(0)) {
+                    try names.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+                }
+            }
+        }
+        {
+            var stmt = try self.db.prepare(
+                "DELETE FROM images WHERE trashed_at IS NOT NULL AND trashed_at <= ?",
+            );
+            defer stmt.deinit();
+            try stmt.bind(1, cutoff_timestamp);
+            _ = try stmt.step();
+        }
+        return names.toOwnedSlice(allocator);
     }
 
     /// Fetches the thumbnail BLOB for one image. Returns null if none stored.

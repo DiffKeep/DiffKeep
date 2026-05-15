@@ -10,12 +10,15 @@ const log = std.log.scoped(.image_grid);
 
 pub const SortMode = enum { date, name, random };
 pub const SortDir = enum { asc, desc };
+pub const ViewMode = enum { library, trash };
 
 pub const ImageEntry = struct {
     id: u64,
     path: []const u8,     // heap-allocated, owned by GridState.images
     filename: []const u8, // slice into path (basename), not separately allocated
     mtime: ?i64,
+    trashed_at: ?i64 = null,
+    trash_name: ?[]const u8 = null, // heap-allocated, only set in trash view
 };
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -65,6 +68,7 @@ pub const thumb_size_min: f32 = 80;
 pub const thumb_size_max: f32 = 320;
 const max_workers = 8;
 const gap: f32 = 8;
+const cell_border: f32 = 2; // border on each side; must be factored into h_margin
 const label_h: f32 = 20;
 const evict_interval_s: i64 = 5;
 const ttl_s: i64 = 45;
@@ -119,11 +123,18 @@ pub const GridState = struct {
     wakeup_fn: ?*const fn () void = null,
 
     // UI state
-    selected_id: ?u64 = null,
+    view_mode: ViewMode = .library,
+    selection: std.AutoHashMap(u64, void), // set of selected image IDs
+    focused_idx: ?usize = null,            // keyboard cursor position (grid index)
+    anchor_idx: ?usize = null,             // shift-select range anchor
     thumb_fraction: f32 = 0.25, // 0..1 maps to thumb_size_min..thumb_size_max (~140px default)
     sort_mode: SortMode = .date,
     sort_dir: SortDir = .desc,  // newest first by default
     sort_seed: u64 = 0,
+    // Pending actions — set by key handlers, consumed by app.zig each frame
+    delete_requested: bool = false,
+    delete_force: bool = false,   // true = Shift+Delete: skip trash, go straight to permanent delete
+    restore_requested: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
         var state = GridState{
@@ -132,6 +143,7 @@ pub const GridState = struct {
             .committed = std.AutoHashMap(u64, CacheEntry).init(allocator),
             .pending = std.AutoHashMap(u64, []u8).init(allocator),
             .queued = std.AutoHashMap(u64, void).init(allocator),
+            .selection = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = try db.getConnection(),
             .thumbnails_in_db = thumbnails_in_db,
             .wakeup_fn = wakeup_fn,
@@ -189,18 +201,55 @@ pub const GridState = struct {
 
         self.loader_db.deinit();
         self.notifier.deinit(self.allocator);
+        self.selection.deinit();
 
         for (self.incoming.items) |e| self.allocator.free(e.path);
         self.incoming.deinit(self.allocator);
 
-        for (self.images.items) |e| self.allocator.free(e.path);
+        for (self.images.items) |e| {
+            self.allocator.free(e.path);
+            if (e.trash_name) |tn| self.allocator.free(tn);
+        }
         self.images.deinit(self.allocator);
+    }
+
+    /// Reload the image list from DB for the current view_mode.
+    /// Clears selection and resets navigation state.
+    pub fn reloadImages(self: *GridState, db: *db_mod.VectorDb) !void {
+        for (self.images.items) |e| {
+            self.allocator.free(e.path);
+            if (e.trash_name) |tn| self.allocator.free(tn);
+        }
+        self.images.clearRetainingCapacity();
+        self.selection.clearRetainingCapacity();
+        self.focused_idx = null;
+        self.anchor_idx = null;
+
+        const entries = switch (self.view_mode) {
+            .library => try db.listAllImages(self.allocator),
+            .trash   => try db.listTrashImages(self.allocator),
+        };
+        defer self.allocator.free(entries);
+        try self.images.ensureTotalCapacity(self.allocator, entries.len);
+        for (entries) |e| {
+            self.images.appendAssumeCapacity(.{
+                .id = e.id,
+                .path = e.path,
+                .filename = std.fs.path.basename(e.path),
+                .mtime = e.mtime,
+                .trashed_at = e.trashed_at,
+                .trash_name = e.trash_name,
+            });
+        }
+        self.applySortOrder();
     }
 
     /// Call once per frame before render(), on the main thread.
     pub fn update(self: *GridState) void {
-        // 1. Drain new images from scan threads
-        self.notifier.drain(self.io, self.allocator, &self.incoming);
+        // 1. Drain new images from scan threads (library view only)
+        if (self.view_mode == .library) {
+            self.notifier.drain(self.io, self.allocator, &self.incoming);
+        }
         const before_count = self.images.items.len;
         for (self.incoming.items) |e| {
             self.images.append(self.allocator, .{
@@ -275,6 +324,18 @@ pub const GridState = struct {
         return thumb_size_min + self.thumb_fraction * (thumb_size_max - thumb_size_min);
     }
 
+    /// Replace the current selection with all items in [from, to] (inclusive, order-independent).
+    fn applyRangeSelect(self: *GridState, from: usize, to: usize) void {
+        const n = self.images.items.len;
+        if (n == 0) return;
+        const lo = @min(from, to);
+        const hi = @min(@max(from, to), n - 1);
+        self.selection.clearRetainingCapacity();
+        for (lo..hi + 1) |i| {
+            self.selection.put(self.images.items[i].id, {}) catch {};
+        }
+    }
+
     fn requestLoad(self: *GridState, id: u64, path: []const u8, high: bool) void {
         if (self.committed.contains(id)) return;
 
@@ -310,22 +371,19 @@ pub const GridState = struct {
             const est_rows: usize = if (n == 0) 0 else (n + est_cols - 1) / est_cols;
             self.scroll_info.virtual_size.h = @as(f32, @floatFromInt(est_rows)) * cell_h;
         }
-        // Keep virtual_size.w at 0 so SA never shows a phantom horizontal bar.
         self.scroll_info.virtual_size.w = 0;
         self.scroll_info.vertical = .given;
-        // horizontal=.given keeps SC from reporting content width as min_size.w,
-        // which would inflate the grid's footprint in the outer row and squeeze
-        // the sidebars.  With .given, SC reports its ~5px default instead.
         self.scroll_info.horizontal = .given;
+
+        // Focusable container: receives keyboard events after any cell is clicked.
+        var grid_box = dvui.box(@src(), .{}, .{ .expand = .both });
+        defer grid_box.deinit();
+        const grid_id = grid_box.data().id;
 
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll_info }, .{ .expand = .both });
         defer scroll.deinit();
 
-        // SC.init() has written the actual viewport dimensions into scroll_info.
-        // avail_w comes from the clip (viewport width in logical pixels after
-        // any vertical scrollbar has taken its slice).
         const avail_w = dvui.clipGet().w / dvui.windowNaturalScale();
-        // Tell SC the virtual width so rectFor uses the right maxw.
         self.scroll_info.virtual_size.w = avail_w;
         if (avail_w < 1) return;
 
@@ -338,8 +396,114 @@ pub const GridState = struct {
             dvui.refresh(null, @src(), scroll.data().id);
         }
 
-        // viewport.y / viewport.h are the scroll position and visible height in
-        // logical pixels — no marker widget needed to derive these.
+        // Clamp focused_idx so it stays valid after image list changes.
+        if (self.focused_idx) |fi| {
+            if (n == 0) {
+                self.focused_idx = null;
+            } else if (fi >= n) {
+                self.focused_idx = n - 1;
+            }
+        }
+
+        // ── Keyboard navigation ──────────────────────────────────────────────
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            switch (e.evt) {
+                .key => |ke| {
+                    if (!dvui.eventMatch(e, .{ .id = grid_id, .r = grid_box.data().borderRectScale().r })) continue;
+                    if (ke.action != .down and ke.action != .repeat) continue;
+                    if (n == 0) continue;
+
+                    const fi: usize = self.focused_idx orelse 0;
+
+                    switch (ke.code) {
+                        .left, .right, .up, .down => {
+                            const delta: i64 = switch (ke.code) {
+                                .left  => -1,
+                                .right =>  1,
+                                .up    => -@as(i64, @intCast(cols)),
+                                .down  =>  @as(i64, @intCast(cols)),
+                                else   => unreachable,
+                            };
+                            const raw = @as(i64, @intCast(fi)) + delta;
+                            const new_fi: usize = if (raw < 0) 0
+                                                  else @min(@as(usize, @intCast(raw)), n - 1);
+                            self.focused_idx = new_fi;
+
+                            if (ke.mod.shift()) {
+                                // Extend range from anchor to new position.
+                                self.applyRangeSelect(self.anchor_idx orelse fi, new_fi);
+                            } else if (ke.mod.control()) {
+                                // Move cursor only — selection unchanged.
+                            } else {
+                                self.selection.clearRetainingCapacity();
+                                self.selection.put(self.images.items[new_fi].id, {}) catch {};
+                                self.anchor_idx = new_fi;
+                            }
+                            e.handle(@src(), grid_box.data());
+                        },
+                        .space => {
+                            if (ke.mod.shift()) {
+                                self.applyRangeSelect(self.anchor_idx orelse fi, fi);
+                            } else {
+                                const id = self.images.items[fi].id;
+                                if (self.selection.contains(id)) {
+                                    _ = self.selection.remove(id);
+                                } else {
+                                    self.selection.put(id, {}) catch {};
+                                }
+                                self.anchor_idx = fi;
+                            }
+                            e.handle(@src(), grid_box.data());
+                        },
+                        .a => {
+                            if (ke.mod.control()) {
+                                for (self.images.items) |img| {
+                                    self.selection.put(img.id, {}) catch {};
+                                }
+                                e.handle(@src(), grid_box.data());
+                            }
+                        },
+                        .escape => {
+                            self.selection.clearRetainingCapacity();
+                            e.handle(@src(), grid_box.data());
+                        },
+                        .delete => {
+                            if (self.selection.count() > 0 or self.focused_idx != null) {
+                                self.delete_requested = true;
+                                self.delete_force = ke.mod.shift();
+                                e.handle(@src(), grid_box.data());
+                            }
+                        },
+                        .r => {
+                            if (self.view_mode == .trash and
+                                (self.selection.count() > 0 or self.focused_idx != null))
+                            {
+                                self.restore_requested = true;
+                                e.handle(@src(), grid_box.data());
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // ── Scroll to keep focused item visible ──────────────────────────────
+        if (self.focused_idx) |fi| {
+            const row = fi / cols;
+            const item_top = @as(f32, @floatFromInt(row)) * cell_h;
+            const item_bot = item_top + cell_h;
+            const vp_h = self.scroll_info.viewport.h;
+            if (item_top < self.scroll_info.viewport.y) {
+                self.scroll_info.viewport.y = item_top;
+            } else if (item_bot > self.scroll_info.viewport.y + vp_h) {
+                self.scroll_info.viewport.y = item_bot - vp_h;
+            }
+        }
+
+        // ── Visible row range ────────────────────────────────────────────────
         const scroll_y = self.scroll_info.viewport.y;
         const scroll_h = self.scroll_info.viewport.h;
         const first_row: usize = @intCast(@max(
@@ -352,7 +516,9 @@ pub const GridState = struct {
         );
         const visible_rows = if (last_row > first_row) last_row - first_row else 1;
 
-        const h_margin = (avail_w - @as(f32, @floatFromInt(cols)) * ts) / @as(f32, @floatFromInt(cols)) / 2.0;
+        // Subtract border contribution (2px each side = 4px per cell) so total
+        // cell width = h_margin + cell_border + ts + cell_border + h_margin == avail_w/cols.
+        const h_margin = (avail_w - @as(f32, @floatFromInt(cols)) * (ts + 2 * cell_border)) / @as(f32, @floatFromInt(cols)) / 2.0;
 
         // Prefetch zone: N screens above and below the viewport
         const buf_rows = visible_rows * prefetch_screens;
@@ -394,7 +560,8 @@ pub const GridState = struct {
             for (0..cols) |col| {
                 const idx = row * cols + col;
                 if (idx >= n) break;
-                self.renderItem(idx, ts, h_margin);
+                const focused = if (self.focused_idx) |fi| fi == idx else false;
+                self.renderItem(idx, ts, h_margin, focused, grid_id);
             }
         }
 
@@ -409,24 +576,55 @@ pub const GridState = struct {
         }
     }
 
-    fn renderItem(self: *GridState, idx: usize, ts: f32, h_margin: f32) void {
+    fn renderItem(self: *GridState, idx: usize, ts: f32, h_margin: f32, focused: bool, grid_id: dvui.Id) void {
         const entry = self.images.items[idx];
-        const selected = if (self.selected_id) |sel| sel == entry.id else false;
+        const selected = self.selection.contains(entry.id);
+
+        // Border: blue when focused (keyboard cursor), invisible otherwise.
+        // Selection is shown via a corner square instead (see below).
+        const bg_color = dvui.themeGet().fill;
+        const border_color: dvui.Color = if (focused) dvui.themeGet().focus else bg_color;
 
         var cell = dvui.box(@src(), .{ .dir = .vertical }, .{
             .id_extra = idx,
             .min_size_content = .{ .w = ts, .h = ts + label_h },
             .margin = .{ .x = h_margin, .y = gap / 2, .w = h_margin, .h = gap / 2 },
-            .border = if (selected) dvui.Rect.all(2) else null,
-            .color_border = dvui.themeGet().focus,
+            .border = dvui.Rect.all(cell_border),
+            .color_border = border_color,
         });
         defer cell.deinit();
 
-        if (dvui.clicked(cell.data(), .{})) {
-            self.selected_id = entry.id;
+        if (dvui.clickedEx(cell.data(), .{})) |click_evt| {
+            // Route subsequent key events to the grid container.
+            dvui.focusWidget(grid_id, null, null);
+
+            const mod = switch (click_evt) {
+                .mouse => |me| me.mod,
+                else => dvui.enums.Mod.none,
+            };
+
+            if (mod.control()) {
+                // Ctrl+click: toggle this item, keep others.
+                if (self.selection.contains(entry.id)) {
+                    _ = self.selection.remove(entry.id);
+                } else {
+                    self.selection.put(entry.id, {}) catch {};
+                }
+                self.anchor_idx = idx;
+            } else if (mod.shift()) {
+                // Shift+click: range from anchor to clicked item.
+                self.applyRangeSelect(self.anchor_idx orelse idx, idx);
+            } else {
+                // Plain click: single selection.
+                self.selection.clearRetainingCapacity();
+                self.selection.put(entry.id, {}) catch {};
+                self.anchor_idx = idx;
+            }
+            self.focused_idx = idx;
         }
 
         // Fixed ts×ts area; dark background is the letterbox fill and loading placeholder.
+        var img_rs: dvui.RectScale = undefined;
         {
             var img_area = dvui.box(@src(), .{}, .{
                 .id_extra = idx,
@@ -434,6 +632,7 @@ pub const GridState = struct {
                 .background = true,
                 .color_fill = .{ .r = 30, .g = 30, .b = 30, .a = 255 },
             });
+            img_rs = img_area.data().contentRectScale();
             defer img_area.deinit();
 
             if (self.committed.get(entry.id)) |ce| {
@@ -453,6 +652,28 @@ pub const GridState = struct {
                     .margin = .{ .x = mx, .y = my, .w = mx, .h = my },
                 });
             }
+        }
+
+        // Selection indicator: white right-triangle in the top-left and bottom-right corners.
+        if (selected) {
+            const sz = 12 * img_rs.s;
+            const r = img_rs.r;
+            const white = dvui.Color{ .r = 255, .g = 255, .b = 255, .a = 220 };
+            const alloc = dvui.currentWindow().arena();
+
+            var tl = dvui.Path.Builder.init(alloc);
+            defer tl.deinit();
+            tl.addPoint(.{ .x = r.x,        .y = r.y        });
+            tl.addPoint(.{ .x = r.x + sz,   .y = r.y        });
+            tl.addPoint(.{ .x = r.x,        .y = r.y + sz   });
+            tl.build().fillConvex(.{ .color = white, .fade = 0 });
+
+            var br = dvui.Path.Builder.init(alloc);
+            defer br.deinit();
+            br.addPoint(.{ .x = r.x + r.w,        .y = r.y + r.h        });
+            br.addPoint(.{ .x = r.x + r.w - sz,   .y = r.y + r.h        });
+            br.addPoint(.{ .x = r.x + r.w,        .y = r.y + r.h - sz   });
+            br.build().fillConvex(.{ .color = white, .fade = 0 });
         }
 
         dvui.labelNoFmt(@src(), entry.filename, .{}, .{

@@ -16,6 +16,7 @@ pub const Config = struct {
     thumbnails_in_db: bool = false,
     prompt_embeddings: bool = false,
     image_embeddings: bool = false,
+    trash_enabled: bool = true,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.data_path) |p| allocator.free(p);

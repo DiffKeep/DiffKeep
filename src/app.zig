@@ -19,6 +19,8 @@ const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
 var g_config: ?[]const u8 = null;
 var g_cfg: config_mod.Config = .{};
 var g_db: ?db_mod.VectorDb = null;
+// Directory that contains the DB file — also used as root for the trash folder.
+var g_data_dir: ?[]const u8 = null;
 
 var g_library_manager: ?library_manager_mod.LibraryManager = null;
 var g_grid: ?image_grid_mod.GridState = null;
@@ -32,6 +34,16 @@ fn wakeupFrame() void {
 var g_library_dialog_open: bool = false;
 var g_settings_open: bool = false;
 var g_db_stats: ?db_mod.DbStats = null;
+var g_trash_stats: ?db_mod.TrashStats = null;
+
+// Delete confirmation dialog state
+var g_skip_delete_confirm: bool = false;           // don't ask again for single soft-delete
+var g_skip_permanent_delete_confirm: bool = false; // don't ask again for single permanent delete
+var g_delete_dialog_open: bool = false;
+var g_delete_dialog_force: bool = false;  // permanent delete (skip trash)
+var g_delete_dialog_count: usize = 0;
+var g_delete_dialog_name_buf: [512]u8 = undefined;
+var g_delete_dialog_name_len: usize = 0;
 const ScanSnapshot = struct { thumbnails_in_db: bool = false, prompt_embeddings: bool = false, image_embeddings: bool = false };
 var g_settings_scan_snapshot: ScanSnapshot = .{};
 var g_pending_library_buf: [4096]u8 = undefined;
@@ -124,7 +136,36 @@ fn appInit(win: *dvui.Window) !void {
         };
         if (db_path) |p| {
             defer init.gpa.free(p);
+            if (std.fs.path.dirname(p)) |dir| {
+                g_data_dir = try init.gpa.dupe(u8, dir);
+            }
             g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
+        }
+
+        // Ensure trash directory exists and purge entries older than 30 days.
+        if (g_data_dir) |data_dir| {
+            var dd = try std.Io.Dir.openDirAbsolute(init.io, data_dir, .{});
+            defer dd.close(init.io);
+            dd.createDirPath(init.io, "trash") catch {};
+
+            if (g_db) |*db| {
+                const now_s: i64 = @intCast(@divTrunc(
+                    std.Io.Clock.real.now(init.io).nanoseconds, std.time.ns_per_s,
+                ));
+                const cutoff = now_s - 30 * 24 * 60 * 60;
+                const expired = db.purgeExpiredTrash(init.gpa, cutoff) catch &[_][]const u8{};
+                defer {
+                    for (expired) |n| init.gpa.free(n);
+                    init.gpa.free(expired);
+                }
+                for (expired) |trash_name| {
+                    const trash_path = std.fs.path.join(
+                        init.gpa, &.{ data_dir, "trash", trash_name },
+                    ) catch continue;
+                    defer init.gpa.free(trash_path);
+                    std.Io.Dir.cwd().deleteFile(init.io, trash_path) catch {};
+                }
+            }
         }
 
         // VIPS must be initialized before any worker threads start calling vips_thumbnail.
@@ -195,6 +236,7 @@ fn appDeinit() void {
         g_cfg.deinit(init.gpa);
         for (g_libraries.items) |p| init.gpa.free(p);
         g_libraries.deinit(init.gpa);
+        if (g_data_dir) |d| init.gpa.free(d);
     }
 }
 
@@ -317,6 +359,217 @@ fn fmtBytes(bytes: i64) BytesFmt {
     return .{ .value = b, .unit = "B" };
 }
 
+const log = std.log.scoped(.app);
+
+/// Attempt an atomic rename; falls back to copy+delete on cross-device moves.
+fn moveFile(io: std.Io, allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var cross_device = false;
+    std.Io.Dir.rename(cwd, src, cwd, dst, io) catch |err| switch (err) {
+        error.CrossDevice => cross_device = true,
+        else => return err,
+    };
+    if (!cross_device) return; // rename succeeded — done
+    // Rename returned CrossDevice — fall back to copy + delete.
+    {
+        var src_file = try std.Io.Dir.cwd().openFile(io, src, .{});
+        defer src_file.close(io);
+        const size = try src_file.length(io);
+        const buf = try allocator.alloc(u8, size);
+        defer allocator.free(buf);
+        _ = try src_file.readPositionalAll(io, buf, 0);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = buf });
+    }
+    try std.Io.Dir.cwd().deleteFile(io, src);
+}
+
+/// IDs to act on: the selection set when non-empty, otherwise just the focused item.
+fn effectiveIds(grid: *const image_grid_mod.GridState, allocator: std.mem.Allocator) !std.AutoHashMap(u64, void) {
+    var ids = std.AutoHashMap(u64, void).init(allocator);
+    errdefer ids.deinit();
+    if (grid.selection.count() > 0) {
+        var it = grid.selection.keyIterator();
+        while (it.next()) |id| try ids.put(id.*, {});
+    } else if (grid.focused_idx) |fi| {
+        if (fi < grid.images.items.len)
+            try ids.put(grid.images.items[fi].id, {});
+    }
+    return ids;
+}
+
+/// Remove items with the given IDs from the grid's image list and selection.
+fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashMap(u64, void)) void {
+    var i: usize = 0;
+    while (i < grid.images.items.len) {
+        const e = grid.images.items[i];
+        if (ids.contains(e.id)) {
+            _ = grid.images.orderedRemove(i);
+            _ = grid.selection.remove(e.id);
+            grid.allocator.free(e.path);
+            if (e.trash_name) |tn| grid.allocator.free(tn);
+        } else {
+            i += 1;
+        }
+    }
+    if (grid.focused_idx) |fi| {
+        if (grid.images.items.len == 0) grid.focused_idx = null
+        else if (fi >= grid.images.items.len) grid.focused_idx = grid.images.items.len - 1;
+    }
+}
+
+/// Move selected images to the trash folder and mark them in the DB.
+fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+    const data_dir = g_data_dir orelse return;
+    var ids = effectiveIds(grid, allocator) catch return;
+    defer ids.deinit();
+    if (ids.count() == 0) return;
+
+    const now_s: i64 = @intCast(@divTrunc(
+        std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s,
+    ));
+
+    for (grid.images.items) |entry| {
+        if (!ids.contains(entry.id)) continue;
+
+        // Get file size
+        var file_size: i64 = 0;
+        if (std.Io.Dir.cwd().openFile(io, entry.path, .{})) |f| {
+            if (f.length(io)) |len| file_size = @intCast(len) else |_| {}
+            f.close(io);
+        } else |_| {}
+
+        // Use "{id}_{basename}" as the trash filename to guarantee uniqueness.
+        const basename = std.fs.path.basename(entry.path);
+        var name_buf: [768]u8 = undefined;
+        const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch continue;
+
+        const dst = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch continue;
+        defer allocator.free(dst);
+
+        moveFile(io, allocator, entry.path, dst) catch |err| {
+            log.warn("trash {s}: {}", .{ basename, err });
+            continue;
+        };
+
+        if (g_db) |*db| {
+            db.trashImage(entry.id, trash_name, file_size, now_s) catch |err| {
+                log.warn("trashImage {d}: {}", .{ entry.id, err });
+            };
+        }
+    }
+
+    removeFromGrid(grid, &ids);
+}
+
+/// Permanently delete selected images from disk and DB.
+fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+    const data_dir = g_data_dir orelse "";
+    var ids = effectiveIds(grid, allocator) catch return;
+    defer ids.deinit();
+    if (ids.count() == 0) return;
+
+    for (grid.images.items) |entry| {
+        if (!ids.contains(entry.id)) continue;
+
+        // Determine where the file currently lives (trash vs library).
+        const file_path: []const u8 = if (entry.trash_name) |tn| blk: {
+            break :blk std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch continue;
+        } else entry.path;
+        defer if (entry.trash_name != null) allocator.free(file_path);
+
+        std.Io.Dir.cwd().deleteFile(io, file_path) catch |err| {
+            log.warn("delete {s}: {}", .{ entry.filename, err });
+        };
+
+        if (g_db) |*db| {
+            db.deleteImage(entry.id) catch |err| {
+                log.warn("deleteImage {d}: {}", .{ entry.id, err });
+            };
+        }
+    }
+
+    removeFromGrid(grid, &ids);
+}
+
+/// Restore selected trash items back to their original library paths.
+fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+    const data_dir = g_data_dir orelse return;
+    var ids = effectiveIds(grid, allocator) catch return;
+    defer ids.deinit();
+    if (ids.count() == 0) return;
+
+    for (grid.images.items) |entry| {
+        if (!ids.contains(entry.id)) continue;
+        const trash_name = entry.trash_name orelse continue;
+
+        const src = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch continue;
+        defer allocator.free(src);
+
+        moveFile(io, allocator, src, entry.path) catch |err| {
+            log.warn("restore {s}: {}", .{ entry.filename, err });
+            continue;
+        };
+
+        if (g_db) |*db| {
+            db.restoreImage(entry.id) catch |err| {
+                log.warn("restoreImage {d}: {}", .{ entry.id, err });
+            };
+        }
+    }
+
+    removeFromGrid(grid, &ids);
+}
+
+/// Open the delete confirmation dialog for the current grid selection.
+fn openDeleteDialog(grid: *const image_grid_mod.GridState, force: bool) void {
+    var count: usize = grid.selection.count();
+    if (count == 0) {
+        if (grid.focused_idx) |fi| {
+            if (fi < grid.images.items.len) count = 1;
+        }
+    }
+    if (count == 0) return;
+
+    g_delete_dialog_count = count;
+    g_delete_dialog_force = force;
+
+    // Snapshot the filename for the single-file label.
+    if (count == 1) {
+        const name: []const u8 = if (grid.selection.count() > 0) blk: {
+            var it = grid.selection.keyIterator();
+            const id = it.next().?.*;
+            for (grid.images.items) |e| {
+                if (e.id == id) break :blk e.filename;
+            }
+            break :blk "";
+        } else if (grid.focused_idx) |fi|
+            grid.images.items[fi].filename
+        else
+            "";
+        const len = @min(name.len, g_delete_dialog_name_buf.len);
+        @memcpy(g_delete_dialog_name_buf[0..len], name[0..len]);
+        g_delete_dialog_name_len = len;
+    }
+
+    const permanent = force or !g_cfg.trash_enabled;
+    if (count == 1) {
+        if (!permanent and g_skip_delete_confirm) {
+            if (g_grid) |*grid_mut| {
+                if (dvui.App.main_init) |init| performTrash(init.io, init.gpa, grid_mut);
+            }
+            return;
+        }
+        if (permanent and g_skip_permanent_delete_confirm) {
+            if (g_grid) |*grid_mut| {
+                if (dvui.App.main_init) |init| performDelete(init.io, init.gpa, grid_mut);
+            }
+            return;
+        }
+    }
+
+    g_delete_dialog_open = true;
+}
+
 fn settingsModal() !void {
     var float = dvui.floatingWindow(@src(), .{
         .modal = true,
@@ -354,6 +607,51 @@ fn settingsModal() !void {
             _ = dvui.checkbox(@src(), &g_cfg.thumbnails_in_db, "Store thumbnails in database", .{ .margin = .{ .h = 6 } });
             _ = dvui.checkbox(@src(), &g_cfg.prompt_embeddings, "Generate prompt embeddings", .{ .margin = .{ .h = 6 } });
             _ = dvui.checkbox(@src(), &g_cfg.image_embeddings, "Generate image embeddings", .{ .margin = .{ .h = 6 } });
+
+            dvui.label(@src(), "Trash", .{}, .{ .font = bold, .margin = .{ .y = 16, .h = 8 } });
+            _ = dvui.checkbox(@src(), &g_cfg.trash_enabled, "Enable trash (30-day auto-purge)", .{ .margin = .{ .h = 6 } });
+            if (g_cfg.trash_enabled) {
+                if (g_trash_stats) |ts| {
+                    const tb = fmtBytes(ts.total_bytes);
+                    var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .expand = .horizontal,
+                        .margin = .{ .h = 6 },
+                    });
+                    defer trash_row.deinit();
+                    dvui.label(@src(), "{d} items ({d:.1} {s})", .{ ts.count, tb.value, tb.unit }, .{
+                        .expand = .horizontal,
+                        .gravity_y = 0.5,
+                    });
+                    if (dvui.button(@src(), "Empty Trash", .{}, .{
+                        .gravity_y = 0.5,
+                        .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                        .corner_radius = dvui.Rect.all(4),
+                    })) {
+                        if (g_data_dir) |data_dir| {
+                            if (g_db) |*db| {
+                                if (dvui.App.main_init) |init| {
+                                    const names = db.purgeExpiredTrash(init.gpa, std.math.maxInt(i64)) catch &[_][]const u8{};
+                                    defer {
+                                        for (names) |n| init.gpa.free(n);
+                                        init.gpa.free(names);
+                                    }
+                                    for (names) |trash_name| {
+                                        const p = std.fs.path.join(init.gpa, &.{ data_dir, "trash", trash_name }) catch continue;
+                                        defer init.gpa.free(p);
+                                        std.Io.Dir.cwd().deleteFile(init.io, p) catch {};
+                                    }
+                                    g_trash_stats = db.getTrashStats() catch null;
+                                    // If grid is in trash view, reload it
+                                    if (g_grid) |*grid| {
+                                        if (grid.view_mode == .trash)
+                                            grid.reloadImages(db) catch {};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             dvui.label(@src(), "Data path", .{}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
             if (g_cfg.data_path) |p| {
@@ -464,6 +762,67 @@ fn settingsModal() !void {
     }
 }
 
+fn deleteConfirmDialog() !void {
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{
+        .min_size_content = .{ .w = 360, .h = 0 },
+    });
+    defer float.deinit();
+    float.autoSize();
+
+    var content = dvui.box(@src(), .{}, .{
+        .expand = .both,
+        .padding = .all(16),
+    });
+    defer content.deinit();
+
+    const permanent = g_delete_dialog_force or !g_cfg.trash_enabled;
+    const title: []const u8 = if (permanent) "Delete permanently?" else "Move to Trash?";
+    dvui.label(@src(), "{s}", .{title}, .{ .font = bold, .margin = .{ .h = 8 } });
+
+    if (g_delete_dialog_count == 1) {
+        const name = g_delete_dialog_name_buf[0..g_delete_dialog_name_len];
+        dvui.label(@src(), "{s}", .{name}, .{ .margin = .{ .h = 12 } });
+    } else {
+        dvui.label(@src(), "{d} files selected", .{g_delete_dialog_count}, .{ .margin = .{ .h = 12 } });
+    }
+
+    var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
+    defer btn_row.deinit();
+
+    if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .all(4) })) {
+        g_delete_dialog_open = false;
+    }
+
+    if (g_delete_dialog_count == 1) {
+        const skip_label: []const u8 = if (permanent)
+            "Delete, don't ask again"
+        else
+            "Move to Trash, don't ask again";
+        if (dvui.button(@src(), skip_label, .{}, .{ .margin = .all(4) })) {
+            g_delete_dialog_open = false;
+            if (permanent) g_skip_permanent_delete_confirm = true
+            else           g_skip_delete_confirm = true;
+            if (g_grid) |*grid| {
+                if (dvui.App.main_init) |init| {
+                    if (permanent) performDelete(init.io, init.gpa, grid)
+                    else           performTrash(init.io, init.gpa, grid);
+                }
+            }
+        }
+    }
+
+    const confirm_label: []const u8 = if (permanent) "Delete" else "Move to Trash";
+    if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+        g_delete_dialog_open = false;
+        if (g_grid) |*grid| {
+            if (dvui.App.main_init) |init| {
+                if (permanent) performDelete(init.io, init.gpa, grid)
+                else           performTrash(init.io, init.gpa, grid);
+            }
+        }
+    }
+}
+
 fn frame() !dvui.App.Result {
     for (dvui.events()) |*e| {
         if (e.evt == .window and e.evt.window.action == .close) return .close;
@@ -472,6 +831,18 @@ fn frame() !dvui.App.Result {
 
     // Drain new images from scan threads and update thumbnail cache
     if (g_grid) |*grid| grid.update();
+
+    // Consume pending delete/restore requests raised by keyboard handlers
+    if (g_grid) |*grid| {
+        if (grid.delete_requested) {
+            grid.delete_requested = false;
+            openDeleteDialog(grid, grid.delete_force);
+        }
+        if (grid.restore_requested) {
+            grid.restore_requested = false;
+            if (dvui.App.main_init) |init| performRestore(init.io, init.gpa, grid);
+        }
+    }
 
     if (g_pending_library_len > 0) {
         const path = g_pending_library_buf[0..g_pending_library_len];
@@ -584,12 +955,29 @@ fn frame() !dvui.App.Result {
             });
             defer sidebar.deinit();
 
+            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+            defer scroll.deinit();
+
+            // Library view selector
             {
-                var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                const in_library = if (g_grid) |*g| g.view_mode == .library else true;
+                const bg: dvui.Options = if (in_library) .{
+                    .background = true,
+                    .color_fill = dvui.themeGet().focus,
+                } else .{};
+                var lib_hdr = dvui.box(@src(), .{ .dir = .horizontal }, bg.override(.{
                     .expand = .horizontal,
                     .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
-                });
-                defer header.deinit();
+                }));
+                defer lib_hdr.deinit();
+                if (dvui.clickedEx(lib_hdr.data(), .{})) |_| {
+                    if (g_grid) |*grid| {
+                        if (grid.view_mode != .library) {
+                            grid.view_mode = .library;
+                            if (g_db) |*db| grid.reloadImages(db) catch {};
+                        }
+                    }
+                }
                 dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 if (dvui.buttonIcon(@src(), "add library", dvui.entypo.plus, .{}, .{}, .{
@@ -610,9 +998,6 @@ fn frame() !dvui.App.Result {
                     }
                 }
             }
-
-            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
-            defer scroll.deinit();
 
             if (g_libraries.items.len == 0) {
                 dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{ .padding = .all(8) });
@@ -647,6 +1032,35 @@ fn frame() !dvui.App.Result {
                             g_confirm_remove_idx = idx;
                         }
                     }
+                }
+            }
+
+            // ── Trash section ─────────────────────────────────────────────
+            if (g_cfg.trash_enabled) {
+                _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
+
+                const in_trash = if (g_grid) |*g| g.view_mode == .trash else false;
+                const trash_bg: dvui.Options = if (in_trash) .{
+                    .background = true,
+                    .color_fill = dvui.themeGet().focus,
+                } else .{};
+                var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, trash_bg.override(.{
+                    .expand = .horizontal,
+                    .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                }));
+                defer trash_row.deinit();
+                if (dvui.clickedEx(trash_row.data(), .{})) |_| {
+                    if (g_grid) |*grid| {
+                        if (grid.view_mode != .trash) {
+                            grid.view_mode = .trash;
+                            if (g_db) |*db| grid.reloadImages(db) catch {};
+                        }
+                    }
+                }
+                dvui.label(@src(), "Trash", .{}, .{ .font = bold, .gravity_y = 0.5 });
+                if (g_trash_stats) |ts| {
+                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+                    dvui.label(@src(), "{d}", .{ts.count}, .{ .gravity_y = 0.5 });
                 }
             }
         }
@@ -738,7 +1152,10 @@ fn frame() !dvui.App.Result {
         })) {
             g_settings_open = !g_settings_open;
             if (g_settings_open) {
-                if (g_db) |*db| g_db_stats = db.getStats() catch null;
+                if (g_db) |*db| {
+                    g_db_stats = db.getStats() catch null;
+                    g_trash_stats = db.getTrashStats() catch null;
+                }
                 g_settings_scan_snapshot = .{
                     .thumbnails_in_db = g_cfg.thumbnails_in_db,
                     .prompt_embeddings = g_cfg.prompt_embeddings,
@@ -815,6 +1232,9 @@ fn frame() !dvui.App.Result {
             g_confirm_remove_idx = null;
         }
     }
+
+    // ── Delete confirmation modal ─────────────────────────────────────────────
+    if (g_delete_dialog_open) try deleteConfirmDialog();
 
     return .ok;
 }
