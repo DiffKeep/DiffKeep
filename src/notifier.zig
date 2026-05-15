@@ -9,14 +9,15 @@ pub const ImageNotifier = struct {
     pub const Entry = struct {
         id: u64,
         path: []const u8, // heap-allocated; ownership transfers on drain
+        mtime: i64,
     };
 
     /// Called from scan worker threads. Duplicates path; safe to call concurrently.
-    pub fn push(self: *ImageNotifier, io: std.Io, allocator: std.mem.Allocator, id: u64, path: []const u8) void {
+    pub fn push(self: *ImageNotifier, io: std.Io, allocator: std.mem.Allocator, id: u64, path: []const u8, mtime: i64) void {
         const path_copy = allocator.dupe(u8, path) catch return;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.incoming.append(allocator, .{ .id = id, .path = path_copy }) catch {
+        self.incoming.append(allocator, .{ .id = id, .path = path_copy, .mtime = mtime }) catch {
             allocator.free(path_copy);
         };
     }

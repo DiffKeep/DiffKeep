@@ -291,7 +291,7 @@ fn panelHandle(
     dvui.dataSet(null, id, "_hov", is_hovered);
     dvui.dataSet(null, id, "_drag", dragged);
 
-    if (is_hovered or collapsed) {
+    {
         const ch: []const u8 = switch (side) {
             .left => if (collapsed) "›" else "‹",
             .right => if (collapsed) "‹" else "›",
@@ -302,6 +302,9 @@ fn panelHandle(
             .expand = .both,
         });
     }
+
+    const tip: []const u8 = if (collapsed) "Click to expand" else "Click to collapse · Drag to resize";
+    dvui.tooltip(@src(), .{ .active_rect = h.data().rectScale().r, .delay = 500_000 }, "{s}", .{tip}, .{});
 }
 
 const BytesFmt = struct { value: f64, unit: []const u8 };
@@ -527,12 +530,43 @@ fn frame() !dvui.App.Result {
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
-        // Thumbnail size slider
+        // Thumbnail size slider + sort controls
         if (g_grid) |*grid| {
             _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction }, .{
                 .gravity_y = 0.5,
                 .min_size_content = .{ .w = 80, .h = 16 },
             });
+
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+            // Sort mode chip — cycles date → name → random on click
+            const sort_chip_label: []const u8 = switch (grid.sort_mode) {
+                .date => "sort: date \u{25bc}",
+                .name => "sort: name \u{25bc}",
+                .random => "sort: random \u{25bc}",
+            };
+            if (dvui.button(@src(), sort_chip_label, .{}, chip.override(.{ .id_extra = 5 }))) {
+                grid.sort_mode = switch (grid.sort_mode) {
+                    .date => .name,
+                    .name => .random,
+                    .random => .date,
+                };
+                grid.applySortOrder();
+            }
+
+            // Direction toggle (date/name) or re-randomize button (random)
+            if (grid.sort_mode == .random) {
+                if (dvui.button(@src(), "~", .{}, chip.override(.{ .id_extra = 6 }))) {
+                    grid.sort_seed +%= 1;
+                    grid.applySortOrder();
+                }
+            } else {
+                const dir_ch: []const u8 = if (grid.sort_dir == .asc) "\u{2191}" else "\u{2193}";
+                if (dvui.button(@src(), dir_ch, .{}, chip.override(.{ .id_extra = 6 }))) {
+                    grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
+                    grid.applySortOrder();
+                }
+            }
         }
     }
 

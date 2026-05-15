@@ -8,10 +8,14 @@ pub const ImageNotifier = notifier_mod.ImageNotifier;
 
 const log = std.log.scoped(.image_grid);
 
+pub const SortMode = enum { date, name, random };
+pub const SortDir = enum { asc, desc };
+
 pub const ImageEntry = struct {
     id: u64,
     path: []const u8,     // heap-allocated, owned by GridState.images
     filename: []const u8, // slice into path (basename), not separately allocated
+    mtime: ?i64,
 };
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -117,6 +121,9 @@ pub const GridState = struct {
     // UI state
     selected_id: ?u64 = null,
     thumb_fraction: f32 = 0.25, // 0..1 maps to thumb_size_min..thumb_size_max (~140px default)
+    sort_mode: SortMode = .date,
+    sort_dir: SortDir = .desc,  // newest first by default
+    sort_seed: u64 = 0,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
         var state = GridState{
@@ -139,10 +146,14 @@ pub const GridState = struct {
                 .id = e.id,
                 .path = e.path,
                 .filename = std.fs.path.basename(e.path),
+                .mtime = e.mtime,
             });
         }
 
-        state.last_eviction_s = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+        const now_ns = std.Io.Clock.real.now(io).nanoseconds;
+        state.last_eviction_s = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
+        state.sort_seed = @truncate(@abs(now_ns));
+        state.applySortOrder();
         return state;
     }
 
@@ -190,17 +201,20 @@ pub const GridState = struct {
     pub fn update(self: *GridState) void {
         // 1. Drain new images from scan threads
         self.notifier.drain(self.io, self.allocator, &self.incoming);
+        const before_count = self.images.items.len;
         for (self.incoming.items) |e| {
             self.images.append(self.allocator, .{
                 .id = e.id,
                 .path = e.path,
                 .filename = std.fs.path.basename(e.path),
+                .mtime = e.mtime,
             }) catch {
                 self.allocator.free(e.path);
                 continue;
             };
         }
         self.incoming.clearAndFree(self.allocator);
+        if (self.images.items.len != before_count) self.applySortOrder();
 
         // 2. Drain pending thumbnails into committed
         const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
@@ -243,6 +257,17 @@ pub const GridState = struct {
             if (self.committed.fetchRemove(id)) |kv| {
                 self.allocator.free(kv.value.bytes);
             }
+        }
+    }
+
+    pub fn applySortOrder(self: *GridState) void {
+        switch (self.sort_mode) {
+            .date => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageDateLt),
+            .name => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageNameLt),
+            .random => {
+                var prng = std.Random.DefaultPrng.init(self.sort_seed);
+                prng.random().shuffle(ImageEntry, self.images.items);
+            },
         }
     }
 
@@ -439,6 +464,21 @@ pub const GridState = struct {
         });
     }
 };
+
+// ── Sort comparators ──────────────────────────────────────────────────────────
+
+fn imageDateLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
+    // null mtime sorts to end regardless of direction
+    if (a.mtime == null and b.mtime == null) return false;
+    if (a.mtime == null) return false;
+    if (b.mtime == null) return true;
+    return if (dir == .desc) a.mtime.? > b.mtime.? else a.mtime.? < b.mtime.?;
+}
+
+fn imageNameLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
+    const cmp = std.mem.order(u8, a.filename, b.filename);
+    return if (dir == .asc) cmp == .lt else cmp == .gt;
+}
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 

@@ -251,7 +251,7 @@ fn processFile(ctx: ScanCtx) void {
     // Notify the grid of new images immediately so they appear without waiting
     // for the full scan to complete.
     if (is_new) {
-        if (ctx.notifier) |n| n.push(ctx.io, ctx.allocator, image.id, ctx.path);
+        if (ctx.notifier) |n| n.push(ctx.io, ctx.allocator, image.id, ctx.path, current_mtime);
     }
 
     // Read file into arena buffer.

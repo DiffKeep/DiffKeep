@@ -480,13 +480,14 @@ pub const VectorDb = struct {
     pub const GridEntry = struct {
         id: u64,
         path: []const u8, // heap-allocated; caller owns
+        mtime: ?i64,
     };
 
     /// Returns all images ordered by id. Used to populate the grid on startup.
     pub fn listAllImages(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare("SELECT id, library_path FROM images ORDER BY id");
+        var stmt = try self.db.prepare("SELECT id, library_path, mtime FROM images ORDER BY id");
         defer stmt.deinit();
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
@@ -496,7 +497,8 @@ pub const VectorDb = struct {
         while (try stmt.step()) {
             const id: u64 = @intCast(stmt.columnInt64(0));
             const path = try allocator.dupe(u8, stmt.columnText(1));
-            try list.append(allocator, .{ .id = id, .path = path });
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
         }
         return list.toOwnedSlice(allocator);
     }
