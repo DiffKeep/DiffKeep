@@ -14,6 +14,7 @@ const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 const detail_panel_mod = @import("detail_panel.zig");
 const sidebar_mod = @import("sidebar.zig");
+const image_viewer_mod = @import("image_viewer.zig");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
 const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
@@ -92,14 +93,6 @@ const left_w_max: f32 = 400;
 const right_w_min: f32 = 220;
 const right_w_max: f32 = 480;
 
-pub const dvui_app: dvui.App = .{
-    .config = .{ .startFn = appStart },
-    .initFn = appInit,
-    .deinitFn = appDeinit,
-    .frameFn = frame,
-};
-
-pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{
     .logFn = dvui.App.logFn,
@@ -230,14 +223,7 @@ fn appInit(win: *dvui.Window) !void {
         g_config orelse "(none)",
     });
 
-    try dvui.addFont("NotoSansCJK", noto_cjk_bytes, null);
-    try dvui.addFont("NotoSansCJKBold", noto_cjk_bold_bytes, null);
-
-    var theme = dvui.themeGet();
-    theme.font_body = theme.font_body.withFamily("NotoSansCJK");
-    theme.font_title = theme.font_title.withFamily("NotoSansCJKBold");
-    theme.font_mono = theme.font_mono.withFamily("NotoSansCJK");
-    dvui.themeSet(theme);
+    try initWindowFontsAndTheme();
 }
 
 fn appDeinit() void {
@@ -1374,4 +1360,278 @@ fn frame() !dvui.App.Result {
     if (g_filter_modal_open) try filterModal();
 
     return .ok;
+}
+
+fn initWindowFontsAndTheme() !void {
+    try dvui.addFont("NotoSansCJK", noto_cjk_bytes, null);
+    try dvui.addFont("NotoSansCJKBold", noto_cjk_bold_bytes, null);
+    var theme = dvui.themeGet();
+    theme.font_body = theme.font_body.withFamily("NotoSansCJK");
+    theme.font_title = theme.font_title.withFamily("NotoSansCJKBold");
+    theme.font_mono = theme.font_mono.withFamily("NotoSansCJK");
+    dvui.themeSet(theme);
+}
+
+const ViewerWindow = struct {
+    back: SDLBackend,
+    win: dvui.Window,
+    sdl_window_id: u32,
+    state: image_viewer_mod.ViewerState,
+    fonts_initialized: bool = false,
+
+    fn deinit(self: *ViewerWindow) void {
+        self.state.deinit();
+        self.win.deinit();
+        self.back.deinit();
+    }
+};
+
+var g_viewer_windows: std.ArrayList(*ViewerWindow) = .empty;
+var g_viewer_next_id: u64 = 1;
+
+fn routeAllSDLEvents(main_back: *SDLBackend, main_win: *dvui.Window) void {
+    const main_id = SDLBackend.c.SDL_GetWindowID(main_back.window);
+    var event: SDLBackend.c.SDL_Event = undefined;
+    while (SDLBackend.c.SDL_PollEvent(&event)) {
+        const eid = sdlEventWindowID(event);
+        if (eid == 0 or eid == main_id) {
+            _ = main_back.addEvent(main_win, event) catch {};
+            continue;
+        }
+        for (g_viewer_windows.items) |vw| {
+            if (vw.sdl_window_id == eid) {
+                _ = vw.back.addEvent(&vw.win, event) catch {};
+                break;
+            }
+        }
+    }
+}
+
+fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
+    const SDL = SDLBackend.c;
+    return switch (event.type) {
+        SDL.SDL_EVENT_KEY_DOWN, SDL.SDL_EVENT_KEY_UP             => event.key.windowID,
+        SDL.SDL_EVENT_TEXT_INPUT, SDL.SDL_EVENT_TEXT_EDITING     => event.text.windowID,
+        SDL.SDL_EVENT_MOUSE_MOTION                               => event.motion.windowID,
+        SDL.SDL_EVENT_MOUSE_BUTTON_DOWN,
+        SDL.SDL_EVENT_MOUSE_BUTTON_UP                            => event.button.windowID,
+        SDL.SDL_EVENT_MOUSE_WHEEL                                => event.wheel.windowID,
+        SDL.SDL_EVENT_WINDOW_RESIZED,
+        SDL.SDL_EVENT_WINDOW_FOCUS_GAINED,
+        SDL.SDL_EVENT_WINDOW_FOCUS_LOST,
+        SDL.SDL_EVENT_WINDOW_MOUSE_ENTER,
+        SDL.SDL_EVENT_WINDOW_MOUSE_LEAVE,
+        SDL.SDL_EVENT_WINDOW_CLOSE_REQUESTED,
+        SDL.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED               => event.window.windowID,
+        else                                                     => 0,
+    };
+}
+
+fn cleanupViewers(gpa: std.mem.Allocator) void {
+    for (g_viewer_windows.items) |vw| {
+        vw.deinit();
+        gpa.destroy(vw);
+    }
+    g_viewer_windows.deinit(gpa);
+}
+
+fn openViewer(grid: *image_grid_mod.GridState, start_id: ?u64) void {
+    const init = dvui.App.main_init orelse return;
+
+    var images: std.ArrayList(image_grid_mod.ImageEntry) = .empty;
+    const use_selection = grid.selection.count() > 1;
+    for (grid.images.items) |e| {
+        if (use_selection and !grid.selection.contains(e.id)) continue;
+        const path_copy = init.gpa.dupe(u8, e.path) catch continue;
+        images.append(init.gpa, .{
+            .id = e.id,
+            .path = path_copy,
+            .filename = std.fs.path.basename(path_copy),
+            .mtime = e.mtime,
+        }) catch {
+            init.gpa.free(path_copy);
+            continue;
+        };
+    }
+    if (images.items.len == 0) {
+        images.deinit(init.gpa);
+        return;
+    }
+
+    var start_idx: usize = 0;
+    if (start_id) |sid| {
+        for (images.items, 0..) |e, i| {
+            if (e.id == sid) {
+                start_idx = i;
+                break;
+            }
+        }
+    }
+
+    const id = g_viewer_next_id;
+    g_viewer_next_id += 1;
+    const vw = init.gpa.create(ViewerWindow) catch {
+        for (images.items) |e| init.gpa.free(e.path);
+        images.deinit(init.gpa);
+        return;
+    };
+
+    var title_buf: [256]u8 = undefined;
+    const title = std.fmt.bufPrintZ(&title_buf, "{s} \u{2014} DiffKeep",
+        .{images.items[start_idx].filename}) catch "DiffKeep";
+
+    const back = SDLBackend.initWindow(.{
+        .io = init.io,
+        .allocator = init.gpa,
+        .size = .{ .w = 1200, .h = 800 },
+        .min_size = .{ .w = 400, .h = 300 },
+        .vsync = true,
+        .title = title,
+    }) catch {
+        for (images.items) |e| init.gpa.free(e.path);
+        images.deinit(init.gpa);
+        init.gpa.destroy(vw);
+        return;
+    };
+
+    vw.* = .{
+        .back = back,
+        .win = undefined,
+        .sdl_window_id = 0,
+        .state = image_viewer_mod.ViewerState.init(
+            init.gpa, id, images, start_idx, wakeupFrame, g_data_dir,
+        ),
+    };
+
+    vw.win = dvui.Window.init(@src(), init.gpa, vw.back.backend(), .{ .id_extra = @intCast(id) })
+        catch {
+            vw.back.deinit();
+            vw.state.deinit();
+            init.gpa.destroy(vw);
+            return;
+        };
+    vw.sdl_window_id = SDLBackend.c.SDL_GetWindowID(vw.back.window);
+
+    g_viewer_windows.append(init.gpa, vw) catch {
+        vw.deinit();
+        init.gpa.destroy(vw);
+    };
+}
+
+fn removeFromViewers(ids: *const std.AutoHashMap(u64, void)) void {
+    for (g_viewer_windows.items) |vw| vw.state.removeImages(ids);
+}
+
+fn performViewerDelete(state: *image_viewer_mod.ViewerState) void {
+    const init = dvui.App.main_init orelse return;
+    if (g_grid) |*grid| {
+        var ids = std.AutoHashMap(u64, void).init(init.gpa);
+        defer ids.deinit();
+        if (state.currentImage()) |img| ids.put(img.id, {}) catch {};
+        if (ids.count() == 0) return;
+        if (state.delete_force or !g_cfg.trash_enabled) {
+            performDelete(init.io, init.gpa, grid);
+        } else {
+            performTrash(init.io, init.gpa, grid);
+        }
+        removeFromViewers(&ids);
+        refreshCounts();
+    }
+}
+
+fn pickMinWait(a: ?u32, b: ?u32) ?u32 {
+    const av = a orelse return b;
+    const bv = b orelse return a;
+    return @min(av, bv);
+}
+
+pub fn main(init: std.process.Init) !void {
+    dvui.App.main_init = init;
+    SDLBackend.c.SDL_SetMainReady();
+
+    const opts = appStart();
+    var back = try SDLBackend.initWindow(.{
+        .io = init.io,
+        .allocator = init.gpa,
+        .size = opts.size,
+        .min_size = opts.min_size,
+        .vsync = opts.vsync,
+        .title = opts.title,
+        .environ_map = init.environ_map,
+    });
+    defer back.deinit();
+
+    var win = try dvui.Window.init(@src(), init.gpa, back.backend(), .{});
+    defer win.deinit();
+
+    try win.begin(win.frame_time_ns);
+    try appInit(&win);
+    _ = try win.end(.{});
+    defer appDeinit();
+    defer cleanupViewers(init.gpa);
+
+    var interrupted = false;
+    main_loop: while (true) {
+        const nstime = win.beginWait(interrupted);
+        routeAllSDLEvents(&back, &win);
+
+        // ── Main window ───────────────────────────────────────────────────────
+        try win.begin(nstime);
+        _ = SDLBackend.c.SDL_SetRenderDrawColor(back.renderer, 0, 0, 0, 255);
+        _ = SDLBackend.c.SDL_RenderClear(back.renderer);
+        var res = try frame();
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            if ((e.evt == .window and e.evt.window.action == .close) or
+                (e.evt == .app and e.evt.app.action == .quit)) res = .close;
+        }
+        var end_micros: ?u32 = try win.end(.{});
+        try back.setCursor(win.cursorRequested());
+        try back.textInputRect(win.textInputRequested());
+        try back.renderPresent();
+        if (res == .close) break :main_loop;
+
+        // ── Viewer windows ────────────────────────────────────────────────────
+        var vi: usize = 0;
+        while (vi < g_viewer_windows.items.len) {
+            const vw = g_viewer_windows.items[vi];
+            try vw.win.begin(nstime);
+
+            if (!vw.fonts_initialized) {
+                vw.fonts_initialized = true;
+                try initWindowFontsAndTheme();
+            }
+
+            _ = SDLBackend.c.SDL_SetRenderDrawColor(vw.back.renderer, 0, 0, 0, 255);
+            _ = SDLBackend.c.SDL_RenderClear(vw.back.renderer);
+            vw.state.render();
+
+            if (vw.state.delete_requested) {
+                vw.state.delete_requested = false;
+                performViewerDelete(&vw.state);
+            }
+
+            var close = !vw.state.open;
+            for (dvui.events()) |*e| {
+                if (!e.handled and e.evt == .window and e.evt.window.action == .close)
+                    close = true;
+            }
+            const vw_end: ?u32 = try vw.win.end(.{});
+            try vw.back.setCursor(vw.win.cursorRequested());
+            try vw.back.renderPresent();
+
+            end_micros = pickMinWait(end_micros, vw_end);
+
+            if (close) {
+                vw.deinit();
+                init.gpa.destroy(vw);
+                _ = g_viewer_windows.swapRemove(vi);
+            } else {
+                vi += 1;
+            }
+        }
+
+        const wait_micros = win.waitTime(end_micros);
+        interrupted = try back.waitEventTimeout(wait_micros);
+    }
 }
