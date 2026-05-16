@@ -7,12 +7,13 @@ const build_options = @import("build_options");
 const icons = @import("icons");
 const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
-const png_mod = @import("image/png-data.zig");
 const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
 const image_grid_mod = @import("image_grid.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
+const detail_panel_mod = @import("detail_panel.zig");
+const sidebar_mod = @import("sidebar.zig");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
 const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
@@ -33,46 +34,13 @@ fn wakeupFrame() void {
     ev.type = g_wakeup_event_type;
     _ = SDLBackend.c.SDL_PushEvent(&ev);
 }
-var g_library_dialog_open: bool = false;
 var g_settings_open: bool = false;
 var g_db_stats: ?db_mod.DbStats = null;
 var g_trash_stats: ?db_mod.TrashStats = null;
 var g_total_image_count: i64 = 0;
 
-// Sidebar filter state
-var g_filter_library_id: ?u64 = null;
-var g_filter_folder: ?[]const u8 = null; // heap-allocated owned copy
-
-const LibraryState = struct {
-    id: u64,
-    path: []const u8,           // owned
-    image_count: i64 = 0,
-    expanded: bool = false,
-    top_folders: []FolderNode = &.{},  // immediate subdirs of library root; owned
-    top_loaded: bool = false,
-
-    fn deinit(self: *LibraryState, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        freeFolderNodes(allocator, self.top_folders);
-    }
-};
-
-/// A node in the library folder tree. Populated lazily when the user expands a node.
-const FolderNode = struct {
-    path: []const u8,         // full absolute path, heap-allocated, owned
-    count: i64,               // images in this subtree (all descendants)
-    children: []FolderNode = &.{},  // heap-allocated; empty until loaded
-    loaded: bool = false,     // true once children have been fetched
-    expanded: bool = false,
-};
-
-fn freeFolderNodes(allocator: std.mem.Allocator, nodes: []FolderNode) void {
-    for (nodes) |*n| {
-        allocator.free(n.path);
-        freeFolderNodes(allocator, n.children);
-    }
-    if (nodes.len > 0) allocator.free(nodes);
-}
+var g_sidebar: sidebar_mod.SidebarState = .{};
+var g_detail: detail_panel_mod.DetailState = .{};
 
 // Delete confirmation dialog state
 var g_skip_delete_confirm: bool = false;           // don't ask again for single soft-delete
@@ -84,10 +52,6 @@ var g_delete_dialog_name_buf: [512]u8 = undefined;
 var g_delete_dialog_name_len: usize = 0;
 const ScanSnapshot = struct { thumbnails_in_db: bool = false, prompt_embeddings: bool = false, image_embeddings: bool = false };
 var g_settings_scan_snapshot: ScanSnapshot = .{};
-var g_pending_library_buf: [4096]u8 = undefined;
-var g_pending_library_len: usize = 0;
-var g_libraries: std.ArrayList(LibraryState) = .empty;
-var g_confirm_remove_idx: ?usize = null;
 
 // Search state: text buffer written by the textEntry widget each frame.
 // g_search_prev mirrors it so we can detect changes and trigger a DB reload.
@@ -104,10 +68,6 @@ var g_filter_modal_value_buf: [256]u8 = std.mem.zeroes([256]u8);
 var g_filter_modal_options: ?[][]const u8 = null;
 var g_filter_modal_options_kind: ?db_mod.FilterColumn = null;
 
-// Right-panel detail: tracks the currently-displayed image so we only re-query on change.
-var g_detail_id: ?u64 = null;
-var g_detail: ?db_mod.ImageDetails = null;
-
 /// Refresh image counts for all libraries, total count, and trash stats.
 /// Called at init and after any operation that changes counts.
 fn refreshCounts() void {
@@ -115,28 +75,11 @@ fn refreshCounts() void {
         if (g_db) |*db| {
             g_total_image_count = db.getTotalImageCount() catch 0;
             g_trash_stats = db.getTrashStats() catch null;
-            for (g_libraries.items) |*lib| {
-                lib.image_count = db.getLibraryImageCount(lib.id) catch 0;
-                // Invalidate cached folder tree so next expansion reloads it.
-                if (lib.top_loaded) {
-                    freeFolderNodes(init.gpa, lib.top_folders);
-                    lib.top_folders = &.{};
-                    lib.top_loaded = false;
-                }
-            }
+            g_sidebar.refreshLibraryCounts(db, init.gpa);
         }
     }
 }
 
-fn libraryFolderCallback(_: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
-    g_library_dialog_open = false;
-    const files = filelist orelse return;
-    if (files[0] == null) return;
-    const path = std.mem.span(files[0].?);
-    const len = @min(path.len, g_pending_library_buf.len);
-    @memcpy(g_pending_library_buf[0..len], path[0..len]);
-    g_pending_library_len = len;
-}
 
 // Panel widths in logical pixels.  _open stores the last non-collapsed width.
 var g_left_w: f32 = 240;
@@ -249,20 +192,7 @@ fn appInit(win: *dvui.Window) !void {
         try vips_mod.init();
 
         if (g_db) |*db| {
-            if (db.listLibraries(init.gpa)) |libs| {
-                defer {
-                    for (libs) |li| init.gpa.free(li.path);
-                    init.gpa.free(libs);
-                }
-                for (libs) |li| {
-                    const count = db.getLibraryImageCount(li.id) catch 0;
-                    try g_libraries.append(init.gpa, .{
-                        .id = li.id,
-                        .path = try init.gpa.dupe(u8, li.path),
-                        .image_count = count,
-                    });
-                }
-            } else |_| {}
+            try g_sidebar.loadLibraries(init.gpa, db);
 
             // Register a custom SDL event so the worker thread can wake the render loop
             // when a thumbnail is ready (dvui only renders on input otherwise).
@@ -321,11 +251,9 @@ fn appDeinit() void {
         database.deinit();
         database.pool.deinit();
     }
-    if (g_detail) |*d| {
-        if (dvui.App.main_init) |init| d.deinit(init.gpa);
-        g_detail = null;
-    }
     if (dvui.App.main_init) |init| {
+        g_detail.deinit(init.gpa);
+        g_sidebar.deinit(init.gpa);
         if (g_config) |cfg_path| {
             config_mod.save(g_cfg, init.io, cfg_path) catch |err| {
                 std.log.warn("failed to save config: {}", .{err});
@@ -333,9 +261,6 @@ fn appDeinit() void {
             init.gpa.free(cfg_path);
         }
         g_cfg.deinit(init.gpa);
-        for (g_libraries.items) |*lib| lib.deinit(init.gpa);
-        g_libraries.deinit(init.gpa);
-        if (g_filter_folder) |f| init.gpa.free(f);
         if (g_data_dir) |d| init.gpa.free(d);
         for (g_active_filters.items) |f| init.gpa.free(f.value);
         g_active_filters.deinit(init.gpa);
@@ -453,41 +378,6 @@ fn panelHandle(
 
     const tip = if (collapsed) i18n.t(.pane_click_to_expand) else i18n.t(.pane_drag_to_resize);
     dvui.tooltip(@src(), .{ .active_rect = h.data().rectScale().r, .delay = 500_000 }, "{s}", .{tip}, .{});
-}
-
-/// Read PNG image dimensions from the IHDR chunk (first 24 bytes of a PNG file).
-fn parsePngDims(buf: []const u8) ?struct { w: u32, h: u32 } {
-    if (buf.len < 24) return null;
-    const sig = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
-    if (!std.mem.eql(u8, buf[0..8], &sig)) return null;
-    if (!std.mem.eql(u8, buf[12..16], "IHDR")) return null;
-    const w: u32 = (@as(u32, buf[16]) << 24) | (@as(u32, buf[17]) << 16) |
-                   (@as(u32, buf[18]) << 8)  | @as(u32, buf[19]);
-    const h: u32 = (@as(u32, buf[20]) << 24) | (@as(u32, buf[21]) << 16) |
-                   (@as(u32, buf[22]) << 8)  | @as(u32, buf[23]);
-    return .{ .w = w, .h = h };
-}
-
-/// Try to parse `text` as JSON and return a pretty-printed copy; returns null if
-/// the text is not valid JSON or allocation fails. Caller owns the returned slice.
-fn prettyJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
-    defer parsed.deinit();
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit(); // no-op after toOwnedSlice; cleans up on error paths
-    var js: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
-    js.write(parsed.value) catch return null;
-    return aw.toOwnedSlice() catch null;
-}
-
-const BytesFmt = struct { value: f64, unit: []const u8 };
-
-fn fmtBytes(bytes: i64) BytesFmt {
-    const b: f64 = @floatFromInt(if (bytes < 0) 0 else bytes);
-    if (b >= 1024 * 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0 * 1024.0), .unit = "GB" };
-    if (b >= 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0), .unit = "MB" };
-    if (b >= 1024) return .{ .value = b / 1024.0, .unit = "KB" };
-    return .{ .value = b, .unit = "B" };
 }
 
 const log = std.log.scoped(.app);
@@ -747,7 +637,7 @@ fn settingsModal() !void {
             _ = dvui.checkbox(@src(), &g_cfg.trash_enabled, i18n.t(.settings_trash_enable), .{ .margin = .{ .h = 6 } });
             if (g_cfg.trash_enabled) {
                 if (g_trash_stats) |ts| {
-                    const tb = fmtBytes(ts.total_bytes);
+                    const tb = detail_panel_mod.fmtBytes(ts.total_bytes);
                     var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
                         .expand = .horizontal,
                         .margin = .{ .h = 6 },
@@ -808,7 +698,7 @@ fn settingsModal() !void {
             dvui.label(@src(), "{s}", .{i18n.t(.settings_database_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
 
             if (g_db_stats) |stats| {
-                const total = fmtBytes(stats.total_bytes);
+                const total = detail_panel_mod.fmtBytes(stats.total_bytes);
                 dvui.label(@src(), "{s}{d:.1} {s}", .{ i18n.t(.settings_db_total_size_label), total.value, total.unit }, .{ .margin = .{ .h = 10 } });
 
                 // Thumbnails
@@ -818,7 +708,7 @@ fn settingsModal() !void {
                         .margin = .{ .h = 6 },
                     });
                     defer row.deinit();
-                    const tb = fmtBytes(stats.thumbnail_bytes);
+                    const tb = detail_panel_mod.fmtBytes(stats.thumbnail_bytes);
                     dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_thumbnails_label), stats.thumbnail_count, tb.value, tb.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
@@ -842,7 +732,7 @@ fn settingsModal() !void {
                         .margin = .{ .h = 6 },
                     });
                     defer row.deinit();
-                    const pe = fmtBytes(stats.prompt_embedding_count * 2048 * 4);
+                    const pe = detail_panel_mod.fmtBytes(stats.prompt_embedding_count * 2048 * 4);
                     dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_prompt_embeddings_label), stats.prompt_embedding_count, pe.value, pe.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
@@ -866,7 +756,7 @@ fn settingsModal() !void {
                         .margin = .{ .h = 6 },
                     });
                     defer row.deinit();
-                    const ie = fmtBytes(stats.image_embedding_count * 2048 * 4);
+                    const ie = detail_panel_mod.fmtBytes(stats.image_embedding_count * 2048 * 4);
                     dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_image_embeddings_label), stats.image_embedding_count, ie.value, ie.unit }, .{
                         .expand = .horizontal,
                         .gravity_y = 0.5,
@@ -951,106 +841,6 @@ fn deleteConfirmDialog() !void {
                 if (permanent) performDelete(init.io, init.gpa, grid)
                 else           performTrash(init.io, init.gpa, grid);
             }
-        }
-    }
-}
-
-/// Render one folder node and recursively its expanded children.
-/// Called from the sidebar; nodes are siblings (not inside each other).
-fn renderFolderNode(node: *FolderNode, lib: *LibraryState, depth: usize) void {
-    const in_lib_view = if (g_grid) |*g| g.view_mode == .library else false;
-    const indent_x: f32 = 8.0 + @as(f32, @floatFromInt(depth)) * 14.0;
-
-    // Stable id per node: hash of the path string.
-    const node_id_extra: usize = @truncate(std.hash.Fnv1a_32.hash(node.path));
-
-    const is_selected = in_lib_view and
-        g_filter_library_id == lib.id and
-        g_filter_folder != null and
-        std.mem.eql(u8, g_filter_folder.?, node.path);
-
-    const row_bg: dvui.Options = if (is_selected) .{
-        .background = true,
-        .color_fill = dvui.themeGet().focus,
-    } else .{};
-
-    const may_have_children = node.children.len > 0 or !node.loaded;
-
-    {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, row_bg.override(.{
-            .id_extra = node_id_extra,
-            .expand = .horizontal,
-            .padding = .{ .x = indent_x, .y = 1, .w = 4, .h = 1 },
-        }));
-        defer row.deinit();
-
-        // Clicking anywhere on the row: toggle expand (if applicable) and set filter.
-        if (dvui.clickedEx(row.data(), .{})) |_| {
-            if (may_have_children or node.expanded) {
-                node.expanded = !node.expanded;
-                if (node.expanded and !node.loaded) {
-                    if (dvui.App.main_init) |init| {
-                        if (g_db) |*db| {
-                            if (db.listImmediateSubdirs(init.gpa, lib.id, node.path)) |subs| {
-                                if (init.gpa.alloc(FolderNode, subs.len)) |new_nodes| {
-                                    for (subs, 0..) |s, i| {
-                                        new_nodes[i] = .{ .path = s.path, .count = s.count };
-                                    }
-                                    init.gpa.free(subs);
-                                    node.children = new_nodes;
-                                } else |_| {
-                                    for (subs) |s| init.gpa.free(s.path);
-                                    init.gpa.free(subs);
-                                }
-                            } else |_| {}
-                            node.loaded = true;
-                        }
-                    }
-                }
-            }
-            if (dvui.App.main_init) |init| {
-                if (g_filter_folder) |f| init.gpa.free(f);
-                g_filter_folder = init.gpa.dupe(u8, node.path) catch null;
-                g_filter_library_id = lib.id;
-            }
-            if (g_grid) |*grid| {
-                grid.filter_library_id = lib.id;
-                grid.filter_folder_path = g_filter_folder;
-                grid.view_mode = .library;
-                if (g_db) |*db| grid.reloadImages(db) catch {};
-            }
-        }
-
-        // Visual expand indicator (non-interactive icon).
-        if (may_have_children or node.expanded) {
-            const tvg = if (node.expanded) icons.tvg.lucide.@"chevron-down" else icons.tvg.lucide.@"chevron-right";
-            dvui.icon(@src(), "expand", tvg, .{}, .{
-                .id_extra = node_id_extra,
-                .min_size_content = .{ .w = 12, .h = 12 },
-                .gravity_y = 0.5,
-            });
-        } else {
-            _ = dvui.spacer(@src(), .{
-                .id_extra = node_id_extra,
-                .min_size_content = .{ .w = 12, .h = 0 },
-            });
-        }
-
-        dvui.label(@src(), "{s}", .{std.fs.path.basename(node.path)}, .{
-            .id_extra = node_id_extra,
-            .expand = .horizontal,
-            .gravity_y = 0.5,
-        });
-        dvui.label(@src(), "{d}", .{node.count}, .{
-            .id_extra = node_id_extra +% 1,
-            .gravity_y = 0.5,
-            .padding = .{ .x = 4, .w = 0 },
-        });
-    }
-
-    if (node.expanded) {
-        for (node.children) |*child| {
-            renderFolderNode(child, lib, depth + 1);
         }
     }
 }
@@ -1237,7 +1027,7 @@ fn frame() !dvui.App.Result {
         if (grid.images.items.len != prev_len) {
             if (g_db) |*db| {
                 g_total_image_count = db.getTotalImageCount() catch g_total_image_count;
-                for (g_libraries.items) |*lib| {
+                for (g_sidebar.libraries.items) |*lib| {
                     lib.image_count = db.getLibraryImageCount(lib.id) catch lib.image_count;
                 }
             }
@@ -1266,23 +1056,13 @@ fn frame() !dvui.App.Result {
         }
     }
 
-    if (g_pending_library_len > 0) {
-        const path = g_pending_library_buf[0..g_pending_library_len];
-        g_pending_library_len = 0;
-        if (dvui.App.main_init) |init| {
-            const duped = try init.gpa.dupe(u8, path);
-            const lib_id: u64 = if (g_library_manager) |*mgr|
-                mgr.addLibrary(init.io, duped) catch 0
-            else if (g_db) |*db|
-                db.storeLibrary(duped) catch 0
-            else
-                0;
-            try g_libraries.append(init.gpa, .{
-                .id = lib_id,
-                .path = duped,
-                .image_count = 0,
-            });
-        }
+    if (dvui.App.main_init) |init| {
+        try g_sidebar.drainPendingLibrary(
+            init.gpa,
+            init.io,
+            if (g_library_manager) |*mgr| mgr else null,
+            if (g_db) |*db| db else null,
+        );
     }
 
     // ── Main column ──────────────────────────────────────────────────────
@@ -1460,211 +1240,16 @@ fn frame() !dvui.App.Result {
 
         // ── Left sidebar ──────────────────────────────────────────────────
         if (g_left_w >= 2) {
-            var sidebar = dvui.box(@src(), .{}, .{
-                .min_size_content = .{ .w = g_left_w, .h = 0 },
-                .expand = .vertical,
-                .background = true,
-            });
-            defer sidebar.deinit();
-
-            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
-            defer scroll.deinit();
-
-            // ── "Library" master header (clears filter, shows all) ───────────
-            {
-                const in_library = if (g_grid) |*g| g.view_mode == .library else true;
-                const unfiltered = g_filter_library_id == null and g_filter_folder == null;
-                const bg: dvui.Options = if (in_library and unfiltered) .{
-                    .background = true,
-                    .color_fill = dvui.themeGet().focus,
-                } else .{};
-                var lib_hdr = dvui.box(@src(), .{ .dir = .horizontal }, bg.override(.{
-                    .expand = .horizontal,
-                    .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
-                }));
-                defer lib_hdr.deinit();
-                {
-                    var lbl_area = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 0.5 });
-                    defer lbl_area.deinit();
-                    if (dvui.clickedEx(lbl_area.data(), .{})) |_| {
-                        if (dvui.App.main_init) |init| {
-                            if (g_filter_folder) |f| init.gpa.free(f);
-                            g_filter_folder = null;
-                            g_filter_library_id = null;
-                        }
-                        if (g_grid) |*grid| {
-                            grid.filter_library_id = null;
-                            grid.filter_folder_path = null;
-                            grid.view_mode = .library;
-                            if (g_db) |*db| grid.reloadImages(db) catch {};
-                        }
-                    }
-                    dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
-                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                }
-                if (dvui.buttonIcon(@src(), "add library", dvui.entypo.plus, .{}, .{}, .{
-                    .min_size_content = .{ .w = 12, .h = 12 },
-                    .gravity_y = 0.5,
-                    .padding = dvui.Rect.all(3),
-                })) {
-                    if (!g_library_dialog_open) {
-                        g_library_dialog_open = true;
-                        const sdl: *SDLBackend = dvui.currentWindow().backend.impl;
-                        SDLBackend.c.SDL_ShowOpenFolderDialog(
-                            libraryFolderCallback,
-                            null,
-                            sdl.window,
-                            null,
-                            false,
-                        );
-                    }
-                }
-            }
-
-            if (g_libraries.items.len == 0) {
-                dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{ .padding = .all(8) });
-            } else {
-                for (g_libraries.items, 0..) |*lib, idx| {
-                    const in_lib_view = if (g_grid) |*g| g.view_mode == .library else false;
-                    const lib_selected = g_filter_library_id == lib.id and g_filter_folder == null;
-
-                    // ── Library header row (horizontal, closed by block) ──
-                    var row_hov = false;
-                    {
-                        const lib_bg: dvui.Options = if (lib_selected and in_lib_view) .{
-                            .background = true,
-                            .color_fill = dvui.themeGet().focus,
-                        } else .{};
-                        var lib_row = dvui.box(@src(), .{ .dir = .horizontal }, lib_bg.override(.{
-                            .id_extra = idx,
-                            .expand = .horizontal,
-                            .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
-                        }));
-                        defer lib_row.deinit();
-
-                        const row_id = lib_row.data().id;
-                        row_hov = dvui.dataGet(null, row_id, "_hov", bool) orelse false;
-                        for (dvui.events()) |*e| {
-                            if (e.evt == .mouse and e.evt.mouse.action == .position)
-                                row_hov = dvui.eventMatchSimple(e, lib_row.data());
-                        }
-                        dvui.dataSet(null, row_id, "_hov", row_hov);
-
-                        // Expand/collapse toggle
-                        const expand_tvg = if (lib.expanded) icons.tvg.lucide.@"chevron-down" else icons.tvg.lucide.@"chevron-right";
-                        if (dvui.buttonIcon(@src(), "expand", expand_tvg, .{}, .{}, .{
-                            .id_extra = idx,
-                            .min_size_content = .{ .w = 14, .h = 14 },
-                            .gravity_y = 0.5,
-                            .padding = dvui.Rect.all(2),
-                            .margin = .{},
-                        })) {
-                            lib.expanded = !lib.expanded;
-                            if (lib.expanded and !lib.top_loaded) {
-                                if (dvui.App.main_init) |init| {
-                                    if (g_db) |*db| {
-                                        if (db.listImmediateSubdirs(init.gpa, lib.id, lib.path)) |subs| {
-                                            if (init.gpa.alloc(FolderNode, subs.len)) |new_nodes| {
-                                                for (subs, 0..) |s, i| {
-                                                    new_nodes[i] = .{ .path = s.path, .count = s.count };
-                                                }
-                                                init.gpa.free(subs);
-                                                lib.top_folders = new_nodes;
-                                            } else |_| {
-                                                for (subs) |s| init.gpa.free(s.path);
-                                                init.gpa.free(subs);
-                                            }
-                                        } else |_| {}
-                                        lib.top_loaded = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Library name (click to filter to this library)
-                        {
-                            var name_area = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                                .id_extra = idx,
-                                .expand = .horizontal,
-                                .gravity_y = 0.5,
-                            });
-                            defer name_area.deinit();
-                            if (dvui.clickedEx(name_area.data(), .{})) |_| {
-                                if (dvui.App.main_init) |init| {
-                                    if (g_filter_folder) |f| init.gpa.free(f);
-                                    g_filter_folder = null;
-                                    g_filter_library_id = lib.id;
-                                }
-                                if (g_grid) |*grid| {
-                                    grid.filter_library_id = lib.id;
-                                    grid.filter_folder_path = null;
-                                    grid.view_mode = .library;
-                                    if (g_db) |*db| grid.reloadImages(db) catch {};
-                                }
-                            }
-                            dvui.label(@src(), "{s}", .{std.fs.path.basename(lib.path)}, .{
-                                .id_extra = idx,
-                                .expand = .horizontal,
-                                .gravity_y = 0.5,
-                            });
-                        }
-
-                        // Image count badge
-                        dvui.label(@src(), "{d}", .{lib.image_count}, .{
-                            .id_extra = idx,
-                            .gravity_y = 0.5,
-                            .padding = .{ .x = 4, .w = 0 },
-                        });
-
-                        // Remove button (shown on hover)
-                        if (row_hov) {
-                            if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
-                                .id_extra = idx,
-                                .min_size_content = .{ .w = 10, .h = 10 },
-                                .gravity_y = 0.5,
-                                .padding = dvui.Rect.all(2),
-                            })) {
-                                g_confirm_remove_idx = idx;
-                            }
-                        }
-                    } // lib_row closed here
-
-                    // ── Folder tree (sibling rows, indented) ─────────────
-                    if (lib.expanded) {
-                        for (lib.top_folders) |*node| {
-                            renderFolderNode(node, lib, 1);
-                        }
-                    }
-                }
-            }
-
-            // ── Trash section ─────────────────────────────────────────────
-            if (g_cfg.trash_enabled) {
-                _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
-
-                const in_trash = if (g_grid) |*g| g.view_mode == .trash else false;
-                const trash_bg: dvui.Options = if (in_trash) .{
-                    .background = true,
-                    .color_fill = dvui.themeGet().focus,
-                } else .{};
-                var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, trash_bg.override(.{
-                    .expand = .horizontal,
-                    .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
-                }));
-                defer trash_row.deinit();
-                if (dvui.clickedEx(trash_row.data(), .{})) |_| {
-                    if (g_grid) |*grid| {
-                        if (grid.view_mode != .trash) {
-                            grid.view_mode = .trash;
-                            if (g_db) |*db| grid.reloadImages(db) catch {};
-                        }
-                    }
-                }
-                dvui.label(@src(), "{s}", .{i18n.t(.sidebar_trash)}, .{ .font = bold, .gravity_y = 0.5 });
-                if (g_trash_stats) |ts| {
-                    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                    dvui.label(@src(), "{d}", .{ts.count}, .{ .gravity_y = 0.5 });
-                }
+            if (dvui.App.main_init) |init| {
+                if (try g_sidebar.render(
+                    g_left_w,
+                    init.gpa,
+                    if (g_db) |*db| db else null,
+                    if (g_grid) |*g| g else null,
+                    if (g_library_manager) |*mgr| mgr else null,
+                    g_cfg.trash_enabled,
+                    g_trash_stats,
+                )) refreshCounts();
             }
         }
 
@@ -1687,280 +1272,20 @@ fn frame() !dvui.App.Result {
 
         // ── Right: metadata panel ─────────────────────────────────────────
         if (g_right_w >= 2) {
-            // Refresh detail when the focused image changes.
             const focused_id: ?u64 = if (g_grid) |*grid|
                 if (grid.focused_idx) |fi|
                     (if (fi < grid.images.items.len) grid.images.items[fi].id else null)
                 else null
             else null;
-
-            if (focused_id != g_detail_id) {
-                if (g_detail) |*d| {
-                    if (dvui.App.main_init) |init| d.deinit(init.gpa);
-                    g_detail = null;
-                }
-                g_detail_id = focused_id;
-                if (focused_id) |fid| {
-                    if (g_db) |*db| {
-                        if (dvui.App.main_init) |init| {
-                            if (db.getImageDetails(init.gpa, fid) catch null) |det| {
-                                g_detail = det;
-                                const img_path = g_detail.?.library_path;
-                                // File size (best-effort).
-                                if (std.Io.Dir.cwd().openFile(init.io, img_path, .{})) |f| {
-                                    defer f.close(init.io);
-                                    if (f.length(init.io)) |sz| {
-                                        g_detail.?.file_size = @intCast(sz);
-                                    } else |_| {}
-                                } else |_| {}
-                                // PNG dims + raw text chunks (best-effort).
-                                var maybe_parser: ?png_mod.PngParser = png_mod.PngParser.init(init.gpa, init.io) catch null;
-                                if (maybe_parser) |*parser| {
-                                    defer parser.deinit();
-                                    if (parser.parseFile(img_path)) |_| {
-                                        // Dims from IHDR chunk.
-                                        for (parser.chunks.items) |pc| {
-                                            if (std.mem.eql(u8, &pc.type, &png_mod.ChunkType.IHDR) and pc.data.len >= 8) {
-                                                g_detail.?.width = std.mem.readInt(u32, pc.data[0..4], .big);
-                                                g_detail.?.height = std.mem.readInt(u32, pc.data[4..8], .big);
-                                                break;
-                                            }
-                                        }
-                                        // Raw text chunks.
-                                        var raw_list: std.ArrayList(db_mod.RawChunk) = .empty;
-                                        const text_chunks = parser.getTExtChunks() catch &[_]png_mod.Chunk{};
-                                        defer init.gpa.free(text_chunks);
-                                        for (text_chunks) |tc| {
-                                            const c = parser.parseTExtChunk(tc) catch continue;
-                                            const kw = c.keyword;
-                                            const raw_text = c.text;
-                                            const maybe_pretty = prettyJson(init.gpa, raw_text);
-                                            const display = maybe_pretty orelse raw_text;
-                                            if (maybe_pretty != null) init.gpa.free(raw_text);
-                                            raw_list.append(init.gpa, .{
-                                                .keyword = kw,
-                                                .display_text = display,
-                                                .is_json = maybe_pretty != null,
-                                            }) catch {
-                                                init.gpa.free(kw);
-                                                init.gpa.free(display);
-                                            };
-                                        }
-                                        const itxt_chunks = parser.getITxtChunks() catch &[_]png_mod.Chunk{};
-                                        defer init.gpa.free(itxt_chunks);
-                                        for (itxt_chunks) |tc| {
-                                            var c = parser.parseITxtChunk(tc) catch continue;
-                                            if (c.compressed) { c.deinit(init.gpa); continue; }
-                                            const kw = c.keyword;
-                                            const raw_text = c.text;
-                                            init.gpa.free(c.language);
-                                            init.gpa.free(c.translated_keyword);
-                                            const maybe_pretty = prettyJson(init.gpa, raw_text);
-                                            const display = maybe_pretty orelse raw_text;
-                                            if (maybe_pretty != null) init.gpa.free(raw_text);
-                                            raw_list.append(init.gpa, .{
-                                                .keyword = kw,
-                                                .display_text = display,
-                                                .is_json = maybe_pretty != null,
-                                            }) catch {
-                                                init.gpa.free(kw);
-                                                init.gpa.free(display);
-                                            };
-                                        }
-                                        if (raw_list.items.len > 0) {
-                                            if (raw_list.toOwnedSlice(init.gpa)) |sl| {
-                                                g_detail.?.raw_chunks = sl;
-                                                g_detail.?.raw_chunks_owned = true;
-                                            } else |_| {
-                                                for (raw_list.items) |*rc| {
-                                                    init.gpa.free(rc.keyword);
-                                                    init.gpa.free(rc.display_text);
-                                                }
-                                                raw_list.deinit(init.gpa);
-                                            }
-                                        }
-                                    } else |_| {}
-                                }
-                            }
-                        }
-                    }
-                }
+            const filename: []const u8 = if (g_grid) |*grid|
+                if (grid.focused_idx) |fi|
+                    (if (fi < grid.images.items.len) grid.images.items[fi].filename else "")
+                else ""
+            else "";
+            if (dvui.App.main_init) |init| {
+                if (g_db) |*db| g_detail.update(focused_id, db, init.gpa, init.io);
             }
-
-            var meta = dvui.box(@src(), .{}, .{
-                .min_size_content = .{ .w = g_right_w, .h = 0 },
-                .max_size_content = .{ .w = g_right_w, .h = 0 },
-                .expand = .vertical,
-                .background = true,
-            });
-            defer meta.deinit();
-
-            // Header: filename of the focused image.
-            {
-                var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                    .expand = .horizontal,
-                    .padding = .{ .x = 8, .y = 6 },
-                });
-                defer header.deinit();
-                const title: []const u8 = if (g_grid) |*grid|
-                    if (grid.focused_idx) |fi|
-                        (if (fi < grid.images.items.len) grid.images.items[fi].filename else "")
-                    else ""
-                else "";
-                if (title.len > 0) {
-                    var tl = dvui.textLayout(@src(), .{}, .{
-                        .font = bold,
-                        .expand = .horizontal,
-                        .background = false,
-                    });
-                    tl.addText(title, .{});
-                    tl.deinit();
-                } else {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_no_image)}, .{ .font = bold });
-                }
-            }
-
-            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
-            defer scroll.deinit();
-
-            if (g_detail) |d| {
-                // Bold section header style.
-                const bp: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 4, .h = 0 } };
-                // Value for block (multi-line) fields — uses textLayout for wrapping.
-                const lp: dvui.Options = .{
-                    .padding = .{ .x = 8, .y = 2, .h = 6 },
-                    .expand = .horizontal,
-                    .background = false,
-                };
-                // Value for compact single-line fields inside horizontal rows.
-                const sp: dvui.Options = .{
-                    .padding = .{ .x = 8, .y = 2, .h = 6 },
-                    .expand = .horizontal,
-                };
-
-                // ── Prompts (block, wrapping) ────────────────────────────────
-                if (d.positive_prompt_text) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_prompt)}, bp);
-                    var tl = dvui.textLayout(@src(), .{}, lp);
-                    tl.addText(v, .{});
-                    tl.deinit();
-                }
-                if (d.negative_prompt_text) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_negative_prompt)}, bp);
-                    var tl = dvui.textLayout(@src(), .{}, lp);
-                    tl.addText(v, .{});
-                    tl.deinit();
-                }
-
-                // ── Model (block) ────────────────────────────────────────────
-                if (d.model) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_model)}, bp);
-                    var tl = dvui.textLayout(@src(), .{}, lp);
-                    tl.addText(v, .{});
-                    tl.deinit();
-                }
-
-                // ── Sampler + Scheduler (side by side) ───────────────────────
-                if (d.sampler != null or d.scheduler != null) {
-                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-                    defer hrow.deinit();
-                    if (d.sampler) |v| {
-                        var sampler_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer sampler_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_sampler)}, bp);
-                        dvui.label(@src(), "{s}", .{v}, sp);
-                    }
-                    if (d.scheduler) |v| {
-                        var scheduler_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer scheduler_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_scheduler)}, bp);
-                        dvui.label(@src(), "{s}", .{v}, sp);
-                    }
-                }
-
-                // ── CFG / Steps / Seed (compact row) ────────────────────────
-                if (d.cfg != null or d.steps != null or d.seed != null) {
-                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-                    defer hrow.deinit();
-                    if (d.cfg) |v| {
-                        var cfg_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer cfg_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_cfg)}, bp);
-                        dvui.label(@src(), "{d:.1}", .{v}, sp);
-                    }
-                    if (d.steps) |v| {
-                        var steps_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer steps_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_steps)}, bp);
-                        dvui.label(@src(), "{d}", .{v}, sp);
-                    }
-                    if (d.seed) |v| {
-                        var seed_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer seed_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_seed)}, bp);
-                        dvui.label(@src(), "{d}", .{v}, sp);
-                    }
-                }
-
-                // ── Resolution + File Size (compact row) ─────────────────────
-                if (d.width != null or d.file_size != null) {
-                    var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-                    defer hrow.deinit();
-                    if (d.width) |w| {
-                        if (d.height) |h| {
-                            var res_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                            defer res_col.deinit();
-                            dvui.label(@src(), "{s}", .{i18n.t(.detail_resolution)}, bp);
-                            dvui.label(@src(), "{d}\u{00d7}{d}", .{ w, h }, sp);
-                        }
-                    }
-                    if (d.file_size) |sz| {
-                        const fb = fmtBytes(sz);
-                        var size_col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                        defer size_col.deinit();
-                        dvui.label(@src(), "{s}", .{i18n.t(.detail_size)}, bp);
-                        dvui.label(@src(), "{d:.1} {s}", .{ fb.value, fb.unit }, sp);
-                    }
-                }
-
-                // ── LoRAs (block) ────────────────────────────────────────────
-                if (d.loras) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_loras)}, bp);
-                    var tl = dvui.textLayout(@src(), .{}, lp);
-                    tl.addText(v, .{});
-                    tl.deinit();
-                }
-
-                // ── Trashed / Path / Date (single-line rows) ─────────────────
-                if (d.trashed_at) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_trashed_at)}, bp);
-                    dvui.label(@src(), "{s}", .{v}, sp);
-                }
-                dvui.label(@src(), "{s}", .{i18n.t(.detail_path)}, bp);
-                {
-                    var tl = dvui.textLayout(@src(), .{}, lp);
-                    tl.addText(d.library_path, .{});
-                    tl.deinit();
-                }
-                if (d.creation_date) |v| {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_date)}, bp);
-                    dvui.label(@src(), "{s}", .{v}, sp);
-                }
-
-                // ── Raw metadata (collapsible per chunk) ─────────────────────
-                if (d.raw_chunks.len > 0) {
-                    dvui.label(@src(), "{s}", .{i18n.t(.detail_raw_metadata)}, bp);
-                    for (d.raw_chunks, 0..) |rc, ci| {
-                        if (dvui.expander(@src(), rc.keyword, .{ .default_expanded = false }, .{ .expand = .horizontal, .id_extra = ci })) {
-                            var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .id_extra = ci }));
-                            tl.addText(rc.display_text, .{});
-                            tl.deinit();
-                        }
-                    }
-                }
-            } else if (focused_id != null) {
-                dvui.label(@src(), "(loading…)", .{}, .{ .padding = .all(8) });
-            }
+            g_detail.renderPanel(g_right_w, filename);
         }
     }
 
@@ -1985,7 +1310,7 @@ fn frame() !dvui.App.Result {
                 });
             }
             const displayed: usize = if (g_grid) |*grid| grid.images.items.len else 0;
-            const is_filtered = g_filter_library_id != null or g_filter_folder != null;
+            const is_filtered = g_sidebar.filter_library_id != null or g_sidebar.filter_folder != null;
             if (is_filtered) {
                 dvui.label(@src(), "{d} {s} ({s} {d})", .{
                     displayed,
@@ -2039,68 +1364,6 @@ fn frame() !dvui.App.Result {
                     };
                 }
             }
-        }
-    }
-
-    // ── Library removal confirmation modal ────────────────────────────────────
-    if (g_confirm_remove_idx) |idx| {
-        if (idx < g_libraries.items.len) {
-            const lib = &g_libraries.items[idx];
-            const name = std.fs.path.basename(lib.path);
-
-            var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{
-                .min_size_content = .{ .w = 360, .h = 0 },
-            });
-            defer float.deinit();
-            float.autoSize();
-
-            var content = dvui.box(@src(), .{}, .{
-                .expand = .both,
-                .padding = .all(16),
-            });
-            defer content.deinit();
-
-            dvui.label(@src(), "{s}", .{i18n.t(.library_remove_title)}, .{ .font = bold, .margin = .{ .h = 6 } });
-            dvui.label(@src(), "{s}", .{name}, .{});
-            dvui.label(@src(), "{s}", .{lib.path}, .{ .margin = .{ .h = 14 } });
-
-            {
-                var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
-                defer btn_row.deinit();
-
-                if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
-                    g_confirm_remove_idx = null;
-                }
-                if (dvui.button(@src(), i18n.t(.action_remove), .{}, .{ .margin = .all(4) })) {
-                    g_confirm_remove_idx = null;
-                    if (dvui.App.main_init) |init| {
-                        var removed = g_libraries.orderedRemove(idx);
-                        const removed_id = removed.id;
-                        if (g_library_manager) |*mgr| {
-                            mgr.removeLibrary(removed.path) catch {};
-                        } else if (g_db) |*db| {
-                            _ = db.removeLibrary(removed.path) catch {};
-                        }
-                        removed.deinit(init.gpa);
-                        // Clear filter if it was pointing at the removed library.
-                        if (g_filter_library_id == removed_id) {
-                            if (g_filter_folder) |f| init.gpa.free(f);
-                            g_filter_folder = null;
-                            g_filter_library_id = null;
-                            if (g_grid) |*grid| {
-                                grid.filter_library_id = null;
-                                grid.filter_folder_path = null;
-                            }
-                        }
-                        if (g_grid) |*grid| {
-                            if (g_db) |*db| grid.reloadImages(db) catch {};
-                        }
-                        refreshCounts();
-                    }
-                }
-            }
-        } else {
-            g_confirm_remove_idx = null;
         }
     }
 

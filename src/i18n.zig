@@ -88,6 +88,19 @@ pub const Strings = struct {
     toolbar_sort_ascending: [:0]const u8,
     toolbar_sort_descending: [:0]const u8,
     toolbar_reshuffle: [:0]const u8,
+
+    context_view_image: [:0]const u8,
+
+    viewer_zoom_fit: [:0]const u8,
+    viewer_zoom_100: [:0]const u8,
+    viewer_fullscreen: [:0]const u8,
+    viewer_exit_fullscreen: [:0]const u8,
+    viewer_toggle_info: [:0]const u8,
+    viewer_prev: [:0]const u8,
+    viewer_next: [:0]const u8,
+    viewer_of: [:0]const u8,
+    viewer_loading: [:0]const u8,
+    viewer_delete: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -176,6 +189,19 @@ pub const en: Strings = .{
     .toolbar_sort_ascending = "Ascending",
     .toolbar_sort_descending = "Descending",
     .toolbar_reshuffle = "Re-randomize order",
+
+    .context_view_image = "View Image",
+
+    .viewer_zoom_fit = "Fit",
+    .viewer_zoom_100 = "1:1",
+    .viewer_fullscreen = "Fullscreen",
+    .viewer_exit_fullscreen = "Exit Fullscreen",
+    .viewer_toggle_info = "Info",
+    .viewer_prev = "Previous image",
+    .viewer_next = "Next image",
+    .viewer_of = "of",
+    .viewer_loading = "Loading\u{2026}",
+    .viewer_delete = "Delete",
 };
 
 pub var active: *const Strings = &en;
