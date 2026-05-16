@@ -66,6 +66,9 @@ pub const Strings = struct {
 
     status_bar_image_count: [:0]const u8,
     status_no_database: [:0]const u8,
+    status_images: [:0]const u8,
+    status_out_of: [:0]const u8,
+    folder_root_label: [:0]const u8,
 
     action_cancel: [:0]const u8,
     action_close: [:0]const u8,
@@ -74,6 +77,13 @@ pub const Strings = struct {
 
     pane_click_to_expand: [:0]const u8,
     pane_drag_to_resize: [:0]const u8,
+
+    toolbar_sort_by_date: [:0]const u8,
+    toolbar_sort_by_name: [:0]const u8,
+    toolbar_sort_randomly: [:0]const u8,
+    toolbar_sort_ascending: [:0]const u8,
+    toolbar_sort_descending: [:0]const u8,
+    toolbar_reshuffle: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -140,6 +150,9 @@ pub const en: Strings = .{
 
     .status_bar_image_count = "Images: ",
     .status_no_database = "no database",
+    .status_images = "images",
+    .status_out_of = "out of",
+    .folder_root_label = "(root)",
 
     .action_cancel = "Cancel",
     .action_close = "Close",
@@ -148,6 +161,13 @@ pub const en: Strings = .{
 
     .pane_click_to_expand = "Click to expand",
     .pane_drag_to_resize = "Click to collapse \u{00b7} Drag to resize",
+
+    .toolbar_sort_by_date = "Sort by date",
+    .toolbar_sort_by_name = "Sort by name",
+    .toolbar_sort_randomly = "Sort randomly",
+    .toolbar_sort_ascending = "Ascending",
+    .toolbar_sort_descending = "Descending",
+    .toolbar_reshuffle = "Re-randomize order",
 };
 
 pub var active: *const Strings = &en;

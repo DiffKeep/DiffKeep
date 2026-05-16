@@ -4,6 +4,7 @@ const dvui = @import("dvui");
 const known_folders = @import("known-folders");
 
 const build_options = @import("build_options");
+const icons = @import("icons");
 const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
 const png_mod = @import("image/png-data.zig");
@@ -36,6 +37,42 @@ var g_library_dialog_open: bool = false;
 var g_settings_open: bool = false;
 var g_db_stats: ?db_mod.DbStats = null;
 var g_trash_stats: ?db_mod.TrashStats = null;
+var g_total_image_count: i64 = 0;
+
+// Sidebar filter state
+var g_filter_library_id: ?u64 = null;
+var g_filter_folder: ?[]const u8 = null; // heap-allocated owned copy
+
+const LibraryState = struct {
+    id: u64,
+    path: []const u8,           // owned
+    image_count: i64 = 0,
+    expanded: bool = false,
+    top_folders: []FolderNode = &.{},  // immediate subdirs of library root; owned
+    top_loaded: bool = false,
+
+    fn deinit(self: *LibraryState, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        freeFolderNodes(allocator, self.top_folders);
+    }
+};
+
+/// A node in the library folder tree. Populated lazily when the user expands a node.
+const FolderNode = struct {
+    path: []const u8,         // full absolute path, heap-allocated, owned
+    count: i64,               // images in this subtree (all descendants)
+    children: []FolderNode = &.{},  // heap-allocated; empty until loaded
+    loaded: bool = false,     // true once children have been fetched
+    expanded: bool = false,
+};
+
+fn freeFolderNodes(allocator: std.mem.Allocator, nodes: []FolderNode) void {
+    for (nodes) |*n| {
+        allocator.free(n.path);
+        freeFolderNodes(allocator, n.children);
+    }
+    if (nodes.len > 0) allocator.free(nodes);
+}
 
 // Delete confirmation dialog state
 var g_skip_delete_confirm: bool = false;           // don't ask again for single soft-delete
@@ -49,12 +86,37 @@ const ScanSnapshot = struct { thumbnails_in_db: bool = false, prompt_embeddings:
 var g_settings_scan_snapshot: ScanSnapshot = .{};
 var g_pending_library_buf: [4096]u8 = undefined;
 var g_pending_library_len: usize = 0;
-var g_libraries: std.ArrayList([]const u8) = .empty;
+var g_libraries: std.ArrayList(LibraryState) = .empty;
 var g_confirm_remove_idx: ?usize = null;
+
+// Search state: text buffer written by the textEntry widget each frame.
+// g_search_prev mirrors it so we can detect changes and trigger a DB reload.
+var g_search_buf: [256]u8 = std.mem.zeroes([256]u8);
+var g_search_prev: [256]u8 = std.mem.zeroes([256]u8);
 
 // Right-panel detail: tracks the currently-displayed image so we only re-query on change.
 var g_detail_id: ?u64 = null;
 var g_detail: ?db_mod.ImageDetails = null;
+
+/// Refresh image counts for all libraries, total count, and trash stats.
+/// Called at init and after any operation that changes counts.
+fn refreshCounts() void {
+    if (dvui.App.main_init) |init| {
+        if (g_db) |*db| {
+            g_total_image_count = db.getTotalImageCount() catch 0;
+            g_trash_stats = db.getTrashStats() catch null;
+            for (g_libraries.items) |*lib| {
+                lib.image_count = db.getLibraryImageCount(lib.id) catch 0;
+                // Invalidate cached folder tree so next expansion reloads it.
+                if (lib.top_loaded) {
+                    freeFolderNodes(init.gpa, lib.top_folders);
+                    lib.top_folders = &.{};
+                    lib.top_loaded = false;
+                }
+            }
+        }
+    }
+}
 
 fn libraryFolderCallback(_: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
     g_library_dialog_open = false;
@@ -177,9 +239,20 @@ fn appInit(win: *dvui.Window) !void {
         try vips_mod.init();
 
         if (g_db) |*db| {
-            const paths = db.listLibraries(init.gpa) catch &[_][]const u8{};
-            defer init.gpa.free(paths);
-            try g_libraries.appendSlice(init.gpa, paths);
+            if (db.listLibraries(init.gpa)) |libs| {
+                defer {
+                    for (libs) |li| init.gpa.free(li.path);
+                    init.gpa.free(libs);
+                }
+                for (libs) |li| {
+                    const count = db.getLibraryImageCount(li.id) catch 0;
+                    try g_libraries.append(init.gpa, .{
+                        .id = li.id,
+                        .path = try init.gpa.dupe(u8, li.path),
+                        .image_count = count,
+                    });
+                }
+            } else |_| {}
 
             // Register a custom SDL event so the worker thread can wake the render loop
             // when a thumbnail is ready (dvui only renders on input otherwise).
@@ -188,7 +261,10 @@ fn appInit(win: *dvui.Window) !void {
             // Init grid before library manager so we can pass the notifier pointer.
             // Grid must be at its final global address before startWorker() is called.
             g_grid = try image_grid_mod.GridState.init(init.io, init.gpa, db, g_cfg.thumbnails_in_db, wakeupFrame);
-            if (g_grid) |*grid| try grid.startWorker();
+            if (g_grid) |*grid| {
+                grid.data_dir = g_data_dir;
+                try grid.startWorker();
+            }
 
             // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s
             // concurrent task receives &g_library_manager.? (stable global address)
@@ -200,6 +276,10 @@ fn appInit(win: *dvui.Window) !void {
                     std.log.warn("startup scan queue failed: {}", .{err});
                 };
             }
+
+            // Initialize counts and trash stats.
+            g_total_image_count = db.getTotalImageCount() catch 0;
+            g_trash_stats = db.getTrashStats() catch null;
         }
     } else {
         try vips_mod.init();
@@ -243,8 +323,9 @@ fn appDeinit() void {
             init.gpa.free(cfg_path);
         }
         g_cfg.deinit(init.gpa);
-        for (g_libraries.items) |p| init.gpa.free(p);
+        for (g_libraries.items) |*lib| lib.deinit(init.gpa);
         g_libraries.deinit(init.gpa);
+        if (g_filter_folder) |f| init.gpa.free(f);
         if (g_data_dir) |d| init.gpa.free(d);
     }
 }
@@ -343,14 +424,14 @@ fn panelHandle(
     dvui.dataSet(null, id, "_drag", dragged);
 
     {
-        const ch: []const u8 = switch (side) {
-            .left => if (collapsed) "›" else "‹",
-            .right => if (collapsed) "‹" else "›",
+        const tvg = switch (side) {
+            .left  => if (collapsed) icons.tvg.lucide.@"chevron-right" else icons.tvg.lucide.@"chevron-left",
+            .right => if (collapsed) icons.tvg.lucide.@"chevron-left"  else icons.tvg.lucide.@"chevron-right",
         };
-        dvui.label(@src(), "{s}", .{ch}, .{
+        dvui.icon(@src(), "pane_toggle", tvg, .{}, .{
             .gravity_y = 0.5,
             .gravity_x = 0.5,
-            .expand = .both,
+            .min_size_content = .{ .w = 10, .h = 10 },
         });
     }
 
@@ -493,6 +574,7 @@ fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.
     }
 
     removeFromGrid(grid, &ids);
+    refreshCounts();
 }
 
 /// Permanently delete selected images from disk and DB.
@@ -523,6 +605,7 @@ fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod
     }
 
     removeFromGrid(grid, &ids);
+    refreshCounts();
 }
 
 /// Restore selected trash items back to their original library paths.
@@ -552,6 +635,7 @@ fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mo
     }
 
     removeFromGrid(grid, &ids);
+    refreshCounts();
 }
 
 /// Open the delete confirmation dialog for the current grid selection.
@@ -855,6 +939,106 @@ fn deleteConfirmDialog() !void {
     }
 }
 
+/// Render one folder node and recursively its expanded children.
+/// Called from the sidebar; nodes are siblings (not inside each other).
+fn renderFolderNode(node: *FolderNode, lib: *LibraryState, depth: usize) void {
+    const in_lib_view = if (g_grid) |*g| g.view_mode == .library else false;
+    const indent_x: f32 = 8.0 + @as(f32, @floatFromInt(depth)) * 14.0;
+
+    // Stable id per node: hash of the path string.
+    const node_id_extra: usize = @truncate(std.hash.Fnv1a_32.hash(node.path));
+
+    const is_selected = in_lib_view and
+        g_filter_library_id == lib.id and
+        g_filter_folder != null and
+        std.mem.eql(u8, g_filter_folder.?, node.path);
+
+    const row_bg: dvui.Options = if (is_selected) .{
+        .background = true,
+        .color_fill = dvui.themeGet().focus,
+    } else .{};
+
+    const may_have_children = node.children.len > 0 or !node.loaded;
+
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, row_bg.override(.{
+            .id_extra = node_id_extra,
+            .expand = .horizontal,
+            .padding = .{ .x = indent_x, .y = 1, .w = 4, .h = 1 },
+        }));
+        defer row.deinit();
+
+        // Clicking anywhere on the row: toggle expand (if applicable) and set filter.
+        if (dvui.clickedEx(row.data(), .{})) |_| {
+            if (may_have_children or node.expanded) {
+                node.expanded = !node.expanded;
+                if (node.expanded and !node.loaded) {
+                    if (dvui.App.main_init) |init| {
+                        if (g_db) |*db| {
+                            if (db.listImmediateSubdirs(init.gpa, lib.id, node.path)) |subs| {
+                                if (init.gpa.alloc(FolderNode, subs.len)) |new_nodes| {
+                                    for (subs, 0..) |s, i| {
+                                        new_nodes[i] = .{ .path = s.path, .count = s.count };
+                                    }
+                                    init.gpa.free(subs);
+                                    node.children = new_nodes;
+                                } else |_| {
+                                    for (subs) |s| init.gpa.free(s.path);
+                                    init.gpa.free(subs);
+                                }
+                            } else |_| {}
+                            node.loaded = true;
+                        }
+                    }
+                }
+            }
+            if (dvui.App.main_init) |init| {
+                if (g_filter_folder) |f| init.gpa.free(f);
+                g_filter_folder = init.gpa.dupe(u8, node.path) catch null;
+                g_filter_library_id = lib.id;
+            }
+            if (g_grid) |*grid| {
+                grid.filter_library_id = lib.id;
+                grid.filter_folder_path = g_filter_folder;
+                grid.view_mode = .library;
+                if (g_db) |*db| grid.reloadImages(db) catch {};
+            }
+        }
+
+        // Visual expand indicator (non-interactive icon).
+        if (may_have_children or node.expanded) {
+            const tvg = if (node.expanded) icons.tvg.lucide.@"chevron-down" else icons.tvg.lucide.@"chevron-right";
+            dvui.icon(@src(), "expand", tvg, .{}, .{
+                .id_extra = node_id_extra,
+                .min_size_content = .{ .w = 12, .h = 12 },
+                .gravity_y = 0.5,
+            });
+        } else {
+            _ = dvui.spacer(@src(), .{
+                .id_extra = node_id_extra,
+                .min_size_content = .{ .w = 12, .h = 0 },
+            });
+        }
+
+        dvui.label(@src(), "{s}", .{std.fs.path.basename(node.path)}, .{
+            .id_extra = node_id_extra,
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+        });
+        dvui.label(@src(), "{d}", .{node.count}, .{
+            .id_extra = node_id_extra +% 1,
+            .gravity_y = 0.5,
+            .padding = .{ .x = 4, .w = 0 },
+        });
+    }
+
+    if (node.expanded) {
+        for (node.children) |*child| {
+            renderFolderNode(child, lib, depth + 1);
+        }
+    }
+}
+
 fn frame() !dvui.App.Result {
     for (dvui.events()) |*e| {
         if (e.evt == .window and e.evt.window.action == .close) return .close;
@@ -862,7 +1046,18 @@ fn frame() !dvui.App.Result {
     }
 
     // Drain new images from scan threads and update thumbnail cache
-    if (g_grid) |*grid| grid.update();
+    if (g_grid) |*grid| {
+        const prev_len = grid.images.items.len;
+        grid.update();
+        if (grid.images.items.len != prev_len) {
+            if (g_db) |*db| {
+                g_total_image_count = db.getTotalImageCount() catch g_total_image_count;
+                for (g_libraries.items) |*lib| {
+                    lib.image_count = db.getLibraryImageCount(lib.id) catch lib.image_count;
+                }
+            }
+        }
+    }
 
     // Consume pending delete/restore requests raised by keyboard handlers
     if (g_grid) |*grid| {
@@ -876,17 +1071,32 @@ fn frame() !dvui.App.Result {
         }
     }
 
+    // Detect search text changes and reload the grid via FTS5
+    if (!std.mem.eql(u8, &g_search_buf, &g_search_prev)) {
+        @memcpy(&g_search_prev, &g_search_buf);
+        const q = std.mem.sliceTo(&g_search_buf, 0);
+        if (g_grid) |*grid| {
+            grid.search_query = if (q.len > 0) q else null;
+            if (g_db) |*db| grid.reloadImages(db) catch {};
+        }
+    }
+
     if (g_pending_library_len > 0) {
         const path = g_pending_library_buf[0..g_pending_library_len];
         g_pending_library_len = 0;
         if (dvui.App.main_init) |init| {
             const duped = try init.gpa.dupe(u8, path);
-            if (g_library_manager) |*mgr| {
-                _ = mgr.addLibrary(init.io, duped) catch {};
-            } else if (g_db) |*db| {
-                _ = db.storeLibrary(duped) catch {};
-            }
-            try g_libraries.append(init.gpa, duped);
+            const lib_id: u64 = if (g_library_manager) |*mgr|
+                mgr.addLibrary(init.io, duped) catch 0
+            else if (g_db) |*db|
+                db.storeLibrary(duped) catch 0
+            else
+                0;
+            try g_libraries.append(init.gpa, .{
+                .id = lib_id,
+                .path = duped,
+                .image_count = 0,
+            });
         }
     }
 
@@ -906,7 +1116,7 @@ fn frame() !dvui.App.Result {
         // Search field — expands to fill available width
         {
             var te = dvui.textEntry(@src(), .{
-                .text = .{ .internal = .{} },
+                .text = .{ .buffer = g_search_buf[0..] },
                 .placeholder = i18n.t(.search_placeholder),
             }, .{
                 .expand = .horizontal,
@@ -926,9 +1136,9 @@ fn frame() !dvui.App.Result {
             .margin = .{ .x = 2, .w = 2 },
             .gravity_y = 0.5,
         };
-        _ = dvui.button(@src(), "model: any \u{25bc}", .{}, chip.override(.{ .id_extra = 1 }));
-        _ = dvui.button(@src(), "aspect: 1:1 \u{25bc}", .{}, chip.override(.{ .id_extra = 2 }));
-        _ = dvui.button(@src(), "date: 30d \u{25bc}", .{}, chip.override(.{ .id_extra = 3 }));
+        _ = dvui.button(@src(), "model: any", .{}, chip.override(.{ .id_extra = 1 }));
+        _ = dvui.button(@src(), "aspect: 1:1", .{}, chip.override(.{ .id_extra = 2 }));
+        _ = dvui.button(@src(), "date: 30d", .{}, chip.override(.{ .id_extra = 3 }));
         _ = dvui.button(@src(), "+ filter", .{}, chip.override(.{ .id_extra = 4 }));
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
@@ -943,32 +1153,76 @@ fn frame() !dvui.App.Result {
             _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
             // Sort mode chip — cycles date → name → random on click
-            const sort_chip_label: []const u8 = switch (grid.sort_mode) {
-                .date => "sort: date \u{25bc}",
-                .name => "sort: name \u{25bc}",
-                .random => "sort: random \u{25bc}",
-            };
-            if (dvui.button(@src(), sort_chip_label, .{}, chip.override(.{ .id_extra = 5 }))) {
-                grid.sort_mode = switch (grid.sort_mode) {
-                    .date => .name,
-                    .name => .random,
-                    .random => .date,
+            {
+                const sort_mode_tvg = switch (grid.sort_mode) {
+                    .date   => icons.tvg.lucide.calendar,
+                    .name   => icons.tvg.lucide.@"a-arrow-down",
+                    .random => icons.tvg.entypo.shuffle,
                 };
-                grid.applySortOrder();
+                const sort_mode_tip = switch (grid.sort_mode) {
+                    .date   => i18n.t(.toolbar_sort_by_date),
+                    .name   => i18n.t(.toolbar_sort_by_name),
+                    .random => i18n.t(.toolbar_sort_randomly),
+                };
+                var bw: dvui.ButtonWidget = undefined;
+                bw.init(@src(), .{}, chip.override(.{ .id_extra = 5, .min_size_content = .{ .w = 16, .h = 16 } }));
+                defer bw.deinit();
+                bw.processEvents();
+                bw.drawBackground();
+                dvui.icon(@src(), "sort_mode_icon", sort_mode_tvg, .{}, .{
+                    .gravity_x = 0.5, .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .expand = .ratio,
+                });
+                if (bw.clicked()) {
+                    grid.sort_mode = switch (grid.sort_mode) {
+                        .date => .name,
+                        .name => .random,
+                        .random => .date,
+                    };
+                    grid.applySortOrder();
+                }
+                bw.drawFocus();
+                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{sort_mode_tip}, .{});
             }
 
             // Direction toggle (date/name) or re-randomize button (random)
             if (grid.sort_mode == .random) {
-                if (dvui.button(@src(), "~", .{}, chip.override(.{ .id_extra = 6 }))) {
+                var bw: dvui.ButtonWidget = undefined;
+                bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+                defer bw.deinit();
+                bw.processEvents();
+                bw.drawBackground();
+                dvui.icon(@src(), "reshuffle_icon", icons.tvg.lucide.dices, .{}, .{
+                    .gravity_x = 0.5, .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .expand = .ratio,
+                });
+                if (bw.clicked()) {
                     grid.sort_seed +%= 1;
                     grid.applySortOrder();
                 }
+                bw.drawFocus();
+                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{i18n.t(.toolbar_reshuffle)}, .{});
             } else {
-                const dir_ch: []const u8 = if (grid.sort_dir == .asc) "\u{2191}" else "\u{2193}";
-                if (dvui.button(@src(), dir_ch, .{}, chip.override(.{ .id_extra = 6 }))) {
+                const dir_tvg = if (grid.sort_dir == .asc) icons.tvg.lucide.@"arrow-up" else icons.tvg.lucide.@"arrow-down";
+                const dir_tip = if (grid.sort_dir == .asc) i18n.t(.toolbar_sort_ascending) else i18n.t(.toolbar_sort_descending);
+                var bw: dvui.ButtonWidget = undefined;
+                bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+                defer bw.deinit();
+                bw.processEvents();
+                bw.drawBackground();
+                dvui.icon(@src(), "sort_dir_icon", dir_tvg, .{}, .{
+                    .gravity_x = 0.5, .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .expand = .ratio,
+                });
+                if (bw.clicked()) {
                     grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
                     grid.applySortOrder();
                 }
+                bw.drawFocus();
+                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{dir_tip}, .{});
             }
         }
     }
@@ -990,10 +1244,11 @@ fn frame() !dvui.App.Result {
             var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
             defer scroll.deinit();
 
-            // Library view selector
+            // ── "Library" master header (clears filter, shows all) ───────────
             {
                 const in_library = if (g_grid) |*g| g.view_mode == .library else true;
-                const bg: dvui.Options = if (in_library) .{
+                const unfiltered = g_filter_library_id == null and g_filter_folder == null;
+                const bg: dvui.Options = if (in_library and unfiltered) .{
                     .background = true,
                     .color_fill = dvui.themeGet().focus,
                 } else .{};
@@ -1006,11 +1261,16 @@ fn frame() !dvui.App.Result {
                     var lbl_area = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 0.5 });
                     defer lbl_area.deinit();
                     if (dvui.clickedEx(lbl_area.data(), .{})) |_| {
+                        if (dvui.App.main_init) |init| {
+                            if (g_filter_folder) |f| init.gpa.free(f);
+                            g_filter_folder = null;
+                            g_filter_library_id = null;
+                        }
                         if (g_grid) |*grid| {
-                            if (grid.view_mode != .library) {
-                                grid.view_mode = .library;
-                                if (g_db) |*db| grid.reloadImages(db) catch {};
-                            }
+                            grid.filter_library_id = null;
+                            grid.filter_folder_path = null;
+                            grid.view_mode = .library;
+                            if (g_db) |*db| grid.reloadImages(db) catch {};
                         }
                     }
                     dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
@@ -1038,34 +1298,115 @@ fn frame() !dvui.App.Result {
             if (g_libraries.items.len == 0) {
                 dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{ .padding = .all(8) });
             } else {
-                for (g_libraries.items, 0..) |lib_path, idx| {
-                    var lib_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                        .id_extra = idx,
-                        .expand = .horizontal,
-                        .padding = .{ .x = 8, .y = 2, .w = 4, .h = 2 },
-                    });
-                    defer lib_row.deinit();
+                for (g_libraries.items, 0..) |*lib, idx| {
+                    const in_lib_view = if (g_grid) |*g| g.view_mode == .library else false;
+                    const lib_selected = g_filter_library_id == lib.id and g_filter_folder == null;
 
-                    const row_id = lib_row.data().id;
-                    var row_hov = dvui.dataGet(null, row_id, "_hov", bool) orelse false;
-                    for (dvui.events()) |*e| {
-                        if (e.evt == .mouse and e.evt.mouse.action == .position)
-                            row_hov = dvui.eventMatchSimple(e, lib_row.data());
-                    }
-                    dvui.dataSet(null, row_id, "_hov", row_hov);
+                    // ── Library header row (horizontal, closed by block) ──
+                    var row_hov = false;
+                    {
+                        const lib_bg: dvui.Options = if (lib_selected and in_lib_view) .{
+                            .background = true,
+                            .color_fill = dvui.themeGet().focus,
+                        } else .{};
+                        var lib_row = dvui.box(@src(), .{ .dir = .horizontal }, lib_bg.override(.{
+                            .id_extra = idx,
+                            .expand = .horizontal,
+                            .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
+                        }));
+                        defer lib_row.deinit();
 
-                    dvui.label(@src(), "{s}", .{std.fs.path.basename(lib_path)}, .{
-                        .expand = .horizontal,
-                        .gravity_y = 0.5,
-                    });
+                        const row_id = lib_row.data().id;
+                        row_hov = dvui.dataGet(null, row_id, "_hov", bool) orelse false;
+                        for (dvui.events()) |*e| {
+                            if (e.evt == .mouse and e.evt.mouse.action == .position)
+                                row_hov = dvui.eventMatchSimple(e, lib_row.data());
+                        }
+                        dvui.dataSet(null, row_id, "_hov", row_hov);
 
-                    if (row_hov) {
-                        if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
-                            .min_size_content = .{ .w = 10, .h = 10 },
+                        // Expand/collapse toggle
+                        const expand_tvg = if (lib.expanded) icons.tvg.lucide.@"chevron-down" else icons.tvg.lucide.@"chevron-right";
+                        if (dvui.buttonIcon(@src(), "expand", expand_tvg, .{}, .{}, .{
+                            .id_extra = idx,
+                            .min_size_content = .{ .w = 14, .h = 14 },
                             .gravity_y = 0.5,
                             .padding = dvui.Rect.all(2),
+                            .margin = .{},
                         })) {
-                            g_confirm_remove_idx = idx;
+                            lib.expanded = !lib.expanded;
+                            if (lib.expanded and !lib.top_loaded) {
+                                if (dvui.App.main_init) |init| {
+                                    if (g_db) |*db| {
+                                        if (db.listImmediateSubdirs(init.gpa, lib.id, lib.path)) |subs| {
+                                            if (init.gpa.alloc(FolderNode, subs.len)) |new_nodes| {
+                                                for (subs, 0..) |s, i| {
+                                                    new_nodes[i] = .{ .path = s.path, .count = s.count };
+                                                }
+                                                init.gpa.free(subs);
+                                                lib.top_folders = new_nodes;
+                                            } else |_| {
+                                                for (subs) |s| init.gpa.free(s.path);
+                                                init.gpa.free(subs);
+                                            }
+                                        } else |_| {}
+                                        lib.top_loaded = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Library name (click to filter to this library)
+                        {
+                            var name_area = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                                .id_extra = idx,
+                                .expand = .horizontal,
+                                .gravity_y = 0.5,
+                            });
+                            defer name_area.deinit();
+                            if (dvui.clickedEx(name_area.data(), .{})) |_| {
+                                if (dvui.App.main_init) |init| {
+                                    if (g_filter_folder) |f| init.gpa.free(f);
+                                    g_filter_folder = null;
+                                    g_filter_library_id = lib.id;
+                                }
+                                if (g_grid) |*grid| {
+                                    grid.filter_library_id = lib.id;
+                                    grid.filter_folder_path = null;
+                                    grid.view_mode = .library;
+                                    if (g_db) |*db| grid.reloadImages(db) catch {};
+                                }
+                            }
+                            dvui.label(@src(), "{s}", .{std.fs.path.basename(lib.path)}, .{
+                                .id_extra = idx,
+                                .expand = .horizontal,
+                                .gravity_y = 0.5,
+                            });
+                        }
+
+                        // Image count badge
+                        dvui.label(@src(), "{d}", .{lib.image_count}, .{
+                            .id_extra = idx,
+                            .gravity_y = 0.5,
+                            .padding = .{ .x = 4, .w = 0 },
+                        });
+
+                        // Remove button (shown on hover)
+                        if (row_hov) {
+                            if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
+                                .id_extra = idx,
+                                .min_size_content = .{ .w = 10, .h = 10 },
+                                .gravity_y = 0.5,
+                                .padding = dvui.Rect.all(2),
+                            })) {
+                                g_confirm_remove_idx = idx;
+                            }
+                        }
+                    } // lib_row closed here
+
+                    // ── Folder tree (sibling rows, indented) ─────────────
+                    if (lib.expanded) {
+                        for (lib.top_folders) |*node| {
+                            renderFolderNode(node, lib, 1);
                         }
                     }
                 }
@@ -1412,12 +1753,22 @@ fn frame() !dvui.App.Result {
                     .gravity_y = 0.5,
                     .min_size_content = .{ .w = 12, .h = 12 },
                 });
-                dvui.label(@src(), "scanning… {d} files", .{mgr.filesScanned()}, .{
+                dvui.label(@src(), "scanning\u{2026} {d} files", .{mgr.filesScanned()}, .{
                     .gravity_y = 0.5,
                     .margin = .{ .x = 4 },
                 });
+            }
+            const displayed: usize = if (g_grid) |*grid| grid.images.items.len else 0;
+            const is_filtered = g_filter_library_id != null or g_filter_folder != null;
+            if (is_filtered) {
+                dvui.label(@src(), "{d} {s} ({s} {d})", .{
+                    displayed,
+                    i18n.t(.status_images),
+                    i18n.t(.status_out_of),
+                    g_total_image_count,
+                }, .{ .gravity_y = 0.5 });
             } else {
-                dvui.label(@src(), "{d} images", .{0}, .{ .gravity_y = 0.5 });
+                dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
             }
         } else {
             dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
@@ -1468,8 +1819,8 @@ fn frame() !dvui.App.Result {
     // ── Library removal confirmation modal ────────────────────────────────────
     if (g_confirm_remove_idx) |idx| {
         if (idx < g_libraries.items.len) {
-            const path = g_libraries.items[idx];
-            const name = std.fs.path.basename(path);
+            const lib = &g_libraries.items[idx];
+            const name = std.fs.path.basename(lib.path);
 
             var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{
                 .min_size_content = .{ .w = 360, .h = 0 },
@@ -1485,7 +1836,7 @@ fn frame() !dvui.App.Result {
 
             dvui.label(@src(), "{s}", .{i18n.t(.library_remove_title)}, .{ .font = bold, .margin = .{ .h = 6 } });
             dvui.label(@src(), "{s}", .{name}, .{});
-            dvui.label(@src(), "{s}", .{path}, .{ .margin = .{ .h = 14 } });
+            dvui.label(@src(), "{s}", .{lib.path}, .{ .margin = .{ .h = 14 } });
 
             {
                 var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
@@ -1497,16 +1848,28 @@ fn frame() !dvui.App.Result {
                 if (dvui.button(@src(), i18n.t(.action_remove), .{}, .{ .margin = .all(4) })) {
                     g_confirm_remove_idx = null;
                     if (dvui.App.main_init) |init| {
-                        const removed = g_libraries.orderedRemove(idx);
+                        var removed = g_libraries.orderedRemove(idx);
+                        const removed_id = removed.id;
                         if (g_library_manager) |*mgr| {
-                            mgr.removeLibrary(removed) catch {};
+                            mgr.removeLibrary(removed.path) catch {};
                         } else if (g_db) |*db| {
-                            _ = db.removeLibrary(removed) catch {};
+                            _ = db.removeLibrary(removed.path) catch {};
                         }
-                        init.gpa.free(removed);
+                        removed.deinit(init.gpa);
+                        // Clear filter if it was pointing at the removed library.
+                        if (g_filter_library_id == removed_id) {
+                            if (g_filter_folder) |f| init.gpa.free(f);
+                            g_filter_folder = null;
+                            g_filter_library_id = null;
+                            if (g_grid) |*grid| {
+                                grid.filter_library_id = null;
+                                grid.filter_folder_path = null;
+                            }
+                        }
                         if (g_grid) |*grid| {
                             if (g_db) |*db| grid.reloadImages(db) catch {};
                         }
+                        refreshCounts();
                     }
                 }
             }

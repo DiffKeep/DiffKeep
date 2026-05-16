@@ -68,14 +68,13 @@ pub const LibraryManager = struct {
 
     /// Queue startup scans for every library already in the DB.
     pub fn scanAllLibraries(self: *LibraryManager, io: std.Io) !void {
-        const paths = try self.db.listLibraries(self.allocator);
+        const libs = try self.db.listLibraries(self.allocator);
         defer {
-            for (paths) |p| self.allocator.free(p);
-            self.allocator.free(paths);
+            for (libs) |li| self.allocator.free(li.path);
+            self.allocator.free(libs);
         }
-        for (paths) |path| {
-            const id = try self.db.storeLibrary(path); // find-or-create, returns id
-            try self.enqueue(io, id, path);
+        for (libs) |li| {
+            try self.enqueue(io, li.id, li.path);
         }
     }
 

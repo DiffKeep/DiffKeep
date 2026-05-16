@@ -60,7 +60,7 @@ fn jpegDimensions(bytes: []const u8) struct { w: f32, h: f32 } {
 
 const LoadRequest = struct {
     id: u64,
-    path: []const u8, // stable pointer into GridState.images entry's path
+    path: []const u8, // heap-allocated copy; freed by worker after use or by reloadImages on queue clear
 };
 
 // ── Layout constants ──────────────────────────────────────────────────────────
@@ -140,6 +140,16 @@ pub const GridState = struct {
     // Mirrored from config so renderItem can condition the context menu label
     trash_enabled: bool = true,
 
+    // Filter state — owned by app.zig, not freed by GridState
+    filter_library_id: ?u64 = null,
+    filter_folder_path: ?[]const u8 = null,
+    // FTS5 search query — points into app.zig's g_search_buf; not owned
+    search_query: ?[]const u8 = null,
+
+    // Data directory (e.g. ~/.local/share/DiffKeep) — borrowed from app, not owned.
+    // Used to resolve trash file paths: <data_dir>/trash/<trash_name>.
+    data_dir: ?[]const u8 = null,
+
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
         var state = GridState{
             .io = io,
@@ -199,6 +209,8 @@ pub const GridState = struct {
         while (pi.next()) |kv| self.allocator.free(kv.value_ptr.*);
         self.pending.deinit();
 
+        for (self.high_queue.items) |r| self.allocator.free(r.path);
+        for (self.low_queue.items) |r| self.allocator.free(r.path);
         self.high_queue.deinit(self.allocator);
         self.low_queue.deinit(self.allocator);
         self.queued.deinit();
@@ -220,6 +232,16 @@ pub const GridState = struct {
     /// Reload the image list from DB for the current view_mode.
     /// Clears selection and resets navigation state.
     pub fn reloadImages(self: *GridState, db: *db_mod.VectorDb) !void {
+        // Clear queues before freeing images so workers don't access freed path pointers.
+        {
+            self.queue_mutex.lockUncancelable(self.io);
+            for (self.high_queue.items) |r| self.allocator.free(r.path);
+            for (self.low_queue.items) |r| self.allocator.free(r.path);
+            self.high_queue.clearRetainingCapacity();
+            self.low_queue.clearRetainingCapacity();
+            self.queued.clearRetainingCapacity();
+            self.queue_mutex.unlock(self.io);
+        }
         for (self.images.items) |e| {
             self.allocator.free(e.path);
             if (e.trash_name) |tn| self.allocator.free(tn);
@@ -230,8 +252,20 @@ pub const GridState = struct {
         self.anchor_idx = null;
 
         const entries = switch (self.view_mode) {
-            .library => try db.listAllImages(self.allocator),
-            .trash   => try db.listTrashImages(self.allocator),
+            .library => blk: {
+                if (self.search_query) |q| {
+                    if (q.len > 0) break :blk try db.searchPrompts(self.allocator, q);
+                }
+                if (self.filter_folder_path) |fp| {
+                    const lib_id = self.filter_library_id orelse break :blk try db.listAllImages(self.allocator);
+                    break :blk try db.listImagesInFolder(self.allocator, lib_id, fp);
+                } else if (self.filter_library_id) |lib_id| {
+                    break :blk try db.listLibraryImages(self.allocator, lib_id);
+                } else {
+                    break :blk try db.listAllImages(self.allocator);
+                }
+            },
+            .trash => try db.listTrashImages(self.allocator),
         };
         defer self.allocator.free(entries);
         try self.images.ensureTotalCapacity(self.allocator, entries.len);
@@ -340,6 +374,15 @@ pub const GridState = struct {
         }
     }
 
+    /// Returns the actual on-disk path for an entry.
+    /// For trash entries this is <data_dir>/trash/<trash_name>; for others it is entry.path.
+    /// Caller is responsible for freeing if the returned slice != entry.path.
+    fn diskPath(self: *GridState, entry: *const ImageEntry) []const u8 {
+        const tn = entry.trash_name orelse return entry.path;
+        const dd = self.data_dir orelse return entry.path;
+        return std.fs.path.join(self.allocator, &.{ dd, "trash", tn }) catch entry.path;
+    }
+
     fn requestLoad(self: *GridState, id: u64, path: []const u8, high: bool) void {
         if (self.committed.contains(id)) return;
 
@@ -348,11 +391,16 @@ pub const GridState = struct {
 
         if (self.queued.contains(id)) return;
 
-        const req = LoadRequest{ .id = id, .path = path };
+        const path_copy = self.allocator.dupe(u8, path) catch return;
+        const req = LoadRequest{ .id = id, .path = path_copy };
         const queue = if (high) &self.high_queue else &self.low_queue;
-        queue.append(self.allocator, req) catch return;
+        queue.append(self.allocator, req) catch {
+            self.allocator.free(path_copy);
+            return;
+        };
         self.queued.put(id, {}) catch {
             _ = queue.pop();
+            self.allocator.free(path_copy);
             return;
         };
         self.queue_cond.signal(self.io);
@@ -544,7 +592,9 @@ pub const GridState = struct {
                 if (self.committed.getPtr(entry.id)) |ce| {
                     if (is_visible) ce.last_seen_s = now_s;
                 } else {
-                    self.requestLoad(entry.id, entry.path, is_visible);
+                    const path = self.diskPath(entry);
+                    defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
+                    self.requestLoad(entry.id, path, is_visible);
                 }
             }
         }
@@ -772,6 +822,7 @@ fn workerFn(state: *GridState) void {
 
         _ = state.queued.remove(req.id);
         state.queue_mutex.unlock(state.io);
+        defer state.allocator.free(req.path);
 
         // Try DB first when thumbnails are stored there (serialized: single shared connection)
         var bytes: ?[]u8 = null;

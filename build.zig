@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
     exe.root_module.addImport("known-folders", known_folders);
+
+    const icons_dep = b.dependency("icons", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("icons", icons_dep.module("icons"));
     exe.root_module.link_libcpp = true;
 
     b.installArtifact(exe);

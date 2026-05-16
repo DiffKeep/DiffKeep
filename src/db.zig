@@ -8,6 +8,16 @@ pub const TrashStats = struct {
     total_bytes: i64 = 0,
 };
 
+pub const LibraryInfo = struct {
+    id: u64,
+    path: []const u8, // heap-allocated
+};
+
+pub const FolderCount = struct {
+    path: []const u8, // heap-allocated; caller frees
+    count: i64,
+};
+
 pub const DbStats = struct {
     total_bytes: i64 = 0,
     thumbnail_count: i64 = 0,
@@ -127,6 +137,20 @@ const migrations = [_][]const u8{
     \\ALTER TABLE images ADD COLUMN trashed_at INTEGER;
     \\ALTER TABLE images ADD COLUMN trash_name TEXT;
     \\ALTER TABLE images ADD COLUMN trash_file_size INTEGER;
+    ,
+    // v7: FTS5 full-text index on positive_prompt_text
+    \\CREATE VIRTUAL TABLE prompt_fts USING fts5(positive_prompt_text, content=images, content_rowid=id);
+    \\INSERT INTO prompt_fts(rowid, positive_prompt_text) SELECT id, positive_prompt_text FROM images WHERE positive_prompt_text IS NOT NULL;
+    \\CREATE TRIGGER prompt_fts_ai AFTER INSERT ON images BEGIN
+    \\  INSERT INTO prompt_fts(rowid, positive_prompt_text) VALUES (new.id, new.positive_prompt_text);
+    \\END;
+    \\CREATE TRIGGER prompt_fts_ad AFTER DELETE ON images BEGIN
+    \\  INSERT INTO prompt_fts(prompt_fts, rowid, positive_prompt_text) VALUES ('delete', old.id, old.positive_prompt_text);
+    \\END;
+    \\CREATE TRIGGER prompt_fts_au AFTER UPDATE OF positive_prompt_text ON images BEGIN
+    \\  INSERT INTO prompt_fts(prompt_fts, rowid, positive_prompt_text) VALUES ('delete', old.id, old.positive_prompt_text);
+    \\  INSERT INTO prompt_fts(rowid, positive_prompt_text) VALUES (new.id, new.positive_prompt_text);
+    \\END;
     ,
 };
 
@@ -399,18 +423,218 @@ pub const VectorDb = struct {
         _ = try stmt.step();
     }
 
-    pub fn listLibraries(self: *VectorDb, allocator: std.mem.Allocator) ![][]const u8 {
+    pub fn listLibraries(self: *VectorDb, allocator: std.mem.Allocator) ![]LibraryInfo {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare("SELECT path FROM libraries ORDER BY id");
+        var stmt = try self.db.prepare("SELECT id, path FROM libraries ORDER BY id");
         defer stmt.deinit();
-        var list: std.ArrayList([]const u8) = .empty;
+        var list: std.ArrayList(LibraryInfo) = .empty;
         errdefer {
-            for (list.items) |p| allocator.free(p);
+            for (list.items) |li| allocator.free(li.path);
             list.deinit(allocator);
         }
         while (try stmt.step()) {
-            try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            try list.append(allocator, .{ .id = id, .path = path });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn getLibraryImageCount(self: *VectorDb, library_id: u64) !i64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT COUNT(*) FROM images WHERE library_id = ? AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        if (try stmt.step()) return stmt.columnInt64(0);
+        return 0;
+    }
+
+    pub fn getTotalImageCount(self: *VectorDb) !i64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT COUNT(*) FROM images WHERE trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        if (try stmt.step()) return stmt.columnInt64(0);
+        return 0;
+    }
+
+    /// Returns immediate subdirectories of parent_path (one level deep) with their subtree
+    /// image counts (i.e. all images under each immediate child, not just direct children).
+    /// Result paths are heap-allocated; caller frees each .path and the slice.
+    pub fn listImmediateSubdirs(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, parent_path: []const u8) ![]FolderCount {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+
+        const pattern = try std.fmt.allocPrint(allocator, "{s}/%", .{parent_path});
+        defer allocator.free(pattern);
+
+        var stmt = try self.db.prepare(
+            "SELECT library_path FROM images WHERE library_id = ? AND library_path LIKE ? AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        try stmt.bind(2, @as([]const u8, pattern));
+
+        var map: std.StringHashMap(i64) = .init(allocator);
+        defer {
+            var kit = map.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            map.deinit();
+        }
+
+        const prefix_len = parent_path.len + 1; // skip parent + "/"
+        while (try stmt.step()) {
+            const path = stmt.columnText(0);
+            if (path.len <= prefix_len) continue;
+            const rest = path[prefix_len..];
+            // Find first "/" after prefix to get immediate child directory name.
+            // Images sitting directly in parent_path have no further slash — skip them.
+            const slash_pos = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+            if (slash_pos == 0) continue;
+            const child_end = prefix_len + slash_pos;
+            const child_path = path[0..child_end];
+            const gop = try map.getOrPut(child_path);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+            } else {
+                const owned = try allocator.dupe(u8, child_path);
+                errdefer allocator.free(owned);
+                gop.key_ptr.* = owned;
+                gop.value_ptr.* = 1;
+            }
+        }
+
+        var result: std.ArrayList(FolderCount) = .empty;
+        errdefer {
+            for (result.items) |fc| allocator.free(fc.path);
+            result.deinit(allocator);
+        }
+        {
+            var it = map.iterator();
+            while (it.next()) |kv| {
+                const path_copy = try allocator.dupe(u8, kv.key_ptr.*);
+                errdefer allocator.free(path_copy);
+                try result.append(allocator, .{ .path = path_copy, .count = kv.value_ptr.* });
+            }
+        }
+        std.mem.sortUnstable(FolderCount, result.items, {}, struct {
+            pub fn lessThan(_: void, a: FolderCount, b: FolderCount) bool {
+                return std.mem.lessThan(u8, a.path, b.path);
+            }
+        }.lessThan);
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Returns distinct parent directories of images in the library with their image counts.
+    /// Uses a HashMap with owned keys; result paths are duplicated into the returned slice.
+    pub fn listLibraryFolders(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64) ![]FolderCount {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+
+        var map: std.StringHashMap(i64) = .init(allocator);
+        defer {
+            var kit = map.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            map.deinit();
+        }
+
+        {
+            var stmt = try self.db.prepare(
+                "SELECT library_path FROM images WHERE library_id = ? AND trashed_at IS NULL",
+            );
+            defer stmt.deinit();
+            try stmt.bind(1, library_id);
+            while (try stmt.step()) {
+                const path = stmt.columnText(0);
+                const dir = std.fs.path.dirname(path) orelse continue;
+                const gop = try map.getOrPut(dir);
+                if (gop.found_existing) {
+                    gop.value_ptr.* += 1;
+                } else {
+                    const owned = try allocator.dupe(u8, dir);
+                    errdefer allocator.free(owned);
+                    gop.key_ptr.* = owned;
+                    gop.value_ptr.* = 1;
+                }
+            }
+        }
+
+        // Build result; duplicate keys so map's defer can free originals safely.
+        var result: std.ArrayList(FolderCount) = .empty;
+        errdefer {
+            for (result.items) |fc| allocator.free(fc.path);
+            result.deinit(allocator);
+        }
+        {
+            var it = map.iterator();
+            while (it.next()) |kv| {
+                const path_copy = try allocator.dupe(u8, kv.key_ptr.*);
+                errdefer allocator.free(path_copy);
+                try result.append(allocator, .{ .path = path_copy, .count = kv.value_ptr.* });
+            }
+        }
+        std.mem.sortUnstable(FolderCount, result.items, {}, struct {
+            pub fn lessThan(_: void, a: FolderCount, b: FolderCount) bool {
+                return std.mem.lessThan(u8, a.path, b.path);
+            }
+        }.lessThan);
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Returns all non-trashed images in a library, ordered by id.
+    pub fn listLibraryImages(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime FROM images WHERE library_id = ? AND trashed_at IS NULL ORDER BY id",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Returns all non-trashed images whose path is under folder_path/, ordered by id.
+    pub fn listImagesInFolder(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, folder_path: []const u8) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        const pattern: []u8 = try std.fmt.allocPrint(allocator, "{s}/%", .{folder_path});
+        defer allocator.free(pattern);
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime FROM images WHERE library_id = ? AND library_path LIKE ? AND trashed_at IS NULL ORDER BY id",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, library_id);
+        try stmt.bind(2, @as([]const u8, pattern));
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
         }
         return list.toOwnedSlice(allocator);
     }
@@ -483,6 +707,36 @@ pub const VectorDb = struct {
         }
 
         return error.FailedToGetTimestamp;
+    }
+
+    /// FTS5 full-text search on positive_prompt_text.
+    /// Returns matching non-trashed images in BM25 rank order.
+    pub fn searchPrompts(self: *VectorDb, allocator: std.mem.Allocator, query: []const u8) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            \\SELECT i.id, i.library_path, i.mtime
+            \\FROM images i
+            \\WHERE i.id IN (SELECT rowid FROM prompt_fts WHERE prompt_fts MATCH ?)
+            \\  AND i.trashed_at IS NULL
+            \\ORDER BY i.id
+            \\LIMIT 1000
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, query);
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     pub fn getStats(self: *VectorDb) !DbStats {
