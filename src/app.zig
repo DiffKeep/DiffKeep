@@ -94,6 +94,16 @@ var g_confirm_remove_idx: ?usize = null;
 var g_search_buf: [256]u8 = std.mem.zeroes([256]u8);
 var g_search_prev: [256]u8 = std.mem.zeroes([256]u8);
 
+// Active metadata filters
+var g_active_filters: std.ArrayList(db_mod.ActiveFilter) = .empty;
+
+// Filter modal state
+var g_filter_modal_open: bool = false;
+var g_filter_modal_kind: db_mod.FilterColumn = .model;
+var g_filter_modal_value_buf: [256]u8 = std.mem.zeroes([256]u8);
+var g_filter_modal_options: ?[][]const u8 = null;
+var g_filter_modal_options_kind: ?db_mod.FilterColumn = null;
+
 // Right-panel detail: tracks the currently-displayed image so we only re-query on change.
 var g_detail_id: ?u64 = null;
 var g_detail: ?db_mod.ImageDetails = null;
@@ -327,6 +337,12 @@ fn appDeinit() void {
         g_libraries.deinit(init.gpa);
         if (g_filter_folder) |f| init.gpa.free(f);
         if (g_data_dir) |d| init.gpa.free(d);
+        for (g_active_filters.items) |f| init.gpa.free(f.value);
+        g_active_filters.deinit(init.gpa);
+        if (g_filter_modal_options) |opts| {
+            for (opts) |s| init.gpa.free(s);
+            init.gpa.free(opts);
+        }
     }
 }
 
@@ -1039,6 +1055,175 @@ fn renderFolderNode(node: *FolderNode, lib: *LibraryState, depth: usize) void {
     }
 }
 
+fn filterColumnLabel(kind: db_mod.FilterColumn) [:0]const u8 {
+    return switch (kind) {
+        .model => i18n.t(.detail_model),
+        .sampler => i18n.t(.detail_sampler),
+        .scheduler => i18n.t(.detail_scheduler),
+    };
+}
+
+fn filterMatchesTyped(opt: []const u8, typed: []const u8) bool {
+    if (typed.len == 0) return true;
+    if (typed.len > opt.len) return false;
+    var i: usize = 0;
+    outer: while (i + typed.len <= opt.len) : (i += 1) {
+        for (typed, 0..) |c, j| {
+            if (std.ascii.toLower(c) != std.ascii.toLower(opt[i + j])) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn filterModal() !void {
+    if (!g_filter_modal_open) return;
+
+    // Fetch autocomplete options when kind changes or first open.
+    if (g_filter_modal_options_kind == null or g_filter_modal_options_kind.? != g_filter_modal_kind) {
+        if (dvui.App.main_init) |init| {
+            if (g_filter_modal_options) |opts| {
+                for (opts) |s| init.gpa.free(s);
+                init.gpa.free(opts);
+                g_filter_modal_options = null;
+            }
+            if (g_db) |*db| {
+                g_filter_modal_options = db.getDistinctColumnValues(init.gpa, g_filter_modal_kind) catch null;
+            }
+        }
+        g_filter_modal_options_kind = g_filter_modal_kind;
+    }
+
+    var float = dvui.floatingWindow(@src(), .{
+        .modal = true,
+        .open_flag = &g_filter_modal_open,
+        .resize = .none,
+    }, .{
+        .min_size_content = .{ .w = 380, .h = 0 },
+    });
+    defer float.deinit();
+    float.autoSize();
+    float.dragAreaSet(dvui.Rect.Physical{});
+
+    var content = dvui.box(@src(), .{}, .{
+        .expand = .both,
+        .padding = .all(16),
+    });
+    defer content.deinit();
+
+    dvui.label(@src(), "{s}", .{i18n.t(.filter_heading)}, .{ .font = bold, .margin = .{ .h = 10 } });
+
+    // Kind selector chips
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .margin = .{ .h = 8 },
+        });
+        defer row.deinit();
+
+        const chip_base: dvui.Options = .{
+            .corner_radius = dvui.Rect.all(12),
+            .padding = .{ .x = 10, .y = 3, .w = 10, .h = 3 },
+            .margin = .{ .w = 4 },
+            .gravity_y = 0.5,
+        };
+
+        const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler };
+        for (kinds) |kind| {
+            const selected = g_filter_modal_kind == kind;
+            const chip_opts = if (selected)
+                chip_base.override(.{
+                    .id_extra = @intFromEnum(kind),
+                    .background = true,
+                    .color_fill = dvui.themeGet().focus,
+                })
+            else
+                chip_base.override(.{ .id_extra = @intFromEnum(kind) });
+            if (dvui.button(@src(), filterColumnLabel(kind), .{}, chip_opts)) {
+                if (g_filter_modal_kind != kind) {
+                    g_filter_modal_kind = kind;
+                    g_filter_modal_value_buf = std.mem.zeroes([256]u8);
+                    g_filter_modal_options_kind = null; // trigger re-fetch
+                }
+            }
+        }
+    }
+
+    // Value text entry
+    {
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = g_filter_modal_value_buf[0..] },
+            .placeholder = i18n.t(.filter_search_placeholder),
+        }, .{
+            .expand = .horizontal,
+            .corner_radius = dvui.Rect.all(4),
+            .margin = .{ .h = 4 },
+        });
+        te.deinit();
+    }
+
+    // Autocomplete options
+    {
+        const typed = std.mem.sliceTo(&g_filter_modal_value_buf, 0);
+        const opts = g_filter_modal_options orelse &.{};
+        var shown: usize = 0;
+        for (opts, 0..) |opt, oi| {
+            if (shown >= 8) break;
+            if (!filterMatchesTyped(opt, typed)) continue;
+            shown += 1;
+            if (dvui.button(@src(), opt, .{}, .{
+                .id_extra = oi,
+                .expand = .horizontal,
+                .padding = .{ .x = 6, .y = 3, .w = 6, .h = 3 },
+                .margin = .{ .h = 1 },
+            })) {
+                @memset(&g_filter_modal_value_buf, 0);
+                const len = @min(opt.len, g_filter_modal_value_buf.len - 1);
+                @memcpy(g_filter_modal_value_buf[0..len], opt[0..len]);
+            }
+        }
+    }
+
+    // Action buttons
+    {
+        var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .gravity_x = 1.0,
+            .margin = .{ .y = 12 },
+        });
+        defer btn_row.deinit();
+
+        if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
+            g_filter_modal_open = false;
+        }
+
+        const val = std.mem.sliceTo(&g_filter_modal_value_buf, 0);
+        const can_add = val.len > 0;
+        const theme = dvui.themeGet();
+        if (dvui.button(@src(), i18n.t(.filter_add), .{}, .{
+            .margin = .all(4),
+            .color_fill = if (!can_add) theme.fill else null,
+            .color_fill_hover = if (!can_add) theme.fill else null,
+            .color_fill_press = if (!can_add) theme.fill else null,
+            .color_text = if (!can_add) theme.border else null,
+            .color_text_hover = if (!can_add) theme.border else null,
+            .color_text_press = if (!can_add) theme.border else null,
+        }) and can_add) {
+            if (dvui.App.main_init) |init| {
+                const owned_val = try init.gpa.dupe(u8, val);
+                try g_active_filters.append(init.gpa, .{
+                    .column = g_filter_modal_kind,
+                    .value = owned_val,
+                });
+                if (g_grid) |*grid| {
+                    grid.filters = g_active_filters.items;
+                    if (g_db) |*db| grid.reloadImages(db) catch {};
+                }
+            }
+            g_filter_modal_open = false;
+        }
+    }
+}
+
 fn frame() !dvui.App.Result {
     for (dvui.events()) |*e| {
         if (e.evt == .window and e.evt.window.action == .close) return .close;
@@ -1136,10 +1321,51 @@ fn frame() !dvui.App.Result {
             .margin = .{ .x = 2, .w = 2 },
             .gravity_y = 0.5,
         };
-        _ = dvui.button(@src(), "model: any", .{}, chip.override(.{ .id_extra = 1 }));
-        _ = dvui.button(@src(), "aspect: 1:1", .{}, chip.override(.{ .id_extra = 2 }));
-        _ = dvui.button(@src(), "date: 30d", .{}, chip.override(.{ .id_extra = 3 }));
-        _ = dvui.button(@src(), "+ filter", .{}, chip.override(.{ .id_extra = 4 }));
+        // Active filter pills
+        var filter_remove_idx: ?usize = null;
+        for (g_active_filters.items, 0..) |f, fi| {
+            var pill = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                .id_extra = fi,
+                .corner_radius = dvui.Rect.all(12),
+                .padding = .{ .x = 8, .y = 3, .w = 4, .h = 3 },
+                .margin = .{ .x = 2, .w = 2 },
+                .gravity_y = 0.5,
+                .background = true,
+                .color_fill = dvui.themeGet().focus,
+            });
+            defer pill.deinit();
+            dvui.label(@src(), "{s}: {s}", .{ filterColumnLabel(f.column), f.value }, .{
+                .id_extra = fi,
+                .gravity_y = 0.5,
+            });
+            if (dvui.buttonIcon(@src(), "remove_filter", dvui.entypo.cross, .{}, .{}, .{
+                .id_extra = fi,
+                .min_size_content = .{ .w = 10, .h = 10 },
+                .gravity_y = 0.5,
+                .padding = dvui.Rect.all(2),
+                .margin = .{ .x = 4 },
+            })) {
+                filter_remove_idx = fi;
+            }
+        }
+        if (filter_remove_idx) |ri| {
+            if (dvui.App.main_init) |init| {
+                const f = g_active_filters.orderedRemove(ri);
+                init.gpa.free(f.value);
+            }
+            if (g_grid) |*grid| {
+                grid.filters = g_active_filters.items;
+                if (g_db) |*db| grid.reloadImages(db) catch {};
+            }
+        }
+
+        // Add filter button
+        if (dvui.button(@src(), i18n.t(.toolbar_add_filter), .{}, chip.override(.{ .id_extra = 4 }))) {
+            g_filter_modal_open = true;
+            g_filter_modal_value_buf = std.mem.zeroes([256]u8);
+            g_filter_modal_kind = .model;
+            g_filter_modal_options_kind = null; // trigger re-fetch
+        }
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
@@ -1880,6 +2106,9 @@ fn frame() !dvui.App.Result {
 
     // ── Delete confirmation modal ─────────────────────────────────────────────
     if (g_delete_dialog_open) try deleteConfirmDialog();
+
+    // ── Filter modal ──────────────────────────────────────────────────────────
+    if (g_filter_modal_open) try filterModal();
 
     return .ok;
 }

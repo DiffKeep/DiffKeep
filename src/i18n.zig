@@ -14,6 +14,10 @@ pub const Strings = struct {
 
     search_placeholder: [:0]const u8,
     search_no_results: [:0]const u8,
+    filter_heading: [:0]const u8,
+    filter_search_placeholder: [:0]const u8,
+    filter_add: [:0]const u8,
+    toolbar_add_filter: [:0]const u8,
 
     detail_prompt: [:0]const u8,
     detail_negative_prompt: [:0]const u8,
@@ -98,6 +102,10 @@ pub const en: Strings = .{
 
     .search_placeholder = "Search prompts\u{2026}",
     .search_no_results = "No results.",
+    .filter_heading = "Add Filter",
+    .filter_search_placeholder = "Type to search\u{2026}",
+    .filter_add = "Add",
+    .toolbar_add_filter = "+ Filter",
 
     .detail_prompt = "Prompt",
     .detail_negative_prompt = "Negative Prompt",

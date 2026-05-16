@@ -205,6 +205,16 @@ fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
 
 }
 
+pub const FilterColumn = enum {
+    model, sampler, scheduler,
+    pub fn name(self: FilterColumn) []const u8 { return @tagName(self); }
+};
+
+pub const ActiveFilter = struct {
+    column: FilterColumn,
+    value: []const u8,
+};
+
 pub const VectorDb = struct {
     db: sqlite.Database,
     allocator: std.mem.Allocator,
@@ -724,6 +734,93 @@ pub const VectorDb = struct {
         );
         defer stmt.deinit();
         try stmt.bind(1, query);
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Returns distinct non-empty values for the given column, sorted, up to 500 entries.
+    /// Caller owns each string and the slice.
+    pub fn getDistinctColumnValues(self: *VectorDb, allocator: std.mem.Allocator, column: FilterColumn) ![][]const u8 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        const col = column.name();
+        const sql = try std.fmt.allocPrint(allocator,
+            "SELECT DISTINCT {s} FROM images WHERE {s} IS NOT NULL AND {s} != '' ORDER BY {s} LIMIT 500",
+            .{ col, col, col, col });
+        defer allocator.free(sql);
+        var stmt = try self.db.prepare(sql);
+        defer stmt.deinit();
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |s| allocator.free(s);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// List non-trashed images with optional library, folder, FTS search, and metadata filters.
+    /// Builds SQL dynamically; all user values go through bind params.
+    pub fn listImagesFiltered(
+        self: *VectorDb,
+        allocator: std.mem.Allocator,
+        library_id: ?u64,
+        folder_path: ?[]const u8,
+        search_query: ?[]const u8,
+        filters: []const ActiveFilter,
+    ) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "SELECT id, library_path, mtime FROM images WHERE trashed_at IS NULL");
+        if (library_id != null) try sql.appendSlice(allocator, " AND library_id = ?");
+        if (folder_path != null) try sql.appendSlice(allocator, " AND library_path LIKE ?");
+        if (search_query != null) try sql.appendSlice(allocator, " AND id IN (SELECT rowid FROM prompt_fts WHERE prompt_fts MATCH ?)");
+        for (filters) |f| {
+            try sql.appendSlice(allocator, " AND ");
+            try sql.appendSlice(allocator, f.column.name());
+            try sql.appendSlice(allocator, " = ?");
+        }
+        try sql.appendSlice(allocator, " ORDER BY id LIMIT 10000");
+
+        var stmt = try self.db.prepare(sql.items);
+        defer stmt.deinit();
+
+        var param: u32 = 1;
+        if (library_id) |lib_id| {
+            try stmt.bind(param, lib_id);
+            param += 1;
+        }
+        if (folder_path) |fp| {
+            const pattern = try std.fmt.allocPrint(allocator, "{s}/%", .{fp});
+            defer allocator.free(pattern);
+            try stmt.bind(param, @as([]const u8, pattern));
+            param += 1;
+        }
+        if (search_query) |q| {
+            try stmt.bind(param, q);
+            param += 1;
+        }
+        for (filters) |f| {
+            try stmt.bind(param, f.value);
+            param += 1;
+        }
+
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
             for (list.items) |e| allocator.free(e.path);

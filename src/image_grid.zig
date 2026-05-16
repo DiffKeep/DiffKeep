@@ -145,6 +145,8 @@ pub const GridState = struct {
     filter_folder_path: ?[]const u8 = null,
     // FTS5 search query — points into app.zig's g_search_buf; not owned
     search_query: ?[]const u8 = null,
+    // Active metadata filters — slice into app.zig's g_active_filters; not owned
+    filters: []const db_mod.ActiveFilter = &.{},
 
     // Data directory (e.g. ~/.local/share/DiffKeep) — borrowed from app, not owned.
     // Used to resolve trash file paths: <data_dir>/trash/<trash_name>.
@@ -253,8 +255,15 @@ pub const GridState = struct {
 
         const entries = switch (self.view_mode) {
             .library => blk: {
-                if (self.search_query) |q| {
-                    if (q.len > 0) break :blk try db.searchPrompts(self.allocator, q);
+                const has_search = if (self.search_query) |q| q.len > 0 else false;
+                if (has_search or self.filters.len > 0) {
+                    break :blk try db.listImagesFiltered(
+                        self.allocator,
+                        self.filter_library_id,
+                        self.filter_folder_path,
+                        if (has_search) self.search_query else null,
+                        self.filters,
+                    );
                 }
                 if (self.filter_folder_path) |fp| {
                     const lib_id = self.filter_library_id orelse break :blk try db.listAllImages(self.allocator);
