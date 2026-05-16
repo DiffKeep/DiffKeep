@@ -1030,6 +1030,11 @@ fn frame() !dvui.App.Result {
             grid.restore_requested = false;
             if (dvui.App.main_init) |init| performRestore(init.io, init.gpa, grid);
         }
+        if (grid.open_viewer_requested) {
+            grid.open_viewer_requested = false;
+            openViewer(grid, grid.viewer_start_id);
+            grid.viewer_start_id = null;
+        }
     }
 
     // Detect search text changes and reload the grid via FTS5
@@ -1382,6 +1387,14 @@ const ViewerWindow = struct {
     fn deinit(self: *ViewerWindow) void {
         self.state.deinit();
         self.win.deinit();
+        // Destroy the SDL renderer and window manually, then suppress SDL_Quit.
+        // SDL3 does not refcount SDL_Init/SDL_Quit — calling SDL_Quit from a
+        // viewer deinit would tear down the video subsystem while the main window
+        // is still running.  Only the main window's deferred back.deinit() should
+        // call SDL_Quit at process exit.
+        SDLBackend.c.SDL_DestroyRenderer(self.back.renderer);
+        SDLBackend.c.SDL_DestroyWindow(self.back.window);
+        self.back.we_own_window = false;
         self.back.deinit();
     }
 };
@@ -1476,9 +1489,7 @@ fn openViewer(grid: *image_grid_mod.GridState, start_id: ?u64) void {
         return;
     };
 
-    var title_buf: [256]u8 = undefined;
-    const title = std.fmt.bufPrintZ(&title_buf, "{s} \u{2014} DiffKeep",
-        .{images.items[start_idx].filename}) catch "DiffKeep";
+    const title = "DiffKeep Viewer";
 
     const back = SDLBackend.initWindow(.{
         .io = init.io,
@@ -1500,8 +1511,10 @@ fn openViewer(grid: *image_grid_mod.GridState, start_id: ?u64) void {
         .sdl_window_id = 0,
         .state = image_viewer_mod.ViewerState.init(
             init.gpa, id, images, start_idx, wakeupFrame, g_data_dir,
+            init.io, if (g_db) |*db| db else null,
         ),
     };
+    vw.state.sdl_window_ptr = vw.back.window;
 
     vw.win = dvui.Window.init(@src(), init.gpa, vw.back.backend(), .{ .id_extra = @intCast(id) })
         catch {

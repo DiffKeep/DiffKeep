@@ -139,6 +139,12 @@ pub const GridState = struct {
     restore_requested: bool = false,
     // Mirrored from config so renderItem can condition the context menu label
     trash_enabled: bool = true,
+    // Viewer opening — set by double-click/Enter/context menu, consumed by app.zig each frame
+    open_viewer_requested: bool = false,
+    viewer_start_id: ?u64 = null,
+    // Double-click state stored here (not in dvui data store) for reliability
+    dblclick_last_id: u64 = 0,
+    dblclick_last_ns: i64 = 0,
 
     // Filter state — owned by app.zig, not freed by GridState
     filter_library_id: ?u64 = null,
@@ -545,6 +551,11 @@ pub const GridState = struct {
                                 e.handle(@src(), grid_box.data());
                             }
                         },
+                        .enter => {
+                            self.open_viewer_requested = true;
+                            self.viewer_start_id = self.images.items[fi].id;
+                            e.handle(@src(), grid_box.data());
+                        },
                         else => {},
                     }
                 },
@@ -678,6 +689,13 @@ pub const GridState = struct {
                 var fm = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{ .id_extra = idx });
                 defer fm.deinit();
 
+                if (dvui.menuItemLabel(@src(), i18n.t(.context_view_image), .{},
+                    .{ .expand = .horizontal }) != null)
+                {
+                    fm.close();
+                    self.open_viewer_requested = true;
+                    self.viewer_start_id = entry.id;
+                }
                 if (self.view_mode == .library) {
                     if (self.trash_enabled) {
                         if (dvui.menuItemLabel(@src(), i18n.t(.context_send_to_trash), .{}, .{ .expand = .horizontal }) != null) {
@@ -727,6 +745,25 @@ pub const GridState = struct {
                 self.anchor_idx = idx;
             }
             self.focused_idx = idx;
+
+            // Double-click detection: same image clicked twice within 400 ms.
+            const now_ns: i96 = std.Io.Clock.real.now(self.io).nanoseconds;
+            const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+            if (self.dblclick_last_id == entry.id and self.dblclick_last_ns > 0) {
+                const delta_ms = now_ms - self.dblclick_last_ns;
+                if (delta_ms >= 0 and delta_ms < 400) {
+                    self.open_viewer_requested = true;
+                    self.viewer_start_id = entry.id;
+                    self.dblclick_last_id = 0;
+                    self.dblclick_last_ns = 0;
+                } else {
+                    self.dblclick_last_id = entry.id;
+                    self.dblclick_last_ns = now_ms;
+                }
+            } else {
+                self.dblclick_last_id = entry.id;
+                self.dblclick_last_ns = now_ms;
+            }
         }
 
         // Fixed ts×ts area; dark background is the letterbox fill and loading placeholder.
