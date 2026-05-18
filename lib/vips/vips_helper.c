@@ -51,3 +51,49 @@ int diffkeep_thumbnail_to_jpeg(
 void diffkeep_vips_free(void *buf) {
     g_free(buf);
 }
+
+int diffkeep_load_image_rgba(
+    const char *filename,
+    void **buf,
+    size_t *len,
+    int *width,
+    int *height
+) {
+    /* vips_thumbnail with a huge target and VIPS_SIZE_DOWN returns the image
+       at its original resolution converted to sRGB(A) uint8 — the same path
+       used by the thumbnail worker, which is known to work from threads. */
+    VipsImage *image = NULL;
+    if (vips_thumbnail(filename, &image, 65535,
+            "height", 65535,
+            "size", VIPS_SIZE_DOWN,
+            "no_rotate", TRUE,
+            NULL) != 0)
+        return -1;
+
+    /* vips_thumbnail outputs 3-band sRGB or 4-band sRGB-A.
+       Ensure we always have 4 bands for dvui. */
+    if (!vips_image_hasalpha(image)) {
+        VipsImage *rgba = NULL;
+        if (vips_addalpha(image, &rgba, NULL) != 0) {
+            g_object_unref(image);
+            return -1;
+        }
+        g_object_unref(image);
+        image = rgba;
+    }
+
+    size_t out_len = 0;
+    void *pixels = vips_image_write_to_memory(image, &out_len);
+    if (!pixels) {
+        g_object_unref(image);
+        return -1;
+    }
+
+    *width  = vips_image_get_width(image);
+    *height = vips_image_get_height(image);
+    *buf    = pixels;
+    *len    = out_len;
+
+    g_object_unref(image);
+    return 0;
+}

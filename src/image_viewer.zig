@@ -6,6 +6,20 @@ const db_mod = @import("db.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const vips_mod = @import("vips");
+
+const cache_radius: usize = 2;
+const cache_size: usize = cache_radius * 2 + 1; // 5 slots
+
+// One slot in the prefetch cache.
+const CacheSlot = struct {
+    image_idx: usize = 0,
+    active: bool = false, // slot is allocated for this image_idx
+    ready: bool = false,  // pixels have been decoded
+    pixels: ?[]u8 = null,
+    width: u32 = 0,
+    height: u32 = 0,
+};
 
 pub const ViewerState = struct {
     id: u64,
@@ -14,18 +28,19 @@ pub const ViewerState = struct {
     images: std.ArrayList(image_grid_mod.ImageEntry),
     current_idx: usize,
 
-    // Full-res image data (owned by this struct)
-    image_bytes: ?[]u8 = null,
+    // Currently displayed image (gpa-owned).
+    image_pixels: ?[]u8 = null,
     image_width: u32 = 0,
     image_height: u32 = 0,
+    image_texture_hash: u64 = 0,
 
-    // Pending image from load thread
-    pending_bytes: ?[]u8 = null,
-    pending_width: u32 = 0,
-    pending_height: u32 = 0,
-    pending_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    load_thread: ?std.Thread = null,
-    stop_load: std.atomic.Value(bool) = .init(false),
+    // Prefetch cache.  cache_mutex protects both cache_slots and cache_threads.
+    // Thread handles are managed only by the main thread.
+    cache_slots: [cache_size]CacheSlot,
+    cache_threads: [cache_size]?std.Thread,
+    cache_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    // Handles for evicted threads (can't join immediately); joined at deinit.
+    orphan_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
 
     // Pan/zoom
     zoom: f32 = 1.0,
@@ -48,6 +63,15 @@ pub const ViewerState = struct {
     // Pending actions consumed by app.zig
     delete_requested: bool = false,
     delete_force: bool = false,
+    // Confirmation dialog state.  app.zig sets delete_confirm_open; viewer renders
+    // the dialog; app.zig consumes delete_confirmed / delete_no_ask.
+    delete_confirm_open: bool = false,
+    delete_pending_permanent: bool = false,
+    delete_pending_id: u64 = 0,
+    delete_pending_name_buf: [512]u8 = undefined,
+    delete_pending_name_len: usize = 0,
+    delete_confirmed: bool = false,
+    delete_no_ask: bool = false,
     wakeup_fn: ?*const fn () void = null,
     data_dir: ?[]const u8 = null,
 
@@ -61,7 +85,7 @@ pub const ViewerState = struct {
         io: std.Io,
         db: ?*db_mod.VectorDb,
     ) ViewerState {
-        var state: ViewerState = .{
+        var state = ViewerState{
             .id = id,
             .gpa = allocator,
             .io = io,
@@ -70,67 +94,175 @@ pub const ViewerState = struct {
             .wakeup_fn = wakeup_fn,
             .data_dir = data_dir,
             .db = db,
+            .cache_slots = undefined,
+            .cache_threads = undefined,
         };
+        for (&state.cache_slots) |*s| s.* = .{};
+        for (&state.cache_threads) |*t| t.* = null;
         if (db != null and images.items.len > 0) {
             state.detail_state.update(images.items[start_idx].id, db.?, allocator, io);
         }
-        // spawnLoadThread() is intentionally NOT called here: init() returns by value,
-        // and spawning a thread with &state before the caller places the struct at its
-        // final address would give the thread a dangling pointer.  The first render()
-        // call spawns the thread once self is stable.
+        // Load threads are spawned on the first render() call, once self is stable.
         return state;
     }
 
     pub fn deinit(self: *ViewerState) void {
-        self.stop_load.store(true, .release);
-        if (self.load_thread) |t| {
-            t.join();
-            self.load_thread = null;
+        // Mark all slots inactive so in-flight threads will discard their results.
+        // Collect thread handles while holding the lock, then join without it.
+        var threads: [cache_size]?std.Thread = undefined;
+        {
+            self.cache_mutex.lockUncancelable(self.io);
+            for (&self.cache_slots, 0..) |*slot, i| {
+                if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
+                slot.active = false;
+                slot.ready = false;
+                threads[i] = self.cache_threads[i];
+                self.cache_threads[i] = null;
+            }
+            self.cache_mutex.unlock(self.io);
         }
-        self.pending_mutex.lockUncancelable(self.io);
-        if (self.pending_bytes) |b| self.gpa.free(b);
-        self.pending_bytes = null;
-        self.pending_mutex.unlock(self.io);
-        if (self.image_bytes) |b| self.gpa.free(b);
-        self.image_bytes = null;
+        for (threads) |maybe_t| { if (maybe_t) |t| t.join(); }
+        for (self.orphan_threads.items) |t| t.join();
+        self.orphan_threads.deinit(self.gpa);
+
+        if (self.image_pixels) |p| self.gpa.free(p);
         for (self.images.items) |e| self.gpa.free(e.path);
         self.images.deinit(self.gpa);
         self.detail_state.deinit(self.gpa);
     }
 
-    fn spawnLoadThread(self: *ViewerState) void {
-        if (self.images.items.len == 0) return;
-        const entry = self.images.items[self.current_idx];
-        self.stop_load.store(true, .release);
-        if (self.load_thread) |t| {
-            t.join();
-            self.load_thread = null;
-        }
-        self.stop_load.store(false, .release);
-        const path_copy = self.gpa.dupe(u8, entry.path) catch return;
-        self.load_thread = std.Thread.spawn(.{}, loadImageThread, .{
-            self.gpa, self.io, self, path_copy,
-        }) catch {
-            self.gpa.free(path_copy);
+    // Promote a ready cache entry for current_idx into image_pixels.
+    // Called at the top of render() so a prefetched image appears in the same
+    // frame as the navigation key-press.
+    fn drainCache(self: *ViewerState) void {
+        if (self.image_pixels != null) return;
+
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+
+        for (&self.cache_slots, 0..) |*slot, i| {
+            if (!slot.active or !slot.ready or slot.image_idx != self.current_idx) continue;
+            const pixels = slot.pixels orelse continue;
+
+            self.image_pixels = pixels;
+            self.image_width = slot.width;
+            self.image_height = slot.height;
+            slot.pixels = null;
+            slot.active = false;
+            slot.ready = false;
+
+            const src = dvui.ImageSource{ .pixels = .{
+                .rgba = pixels,
+                .width = slot.width,
+                .height = slot.height,
+            } };
+            self.image_texture_hash = src.hash();
+
+            // Thread has finished; join it now (it has already exited or will
+            // momentarily after releasing the lock it holds here).
+            if (self.cache_threads[i]) |t| {
+                self.cache_mutex.unlock(self.io);
+                t.join();
+                self.cache_mutex.lockUncancelable(self.io);
+                self.cache_threads[i] = null;
+            }
             return;
-        };
+        }
     }
 
-    fn drainPendingLoad(self: *ViewerState) void {
-        self.pending_mutex.lockUncancelable(self.io);
-        defer self.pending_mutex.unlock(self.io);
-        const bytes = self.pending_bytes orelse return;
-        self.pending_bytes = null;
-        if (self.image_bytes) |old| self.gpa.free(old);
-        self.image_bytes = bytes;
-        self.image_width = self.pending_width;
-        self.image_height = self.pending_height;
+    // Maintain the cache window [current_idx-2, current_idx+2].
+    // Evicts entries that have fallen outside and starts loads for missing ones.
+    // Guards against duplicate loads: an index is skipped if it is already
+    // active in the cache, or is current_idx and already displayed.
+    fn updateCache(self: *ViewerState) void {
+        const n = self.images.items.len;
+        if (n == 0) return;
+
+        const idx = self.current_idx;
+        const lo = idx -| cache_radius;
+        const hi = @min(idx + cache_radius, n - 1);
+
+        const LoadTask = struct { slot_i: usize, image_idx: usize, path: [:0]u8 };
+        var tasks: [cache_size]LoadTask = undefined;
+        var task_count: usize = 0;
+
+        {
+            self.cache_mutex.lockUncancelable(self.io);
+            defer self.cache_mutex.unlock(self.io);
+
+            // Evict slots that have fallen outside the window.
+            for (&self.cache_slots, 0..) |*slot, i| {
+                if (!slot.active) continue;
+                if (slot.image_idx < lo or slot.image_idx > hi) {
+                    if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
+                    slot.active = false;
+                    slot.ready = false;
+                    if (self.cache_threads[i]) |t| {
+                        // Can't join here (we hold the mutex); park for deinit.
+                        self.orphan_threads.append(self.gpa, t) catch t.join();
+                        self.cache_threads[i] = null;
+                    }
+                }
+            }
+
+            // Queue loads for desired indices not already present.
+            var wi = lo;
+            while (wi <= hi) : (wi += 1) {
+                // Skip if already in cache (loading or ready).
+                var found = false;
+                for (&self.cache_slots) |*slot| {
+                    if (slot.active and slot.image_idx == wi) { found = true; break; }
+                }
+                if (found) continue;
+
+                // Skip current_idx if it is already displayed.
+                if (wi == self.current_idx and self.image_pixels != null) continue;
+
+                // Find a free slot.
+                var free_i: ?usize = null;
+                for (&self.cache_slots, 0..) |*slot, i| {
+                    if (!slot.active) { free_i = i; break; }
+                }
+                const si = free_i orelse continue;
+
+                const path_copy = self.gpa.dupeZ(u8, self.images.items[wi].path) catch continue;
+                self.cache_slots[si] = .{ .active = true, .image_idx = wi };
+                if (task_count < cache_size) {
+                    tasks[task_count] = .{ .slot_i = si, .image_idx = wi, .path = path_copy };
+                    task_count += 1;
+                } else {
+                    self.gpa.free(path_copy);
+                    self.cache_slots[si].active = false;
+                }
+            }
+        }
+
+        // Spawn threads outside the lock.
+        for (tasks[0..task_count]) |task| {
+            const t = std.Thread.spawn(.{}, loadCacheThread, .{
+                self.gpa, self.io, self, task.slot_i, task.image_idx, task.path,
+            }) catch {
+                self.gpa.free(task.path);
+                self.cache_mutex.lockUncancelable(self.io);
+                self.cache_slots[task.slot_i].active = false;
+                self.cache_mutex.unlock(self.io);
+                continue;
+            };
+            self.cache_mutex.lockUncancelable(self.io);
+            self.cache_threads[task.slot_i] = t;
+            self.cache_mutex.unlock(self.io);
+        }
     }
 
     pub fn navigateTo(self: *ViewerState, idx: usize) void {
         if (self.images.items.len == 0) return;
         self.current_idx = @min(idx, self.images.items.len - 1);
-        if (self.image_bytes) |b| { self.gpa.free(b); self.image_bytes = null; }
+        if (self.image_pixels) |p| {
+            dvui.textureInvalidateCache(self.image_texture_hash);
+            self.gpa.free(p);
+            self.image_pixels = null;
+            self.image_texture_hash = 0;
+        }
         self.image_width = 0;
         self.image_height = 0;
         self.pan_x = 0;
@@ -139,7 +271,7 @@ pub const ViewerState = struct {
         if (self.db) |db| {
             self.detail_state.update(self.images.items[self.current_idx].id, db, self.gpa, self.io);
         }
-        self.spawnLoadThread();
+        // drainCache() + updateCache() in the next render() handle the actual load.
     }
 
     pub fn currentImage(self: *const ViewerState) ?*const image_grid_mod.ImageEntry {
@@ -149,29 +281,52 @@ pub const ViewerState = struct {
 
     pub fn removeImages(self: *ViewerState, ids: *const std.AutoHashMap(u64, void)) void {
         var i: usize = 0;
+        var any_removed = false;
         var removed_current = false;
         while (i < self.images.items.len) {
             const e = self.images.items[i];
             if (ids.contains(e.id)) {
                 self.gpa.free(e.path);
                 _ = self.images.orderedRemove(i);
+                any_removed = true;
                 if (i == self.current_idx) removed_current = true else if (i < self.current_idx) self.current_idx -|= 1;
             } else i += 1;
         }
         if (self.images.items.len == 0) { self.open = false; return; }
+        if (!any_removed) return;
+        // Any removal shifts subsequent indices, invalidating all cache slots.
+        self.flushCache();
         if (removed_current) {
             self.current_idx = @min(self.current_idx, self.images.items.len - 1);
             self.navigateTo(self.current_idx);
         }
     }
 
-    pub fn render(self: *ViewerState) void {
-        // Spawn the initial load thread on the first render, when self is stable.
-        if (self.load_thread == null and self.image_bytes == null and self.images.items.len > 0) {
-            self.spawnLoadThread();
+    // Mark all cache slots inactive and park their threads as orphans.
+    // Called when the images list is mutated (indices shift).
+    fn flushCache(self: *ViewerState) void {
+        var threads: [cache_size]?std.Thread = undefined;
+        {
+            self.cache_mutex.lockUncancelable(self.io);
+            for (&self.cache_slots, 0..) |*slot, i| {
+                if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
+                slot.active = false;
+                slot.ready = false;
+                threads[i] = self.cache_threads[i];
+                self.cache_threads[i] = null;
+            }
+            self.cache_mutex.unlock(self.io);
         }
-        self.drainPendingLoad();
+        for (threads) |maybe_t| {
+            if (maybe_t) |t| self.orphan_threads.append(self.gpa, t) catch t.join();
+        }
+    }
+
+    pub fn render(self: *ViewerState) void {
+        self.drainCache();
+        self.updateCache();
         self.handleKeyEvents();
+        if (self.delete_confirm_open) self.renderDeleteConfirmDialog();
 
         var outer = dvui.box(@src(), .{}, .{ .expand = .both, .background = true });
         defer outer.deinit();
@@ -246,6 +401,52 @@ pub const ViewerState = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    fn renderDeleteConfirmDialog(self: *ViewerState) void {
+        var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{
+            .min_size_content = .{ .w = 360, .h = 0 },
+        });
+        defer float.deinit();
+        float.autoSize();
+
+        var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+        defer content.deinit();
+
+        const title = if (self.delete_pending_permanent)
+            i18n.t(.confirm_delete_title)
+        else
+            i18n.t(.confirm_trash_title);
+        dvui.label(@src(), "{s}", .{title}, .{ .font = dvui.themeGet().font_heading, .margin = .{ .h = 8 } });
+
+        const name = self.delete_pending_name_buf[0..self.delete_pending_name_len];
+        dvui.label(@src(), "{s}", .{name}, .{ .margin = .{ .h = 12 } });
+
+        var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
+        defer btn_row.deinit();
+
+        if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
+            self.delete_confirm_open = false;
+        }
+
+        const skip_label = if (self.delete_pending_permanent)
+            i18n.t(.confirm_delete_no_ask)
+        else
+            i18n.t(.confirm_trash_no_ask);
+        if (dvui.button(@src(), skip_label, .{}, .{ .margin = .all(4) })) {
+            self.delete_confirm_open = false;
+            self.delete_no_ask = true;
+            self.delete_confirmed = true;
+        }
+
+        const confirm_label = if (self.delete_pending_permanent)
+            i18n.t(.confirm_delete)
+        else
+            i18n.t(.confirm_move_to_trash);
+        if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+            self.delete_confirm_open = false;
+            self.delete_confirmed = true;
         }
     }
 
@@ -354,7 +555,7 @@ pub const ViewerState = struct {
 
         self.handleAreaMouseEvents(wd, crs);
 
-        if (self.image_bytes) |bytes| {
+        if (self.image_pixels) |pixels| {
             const s = crs.s;
             const img_w_p = @as(f32, @floatFromInt(self.image_width)) * self.zoom * s;
             const img_h_p = @as(f32, @floatFromInt(self.image_height)) * self.zoom * s;
@@ -369,7 +570,12 @@ pub const ViewerState = struct {
             const prev_clip = dvui.clipGet();
             dvui.clipSet(crs.r.intersect(prev_clip));
             dvui.renderImage(
-                .{ .imageFile = .{ .bytes = bytes, .invalidation = .ptr } },
+                .{ .pixels = .{
+                    .rgba = pixels,
+                    .width = self.image_width,
+                    .height = self.image_height,
+                    .invalidation = .ptr,
+                } },
                 .{ .r = img_rect, .s = s },
                 .{},
             ) catch {};
@@ -494,71 +700,39 @@ pub const ViewerState = struct {
     }
 };
 
-fn parseDimsFromBytes(bytes: []const u8) struct { w: u32, h: u32 } {
-    // PNG: 8-byte signature followed by IHDR (length 4 + type 4 + width 4 + height 4)
-    if (bytes.len >= 24 and
-        bytes[0] == 137 and bytes[1] == 80 and bytes[2] == 78 and bytes[3] == 71 and
-        bytes[4] == 13 and bytes[5] == 10 and bytes[6] == 26 and bytes[7] == 10)
-    {
-        const w = std.mem.readInt(u32, bytes[16..20], .big);
-        const h = std.mem.readInt(u32, bytes[20..24], .big);
-        if (w > 0 and h > 0) return .{ .w = w, .h = h };
-    }
-    // JPEG SOF scan
-    if (bytes.len >= 2 and bytes[0] == 0xFF and bytes[1] == 0xD8) {
-        var i: usize = 2;
-        while (i + 3 < bytes.len) {
-            if (bytes[i] != 0xFF) break;
-            const marker = bytes[i + 1];
-            if (marker >= 0xC0 and marker <= 0xCF and
-                marker != 0xC4 and marker != 0xC8 and marker != 0xCC)
-            {
-                if (i + 8 < bytes.len) {
-                    const h: u32 = (@as(u32, bytes[i + 5]) << 8) | bytes[i + 6];
-                    const w: u32 = (@as(u32, bytes[i + 7]) << 8) | bytes[i + 8];
-                    if (w > 0 and h > 0) return .{ .w = w, .h = h };
-                }
-                break;
-            }
-            const seg_len: usize = (@as(usize, bytes[i + 2]) << 8) | bytes[i + 3];
-            if (seg_len < 2) break;
-            i += 2 + seg_len;
-        }
-    }
-    return .{ .w = 0, .h = 0 };
-}
-
-fn loadImageThread(
+fn loadCacheThread(
     gpa: std.mem.Allocator,
     io: std.Io,
     state: *ViewerState,
-    path: []const u8,
+    slot_i: usize,
+    image_idx: usize,
+    path: [:0]u8,
 ) void {
     defer gpa.free(path);
+    defer vips_mod.threadShutdown();
 
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
-    defer file.close(io);
-    const file_size = file.length(io) catch return;
-    if (file_size > 256 * 1024 * 1024) return;
-    const bytes = gpa.alloc(u8, file_size) catch return;
-    _ = file.readPositionalAll(io, bytes, 0) catch {
-        gpa.free(bytes);
-        return;
-    };
+    const result = vips_mod.loadImageRgbaWithDims(gpa, path) catch return;
 
-    if (state.stop_load.load(.acquire)) {
-        gpa.free(bytes);
-        return;
+    var should_wakeup = false;
+    {
+        state.cache_mutex.lockUncancelable(io);
+        defer state.cache_mutex.unlock(io);
+
+        const slot = &state.cache_slots[slot_i];
+        if (!slot.active or slot.image_idx != image_idx) {
+            // Slot was evicted or reused while we were loading; discard result.
+            gpa.free(result.pixels);
+        } else {
+            if (slot.pixels) |old| gpa.free(old);
+            slot.pixels = result.pixels;
+            slot.width = result.width;
+            slot.height = result.height;
+            slot.ready = true;
+            should_wakeup = true;
+        }
     }
 
-    const dims = parseDimsFromBytes(bytes);
-
-    state.pending_mutex.lockUncancelable(io);
-    defer state.pending_mutex.unlock(io);
-    if (state.pending_bytes) |old| gpa.free(old);
-    state.pending_bytes = bytes;
-    state.pending_width = dims.w;
-    state.pending_height = dims.h;
-
-    if (state.wakeup_fn) |wakeup| wakeup();
+    if (should_wakeup) {
+        if (state.wakeup_fn) |wakeup| wakeup();
+    }
 }

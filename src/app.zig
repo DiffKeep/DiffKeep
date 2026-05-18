@@ -51,6 +51,7 @@ var g_delete_dialog_force: bool = false;  // permanent delete (skip trash)
 var g_delete_dialog_count: usize = 0;
 var g_delete_dialog_name_buf: [512]u8 = undefined;
 var g_delete_dialog_name_len: usize = 0;
+
 const ScanSnapshot = struct { thumbnails_in_db: bool = false, prompt_embeddings: bool = false, image_embeddings: bool = false };
 var g_settings_scan_snapshot: ScanSnapshot = .{};
 
@@ -1535,21 +1536,77 @@ fn removeFromViewers(ids: *const std.AutoHashMap(u64, void)) void {
     for (g_viewer_windows.items) |vw| vw.state.removeImages(ids);
 }
 
-fn performViewerDelete(state: *image_viewer_mod.ViewerState) void {
-    const init = dvui.App.main_init orelse return;
-    if (g_grid) |*grid| {
-        var ids = std.AutoHashMap(u64, void).init(init.gpa);
-        defer ids.deinit();
-        if (state.currentImage()) |img| ids.put(img.id, {}) catch {};
-        if (ids.count() == 0) return;
-        if (state.delete_force or !g_cfg.trash_enabled) {
-            performDelete(init.io, init.gpa, grid);
-        } else {
-            performTrash(init.io, init.gpa, grid);
-        }
-        removeFromViewers(&ids);
-        refreshCounts();
+/// Perform trash/delete on a specific image entry owned by a viewer (not grid selection).
+fn performViewerDeleteEntry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    entry: image_grid_mod.ImageEntry,
+    force: bool,
+) void {
+    const data_dir = g_data_dir orelse return;
+
+    if (force or !g_cfg.trash_enabled) {
+        const file_path: []const u8 = if (entry.trash_name) |tn|
+            std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
+        else
+            entry.path;
+        defer if (entry.trash_name != null) allocator.free(file_path);
+        std.Io.Dir.cwd().deleteFile(io, file_path) catch |err|
+            log.warn("delete {s}: {}", .{ entry.filename, err });
+        if (g_db) |*db| db.deleteImage(entry.id) catch |err|
+            log.warn("deleteImage {d}: {}", .{ entry.id, err });
+    } else {
+        const now_s: i64 = @intCast(@divTrunc(
+            std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s,
+        ));
+        var file_size: i64 = 0;
+        if (std.Io.Dir.cwd().openFile(io, entry.path, .{})) |f| {
+            if (f.length(io)) |len| file_size = @intCast(len) else |_| {}
+            f.close(io);
+        } else |_| {}
+        const basename = std.fs.path.basename(entry.path);
+        var name_buf: [768]u8 = undefined;
+        const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch return;
+        const dst = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch return;
+        defer allocator.free(dst);
+        moveFile(io, allocator, entry.path, dst) catch |err| {
+            log.warn("trash {s}: {}", .{ entry.filename, err });
+            return;
+        };
+        if (g_db) |*db| db.trashImage(entry.id, trash_name, file_size, now_s) catch |err|
+            log.warn("trashImage {d}: {}", .{ entry.id, err });
     }
+
+    var ids = std.AutoHashMap(u64, void).init(allocator);
+    defer ids.deinit();
+    ids.put(entry.id, {}) catch {};
+    if (g_grid) |*grid| removeFromGrid(grid, &ids);
+    removeFromViewers(&ids);
+    refreshCounts();
+}
+
+fn openViewerDeleteDialog(state: *image_viewer_mod.ViewerState, force: bool) void {
+    const init = dvui.App.main_init orelse return;
+    const img = state.currentImage() orelse return;
+
+    const permanent = force or !g_cfg.trash_enabled;
+
+    if (!permanent and g_skip_delete_confirm) {
+        performViewerDeleteEntry(init.io, init.gpa, img.*, force);
+        return;
+    }
+    if (permanent and g_skip_permanent_delete_confirm) {
+        performViewerDeleteEntry(init.io, init.gpa, img.*, force);
+        return;
+    }
+
+    // Populate viewer state; the dialog renders inside the viewer window.
+    state.delete_pending_id = img.id;
+    state.delete_pending_permanent = permanent;
+    const len = @min(img.filename.len, state.delete_pending_name_buf.len);
+    @memcpy(state.delete_pending_name_buf[0..len], img.filename[0..len]);
+    state.delete_pending_name_len = len;
+    state.delete_confirm_open = true;
 }
 
 fn pickMinWait(a: ?u32, b: ?u32) ?u32 {
@@ -1621,7 +1678,25 @@ pub fn main(init: std.process.Init) !void {
 
             if (vw.state.delete_requested) {
                 vw.state.delete_requested = false;
-                performViewerDelete(&vw.state);
+                openViewerDeleteDialog(&vw.state, vw.state.delete_force);
+            }
+
+            if (vw.state.delete_confirmed) {
+                vw.state.delete_confirmed = false;
+                if (vw.state.delete_no_ask) {
+                    vw.state.delete_no_ask = false;
+                    if (vw.state.delete_pending_permanent) g_skip_permanent_delete_confirm = true
+                    else g_skip_delete_confirm = true;
+                }
+                if (dvui.App.main_init) |main_init| {
+                    const iid = vw.state.delete_pending_id;
+                    for (vw.state.images.items) |e| {
+                        if (e.id == iid) {
+                            performViewerDeleteEntry(main_init.io, main_init.gpa, e, vw.state.delete_pending_permanent);
+                            break;
+                        }
+                    }
+                }
             }
 
             var close = !vw.state.open;

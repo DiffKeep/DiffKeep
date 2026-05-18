@@ -15,3 +15,13 @@ int diffkeep_thumbnail_to_jpeg(
 );
 
 void diffkeep_vips_free(void *buf);
+
+/* Load a full-resolution image as a packed RGBA8 buffer.
+   Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
+int diffkeep_load_image_rgba(
+    const char *filename,
+    void **buf,
+    size_t *len,
+    int *width,
+    int *height
+);
