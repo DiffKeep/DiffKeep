@@ -15,6 +15,7 @@ const SDLBackend = @import("backend");
 const detail_panel_mod = @import("detail_panel.zig");
 const sidebar_mod = @import("sidebar.zig");
 const image_viewer_mod = @import("image_viewer.zig");
+const dnd_mod = @import("dnd.zig");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
 const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
@@ -42,6 +43,8 @@ var g_total_image_count: i64 = 0;
 
 var g_sidebar: sidebar_mod.SidebarState = .{};
 var g_detail: detail_panel_mod.DetailState = .{};
+var g_dnd: ?dnd_mod.DragSource = null;
+var g_dnd_drag_cursor: ?*SDLBackend.c.SDL_Cursor = null;
 
 // Delete confirmation dialog state
 var g_skip_delete_confirm: bool = false;           // don't ask again for single soft-delete
@@ -228,6 +231,7 @@ fn appInit(win: *dvui.Window) !void {
 }
 
 fn appDeinit() void {
+    if (g_dnd) |*dnd| dnd.deinit();
     // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
         if (g_library_manager) |*mgr| mgr.deinit(init.io);
@@ -1056,6 +1060,28 @@ fn frame() !dvui.App.Result {
                 detail_panel_mod.copyImageToClipboard(grid.copy_image_path, init.gpa, init.io);
             }
         }
+        if (grid.drag_requested) {
+            grid.drag_requested = false;
+            if (g_dnd) |*dnd| {
+                if (dvui.App.main_init) |init| {
+                    var items: std.ArrayList(dnd_mod.DragItem) = .empty;
+                    defer items.deinit(init.gpa);
+                    for (grid.drag_requested_ids.items) |id| {
+                        for (grid.images.items) |entry| {
+                            if (entry.id != id) continue;
+                            const thumb = grid.committed.get(id);
+                            items.append(init.gpa, .{
+                                .path       = entry.path,
+                                .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
+                            }) catch break;
+                            break;
+                        }
+                    }
+                    dnd.startDrag(items.items);
+                }
+            }
+            grid.drag_requested_ids.clearRetainingCapacity();
+        }
     }
 
     // Detect search text changes and reload the grid via FTS5
@@ -1424,6 +1450,7 @@ var g_viewer_windows: std.ArrayList(*ViewerWindow) = .empty;
 var g_viewer_next_id: u64 = 1;
 
 fn routeAllSDLEvents(main_back: *SDLBackend, main_win: *dvui.Window) void {
+    if (g_dnd) |*dnd| dnd.pumpEvents();
     const main_id = SDLBackend.c.SDL_GetWindowID(main_back.window);
     var event: SDLBackend.c.SDL_Event = undefined;
     while (SDLBackend.c.SDL_PollEvent(&event)) {
@@ -1657,6 +1684,7 @@ pub fn main(init: std.process.Init) !void {
     try win.begin(win.frame_time_ns);
     try appInit(&win);
     _ = try win.end(.{});
+    g_dnd = dnd_mod.DragSource.init(init.gpa, back.window);
     defer appDeinit();
     defer cleanupViewers(init.gpa);
 
@@ -1664,6 +1692,7 @@ pub fn main(init: std.process.Init) !void {
     main_loop: while (true) {
         const nstime = win.beginWait(interrupted);
         routeAllSDLEvents(&back, &win);
+        if (g_dnd) |*dnd| dnd.tick(init.io);
 
         // ── Main window ───────────────────────────────────────────────────────
         try win.begin(nstime);
@@ -1677,6 +1706,17 @@ pub fn main(init: std.process.Init) !void {
         }
         var end_micros: ?u32 = try win.end(.{});
         try back.setCursor(win.cursorRequested());
+        if (g_dnd) |*dnd| {
+            if (dnd.isDragging()) {
+                if (g_dnd_drag_cursor == null)
+                    g_dnd_drag_cursor = SDLBackend.c.SDL_CreateSystemCursor(SDLBackend.c.SDL_SYSTEM_CURSOR_MOVE);
+                if (g_dnd_drag_cursor) |c| _ = SDLBackend.c.SDL_SetCursor(c);
+            } else if (g_dnd_drag_cursor) |c| {
+                SDLBackend.c.SDL_DestroyCursor(c);
+                g_dnd_drag_cursor = null;
+                _ = SDLBackend.c.SDL_SetCursor(null);
+            }
+        }
         try back.textInputRect(win.textInputRequested());
         try back.renderPresent();
         if (res == .close) break :main_loop;

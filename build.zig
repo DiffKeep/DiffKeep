@@ -39,6 +39,9 @@ pub fn build(b: *std.Build) !void {
     const icons_dep = b.dependency("icons", .{ .target = target, .optimize = optimize });
     exe.root_module.addImport("icons", icons_dep.module("icons"));
     exe.root_module.link_libcpp = true;
+    if (target.result.os.tag == .linux) {
+        exe.root_module.linkSystemLibrary("X11", .{});
+    }
 
     b.installArtifact(exe);
 

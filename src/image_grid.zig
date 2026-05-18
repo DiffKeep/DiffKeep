@@ -141,6 +141,8 @@ pub const GridState = struct {
     copy_prompt_id: u64 = 0,
     copy_image_requested: bool = false,
     copy_image_path: []const u8 = "",
+    drag_requested: bool = false,
+    drag_requested_ids: std.ArrayListUnmanaged(u64) = .empty,
     // Mirrored from config so renderItem can condition the context menu label
     trash_enabled: bool = true,
     // Viewer opening — set by double-click/Enter/context menu, consumed by app.zig each frame
@@ -230,6 +232,7 @@ pub const GridState = struct {
         self.loader_db.deinit();
         self.notifier.deinit();
         self.selection.deinit();
+        self.drag_requested_ids.deinit(self.allocator);
 
         for (self.incoming.items) |e| self.allocator.free(e.path);
         self.incoming.deinit(self.allocator);
@@ -781,6 +784,30 @@ pub const GridState = struct {
             } else {
                 self.dblclick_last_id = entry.id;
                 self.dblclick_last_ns = now_ms;
+            }
+        }
+
+        // Drag-to-external: if captured and motion exceeds drag threshold, start XDND.
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            if (e.evt != .mouse) continue;
+            if (e.evt.mouse.action != .motion) continue;
+            if (!dvui.captured(cell.data().id)) continue;
+            if (dvui.dragging(e.evt.mouse.p, null) == null) continue;
+            e.handled = true;
+            dvui.captureMouse(null, e.num);
+            dvui.dragEnd();
+            log.debug("drag gesture fired on id={d}", .{entry.id});
+            self.drag_requested = true;
+            self.drag_requested_ids.clearRetainingCapacity();
+            if (self.selection.contains(entry.id)) {
+                // Drag all selected images
+                var it = self.selection.keyIterator();
+                while (it.next()) |id| {
+                    self.drag_requested_ids.append(self.allocator, id.*) catch {};
+                }
+            } else {
+                self.drag_requested_ids.append(self.allocator, entry.id) catch {};
             }
         }
 
