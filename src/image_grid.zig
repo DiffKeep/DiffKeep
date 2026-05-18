@@ -137,6 +137,10 @@ pub const GridState = struct {
     delete_requested: bool = false,
     delete_force: bool = false,   // true = Shift+Delete or "Delete Permanently": skip trash
     restore_requested: bool = false,
+    copy_prompt_requested: bool = false,
+    copy_prompt_id: u64 = 0,
+    copy_image_requested: bool = false,
+    copy_image_path: []const u8 = "",
     // Mirrored from config so renderItem can condition the context menu label
     trash_enabled: bool = true,
     // Viewer opening — set by double-click/Enter/context menu, consumed by app.zig each frame
@@ -695,6 +699,20 @@ pub const GridState = struct {
                     fm.close();
                     self.open_viewer_requested = true;
                     self.viewer_start_id = entry.id;
+                }
+                if (dvui.menuItemLabel(@src(), i18n.t(.context_copy_prompt), .{},
+                    .{ .expand = .horizontal }) != null)
+                {
+                    fm.close();
+                    self.copy_prompt_requested = true;
+                    self.copy_prompt_id = entry.id;
+                }
+                if (dvui.menuItemLabel(@src(), i18n.t(.context_copy_image), .{},
+                    .{ .expand = .horizontal }) != null)
+                {
+                    fm.close();
+                    self.copy_image_requested = true;
+                    self.copy_image_path = entry.path;
                 }
                 if (self.view_mode == .library) {
                     if (self.trash_enabled) {

@@ -1053,6 +1053,18 @@ pub const VectorDb = struct {
         return null;
     }
 
+    /// Fetch just the positive prompt text for a single image. Returns null if not found or no prompt.
+    pub fn getPositivePromptText(self: *VectorDb, allocator: std.mem.Allocator, id: u64) !?[]const u8 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT positive_prompt_text FROM images WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        if (!try stmt.step()) return null;
+        if (stmt.columnIsNull(0)) return null;
+        return try allocator.dupe(u8, stmt.columnText(0));
+    }
+
     /// Fetch full metadata for a single image by ID. Returns null if not found.
     pub fn getImageDetails(self: *VectorDb, allocator: std.mem.Allocator, id: u64) !?ImageDetails {
         self.db_mutex.lockUncancelable(self.io);

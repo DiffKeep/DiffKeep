@@ -1036,6 +1036,26 @@ fn frame() !dvui.App.Result {
             openViewer(grid, grid.viewer_start_id);
             grid.viewer_start_id = null;
         }
+        if (grid.copy_prompt_requested) {
+            grid.copy_prompt_requested = false;
+            if (dvui.App.main_init) |init| {
+                if (g_db) |*db| {
+                    if (db.getPositivePromptText(init.gpa, grid.copy_prompt_id) catch null) |prompt| {
+                        defer init.gpa.free(prompt);
+                        if (init.gpa.dupeZ(u8, prompt)) |c_str| {
+                            defer init.gpa.free(c_str);
+                            _ = SDLBackend.c.SDL_SetClipboardText(c_str.ptr);
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+        if (grid.copy_image_requested) {
+            grid.copy_image_requested = false;
+            if (dvui.App.main_init) |init| {
+                detail_panel_mod.copyImageToClipboard(grid.copy_image_path, init.gpa, init.io);
+            }
+        }
     }
 
     // Detect search text changes and reload the grid via FTS5
@@ -1276,8 +1296,8 @@ fn frame() !dvui.App.Result {
             else "";
             if (dvui.App.main_init) |init| {
                 if (g_db) |*db| g_detail.update(focused_id, db, init.gpa, init.io);
+                g_detail.renderPanel(g_right_w, filename, init.gpa, init.io);
             }
-            g_detail.renderPanel(g_right_w, filename);
         }
     }
 

@@ -62,6 +62,8 @@ pub const Strings = struct {
     confirm_delete: [:0]const u8,
     confirm_move_to_trash: [:0]const u8,
 
+    context_copy_prompt: [:0]const u8,
+    context_copy_image: [:0]const u8,
     context_send_to_trash: [:0]const u8,
     context_restore_from_trash: [:0]const u8,
     context_delete_permanently: [:0]const u8,
@@ -78,6 +80,8 @@ pub const Strings = struct {
     action_close: [:0]const u8,
     action_clear: [:0]const u8,
     action_remove: [:0]const u8,
+    action_copy: [:0]const u8,
+    action_copy_image: [:0]const u8,
 
     pane_click_to_expand: [:0]const u8,
     pane_drag_to_resize: [:0]const u8,
@@ -163,6 +167,8 @@ pub const en: Strings = .{
     .confirm_delete = "Delete",
     .confirm_move_to_trash = "Move to Trash",
 
+    .context_copy_prompt = "Copy Prompt",
+    .context_copy_image = "Copy Image",
     .context_send_to_trash = "Send to Trash",
     .context_restore_from_trash = "Restore from Trash",
     .context_delete_permanently = "Delete Permanently",
@@ -179,6 +185,8 @@ pub const en: Strings = .{
     .action_close = "Close",
     .action_clear = "Clear",
     .action_remove = "Remove",
+    .action_copy = "Copy",
+    .action_copy_image = "Copy Image",
 
     .pane_click_to_expand = "Click to expand",
     .pane_drag_to_resize = "Click to collapse \u{00b7} Drag to resize",

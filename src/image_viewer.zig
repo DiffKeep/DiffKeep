@@ -689,7 +689,7 @@ pub const ViewerState = struct {
         const filename: []const u8 = if (self.images.items.len > 0)
             self.images.items[self.current_idx].filename
         else "";
-        self.detail_state.renderPanel(self.info_w, filename);
+        self.detail_state.renderPanel(self.info_w, filename, self.gpa, self.io);
     }
 
     fn toggleFullscreen(self: *ViewerState) void {
