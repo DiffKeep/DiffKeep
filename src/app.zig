@@ -11,6 +11,8 @@ const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
 const fs_watch_mod = @import("fs_watch.zig");
 const image_grid_mod = @import("image_grid.zig");
+const llama_mod = @import("llama.zig");
+const mtmd_mod = @import("mtmd.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 const detail_panel_mod = @import("detail_panel.zig");
@@ -70,6 +72,51 @@ var g_settings_scan_snapshot: ScanSnapshot = .{};
 // g_search_prev mirrors it so we can detect changes and trigger a DB reload.
 var g_search_buf: [256]u8 = std.mem.zeroes([256]u8);
 var g_search_prev: [256]u8 = std.mem.zeroes([256]u8);
+
+// Search mode
+var g_search_mode: image_grid_mod.SearchMode = .combined;
+
+// Per-search model instances for query embedding (separate from scan models)
+var g_search_text_pool: ?llama_mod.Pool = null;
+var g_search_vl_ctx: ?mtmd_mod.VlContext = null;
+
+// Heap-allocated query embedding (freed on next query change or app exit)
+var g_query_embedding: ?[]const f32 = null;
+
+// Model path settings buffers (copied from/to g_cfg on settings open/close)
+var g_embedding_model_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8);
+var g_embedding_mmproj_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8);
+var g_reranker_model_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8);
+var g_reranker_mmproj_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8);
+// Snapshot of paths when settings opened (detect changes on close)
+var g_settings_model_snapshot: struct {
+    model: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    mmproj: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    reranker: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    reranker_mmproj: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+} = .{};
+
+// Reranker model instance (separate from scan models, used on main search thread)
+var g_search_reranker: ?mtmd_mod.RerankContext = null;
+
+// Background reranking state
+var g_rerank_group: std.Io.Group = .init;
+var g_rerank_done: std.atomic.Value(bool) = .init(false);
+var g_rerank_result_ids: ?[]u64 = null;
+var g_rerank_result_gen: u64 = 0;
+var g_search_generation: std.atomic.Value(u64) = .init(0);
+var g_picker_open: bool = false;
+// Must be a global — SDL_ShowOpenFileDialog is async and reads the filter after the call returns.
+const g_gguf_filter = SDLBackend.c.SDL_DialogFileFilter{ .name = "GGUF model", .pattern = "gguf" };
+
+// Model download state (one slot per file: embedding, mmproj, reranker, reranker_mmproj)
+const download_quant_options = [_][:0]const u8{
+    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
+    "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0",
+};
+var g_download_quant_idx: usize = 9; // Q8_0
+var g_download_status: [4]std.atomic.Value(u8) = .{ .init(0), .init(0), .init(0), .init(0) };
+var g_download_group: std.Io.Group = .init;
 
 // Active metadata filters
 var g_active_filters: std.ArrayList(db_mod.ActiveFilter) = .empty;
@@ -144,6 +191,27 @@ fn appInit(win: *dvui.Window) !void {
 
         if (g_config) |cfg_path| {
             g_cfg = try config_mod.load(init.gpa, init.io, cfg_path);
+        }
+
+        if (g_cfg.embedding_model_path) |p| {
+            const len = @min(p.len, g_embedding_model_buf.len - 1);
+            @memcpy(g_embedding_model_buf[0..len], p[0..len]);
+            g_embedding_model_buf[len] = 0;
+        }
+        if (g_cfg.embedding_mmproj_path) |p| {
+            const len = @min(p.len, g_embedding_mmproj_buf.len - 1);
+            @memcpy(g_embedding_mmproj_buf[0..len], p[0..len]);
+            g_embedding_mmproj_buf[len] = 0;
+        }
+        if (g_cfg.reranker_model_path) |p| {
+            const len = @min(p.len, g_reranker_model_buf.len - 1);
+            @memcpy(g_reranker_model_buf[0..len], p[0..len]);
+            g_reranker_model_buf[len] = 0;
+        }
+        if (g_cfg.reranker_mmproj_path) |p| {
+            const len = @min(p.len, g_reranker_mmproj_buf.len - 1);
+            @memcpy(g_reranker_mmproj_buf[0..len], p[0..len]);
+            g_reranker_mmproj_buf[len] = 0;
         }
 
         const db_path = blk: {
@@ -238,6 +306,8 @@ fn appInit(win: *dvui.Window) !void {
             const watcher_ptr: ?*fs_watch_mod.FsWatcher = if (g_fs_watcher != null) &g_fs_watcher.? else null;
             g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings, notifier, watcher_ptr);
             if (g_library_manager) |*mgr| {
+                mgr.embedding_model_path = g_cfg.embedding_model_path;
+                mgr.embedding_mmproj_path = g_cfg.embedding_mmproj_path;
                 mgr.wakeup_fn = wakeupFrame;
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
@@ -280,6 +350,20 @@ fn appDeinit() void {
     // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
         if (g_library_manager) |*mgr| mgr.deinit(init.io);
+    }
+    if (dvui.App.main_init) |init| {
+        g_rerank_group.await(init.io) catch {};
+        g_download_group.await(init.io) catch {};
+    }
+    if (g_rerank_result_ids) |ids| {
+        if (dvui.App.main_init) |init| init.gpa.free(ids);
+        g_rerank_result_ids = null;
+    }
+    if (g_search_reranker) |*rr| rr.deinit();
+    if (g_search_vl_ctx) |*vc| vc.deinit();
+    if (g_search_text_pool) |*tp| tp.deinit();
+    if (dvui.App.main_init) |init| {
+        if (g_query_embedding) |emb| init.gpa.free(emb);
     }
     if (g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
@@ -633,45 +717,367 @@ fn openDeleteDialog(grid: *const image_grid_mod.GridState, force: bool) void {
     g_delete_dialog_open = true;
 }
 
+fn applyRerankResults(allocator: std.mem.Allocator) void {
+    const ids = g_rerank_result_ids orelse return;
+    defer {
+        allocator.free(ids);
+        g_rerank_result_ids = null;
+    }
+    if (g_rerank_result_gen != g_search_generation.load(.acquire)) return;
+    const grid = if (g_grid) |*g| g else return;
+
+    var pos_map = std.AutoHashMap(u64, usize).init(allocator);
+    defer pos_map.deinit();
+    for (grid.images.items, 0..) |entry, i| {
+        pos_map.put(entry.id, i) catch {};
+    }
+
+    var reordered: std.ArrayList(image_grid_mod.ImageEntry) = .empty;
+    defer reordered.deinit(allocator);
+    reordered.ensureTotalCapacity(allocator, grid.images.items.len) catch return;
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    for (ids) |id| {
+        if (pos_map.get(id)) |pos| {
+            reordered.append(allocator, grid.images.items[pos]) catch {};
+            seen.put(id, {}) catch {};
+        }
+    }
+    for (grid.images.items) |entry| {
+        if (!seen.contains(entry.id)) {
+            reordered.append(allocator, entry) catch {};
+        }
+    }
+    if (reordered.items.len == grid.images.items.len) {
+        @memcpy(grid.images.items, reordered.items);
+        grid.focused_idx = null;
+        grid.selection.clearRetainingCapacity();
+    }
+}
+
+// ── Background reranking ───────────────────────────────────────────────────
+
+const RerankTaskCtx = struct {
+    allocator: std.mem.Allocator,
+    query: []const u8,         // owned, freed after task
+    image_paths: [][]u8,       // owned, freed after task
+    image_ids: []u64,          // owned, freed after task
+    generation: u64,
+    reranker: *mtmd_mod.RerankContext,
+    result_ids: *?[]u64,
+    result_gen: *u64,
+    done: *std.atomic.Value(bool),
+    current_gen: *std.atomic.Value(u64),
+};
+
+const RERANK_INSTRUCTION = "Retrieve AI-generated images that visually match the user's search query.";
+
+fn rerankTask(ctx: RerankTaskCtx) void {
+    defer {
+        ctx.allocator.free(ctx.query);
+        for (ctx.image_paths) |p| ctx.allocator.free(p);
+        ctx.allocator.free(ctx.image_paths);
+        ctx.allocator.free(ctx.image_ids);
+    }
+    if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+
+    const ScoreEntry = struct { id: u64, score: f32 };
+    var scored: std.ArrayList(ScoreEntry) = .empty;
+    defer scored.deinit(ctx.allocator);
+
+    for (ctx.image_paths, ctx.image_ids) |path, id| {
+        if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+        const score = ctx.reranker.scoreImageFile(ctx.allocator, ctx.query, RERANK_INSTRUCTION, path) catch 0.0;
+        scored.append(ctx.allocator, .{ .id = id, .score = score }) catch break;
+    }
+    if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+
+    std.sort.pdq(ScoreEntry, scored.items, {}, struct {
+        fn lt(_: void, a: ScoreEntry, b: ScoreEntry) bool { return a.score > b.score; }
+    }.lt);
+
+    const ids = ctx.allocator.alloc(u64, scored.items.len) catch return;
+    for (scored.items, 0..) |s, i| ids[i] = s.id;
+
+    ctx.result_ids.* = ids;
+    ctx.result_gen.* = ctx.generation;
+    ctx.done.store(true, .release);
+}
+
+/// Spawns a background rerank task for the current grid results (top rerank_top_k entries).
+/// No-op if the reranker is not configured or mode is FTS.
+fn maybeSpawnRerank(grid: *image_grid_mod.GridState, query: []const u8) void {
+    const init = dvui.App.main_init orelse return;
+    const reranker_model = g_cfg.reranker_model_path orelse return;
+    const reranker_mmproj = g_cfg.reranker_mmproj_path orelse return;
+    if (g_search_mode == .fts) return;
+    if (grid.images.items.len == 0) return;
+
+    if (g_search_reranker == null) {
+        g_search_reranker = mtmd_mod.RerankContext.init(init.gpa, reranker_model, reranker_mmproj) catch |err| {
+            log.warn("reranker init: {}", .{err});
+            return;
+        };
+    }
+
+    const gen = g_search_generation.fetchAdd(1, .acq_rel) + 1;
+    g_rerank_done.store(false, .release);
+    if (g_rerank_result_ids) |ids| { init.gpa.free(ids); g_rerank_result_ids = null; }
+
+    const top_k = @min(grid.images.items.len, g_cfg.rerank_top_k);
+    var image_paths = init.gpa.alloc([]u8, top_k) catch return;
+    const image_ids = init.gpa.alloc(u64, top_k) catch { init.gpa.free(image_paths); return; };
+    var n: usize = 0;
+    for (grid.images.items[0..top_k]) |entry| {
+        image_paths[n] = init.gpa.dupe(u8, entry.path) catch break;
+        image_ids[n] = entry.id;
+        n += 1;
+    }
+    if (n < top_k) {
+        for (image_paths[0..n]) |p| init.gpa.free(p);
+        init.gpa.free(image_paths);
+        init.gpa.free(image_ids);
+        return;
+    }
+
+    const query_copy = init.gpa.dupe(u8, query) catch {
+        for (image_paths) |p| init.gpa.free(p);
+        init.gpa.free(image_paths);
+        init.gpa.free(image_ids);
+        return;
+    };
+
+    const ctx = RerankTaskCtx{
+        .allocator = init.gpa,
+        .query = query_copy,
+        .image_paths = image_paths,
+        .image_ids = image_ids,
+        .generation = gen,
+        .reranker = &g_search_reranker.?,
+        .result_ids = &g_rerank_result_ids,
+        .result_gen = &g_rerank_result_gen,
+        .done = &g_rerank_done,
+        .current_gen = &g_search_generation,
+    };
+    g_rerank_group.concurrent(init.io, rerankTask, .{ctx}) catch |err| {
+        log.warn("spawn rerank task: {}", .{err});
+        init.gpa.free(query_copy);
+        for (image_paths) |p| init.gpa.free(p);
+        init.gpa.free(image_paths);
+        init.gpa.free(image_ids);
+    };
+}
+
+// ── Model download ─────────────────────────────────────────────────────────
+
+const DownloadTaskCtx = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,       // owned
+    dest_path: []const u8, // owned
+    slot: usize,
+    status: *std.atomic.Value(u8),
+};
+
+fn downloadTask(ctx: DownloadTaskCtx) void {
+    defer {
+        ctx.allocator.free(ctx.url);
+        ctx.allocator.free(ctx.dest_path);
+    }
+    const result = std.process.run(ctx.allocator, ctx.io, .{
+        .argv = &.{ "curl", "-L", "-f", "--create-dirs", "-o", ctx.dest_path, ctx.url },
+    }) catch {
+        ctx.status.store(3, .release); // failed
+        return;
+    };
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        ctx.status.store(3, .release); // failed
+    } else {
+        ctx.status.store(2, .release); // done
+    }
+}
+
+/// Spawns a curl download for the given slot. Does nothing if already running.
+fn spawnDownload(
+    init: std.process.Init,
+    slot: usize,
+    url: []const u8,
+    dest_path: []const u8,
+) void {
+    if (g_download_status[slot].load(.acquire) == 1) return; // already running
+    const url_copy = init.gpa.dupe(u8, url) catch return;
+    const dest_copy = init.gpa.dupe(u8, dest_path) catch { init.gpa.free(url_copy); return; };
+    const ctx = DownloadTaskCtx{
+        .allocator = init.gpa,
+        .io = init.io,
+        .url = url_copy,
+        .dest_path = dest_copy,
+        .slot = slot,
+        .status = &g_download_status[slot],
+    };
+    g_download_status[slot].store(1, .release);
+    g_download_group.concurrent(init.io, downloadTask, .{ctx}) catch |err| {
+        log.warn("spawn download task: {}", .{err});
+        g_download_status[slot].store(0, .release);
+        init.gpa.free(url_copy);
+        init.gpa.free(dest_copy);
+    };
+}
+
+fn modelFilePickerCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    g_picker_open = false;
+    const buf: *[4096:0]u8 = @ptrCast(@alignCast(userdata orelse return));
+    const files = filelist orelse return;
+    if (files[0] == null) return;
+    const path = std.mem.span(files[0].?);
+    const len = @min(path.len, 4095);
+    @memcpy(buf[0..len], path[0..len]);
+    buf[len] = 0;
+}
+
+fn pathEntryWithPicker(
+    src: std.builtin.SourceLocation,
+    buf: *[4096:0]u8,
+    placeholder: [:0]const u8,
+    id: usize,
+) void {
+    var row = dvui.box(src, .{ .dir = .horizontal }, .{
+        .id_extra = id,
+        .expand = .horizontal,
+        .margin = .{ .h = 4 },
+    });
+    defer row.deinit();
+    {
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = buf[0..] },
+            .placeholder = placeholder,
+        }, .{
+            .id_extra = id,
+            .expand = .horizontal,
+            .min_size_content = .{ .h = 22 },
+            .corner_radius = dvui.Rect.all(4),
+        });
+        defer te.deinit();
+    }
+    if (!g_picker_open and dvui.button(@src(), "...", .{}, .{
+        .id_extra = id,
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 28, .h = 22 },
+        .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 },
+        .margin = .{ .x = 4 },
+        .corner_radius = dvui.Rect.all(4),
+    })) {
+        g_picker_open = true;
+        const sdl: *SDLBackend = dvui.currentWindow().backend.impl;
+        SDLBackend.c.SDL_ShowOpenFileDialog(
+            modelFilePickerCallback,
+            buf,
+            sdl.window,
+            &g_gguf_filter,
+            1,
+            null,
+            false,
+        );
+    }
+}
+
 fn settingsModal() !void {
+    const win = dvui.windowRect();
+    const margin_x = @max(60, win.w * 0.07);
+    const margin_y = @max(40, win.h * 0.07);
+    var modal_rect = dvui.Rect{
+        .x = margin_x,
+        .y = margin_y,
+        .w = win.w - 2 * margin_x,
+        .h = win.h - 2 * margin_y,
+    };
     var float = dvui.floatingWindow(@src(), .{
         .modal = true,
         .open_flag = &g_settings_open,
         .resize = .none,
+        .rect = &modal_rect,
     }, .{
-        .min_size_content = .{ .w = 560, .h = 0 },
+        .min_size_content = .{ .w = 600, .h = 300 },
     });
     defer float.deinit();
-    float.autoSize();
-    float.dragAreaSet(dvui.Rect.Physical{});
 
-    var content = dvui.box(@src(), .{}, .{
+    var outer = dvui.box(@src(), .{}, .{
         .expand = .both,
         .padding = .all(16),
     });
-    defer content.deinit();
+    defer outer.deinit();
 
     dvui.label(@src(), "{s}", .{i18n.t(.settings_heading)}, .{ .font = bold, .margin = .{ .h = 12 } });
 
     {
+        var scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{
+            .expand = .both,
+            .max_size_content = dvui.Options.MaxSize.height(0),
+        });
+        defer scroll.deinit();
+
         var cols = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer cols.deinit();
 
-        // ── Left column: config toggles ───────────────────────────────────
+        // ── Left column ───────────────────────────────────────────────────
         {
-            var left = dvui.box(@src(), .{}, .{
+            var left_col = dvui.box(@src(), .{}, .{
                 .expand = .both,
-                .min_size_content = .{ .w = 240, .h = 0 },
-                .padding = .{ .w = 16 },
+                .min_size_content = .{ .w = 280 },
+                .padding = .{ .w = 12 },
             });
-            defer left.deinit();
+            defer left_col.deinit();
 
             dvui.label(@src(), "{s}", .{i18n.t(.settings_scan_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
             _ = dvui.checkbox(@src(), &g_cfg.thumbnails_in_db, i18n.t(.settings_thumbnails_in_db), .{ .margin = .{ .h = 6 } });
             _ = dvui.checkbox(@src(), &g_cfg.prompt_embeddings, i18n.t(.settings_prompt_embeddings), .{ .margin = .{ .h = 6 } });
             _ = dvui.checkbox(@src(), &g_cfg.image_embeddings, i18n.t(.settings_image_embeddings), .{ .margin = .{ .h = 6 } });
 
-            dvui.label(@src(), "{s}", .{i18n.t(.settings_trash_section)}, .{ .font = bold, .margin = .{ .y = 16, .h = 8 } });
+            // Embedding model paths
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_model_path)}, .{ .font = bold, .margin = .{ .y = 12, .h = 4 } });
+            pathEntryWithPicker(@src(), &g_embedding_model_buf, i18n.t(.settings_model_placeholder), 0);
+
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_mmproj_path)}, .{ .font = bold, .margin = .{ .y = 8, .h = 4 } });
+            pathEntryWithPicker(@src(), &g_embedding_mmproj_buf, i18n.t(.settings_mmproj_placeholder), 1);
+
+            // Reranker section
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_reranker_section)}, .{ .font = bold, .margin = .{ .y = 16, .h = 4 } });
+
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_reranker_model_path)}, .{ .font = bold, .margin = .{ .y = 4, .h = 4 } });
+            pathEntryWithPicker(@src(), &g_reranker_model_buf, i18n.t(.settings_reranker_model_placeholder), 2);
+
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_reranker_mmproj_path)}, .{ .font = bold, .margin = .{ .y = 8, .h = 4 } });
+            pathEntryWithPicker(@src(), &g_reranker_mmproj_buf, i18n.t(.settings_reranker_mmproj_placeholder), 3);
+
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_rerank_top_k)}, .{ .font = bold, .margin = .{ .y = 8, .h = 4 } });
+            {
+                var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 4 } });
+                defer row.deinit();
+                if (dvui.button(@src(), "-", .{}, .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 28, .h = 24 },
+                    .corner_radius = dvui.Rect.all(4),
+                })) {
+                    if (g_cfg.rerank_top_k > 1) g_cfg.rerank_top_k -= 1;
+                }
+                dvui.label(@src(), " {d} ", .{g_cfg.rerank_top_k}, .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 44 },
+                });
+                if (dvui.button(@src(), "+", .{}, .{
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 28, .h = 24 },
+                    .corner_radius = dvui.Rect.all(4),
+                })) {
+                    if (g_cfg.rerank_top_k < 200) g_cfg.rerank_top_k += 1;
+                }
+            }
+
+            // Trash section
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_trash_section)}, .{ .font = bold, .margin = .{ .y = 20, .h = 8 } });
             _ = dvui.checkbox(@src(), &g_cfg.trash_enabled, i18n.t(.settings_trash_enable), .{ .margin = .{ .h = 6 } });
             if (g_cfg.trash_enabled) {
                 if (g_trash_stats) |ts| {
@@ -704,10 +1110,8 @@ fn settingsModal() !void {
                                         std.Io.Dir.cwd().deleteFile(init.io, p) catch {};
                                     }
                                     g_trash_stats = db.getTrashStats() catch null;
-                                    // If grid is in trash view, reload it
                                     if (g_grid) |*grid| {
-                                        if (grid.view_mode == .trash)
-                                            grid.reloadImages(db) catch {};
+                                        if (grid.view_mode == .trash) grid.reloadImages(db) catch {};
                                     }
                                 }
                             }
@@ -724,89 +1128,149 @@ fn settingsModal() !void {
             }
         }
 
-        // ── Right column: DB overview ─────────────────────────────────────
+        // ── Right column ──────────────────────────────────────────────────
         {
-            var right = dvui.box(@src(), .{}, .{
+            var right_col = dvui.box(@src(), .{}, .{
                 .expand = .both,
-                .min_size_content = .{ .w = 240, .h = 0 },
-                .padding = .{ .x = 16 },
+                .min_size_content = .{ .w = 280 },
+                .padding = .{ .x = 12 },
             });
-            defer right.deinit();
+            defer right_col.deinit();
 
+            // Database section
             dvui.label(@src(), "{s}", .{i18n.t(.settings_database_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
-
             if (g_db_stats) |stats| {
                 const total = detail_panel_mod.fmtBytes(stats.total_bytes);
                 dvui.label(@src(), "{s}{d:.1} {s}", .{ i18n.t(.settings_db_total_size_label), total.value, total.unit }, .{ .margin = .{ .h = 10 } });
 
-                // Thumbnails
-                {
+                const db_label_keys = [_]std.meta.FieldEnum(i18n.Strings){
+                    .settings_db_thumbnails_label,
+                    .settings_db_prompt_embeddings_label,
+                    .settings_db_image_embeddings_label,
+                };
+                const db_rows = [_]struct {
+                    count: i64,
+                    bytes: i64,
+                    clear_fn: *const fn (*db_mod.VectorDb) anyerror!void,
+                }{
+                    .{ .count = stats.thumbnail_count,        .bytes = stats.thumbnail_bytes,                   .clear_fn = db_mod.VectorDb.clearThumbnails },
+                    .{ .count = stats.prompt_embedding_count, .bytes = stats.prompt_embedding_count * 2048 * 4, .clear_fn = db_mod.VectorDb.clearPromptEmbeddings },
+                    .{ .count = stats.image_embedding_count,  .bytes = stats.image_embedding_count * 2048 * 4,  .clear_fn = db_mod.VectorDb.clearImageEmbeddings },
+                };
+                inline for (db_label_keys, db_rows, 0..) |label_key, r, ri| {
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .id_extra = ri,
                         .expand = .horizontal,
                         .margin = .{ .h = 6 },
                     });
                     defer row.deinit();
-                    const tb = detail_panel_mod.fmtBytes(stats.thumbnail_bytes);
-                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_thumbnails_label), stats.thumbnail_count, tb.value, tb.unit }, .{
+                    const sz = detail_panel_mod.fmtBytes(r.bytes);
+                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(label_key), r.count, sz.value, sz.unit }, .{
+                        .id_extra = ri,
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
                     if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
+                        .id_extra = ri,
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
                     })) {
                         if (g_db) |*db| {
-                            db.clearThumbnails() catch {};
+                            r.clear_fn(db) catch {};
                             g_db_stats = db.getStats() catch null;
                         }
                     }
                 }
+            } else {
+                dvui.label(@src(), "{s}", .{i18n.t(.settings_db_no_database)}, .{});
+            }
 
-                // Prompt embeddings
+            // Download section
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_download_section)}, .{ .font = bold, .margin = .{ .y = 20, .h = 8 } });
+            if (g_data_dir) |data_dir| {
+                // Quantization selector
+                dvui.label(@src(), "{s}", .{i18n.t(.settings_download_quantization)}, .{ .font = bold, .margin = .{ .h = 4 } });
                 {
-                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                        .expand = .horizontal,
-                        .margin = .{ .h = 6 },
-                    });
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 8 } });
                     defer row.deinit();
-                    const pe = detail_panel_mod.fmtBytes(stats.prompt_embedding_count * 2048 * 4);
-                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_prompt_embeddings_label), stats.prompt_embedding_count, pe.value, pe.unit }, .{
-                        .expand = .horizontal,
+                    if (dvui.button(@src(), "◀", .{}, .{
                         .gravity_y = 0.5,
-                    });
-                    if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
-                        .gravity_y = 0.5,
-                        .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                        .min_size_content = .{ .w = 28, .h = 24 },
                         .corner_radius = dvui.Rect.all(4),
                     })) {
-                        if (g_db) |*db| {
-                            db.clearPromptEmbeddings() catch {};
-                            g_db_stats = db.getStats() catch null;
-                        }
+                        if (g_download_quant_idx > 0) g_download_quant_idx -= 1;
+                    }
+                    dvui.label(@src(), " {s} ", .{download_quant_options[g_download_quant_idx]}, .{
+                        .gravity_y = 0.5,
+                        .min_size_content = .{ .w = 56 },
+                    });
+                    if (dvui.button(@src(), "▶", .{}, .{
+                        .gravity_y = 0.5,
+                        .min_size_content = .{ .w = 28, .h = 24 },
+                        .corner_radius = dvui.Rect.all(4),
+                    })) {
+                        if (g_download_quant_idx + 1 < download_quant_options.len) g_download_quant_idx += 1;
                     }
                 }
-
-                // Image embeddings
-                {
+                const quant = download_quant_options[g_download_quant_idx];
+                const dl_labels = [4][:0]const u8{
+                    i18n.t(.settings_download_embedding),
+                    i18n.t(.settings_download_mmproj),
+                    i18n.t(.settings_download_reranker),
+                    i18n.t(.settings_download_reranker_mmproj),
+                };
+                for (dl_labels, 0..) |label, fi| {
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                        .id_extra = fi,
                         .expand = .horizontal,
-                        .margin = .{ .h = 6 },
+                        .margin = .{ .h = 5 },
                     });
                     defer row.deinit();
-                    const ie = detail_panel_mod.fmtBytes(stats.image_embedding_count * 2048 * 4);
-                    dvui.label(@src(), "{s}{d} ({d:.1} {s})", .{ i18n.t(.settings_db_image_embeddings_label), stats.image_embedding_count, ie.value, ie.unit }, .{
+                    dvui.label(@src(), "{s}", .{label}, .{
+                        .id_extra = fi,
                         .expand = .horizontal,
                         .gravity_y = 0.5,
                     });
-                    if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
+                    const status: u8 = g_download_status[fi].load(.acquire);
+                    const btn_label: [:0]const u8 = switch (status) {
+                        1 => i18n.t(.settings_download_running),
+                        2 => i18n.t(.settings_download_done),
+                        3 => i18n.t(.settings_download_failed),
+                        else => i18n.t(.settings_download_idle),
+                    };
+                    if (dvui.button(@src(), btn_label, .{}, .{
+                        .id_extra = fi,
                         .gravity_y = 0.5,
                         .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                         .corner_radius = dvui.Rect.all(4),
-                    })) {
-                        if (g_db) |*db| {
-                            db.clearImageEmbeddings() catch {};
-                            g_db_stats = db.getStats() catch null;
+                    }) and status == 0) {
+                        if (dvui.App.main_init) |init| {
+                            const url: []const u8 = switch (fi) {
+                                0 => std.fmt.allocPrint(init.gpa,
+                                    "https://huggingface.co/DevQuasar/Qwen.Qwen3-VL-Embedding-2B-GGUF/resolve/main/Qwen.Qwen3-VL-Embedding-2B.{s}.gguf",
+                                    .{quant}) catch continue,
+                                1 => init.gpa.dupe(u8,
+                                    "https://huggingface.co/DevQuasar/Qwen.Qwen3-VL-Embedding-2B-GGUF/resolve/main/mmproj-Qwen.Qwen3-VL-Embedding-2B.f16.gguf") catch continue,
+                                2 => std.fmt.allocPrint(init.gpa,
+                                    "https://huggingface.co/mradermacher/Qwen3-VL-Reranker-2B-GGUF/resolve/main/Qwen3-VL-Reranker-2B.{s}.gguf",
+                                    .{quant}) catch continue,
+                                3 => init.gpa.dupe(u8,
+                                    "https://huggingface.co/mradermacher/Qwen3-VL-Reranker-2B-GGUF/resolve/main/Qwen3-VL-Reranker-2B.mmproj-f16.gguf") catch continue,
+                                else => continue,
+                            };
+                            defer init.gpa.free(url);
+                            const filename: []const u8 = switch (fi) {
+                                0 => std.fmt.allocPrint(init.gpa, "Qwen.Qwen3-VL-Embedding-2B.{s}.gguf", .{quant}) catch continue,
+                                1 => init.gpa.dupe(u8, "mmproj-Qwen.Qwen3-VL-Embedding-2B.f16.gguf") catch continue,
+                                2 => std.fmt.allocPrint(init.gpa, "Qwen3-VL-Reranker-2B.{s}.gguf", .{quant}) catch continue,
+                                3 => init.gpa.dupe(u8, "Qwen3-VL-Reranker-2B.mmproj-f16.gguf") catch continue,
+                                else => continue,
+                            };
+                            defer init.gpa.free(filename);
+                            const dest = std.fs.path.join(init.gpa, &.{ data_dir, "models", "search", filename }) catch continue;
+                            defer init.gpa.free(dest);
+                            spawnDownload(init, fi, url, dest);
                         }
                     }
                 }
@@ -1052,6 +1516,376 @@ fn filterModal() !void {
     }
 }
 
+fn embedSearchQuery(allocator: std.mem.Allocator, query: []const u8, mode: image_grid_mod.SearchMode) !void {
+    const model_path = g_cfg.embedding_model_path orelse return error.NoModelPath;
+    switch (mode) {
+        .fts => {},
+        // semantic and combined both use the text pool (mean pooling) for query embedding
+        .semantic, .combined => {
+            if (g_search_text_pool == null) {
+                g_search_text_pool = llama_mod.Pool.init(allocator, .{
+                    .embeddings   = true,
+                    .pooling_type = 1,
+                    .n_ctx        = 2048,
+                    .n_batch      = 512,
+                    .n_ubatch     = 512,
+                    .n_gpu_layers = 999,
+                });
+            }
+            const tp = &g_search_text_pool.?;
+            const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
+            defer allocator.free(q_text);
+            const tc = try tp.get(model_path, 60_000, null);
+            defer tp.release(tc);
+            var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
+            defer {
+                for (chunks.items) |e| allocator.free(e);
+                chunks.deinit(allocator);
+            }
+            if (chunks.items.len > 0) {
+                g_query_embedding = chunks.orderedRemove(0);
+                if (g_grid) |*grid| grid.query_embedding = g_query_embedding.?;
+            }
+        },
+        .visual => {
+            const mmproj_path = g_cfg.embedding_mmproj_path orelse return error.NoMmprojPath;
+            if (g_search_vl_ctx == null) {
+                g_search_vl_ctx = try mtmd_mod.VlContext.init(allocator, model_path, mmproj_path);
+            }
+            const vc = &g_search_vl_ctx.?;
+            const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
+            defer allocator.free(q_text);
+            // For visual mode: embed the text query through the VL text encoder
+            const tc = try vc.pool.get(model_path, 60_000, null);
+            defer vc.pool.release(tc);
+            var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
+            defer {
+                for (chunks.items) |e| allocator.free(e);
+                chunks.deinit(allocator);
+            }
+            if (chunks.items.len > 0) {
+                g_query_embedding = chunks.orderedRemove(0);
+                if (g_grid) |*grid| grid.query_embedding = g_query_embedding.?;
+            }
+        },
+    }
+}
+
+fn renderToolbar() void {
+    var toolbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
+        .background = true,
+    });
+    defer toolbar.deinit();
+
+    // Search field — expands to fill available width
+    {
+        var te = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = g_search_buf[0..] },
+            .placeholder = i18n.t(.search_placeholder),
+        }, .{
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+            .corner_radius = dvui.Rect.all(5),
+            .min_size_content = .{ .h = 22 },
+        });
+        defer te.deinit();
+    }
+
+    // Search mode buttons
+    {
+        const modes = [_]struct { mode: image_grid_mod.SearchMode, label: [:0]const u8 }{
+            .{ .mode = .fts,      .label = i18n.t(.search_mode_fts) },
+            .{ .mode = .semantic, .label = i18n.t(.search_mode_semantic) },
+            .{ .mode = .visual,   .label = i18n.t(.search_mode_visual) },
+            .{ .mode = .combined, .label = i18n.t(.search_mode_combined) },
+        };
+        for (modes, 0..) |m, mi| {
+            const active = g_search_mode == m.mode;
+            if (dvui.button(@src(), m.label, .{}, .{
+                .id_extra = mi,
+                .gravity_y = 0.5,
+                .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
+                .corner_radius = dvui.Rect.all(4),
+                .margin = .{ .x = 2, .w = 2 },
+                .color_fill = if (active) dvui.themeGet().focus else null,
+            })) {
+                if (g_search_mode != m.mode) {
+                    g_search_mode = m.mode;
+                    // Force reload with new mode
+                    if (g_grid) |*grid| {
+                        grid.search_mode = m.mode;
+                        // Clear embedding if switching to FTS
+                        if (m.mode == .fts) {
+                            grid.query_embedding = null;
+                        }
+                        if (g_db) |*db| grid.reloadImages(db) catch {};
+                    }
+                    // Trigger re-embed on mode switch
+                    g_search_prev = std.mem.zeroes([256]u8);
+                }
+            }
+        }
+    }
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 4, .h = 0 } });
+
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+    // Filter chips
+    const chip: dvui.Options = .{
+        .corner_radius = dvui.Rect.all(12),
+        .padding = .{ .x = 10, .y = 3, .w = 10, .h = 3 },
+        .margin = .{ .x = 2, .w = 2 },
+        .gravity_y = 0.5,
+    };
+    // Active filter pills
+    var filter_remove_idx: ?usize = null;
+    for (g_active_filters.items, 0..) |f, fi| {
+        var pill = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = fi,
+            .corner_radius = dvui.Rect.all(12),
+            .padding = .{ .x = 8, .y = 3, .w = 4, .h = 3 },
+            .margin = .{ .x = 2, .w = 2 },
+            .gravity_y = 0.5,
+            .background = true,
+            .color_fill = dvui.themeGet().focus,
+        });
+        defer pill.deinit();
+        dvui.label(@src(), "{s}: {s}", .{ filterColumnLabel(f.column), f.value }, .{
+            .id_extra = fi,
+            .gravity_y = 0.5,
+        });
+        if (dvui.buttonIcon(@src(), "remove_filter", dvui.entypo.cross, .{}, .{}, .{
+            .id_extra = fi,
+            .min_size_content = .{ .w = 10, .h = 10 },
+            .gravity_y = 0.5,
+            .padding = dvui.Rect.all(2),
+            .margin = .{ .x = 4 },
+        })) {
+            filter_remove_idx = fi;
+        }
+    }
+    if (filter_remove_idx) |ri| {
+        if (dvui.App.main_init) |init| {
+            const f = g_active_filters.orderedRemove(ri);
+            init.gpa.free(f.value);
+        }
+        if (g_grid) |*grid| {
+            grid.filters = g_active_filters.items;
+            if (g_db) |*db| grid.reloadImages(db) catch {};
+        }
+    }
+
+    // Add filter button
+    if (dvui.button(@src(), i18n.t(.toolbar_add_filter), .{}, chip.override(.{ .id_extra = 4 }))) {
+        g_filter_modal_open = true;
+        g_filter_modal_value_buf = std.mem.zeroes([256]u8);
+        g_filter_modal_kind = .model;
+        g_filter_modal_options_kind = null; // trigger re-fetch
+    }
+
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+    // Thumbnail size slider + sort controls
+    if (g_grid) |*grid| {
+        _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction }, .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 80, .h = 16 },
+        });
+
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+        // Sort mode chip — cycles date → name → random on click
+        {
+            const sort_mode_tvg = switch (grid.sort_mode) {
+                .date   => icons.tvg.lucide.calendar,
+                .name   => icons.tvg.lucide.@"a-arrow-down",
+                .random => icons.tvg.entypo.shuffle,
+            };
+            const sort_mode_tip = switch (grid.sort_mode) {
+                .date   => i18n.t(.toolbar_sort_by_date),
+                .name   => i18n.t(.toolbar_sort_by_name),
+                .random => i18n.t(.toolbar_sort_randomly),
+            };
+            var bw: dvui.ButtonWidget = undefined;
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 5, .min_size_content = .{ .w = 16, .h = 16 } }));
+            defer bw.deinit();
+            bw.processEvents();
+            bw.drawBackground();
+            dvui.icon(@src(), "sort_mode_icon", sort_mode_tvg, .{}, .{
+                .gravity_x = 0.5, .gravity_y = 0.5,
+                .min_size_content = .{ .w = 16, .h = 16 },
+                .expand = .ratio,
+            });
+            if (bw.clicked()) {
+                grid.sort_mode = switch (grid.sort_mode) {
+                    .date => .name,
+                    .name => .random,
+                    .random => .date,
+                };
+                grid.applySortOrder();
+            }
+            bw.drawFocus();
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{sort_mode_tip}, .{});
+        }
+
+        // Direction toggle (date/name) or re-randomize button (random)
+        if (grid.sort_mode == .random) {
+            var bw: dvui.ButtonWidget = undefined;
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+            defer bw.deinit();
+            bw.processEvents();
+            bw.drawBackground();
+            dvui.icon(@src(), "reshuffle_icon", icons.tvg.lucide.dices, .{}, .{
+                .gravity_x = 0.5, .gravity_y = 0.5,
+                .min_size_content = .{ .w = 16, .h = 16 },
+                .expand = .ratio,
+            });
+            if (bw.clicked()) {
+                grid.sort_seed +%= 1;
+                grid.applySortOrder();
+            }
+            bw.drawFocus();
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{i18n.t(.toolbar_reshuffle)}, .{});
+        } else {
+            const dir_tvg = if (grid.sort_dir == .asc) icons.tvg.lucide.@"arrow-up" else icons.tvg.lucide.@"arrow-down";
+            const dir_tip = if (grid.sort_dir == .asc) i18n.t(.toolbar_sort_ascending) else i18n.t(.toolbar_sort_descending);
+            var bw: dvui.ButtonWidget = undefined;
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+            defer bw.deinit();
+            bw.processEvents();
+            bw.drawBackground();
+            dvui.icon(@src(), "sort_dir_icon", dir_tvg, .{}, .{
+                .gravity_x = 0.5, .gravity_y = 0.5,
+                .min_size_content = .{ .w = 16, .h = 16 },
+                .expand = .ratio,
+            });
+            if (bw.clicked()) {
+                grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
+                grid.applySortOrder();
+            }
+            bw.drawFocus();
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{dir_tip}, .{});
+        }
+    }
+}
+
+fn renderContent() !void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .background = true });
+    defer row.deinit();
+
+    // ── Left sidebar ──────────────────────────────────────────────────
+    if (g_left_w >= 2) {
+        if (dvui.App.main_init) |init| {
+            if (try g_sidebar.render(
+                g_left_w,
+                init.gpa,
+                if (g_db) |*db| db else null,
+                if (g_grid) |*g| g else null,
+                if (g_library_manager) |*mgr| mgr else null,
+                g_cfg.trash_enabled,
+                g_trash_stats,
+            )) refreshCounts();
+        }
+    }
+
+    panelHandle(@src(), .left, &g_left_w, &g_left_w_open, left_w_min, left_w_max);
+
+    // ── Center: image grid ────────────────────────────────────────────
+    {
+        var grid_area = dvui.box(@src(), .{}, .{ .expand = .both });
+        defer grid_area.deinit();
+
+        if (g_grid) |*grid| {
+            grid.trash_enabled = g_cfg.trash_enabled;
+            grid.render();
+        } else {
+            dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });
+        }
+    }
+
+    panelHandle(@src(), .right, &g_right_w, &g_right_w_open, right_w_min, right_w_max);
+
+    // ── Right: metadata panel ─────────────────────────────────────────
+    if (g_right_w >= 2) {
+        const focused_id: ?u64 = if (g_grid) |*grid|
+            if (grid.focused_idx) |fi|
+                (if (fi < grid.images.items.len) grid.images.items[fi].id else null)
+            else null
+        else null;
+        const filename: []const u8 = if (g_grid) |*grid|
+            if (grid.focused_idx) |fi|
+                (if (fi < grid.images.items.len) grid.images.items[fi].filename else "")
+            else ""
+        else "";
+        if (dvui.App.main_init) |init| {
+            if (g_db) |*db| g_detail.update(focused_id, db, init.gpa, init.io);
+            g_detail.renderPanel(g_right_w, filename, init.gpa, init.io);
+        }
+    }
+}
+
+fn renderStatusBar() void {
+    var statusbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .padding = .{ .x = 8, .y = 2, .w = 4, .h = 2 },
+        .background = true,
+    });
+    defer statusbar.deinit();
+
+    if (g_library_manager) |*mgr| {
+        if (mgr.isScanActive()) {
+            _ = dvui.spinner(@src(), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 12, .h = 12 },
+            });
+            dvui.label(@src(), "scanning\u{2026} {d} files", .{mgr.filesScanned()}, .{
+                .gravity_y = 0.5,
+                .margin = .{ .x = 4 },
+            });
+        }
+        const displayed: usize = if (g_grid) |*grid| grid.images.items.len else 0;
+        const is_filtered = g_sidebar.filter_library_id != null or g_sidebar.filter_folder != null;
+        if (is_filtered) {
+            dvui.label(@src(), "{d} {s} ({s} {d})", .{
+                displayed,
+                i18n.t(.status_images),
+                i18n.t(.status_out_of),
+                g_total_image_count,
+            }, .{ .gravity_y = 0.5 });
+        } else {
+            dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
+        }
+    } else {
+        dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
+    }
+    _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+    if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
+        .min_size_content = .{ .w = 14, .h = 14 },
+        .gravity_y = 0.5,
+        .padding = dvui.Rect.all(3),
+        .margin = .{ .w = 2 },
+    })) {
+        g_settings_open = !g_settings_open;
+        if (g_settings_open) {
+            if (g_db) |*db| {
+                g_db_stats = db.getStats() catch null;
+                g_trash_stats = db.getTrashStats() catch null;
+            }
+            g_settings_scan_snapshot = .{
+                .thumbnails_in_db = g_cfg.thumbnails_in_db,
+                .prompt_embeddings = g_cfg.prompt_embeddings,
+                .image_embeddings = g_cfg.image_embeddings,
+            };
+            @memcpy(&g_settings_model_snapshot.model, &g_embedding_model_buf);
+            @memcpy(&g_settings_model_snapshot.mmproj, &g_embedding_mmproj_buf);
+            @memcpy(&g_settings_model_snapshot.reranker, &g_reranker_model_buf);
+            @memcpy(&g_settings_model_snapshot.reranker_mmproj, &g_reranker_mmproj_buf);
+        }
+    }
+}
+
 fn frame() !dvui.App.Result {
     for (dvui.events()) |*e| {
         if (e.evt == .window and e.evt.window.action == .close) return .close;
@@ -1074,6 +1908,67 @@ fn frame() !dvui.App.Result {
                 g_total_image_count = db.getTotalImageCount() catch g_total_image_count;
                 for (g_sidebar.libraries.items) |*lib| {
                     lib.image_count = db.getLibraryImageCount(lib.id) catch lib.image_count;
+                }
+            }
+        }
+    }
+
+    // Apply rerank results when the background task completes
+    if (g_rerank_done.load(.acquire)) {
+        g_rerank_done.store(false, .release);
+        if (dvui.App.main_init) |init| {
+            applyRerankResults(init.gpa);
+        }
+    }
+
+    // Apply completed model downloads (auto-fill config paths)
+    if (dvui.App.main_init) |init| {
+        if (g_data_dir) |data_dir| {
+            const slots = [_]struct { slot: usize, cfg_field: enum { emb, mmproj, rr, rr_mmproj } }{
+                .{ .slot = 0, .cfg_field = .emb },
+                .{ .slot = 1, .cfg_field = .mmproj },
+                .{ .slot = 2, .cfg_field = .rr },
+                .{ .slot = 3, .cfg_field = .rr_mmproj },
+            };
+            const quant = download_quant_options[g_download_quant_idx];
+            for (slots) |s| {
+                if (g_download_status[s.slot].load(.acquire) == 2) {
+                    // Build the expected dest path and auto-fill if config is empty
+                    const filename: []const u8 = switch (s.cfg_field) {
+                        .emb  => std.fmt.allocPrint(init.gpa, "Qwen.Qwen3-VL-Embedding-2B.{s}.gguf", .{quant}) catch continue,
+                        .mmproj => init.gpa.dupe(u8, "mmproj-Qwen.Qwen3-VL-Embedding-2B.f16.gguf") catch continue,
+                        .rr   => std.fmt.allocPrint(init.gpa, "Qwen3-VL-Reranker-2B.{s}.gguf", .{quant}) catch continue,
+                        .rr_mmproj => init.gpa.dupe(u8, "Qwen3-VL-Reranker-2B.mmproj-f16.gguf") catch continue,
+                    };
+                    defer init.gpa.free(filename);
+                    const dest = std.fs.path.join(init.gpa, &.{ data_dir, "models", "search", filename }) catch continue;
+                    defer init.gpa.free(dest);
+                    switch (s.cfg_field) {
+                        .emb => if (g_cfg.embedding_model_path == null) {
+                            g_cfg.embedding_model_path = init.gpa.dupe(u8, dest) catch null;
+                            const len = @min(dest.len, g_embedding_model_buf.len - 1);
+                            @memcpy(g_embedding_model_buf[0..len], dest[0..len]);
+                            g_embedding_model_buf[len] = 0;
+                        },
+                        .mmproj => if (g_cfg.embedding_mmproj_path == null) {
+                            g_cfg.embedding_mmproj_path = init.gpa.dupe(u8, dest) catch null;
+                            const len = @min(dest.len, g_embedding_mmproj_buf.len - 1);
+                            @memcpy(g_embedding_mmproj_buf[0..len], dest[0..len]);
+                            g_embedding_mmproj_buf[len] = 0;
+                        },
+                        .rr => if (g_cfg.reranker_model_path == null) {
+                            g_cfg.reranker_model_path = init.gpa.dupe(u8, dest) catch null;
+                            const len = @min(dest.len, g_reranker_model_buf.len - 1);
+                            @memcpy(g_reranker_model_buf[0..len], dest[0..len]);
+                            g_reranker_model_buf[len] = 0;
+                        },
+                        .rr_mmproj => if (g_cfg.reranker_mmproj_path == null) {
+                            g_cfg.reranker_mmproj_path = init.gpa.dupe(u8, dest) catch null;
+                            const len = @min(dest.len, g_reranker_mmproj_buf.len - 1);
+                            @memcpy(g_reranker_mmproj_buf[0..len], dest[0..len]);
+                            g_reranker_mmproj_buf[len] = 0;
+                        },
+                    }
                 }
             }
         }
@@ -1138,13 +2033,40 @@ fn frame() !dvui.App.Result {
         }
     }
 
-    // Detect search text changes and reload the grid via FTS5
+    // Detect search text changes and reload the grid
     if (!std.mem.eql(u8, &g_search_buf, &g_search_prev)) {
         @memcpy(&g_search_prev, &g_search_buf);
         const q = std.mem.sliceTo(&g_search_buf, 0);
         if (g_grid) |*grid| {
-            grid.search_query = if (q.len > 0) q else null;
-            if (g_db) |*db| grid.reloadImages(db) catch {};
+            grid.search_mode = g_search_mode;
+            switch (g_search_mode) {
+                .fts => {
+                    grid.search_query = if (q.len > 0) q else null;
+                    grid.query_embedding = null;
+                    if (g_query_embedding) |emb| {
+                        if (dvui.App.main_init) |init| init.gpa.free(emb);
+                        g_query_embedding = null;
+                    }
+                    if (g_db) |*db| grid.reloadImages(db) catch {};
+                },
+                .semantic, .visual, .combined => {
+                    grid.search_query = null;
+                    if (g_query_embedding) |emb| {
+                        if (dvui.App.main_init) |init| init.gpa.free(emb);
+                        g_query_embedding = null;
+                    }
+                    grid.query_embedding = null;
+                    if (q.len > 0) {
+                        if (dvui.App.main_init) |init| {
+                            embedSearchQuery(init.gpa, q, g_search_mode) catch |err| {
+                                log.warn("search embed: {}", .{err});
+                            };
+                        }
+                    }
+                    if (g_db) |*db| grid.reloadImages(db) catch {};
+                    if (q.len > 0) maybeSpawnRerank(grid, q);
+                },
+            }
         }
     }
 
@@ -1207,287 +2129,16 @@ fn frame() !dvui.App.Result {
     var col = dvui.box(@src(), .{}, .{ .expand = .both });
     defer col.deinit();
 
-    // ── Toolbar ──────────────────────────────────────────────────────────
-    {
-        var toolbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
-            .expand = .horizontal,
-            .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
-            .background = true,
-        });
-        defer toolbar.deinit();
-
-        // Search field — expands to fill available width
-        {
-            var te = dvui.textEntry(@src(), .{
-                .text = .{ .buffer = g_search_buf[0..] },
-                .placeholder = i18n.t(.search_placeholder),
-            }, .{
-                .expand = .horizontal,
-                .gravity_y = 0.5,
-                .corner_radius = dvui.Rect.all(5),
-                .min_size_content = .{ .h = 22 },
-            });
-            defer te.deinit();
-        }
-
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
-
-        // Filter chips
-        const chip: dvui.Options = .{
-            .corner_radius = dvui.Rect.all(12),
-            .padding = .{ .x = 10, .y = 3, .w = 10, .h = 3 },
-            .margin = .{ .x = 2, .w = 2 },
-            .gravity_y = 0.5,
-        };
-        // Active filter pills
-        var filter_remove_idx: ?usize = null;
-        for (g_active_filters.items, 0..) |f, fi| {
-            var pill = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                .id_extra = fi,
-                .corner_radius = dvui.Rect.all(12),
-                .padding = .{ .x = 8, .y = 3, .w = 4, .h = 3 },
-                .margin = .{ .x = 2, .w = 2 },
-                .gravity_y = 0.5,
-                .background = true,
-                .color_fill = dvui.themeGet().focus,
-            });
-            defer pill.deinit();
-            dvui.label(@src(), "{s}: {s}", .{ filterColumnLabel(f.column), f.value }, .{
-                .id_extra = fi,
-                .gravity_y = 0.5,
-            });
-            if (dvui.buttonIcon(@src(), "remove_filter", dvui.entypo.cross, .{}, .{}, .{
-                .id_extra = fi,
-                .min_size_content = .{ .w = 10, .h = 10 },
-                .gravity_y = 0.5,
-                .padding = dvui.Rect.all(2),
-                .margin = .{ .x = 4 },
-            })) {
-                filter_remove_idx = fi;
-            }
-        }
-        if (filter_remove_idx) |ri| {
-            if (dvui.App.main_init) |init| {
-                const f = g_active_filters.orderedRemove(ri);
-                init.gpa.free(f.value);
-            }
-            if (g_grid) |*grid| {
-                grid.filters = g_active_filters.items;
-                if (g_db) |*db| grid.reloadImages(db) catch {};
-            }
-        }
-
-        // Add filter button
-        if (dvui.button(@src(), i18n.t(.toolbar_add_filter), .{}, chip.override(.{ .id_extra = 4 }))) {
-            g_filter_modal_open = true;
-            g_filter_modal_value_buf = std.mem.zeroes([256]u8);
-            g_filter_modal_kind = .model;
-            g_filter_modal_options_kind = null; // trigger re-fetch
-        }
-
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
-
-        // Thumbnail size slider + sort controls
-        if (g_grid) |*grid| {
-            _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction }, .{
-                .gravity_y = 0.5,
-                .min_size_content = .{ .w = 80, .h = 16 },
-            });
-
-            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
-
-            // Sort mode chip — cycles date → name → random on click
-            {
-                const sort_mode_tvg = switch (grid.sort_mode) {
-                    .date   => icons.tvg.lucide.calendar,
-                    .name   => icons.tvg.lucide.@"a-arrow-down",
-                    .random => icons.tvg.entypo.shuffle,
-                };
-                const sort_mode_tip = switch (grid.sort_mode) {
-                    .date   => i18n.t(.toolbar_sort_by_date),
-                    .name   => i18n.t(.toolbar_sort_by_name),
-                    .random => i18n.t(.toolbar_sort_randomly),
-                };
-                var bw: dvui.ButtonWidget = undefined;
-                bw.init(@src(), .{}, chip.override(.{ .id_extra = 5, .min_size_content = .{ .w = 16, .h = 16 } }));
-                defer bw.deinit();
-                bw.processEvents();
-                bw.drawBackground();
-                dvui.icon(@src(), "sort_mode_icon", sort_mode_tvg, .{}, .{
-                    .gravity_x = 0.5, .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 16, .h = 16 },
-                    .expand = .ratio,
-                });
-                if (bw.clicked()) {
-                    grid.sort_mode = switch (grid.sort_mode) {
-                        .date => .name,
-                        .name => .random,
-                        .random => .date,
-                    };
-                    grid.applySortOrder();
-                }
-                bw.drawFocus();
-                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{sort_mode_tip}, .{});
-            }
-
-            // Direction toggle (date/name) or re-randomize button (random)
-            if (grid.sort_mode == .random) {
-                var bw: dvui.ButtonWidget = undefined;
-                bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
-                defer bw.deinit();
-                bw.processEvents();
-                bw.drawBackground();
-                dvui.icon(@src(), "reshuffle_icon", icons.tvg.lucide.dices, .{}, .{
-                    .gravity_x = 0.5, .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 16, .h = 16 },
-                    .expand = .ratio,
-                });
-                if (bw.clicked()) {
-                    grid.sort_seed +%= 1;
-                    grid.applySortOrder();
-                }
-                bw.drawFocus();
-                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{i18n.t(.toolbar_reshuffle)}, .{});
-            } else {
-                const dir_tvg = if (grid.sort_dir == .asc) icons.tvg.lucide.@"arrow-up" else icons.tvg.lucide.@"arrow-down";
-                const dir_tip = if (grid.sort_dir == .asc) i18n.t(.toolbar_sort_ascending) else i18n.t(.toolbar_sort_descending);
-                var bw: dvui.ButtonWidget = undefined;
-                bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
-                defer bw.deinit();
-                bw.processEvents();
-                bw.drawBackground();
-                dvui.icon(@src(), "sort_dir_icon", dir_tvg, .{}, .{
-                    .gravity_x = 0.5, .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 16, .h = 16 },
-                    .expand = .ratio,
-                });
-                if (bw.clicked()) {
-                    grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
-                    grid.applySortOrder();
-                }
-                bw.drawFocus();
-                dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{dir_tip}, .{});
-            }
-        }
-    }
-
-    // ── Content row: [left panel] [handle] [center] [handle] [right panel] ──
-    {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .background = true });
-        defer row.deinit();
-
-        // ── Left sidebar ──────────────────────────────────────────────────
-        if (g_left_w >= 2) {
-            if (dvui.App.main_init) |init| {
-                if (try g_sidebar.render(
-                    g_left_w,
-                    init.gpa,
-                    if (g_db) |*db| db else null,
-                    if (g_grid) |*g| g else null,
-                    if (g_library_manager) |*mgr| mgr else null,
-                    g_cfg.trash_enabled,
-                    g_trash_stats,
-                )) refreshCounts();
-            }
-        }
-
-        panelHandle(@src(), .left, &g_left_w, &g_left_w_open, left_w_min, left_w_max);
-
-        // ── Center: image grid ────────────────────────────────────────────
-        {
-            var grid_area = dvui.box(@src(), .{}, .{ .expand = .both });
-            defer grid_area.deinit();
-
-            if (g_grid) |*grid| {
-                grid.trash_enabled = g_cfg.trash_enabled;
-                grid.render();
-            } else {
-                dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });
-            }
-        }
-
-        panelHandle(@src(), .right, &g_right_w, &g_right_w_open, right_w_min, right_w_max);
-
-        // ── Right: metadata panel ─────────────────────────────────────────
-        if (g_right_w >= 2) {
-            const focused_id: ?u64 = if (g_grid) |*grid|
-                if (grid.focused_idx) |fi|
-                    (if (fi < grid.images.items.len) grid.images.items[fi].id else null)
-                else null
-            else null;
-            const filename: []const u8 = if (g_grid) |*grid|
-                if (grid.focused_idx) |fi|
-                    (if (fi < grid.images.items.len) grid.images.items[fi].filename else "")
-                else ""
-            else "";
-            if (dvui.App.main_init) |init| {
-                if (g_db) |*db| g_detail.update(focused_id, db, init.gpa, init.io);
-                g_detail.renderPanel(g_right_w, filename, init.gpa, init.io);
-            }
-        }
-    }
-
-    // ── Statusbar ──────────────────────────────────────────────────────────
-    {
-        var statusbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
-            .expand = .horizontal,
-            .padding = .{ .x = 8, .y = 2, .w = 4, .h = 2 },
-            .background = true,
-        });
-        defer statusbar.deinit();
-
-        if (g_library_manager) |*mgr| {
-            if (mgr.isScanActive()) {
-                _ = dvui.spinner(@src(), .{
-                    .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 12, .h = 12 },
-                });
-                dvui.label(@src(), "scanning\u{2026} {d} files", .{mgr.filesScanned()}, .{
-                    .gravity_y = 0.5,
-                    .margin = .{ .x = 4 },
-                });
-            }
-            const displayed: usize = if (g_grid) |*grid| grid.images.items.len else 0;
-            const is_filtered = g_sidebar.filter_library_id != null or g_sidebar.filter_folder != null;
-            if (is_filtered) {
-                dvui.label(@src(), "{d} {s} ({s} {d})", .{
-                    displayed,
-                    i18n.t(.status_images),
-                    i18n.t(.status_out_of),
-                    g_total_image_count,
-                }, .{ .gravity_y = 0.5 });
-            } else {
-                dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
-            }
-        } else {
-            dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
-        }
-        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-        if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
-            .min_size_content = .{ .w = 14, .h = 14 },
-            .gravity_y = 0.5,
-            .padding = dvui.Rect.all(3),
-            .margin = .{ .w = 2 },
-        })) {
-            g_settings_open = !g_settings_open;
-            if (g_settings_open) {
-                if (g_db) |*db| {
-                    g_db_stats = db.getStats() catch null;
-                    g_trash_stats = db.getTrashStats() catch null;
-                }
-                g_settings_scan_snapshot = .{
-                    .thumbnails_in_db = g_cfg.thumbnails_in_db,
-                    .prompt_embeddings = g_cfg.prompt_embeddings,
-                    .image_embeddings = g_cfg.image_embeddings,
-                };
-            }
-        }
-    }
+    renderToolbar();
+    try renderContent();
+    renderStatusBar();
 
     // ── Settings modal ────────────────────────────────────────────────────────
     const settings_was_open = g_settings_open;
     if (g_settings_open) try settingsModal();
     if (settings_was_open and !g_settings_open) {
+        var need_rescan = false;
+
         const changed = g_cfg.thumbnails_in_db != g_settings_scan_snapshot.thumbnails_in_db or
             g_cfg.prompt_embeddings != g_settings_scan_snapshot.prompt_embeddings or
             g_cfg.image_embeddings != g_settings_scan_snapshot.image_embeddings;
@@ -1496,6 +2147,51 @@ fn frame() !dvui.App.Result {
                 mgr.thumbnails_in_db = g_cfg.thumbnails_in_db;
                 mgr.prompt_embeddings = g_cfg.prompt_embeddings;
                 mgr.image_embeddings = g_cfg.image_embeddings;
+            }
+            need_rescan = true;
+        }
+        const model_changed = !std.mem.eql(u8, &g_embedding_model_buf, &g_settings_model_snapshot.model) or
+            !std.mem.eql(u8, &g_embedding_mmproj_buf, &g_settings_model_snapshot.mmproj);
+        if (model_changed) {
+            if (dvui.App.main_init) |init| {
+                // Update config strings
+                if (g_cfg.embedding_model_path) |p| init.gpa.free(p);
+                const model_str = std.mem.sliceTo(&g_embedding_model_buf, 0);
+                g_cfg.embedding_model_path = if (model_str.len > 0) init.gpa.dupe(u8, model_str) catch null else null;
+                if (g_cfg.embedding_mmproj_path) |p| init.gpa.free(p);
+                const mmproj_str = std.mem.sliceTo(&g_embedding_mmproj_buf, 0);
+                g_cfg.embedding_mmproj_path = if (mmproj_str.len > 0) init.gpa.dupe(u8, mmproj_str) catch null else null;
+                // Update library manager paths and reset cached model state
+                if (g_library_manager) |*mgr| {
+                    mgr.embedding_model_path = g_cfg.embedding_model_path;
+                    mgr.embedding_mmproj_path = g_cfg.embedding_mmproj_path;
+                    mgr.vl_ctx_initialized.store(false, .release);
+                    if (mgr.text_pool) |*tp| { tp.deinit(); mgr.text_pool = null; }
+                }
+                // Reset search models so they're re-initialized on next use
+                if (g_search_vl_ctx) |*vc| { vc.deinit(); g_search_vl_ctx = null; }
+                if (g_search_text_pool) |*tp| { tp.deinit(); g_search_text_pool = null; }
+            }
+            // Rescan so images missing embeddings get them with the new model.
+            if (g_cfg.prompt_embeddings or g_cfg.image_embeddings) need_rescan = true;
+        }
+        const reranker_changed = !std.mem.eql(u8, &g_reranker_model_buf, &g_settings_model_snapshot.reranker) or
+            !std.mem.eql(u8, &g_reranker_mmproj_buf, &g_settings_model_snapshot.reranker_mmproj);
+        if (reranker_changed) {
+            if (dvui.App.main_init) |init| {
+                if (g_cfg.reranker_model_path) |p| init.gpa.free(p);
+                const rr_str = std.mem.sliceTo(&g_reranker_model_buf, 0);
+                g_cfg.reranker_model_path = if (rr_str.len > 0) init.gpa.dupe(u8, rr_str) catch null else null;
+                if (g_cfg.reranker_mmproj_path) |p| init.gpa.free(p);
+                const rr_mmproj_str = std.mem.sliceTo(&g_reranker_mmproj_buf, 0);
+                g_cfg.reranker_mmproj_path = if (rr_mmproj_str.len > 0) init.gpa.dupe(u8, rr_mmproj_str) catch null else null;
+                // Reset cached reranker so it's re-initialized on next use
+                if (g_search_reranker) |*rr| { rr.deinit(); g_search_reranker = null; }
+            }
+        }
+        // Trigger rescan after all path/flag updates are applied.
+        if (need_rescan) {
+            if (g_library_manager) |*mgr| {
                 if (dvui.App.main_init) |init| {
                     mgr.scanAllLibraries(init.io) catch |err| {
                         std.log.warn("rescan after config change: {}", .{err});

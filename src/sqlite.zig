@@ -316,8 +316,8 @@ pub const Database = struct {
     }
 
     // Insert a vector into the table
-    pub fn insertVector(self: *Database, table_name: []const u8, _: usize, vector: []const f32) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO {s} (id, vector) VALUES (?, ?)", .{table_name});
+    pub fn insertVector(self: *Database, table_name: []const u8, id: i64, vector: []const f32) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, "INSERT OR REPLACE INTO {s}(rowid, vector) VALUES (?, ?)", .{table_name});
         defer self.allocator.free(sql);
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -329,7 +329,8 @@ pub const Database = struct {
         }
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_blob(stmt, 1, @ptrCast(vector.ptr), @intCast(vector.len * @sizeOf(f32)), c.SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 1, id);
+        _ = c.sqlite3_bind_blob(stmt, 2, @ptrCast(vector.ptr), @intCast(vector.len * @sizeOf(f32)), c.SQLITE_STATIC);
 
         const step_result = c.sqlite3_step(stmt);
         if (step_result != c.SQLITE_DONE) {
@@ -341,7 +342,7 @@ pub const Database = struct {
 
     // Search for nearest vectors
     pub fn searchNearestVectors(self: *Database, table_name: []const u8, query_vector: []const f32, limit: usize) !std.ArrayList(VecResult) {
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT id, vec_distance_cosine(vector, ?) as distance FROM {s} ORDER BY distance LIMIT ?", .{table_name});
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT rowid, vec_distance_cosine(vector, ?) as distance FROM {s} ORDER BY distance ASC LIMIT ?", .{table_name});
         defer self.allocator.free(sql);
 
         var stmt: ?*c.sqlite3_stmt = null;

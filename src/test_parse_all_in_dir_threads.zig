@@ -178,7 +178,7 @@ fn embedResults(
         });
         defer pool.deinit();
 
-        const ctx = try pool.get(model_path, 30_000);
+        const ctx = try pool.get(model_path, 30_000, null);
         defer pool.release(ctx);
 
         const t0 = std.Io.Timestamp.now(io, .awake);
@@ -216,7 +216,7 @@ fn embedResults(
 
         for (results) |r| {
             const item = r orelse continue;
-            const embd = vl.embedImageFile(allocator, item.path, "") catch {
+            const embd = vl.embedImageFile(allocator, item.path, "", null) catch {
                 n_err += 1;
                 continue;
             };

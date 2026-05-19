@@ -86,7 +86,7 @@ pub const VlContext = struct {
         });
 
         // Load the model so we can hand the llama_model* to mtmd.
-        const ctx = try pool.get(model_path, 30_000);
+        const ctx = try pool.get(model_path, 30_000, null);
 
         const model_ptr = pool.model.?.ptr;
         const mmproj_z = try allocator.dupeZ(u8, mmproj_path);
@@ -119,8 +119,9 @@ pub const VlContext = struct {
         allocator: std.mem.Allocator,
         image_path: []const u8,
         prefix: []const u8,
+        stop: ?*const std.atomic.Value(bool),
     ) ![]f32 {
-        const ctx = try self.pool.get(self.model_path, 30_000);
+        const ctx = try self.pool.get(self.model_path, 30_000, stop);
         defer self.pool.release(ctx);
 
         const n_embd: usize = @intCast(c.llama_model_n_embd(self.pool.model.?.ptr));
@@ -157,7 +158,7 @@ pub const VlContext = struct {
         ny: u32,
         prefix: []const u8,
     ) ![]f32 {
-        const ctx = try self.pool.get(self.model_path, 30_000);
+        const ctx = try self.pool.get(self.model_path, 30_000, null);
         defer self.pool.release(ctx);
 
         const n_embd: usize = @intCast(c.llama_model_n_embd(self.pool.model.?.ptr));
@@ -214,7 +215,7 @@ pub const RerankContext = struct {
             .n_gpu_layers = 999,
         });
 
-        const ctx = try pool.get(model_path, 30_000);
+        const ctx = try pool.get(model_path, 30_000, null);
         const model_ptr = pool.model.?.ptr;
 
         var yes_id: i32 = -1;
@@ -260,7 +261,7 @@ pub const RerankContext = struct {
         instruction: []const u8,
         image_path: []const u8,
     ) !f32 {
-        const ctx = try self.pool.get(self.model_path, 60_000);
+        const ctx = try self.pool.get(self.model_path, 60_000, null);
         defer self.pool.release(ctx);
 
         const query_z = try allocator.dupeZ(u8, query);

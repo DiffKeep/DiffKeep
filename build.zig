@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) !void {
 
     // *** llama ***
     try addLlama(b, exe);
+    try addMtmd(b, exe);
 
     // *** Dev/research tools (not part of the GUI, useful for data pipeline work) ***
 

@@ -30,6 +30,8 @@ pub const ImageMeta = struct {
     id: u64,
     mtime: ?i64,
     has_thumbnail: bool,
+    has_prompt_embedding: bool,
+    has_image_embedding: bool,
     seen: bool = false,
 };
 
@@ -253,10 +255,10 @@ pub const VectorDb = struct {
         self.pool.release(&self.db) catch {};
     }
 
-    pub fn storeImageEmbedding(self: *VectorDb, id: usize, embedding: []const f32) !void {
+    pub fn storeImageEmbedding(self: *VectorDb, id: u64, embedding: []const f32) !void {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        try self.db.insertVector("image_embeddings", id, embedding);
+        try self.db.insertVector("image_embeddings", @as(i64, @intCast(id)), embedding);
     }
 
     pub fn findSimilarImages(self: *VectorDb, query_embedding: []const f32, limit: usize) !std.ArrayList(sqlite.VecResult) {
@@ -295,53 +297,136 @@ pub const VectorDb = struct {
     }
 
     /// Store a prompt embedding in the database
-    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, embedding: []const f32, positive: bool) !void {
+    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, embedding: []const f32) !void {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt: sqlite.PreparedStatement = undefined;
-        if (positive) {
-            stmt = try self.db.prepare("INSERT OR REPLACE INTO positive_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 2048))");
-        } else {
-            stmt = try self.db.prepare("INSERT OR REPLACE INTO negative_prompt_embeddings (image_id, embedding) VALUES (?, vector_embed(?, 2048))");
-        }
-        defer stmt.deinit();
-
-        try stmt.bind(1, image_id);
-        try stmt.bindBlob(2, std.mem.sliceAsBytes(embedding[0..2048]));
-
-        _ = try stmt.step();
+        try self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), embedding);
     }
 
-    /// Find similar images based on a prompt embedding
-    pub fn findSimilarPrompts(self: *VectorDb, query_embedding: [*]const f32, limit: usize) !std.ArrayList(SearchResult) {
+    /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 2048-dim.
+    pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var results = std.ArrayList(SearchResult).init(self.allocator);
-        errdefer results.deinit();
-
-        const sql =
-            \\SELECT p.image_id, p.prompt_text, vector_distance(pe.embedding, vector_embed(?)) as distance
-            \\FROM prompt_embeddings pe
-            \\JOIN prompts p ON p.image_id = pe.image_id
-            \\ORDER BY distance ASC
+        var stmt = try self.db.prepare(
+            \\SELECT i.id, i.library_path, i.mtime
+            \\FROM images i
+            \\JOIN positive_prompt_embeddings pe ON pe.rowid = i.id
+            \\WHERE i.trashed_at IS NULL
+            \\ORDER BY vec_distance_cosine(pe.vector, ?) ASC
             \\LIMIT ?
-        ;
-
-        var stmt = try self.db.prepare(sql);
+        );
         defer stmt.deinit();
-
-        try stmt.bindBlob(1, std.mem.sliceAsBytes(query_embedding[0..768]));
+        try stmt.bindBlob(1, std.mem.sliceAsBytes(query));
         try stmt.bind(2, @as(i64, @intCast(limit)));
-
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
         while (try stmt.step()) {
-            try results.append(.{
-                .id = @intCast(stmt.columnInt64(0)),
-                .distance = stmt.columnFloat(2),
-                .prompt = try self.allocator.dupe(u8, stmt.columnText(1)),
-            });
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// KNN search on image_embeddings. query must be L2-normalized, 2048-dim.
+    pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            \\SELECT i.id, i.library_path, i.mtime
+            \\FROM images i
+            \\JOIN image_embeddings ie ON ie.rowid = i.id
+            \\WHERE i.trashed_at IS NULL
+            \\ORDER BY vec_distance_cosine(ie.vector, ?) ASC
+            \\LIMIT ?
+        );
+        defer stmt.deinit();
+        try stmt.bindBlob(1, std.mem.sliceAsBytes(query));
+        try stmt.bind(2, @as(i64, @intCast(limit)));
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// RRF-merged KNN search over both prompt and image embeddings.
+    /// Runs both queries independently (top `limit` each), merges via Reciprocal
+    /// Rank Fusion (k=60), and returns the top `limit` results sorted by combined
+    /// score descending.  query must be L2-normalized, 2048-dim.
+    pub fn searchCombined(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
+        const prompt_results = try self.searchByPromptEmbedding(allocator, query, limit);
+        defer {
+            for (prompt_results) |e| allocator.free(e.path);
+            allocator.free(prompt_results);
+        }
+        const image_results = try self.searchByImageEmbedding(allocator, query, limit);
+        defer {
+            for (image_results) |e| allocator.free(e.path);
+            allocator.free(image_results);
         }
 
-        return results;
+        const RrfEntry = struct { score: f32, id: u64, path: []const u8, mtime: ?i64 };
+        var map = std.AutoHashMap(u64, RrfEntry).init(allocator);
+        defer map.deinit();
+
+        const rrf_k: f32 = 60.0;
+
+        for (prompt_results, 0..) |entry, rank| {
+            const contrib: f32 = 1.0 / (rrf_k + @as(f32, @floatFromInt(rank + 1)));
+            const gop = try map.getOrPut(entry.id);
+            if (gop.found_existing) {
+                gop.value_ptr.score += contrib;
+            } else {
+                gop.value_ptr.* = .{ .score = contrib, .id = entry.id, .path = entry.path, .mtime = entry.mtime };
+            }
+        }
+        for (image_results, 0..) |entry, rank| {
+            const contrib: f32 = 1.0 / (rrf_k + @as(f32, @floatFromInt(rank + 1)));
+            const gop = try map.getOrPut(entry.id);
+            if (gop.found_existing) {
+                gop.value_ptr.score += contrib;
+            } else {
+                gop.value_ptr.* = .{ .score = contrib, .id = entry.id, .path = entry.path, .mtime = entry.mtime };
+            }
+        }
+
+        // Collect, sort descending by score
+        var merged = try allocator.alloc(RrfEntry, map.count());
+        defer allocator.free(merged);
+        var it = map.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |v| : (i += 1) merged[i] = v.*;
+        std.sort.pdq(RrfEntry, merged, {}, struct {
+            fn lt(_: void, a: RrfEntry, b: RrfEntry) bool { return a.score > b.score; }
+        }.lt);
+
+        // Build result slice (dupe paths, they'll be freed by callers)
+        const n = @min(merged.len, limit);
+        var out = try allocator.alloc(GridEntry, n);
+        var out_filled: usize = 0;
+        errdefer {
+            for (out[0..out_filled]) |e| allocator.free(e.path);
+            allocator.free(out);
+        }
+        for (merged[0..n]) |e| {
+            out[out_filled] = .{ .id = e.id, .path = try allocator.dupe(u8, e.path), .mtime = e.mtime };
+            out_filled += 1;
+        }
+        return out;
     }
 
     /// Caller owns all Image string fields; free with image.deinit(allocator).
@@ -691,7 +776,14 @@ pub const VectorDb = struct {
             map.deinit();
         }
         var stmt = try self.db.prepare(
-            "SELECT id, library_path, mtime, (thumbnail IS NOT NULL) FROM images WHERE library_id = ? AND trashed_at IS NULL",
+            \\SELECT i.id, i.library_path, i.mtime,
+            \\       (i.thumbnail IS NOT NULL),
+            \\       (pe.rowid IS NOT NULL),
+            \\       (ie.rowid IS NOT NULL)
+            \\FROM images i
+            \\LEFT JOIN positive_prompt_embeddings pe ON pe.rowid = i.id
+            \\LEFT JOIN image_embeddings ie ON ie.rowid = i.id
+            \\WHERE i.library_id = ? AND i.trashed_at IS NULL
         );
         defer stmt.deinit();
         try stmt.bind(1, library_id);
@@ -701,7 +793,9 @@ pub const VectorDb = struct {
             errdefer allocator.free(path);
             const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
             const has_thumbnail = stmt.columnInt64(3) != 0;
-            try map.put(path, .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail });
+            const has_prompt_embedding = stmt.columnInt64(4) != 0;
+            const has_image_embedding = stmt.columnInt64(5) != 0;
+            try map.put(path, .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail, .has_prompt_embedding = has_prompt_embedding, .has_image_embedding = has_image_embedding });
         }
         return map;
     }

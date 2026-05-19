@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer pool.deinit();
 
-    const ctx = try pool.get(model_path, 30_000);
+    const ctx = try pool.get(model_path, 30_000, null);
     defer pool.release(ctx);
 
     var embeddings = try llama.createEmbeddingFromPrompt(allocator, ctx, text, 512);

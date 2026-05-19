@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (image_paths.items) |path| {
         try println(io, "Embedding: {s}", .{path});
-        const embd = try vl.embedImageFile(allocator, path, "");
+        const embd = try vl.embedImageFile(allocator, path, "", null);
         try embeddings.append(allocator, embd);
 
         // Print first 8 values as a sanity check.

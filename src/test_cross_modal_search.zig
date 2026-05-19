@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
         .n_gpu_layers = 999,
     });
     defer text_pool.deinit();
-    const text_ctx = try text_pool.get(model_arg, 30_000);
+    const text_ctx = try text_pool.get(model_arg, 30_000, null);
     defer text_pool.release(text_ctx);
 
     // ── Optionally init reranker ──────────────────────────────────────
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(img_embds);
     }
     for (corpus, 0..) |e, i| {
-        img_embds[i] = try vl.embedImageFile(allocator, e.path, "");
+        img_embds[i] = try vl.embedImageFile(allocator, e.path, "", null);
     }
     std.log.info("Done embedding. Running queries...", .{});
 

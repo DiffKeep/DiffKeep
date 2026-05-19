@@ -12,6 +12,7 @@ const log = std.log.scoped(.image_grid);
 pub const SortMode = enum { date, name, random };
 pub const SortDir = enum { asc, desc };
 pub const ViewMode = enum { library, trash };
+pub const SearchMode = enum { fts, semantic, visual, combined };
 
 pub const ImageEntry = struct {
     id: u64,
@@ -159,6 +160,9 @@ pub const GridState = struct {
     search_query: ?[]const u8 = null,
     // Active metadata filters — slice into app.zig's g_active_filters; not owned
     filters: []const db_mod.ActiveFilter = &.{},
+    // Search mode and query embedding for semantic/visual search
+    search_mode: SearchMode = .fts,
+    query_embedding: ?[]const f32 = null,  // borrowed, not owned
 
     // Data directory (e.g. ~/.local/share/DiffKeep) — borrowed from app, not owned.
     // Used to resolve trash file paths: <data_dir>/trash/<trash_name>.
@@ -268,13 +272,23 @@ pub const GridState = struct {
 
         const entries = switch (self.view_mode) {
             .library => blk: {
-                const has_search = if (self.search_query) |q| q.len > 0 else false;
-                if (has_search or self.filters.len > 0) {
+                const has_text = if (self.search_query) |q| q.len > 0 else false;
+                // Vector search modes — only when an embedding is available
+                if (self.query_embedding) |embd| {
+                    switch (self.search_mode) {
+                        .semantic  => break :blk try db.searchByPromptEmbedding(self.allocator, embd, 200),
+                        .visual    => break :blk try db.searchByImageEmbedding(self.allocator, embd, 200),
+                        .combined  => break :blk try db.searchCombined(self.allocator, embd, 200),
+                        .fts       => {},
+                    }
+                }
+                // FTS / filtered query
+                if (has_text or self.filters.len > 0) {
                     break :blk try db.listImagesFiltered(
                         self.allocator,
                         self.filter_library_id,
                         self.filter_folder_path,
-                        if (has_search) self.search_query else null,
+                        if (has_text) self.search_query else null,
                         self.filters,
                     );
                 }
@@ -374,8 +388,15 @@ pub const GridState = struct {
             .date => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageDateLt),
             .name => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageNameLt),
             .random => {
-                var prng = std.Random.DefaultPrng.init(self.sort_seed);
-                prng.random().shuffle(ImageEntry, self.images.items);
+                // Sort by hash(seed, id) so each image has a stable position
+                // independent of list size — deleting one image won't reorder the rest.
+                std.mem.sort(ImageEntry, self.images.items, self.sort_seed, struct {
+                    fn lt(seed: u64, a: ImageEntry, b: ImageEntry) bool {
+                        const ha = std.hash.Wyhash.hash(seed, std.mem.asBytes(&a.id));
+                        const hb = std.hash.Wyhash.hash(seed, std.mem.asBytes(&b.id));
+                        return ha < hb;
+                    }
+                }.lt);
             },
         }
     }
