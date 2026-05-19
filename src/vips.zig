@@ -54,6 +54,27 @@ pub fn loadImageRgbaWithDims(
     };
 }
 
+pub fn jpegBytesToRgba(
+    allocator: std.mem.Allocator,
+    jpeg_data: []const u8,
+    size: c_int,
+) !struct { pixels: []u8, width: u32, height: u32 } {
+    var buf: ?*anyopaque = null;
+    var len: usize = 0;
+    var w: c_int = 0;
+    var h: c_int = 0;
+
+    if (c.diffkeep_jpeg_bytes_to_rgba(jpeg_data.ptr, jpeg_data.len, size, &buf, &len, &w, &h) != 0)
+        return error.VipsDecodeFailed;
+    defer c.diffkeep_vips_free(buf);
+
+    return .{
+        .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
+        .width  = @intCast(w),
+        .height = @intCast(h),
+    };
+}
+
 pub fn thumbnailToJpeg(allocator: std.mem.Allocator, path: [:0]const u8, size: c_int) ![]u8 {
     var buf: ?*anyopaque = null;
     var len: usize = 0;

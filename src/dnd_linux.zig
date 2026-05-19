@@ -1,21 +1,570 @@
 const std = @import("std");
 const SDLBackend = @import("backend");
+const vips = @import("vips");
 
 const xlib = @cImport({
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xatom.h");
+    @cInclude("X11/Xcursor/Xcursor.h");
+    @cInclude("X11/extensions/XInput2.h");
 });
+
+const wl = @cImport({
+    @cInclude("wayland-client.h");
+});
+
+// ─── X11 constants ───────────────────────────────────────────────────────────
 
 const XA_ATOM: xlib.Atom = 4;
 const XA_WINDOW: xlib.Atom = 33;
 const SelectionRequest: c_int = 30;
 const SelectionNotify: c_int = 31;
 const ClientMessage: c_int = 33;
+const GenericEvent: c_int = 35;
 const PropModeReplace: c_int = 0;
 const Button1Mask: c_uint = 1 << 8;
 const CWOverrideRedirect: c_ulong = 1 << 9;
-const XC_hand2: c_uint = 60;
 const xdnd_version: c_long = 5;
+const cursor_size: c_int = 96;
+const XI_RawButtonRelease: c_int = 16;
+
+// ─── Wayland constants ───────────────────────────────────────────────────────
+
+const BTN_LEFT: u32 = 0x110;
+const WL_POINTER_BUTTON_STATE_PRESSED: u32 = 1;
+const WL_SHM_FORMAT_ARGB8888: u32 = 0;
+const WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY: u32 = 1;
+
+// ─── Shared types ────────────────────────────────────────────────────────────
+
+pub const DragItem = struct {
+    path:       []const u8,
+    thumb_jpeg: []const u8,
+};
+
+const Phase = enum { idle, dragging, finishing };
+
+// ─── URI list builder (shared) ───────────────────────────────────────────────
+
+fn buildUriList(allocator: std.mem.Allocator, items: []const DragItem) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    for (items) |item| {
+        try list.appendSlice(allocator, "file://");
+        for (item.path) |byte| {
+            switch (byte) {
+                'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '/' =>
+                    try list.append(allocator, byte),
+                else => {
+                    const hex = "0123456789ABCDEF";
+                    try list.append(allocator, '%');
+                    try list.append(allocator, hex[byte >> 4]);
+                    try list.append(allocator, hex[byte & 0xf]);
+                },
+            }
+        }
+        try list.appendSlice(allocator, "\r\n");
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+// ─── Ghost compositing (shared, used by Wayland) ─────────────────────────────
+
+const ghost_thumb_px: c_int = 96;
+const ghost_offset_px: u32 = 5;
+
+const GhostResult = struct { pixels: []u8, width: u32, height: u32 };
+
+/// Returns a heap-allocated RGBA canvas or null if no thumbnails could be decoded.
+/// Caller owns the returned pixels slice and must free it with allocator.free().
+fn composeGhost(allocator: std.mem.Allocator, items: []const DragItem) ?GhostResult {
+    const n: u32 = @intCast(@min(items.len, 3));
+    if (n == 0) return null;
+
+    const thumb_px: u32 = @intCast(ghost_thumb_px);
+    const canvas_w = thumb_px + (n - 1) * ghost_offset_px;
+    const canvas_h = canvas_w;
+
+    const canvas = allocator.alloc(u8, canvas_w * canvas_h * 4) catch return null;
+    @memset(canvas, 0); // transparent black
+
+    // Paint layers back-to-front so front layers composite over back layers.
+    var layer: usize = n;
+    while (layer > 0) {
+        layer -= 1;
+        if (items[layer].thumb_jpeg.len == 0) continue;
+
+        const dec = vips.jpegBytesToRgba(allocator, items[layer].thumb_jpeg, ghost_thumb_px)
+            catch continue;
+        defer allocator.free(dec.pixels);
+
+        const tw = dec.width;
+        const th = dec.height;
+        const box_x: u32 = @as(u32, @intCast(layer)) * ghost_offset_px;
+        const box_y: u32 = box_x;
+        const pad_x: u32 = (thumb_px - @min(tw, thumb_px)) / 2;
+        const pad_y: u32 = (thumb_px - @min(th, thumb_px)) / 2;
+
+        for (0..th) |row| {
+            for (0..tw) |col| {
+                const si = (row * tw + col) * 4;
+                const sa: u32 = dec.pixels[si + 3];
+                if (sa == 0) continue;
+
+                const dx = box_x + pad_x + col;
+                const dy = box_y + pad_y + row;
+                if (dx >= canvas_w or dy >= canvas_h) continue;
+
+                const di = (dy * canvas_w + dx) * 4;
+                const da: u32 = canvas[di + 3];
+                const na: u32 = sa + da * (255 - sa) / 255;
+                if (na == 0) continue;
+                canvas[di + 0] = @intCast((@as(u32, dec.pixels[si + 0]) * sa + @as(u32, canvas[di + 0]) * da * (255 - sa) / 255) / na);
+                canvas[di + 1] = @intCast((@as(u32, dec.pixels[si + 1]) * sa + @as(u32, canvas[di + 1]) * da * (255 - sa) / 255) / na);
+                canvas[di + 2] = @intCast((@as(u32, dec.pixels[si + 2]) * sa + @as(u32, canvas[di + 2]) * da * (255 - sa) / 255) / na);
+                canvas[di + 3] = @intCast(na);
+            }
+        }
+    }
+
+    for (0..canvas_w * canvas_h) |px| {
+        if (canvas[px * 4 + 3] != 0) return .{ .pixels = canvas, .width = canvas_w, .height = canvas_h };
+    }
+    allocator.free(canvas);
+    return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Wayland drag source
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Wayland registry callbacks ──────────────────────────────────────────────
+
+fn wlRegistryGlobal(
+    data: ?*anyopaque,
+    registry: ?*wl.struct_wl_registry,
+    name: u32,
+    interface: [*c]const u8,
+    version: u32,
+) callconv(.c) void {
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    const iface = std.mem.span(interface);
+    if (std.mem.eql(u8, iface, "wl_compositor")) {
+        self.compositor = @ptrCast(wl.wl_registry_bind(registry.?, name, &wl.wl_compositor_interface, @min(version, 4)));
+    } else if (std.mem.eql(u8, iface, "wl_seat")) {
+        self.seat = @ptrCast(wl.wl_registry_bind(registry.?, name, &wl.wl_seat_interface, @min(version, 5)));
+    } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+        const v = @min(version, 3);
+        self.ddm = @ptrCast(wl.wl_registry_bind(registry.?, name, &wl.wl_data_device_manager_interface, v));
+        self.ddm_version = v;
+    } else if (std.mem.eql(u8, iface, "wl_shm")) {
+        self.shm = @ptrCast(wl.wl_registry_bind(registry.?, name, &wl.wl_shm_interface, @min(version, 1)));
+    }
+}
+
+fn wlRegistryGlobalRemove(
+    data: ?*anyopaque,
+    registry: ?*wl.struct_wl_registry,
+    name: u32,
+) callconv(.c) void {
+    _ = data; _ = registry; _ = name;
+}
+
+const registry_listener = wl.wl_registry_listener{
+    .global        = wlRegistryGlobal,
+    .global_remove = wlRegistryGlobalRemove,
+};
+
+// ─── Wayland pointer callbacks ───────────────────────────────────────────────
+
+fn wlPointerEnter(
+    data: ?*anyopaque,
+    pointer: ?*wl.struct_wl_pointer,
+    serial: u32,
+    surface: ?*wl.struct_wl_surface,
+    sx: wl.wl_fixed_t,
+    sy: wl.wl_fixed_t,
+) callconv(.c) void {
+    _ = pointer; _ = sx; _ = sy;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    self.surf_focused = (surface == self.sdl_surf);
+    if (self.surf_focused) self.last_serial = serial;
+}
+
+fn wlPointerLeave(
+    data: ?*anyopaque,
+    pointer: ?*wl.struct_wl_pointer,
+    serial: u32,
+    surface: ?*wl.struct_wl_surface,
+) callconv(.c) void {
+    _ = pointer; _ = serial; _ = surface;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    self.surf_focused = false;
+}
+
+fn wlPointerMotion(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, t: u32, x: wl.wl_fixed_t, y: wl.wl_fixed_t) callconv(.c) void { _ = data; _ = p; _ = t; _ = x; _ = y; }
+
+fn wlPointerButton(
+    data: ?*anyopaque,
+    pointer: ?*wl.struct_wl_pointer,
+    serial: u32,
+    time: u32,
+    button: u32,
+    state: u32,
+) callconv(.c) void {
+    _ = pointer; _ = time;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    if (button == BTN_LEFT and state == WL_POINTER_BUTTON_STATE_PRESSED and self.surf_focused) {
+        self.last_serial = serial;
+        std.log.debug("dnd/wl: captured button serial={d}", .{serial});
+    }
+}
+
+fn wlPointerAxis(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, t: u32, a: u32, v: wl.wl_fixed_t) callconv(.c) void { _ = data; _ = p; _ = t; _ = a; _ = v; }
+fn wlPointerFrame(data: ?*anyopaque, p: ?*wl.struct_wl_pointer) callconv(.c) void { _ = data; _ = p; }
+fn wlPointerAxisSource(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, s: u32) callconv(.c) void { _ = data; _ = p; _ = s; }
+fn wlPointerAxisStop(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, t: u32, a: u32) callconv(.c) void { _ = data; _ = p; _ = t; _ = a; }
+fn wlPointerAxisDiscrete(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, a: u32, d: i32) callconv(.c) void { _ = data; _ = p; _ = a; _ = d; }
+fn wlPointerAxisValue120(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, a: u32, v: i32) callconv(.c) void { _ = data; _ = p; _ = a; _ = v; }
+fn wlPointerAxisRelativeDirection(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, a: u32, d: u32) callconv(.c) void { _ = data; _ = p; _ = a; _ = d; }
+
+const pointer_listener = wl.wl_pointer_listener{
+    .enter                   = wlPointerEnter,
+    .leave                   = wlPointerLeave,
+    .motion                  = wlPointerMotion,
+    .button                  = wlPointerButton,
+    .axis                    = wlPointerAxis,
+    .frame                   = wlPointerFrame,
+    .axis_source             = wlPointerAxisSource,
+    .axis_stop               = wlPointerAxisStop,
+    .axis_discrete           = wlPointerAxisDiscrete,
+    .axis_value120           = wlPointerAxisValue120,
+    .axis_relative_direction = wlPointerAxisRelativeDirection,
+};
+
+// ─── Wayland data-source callbacks ───────────────────────────────────────────
+
+fn wlDataSourceTarget(data: ?*anyopaque, s: ?*wl.struct_wl_data_source, m: [*c]const u8) callconv(.c) void { _ = data; _ = s; _ = m; }
+
+fn wlDataSourceSend(
+    data: ?*anyopaque,
+    source: ?*wl.struct_wl_data_source,
+    mime_type: [*c]const u8,
+    fd: i32,
+) callconv(.c) void {
+    _ = source;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    if (std.mem.eql(u8, std.mem.span(mime_type), "text/uri-list")) {
+        _ = std.os.linux.write(@intCast(fd), self.uri_list.ptr, self.uri_list.len);
+    }
+    // Compositor transfers fd ownership to us; we must always close it.
+    _ = std.os.linux.close(@intCast(fd));
+}
+
+fn wlDataSourceCancelled(
+    data: ?*anyopaque,
+    source: ?*wl.struct_wl_data_source,
+) callconv(.c) void {
+    _ = source;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    std.log.debug("dnd/wl: data_source cancelled", .{});
+    self.resetToIdle();
+}
+
+fn wlDataSourceDndDropPerformed(data: ?*anyopaque, s: ?*wl.struct_wl_data_source) callconv(.c) void {
+    _ = s;
+    std.log.debug("dnd/wl: dnd_drop_performed", .{});
+    // Do not destroy the source yet; wait for dnd_finished.
+    _ = data;
+}
+
+fn wlDataSourceDndFinished(
+    data: ?*anyopaque,
+    source: ?*wl.struct_wl_data_source,
+) callconv(.c) void {
+    _ = source;
+    const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
+    std.log.debug("dnd/wl: dnd_finished", .{});
+    self.resetToIdle();
+}
+
+fn wlDataSourceAction(data: ?*anyopaque, s: ?*wl.struct_wl_data_source, a: u32) callconv(.c) void { _ = data; _ = s; _ = a; }
+
+const data_source_listener = wl.wl_data_source_listener{
+    .target             = wlDataSourceTarget,
+    .send               = wlDataSourceSend,
+    .cancelled          = wlDataSourceCancelled,
+    .dnd_drop_performed = wlDataSourceDndDropPerformed,
+    .dnd_finished       = wlDataSourceDndFinished,
+    .action             = wlDataSourceAction,
+};
+
+// ─── Wayland data-device callbacks (source-only: destroy all offers) ─────────
+
+fn wlDataDeviceDataOffer(
+    data: ?*anyopaque,
+    dd: ?*wl.struct_wl_data_device,
+    offer: ?*wl.struct_wl_data_offer,
+) callconv(.c) void {
+    _ = data; _ = dd;
+    if (offer) |o| wl.wl_data_offer_destroy(o);
+}
+fn wlDataDeviceEnter(data: ?*anyopaque, dd: ?*wl.struct_wl_data_device, serial: u32, surface: ?*wl.struct_wl_surface, x: wl.wl_fixed_t, y: wl.wl_fixed_t, offer: ?*wl.struct_wl_data_offer) callconv(.c) void { _ = data; _ = dd; _ = serial; _ = surface; _ = x; _ = y; _ = offer; }
+fn wlDataDeviceLeave(data: ?*anyopaque, dd: ?*wl.struct_wl_data_device) callconv(.c) void { _ = data; _ = dd; }
+fn wlDataDeviceMotion(data: ?*anyopaque, dd: ?*wl.struct_wl_data_device, t: u32, x: wl.wl_fixed_t, y: wl.wl_fixed_t) callconv(.c) void { _ = data; _ = dd; _ = t; _ = x; _ = y; }
+fn wlDataDeviceDrop(data: ?*anyopaque, dd: ?*wl.struct_wl_data_device) callconv(.c) void { _ = data; _ = dd; }
+fn wlDataDeviceSelection(data: ?*anyopaque, dd: ?*wl.struct_wl_data_device, offer: ?*wl.struct_wl_data_offer) callconv(.c) void { _ = data; _ = dd; _ = offer; }
+
+const data_device_listener = wl.wl_data_device_listener{
+    .data_offer = wlDataDeviceDataOffer,
+    .enter      = wlDataDeviceEnter,
+    .leave      = wlDataDeviceLeave,
+    .motion     = wlDataDeviceMotion,
+    .drop       = wlDataDeviceDrop,
+    .selection  = wlDataDeviceSelection,
+};
+
+// ─── WaylandDragSource ───────────────────────────────────────────────────────
+
+const WaylandDragSource = struct {
+    allocator:   std.mem.Allocator,
+    display:     *wl.struct_wl_display,
+    sdl_surf:    *wl.struct_wl_surface,
+    registry:    *wl.struct_wl_registry,
+
+    compositor:  ?*wl.struct_wl_compositor = null,
+    seat:        ?*wl.struct_wl_seat = null,
+    ddm:         ?*wl.struct_wl_data_device_manager = null,
+    shm:         ?*wl.struct_wl_shm = null,
+    ddm_version: u32 = 0,
+
+    pointer:     ?*wl.struct_wl_pointer = null,
+    data_device: ?*wl.struct_wl_data_device = null,
+
+    last_serial:  u32 = 0,
+    surf_focused: bool = false,
+
+    phase:       Phase = .idle,
+    data_source: ?*wl.struct_wl_data_source = null,
+
+    icon_surface:  ?*wl.struct_wl_surface = null,
+    icon_buffer:   ?*wl.struct_wl_buffer = null,
+    icon_shm_fd:   std.posix.fd_t = -1,
+    icon_shm_size: usize = 0,
+    icon_shm_ptr:  ?[]align(std.heap.page_size_min) u8 = null,
+
+    uri_list: []u8 = &.{},
+
+    fn init(allocator: std.mem.Allocator, sdl_window: *SDLBackend.c.SDL_Window) ?*WaylandDragSource {
+        const props = SDLBackend.c.SDL_GetWindowProperties(sdl_window);
+        const dpy_raw = SDLBackend.c.SDL_GetPointerProperty(
+            props, SDLBackend.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return null;
+        const surf_raw = SDLBackend.c.SDL_GetPointerProperty(
+            props, SDLBackend.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return null;
+
+        const display: *wl.struct_wl_display = @ptrCast(@alignCast(dpy_raw));
+        const sdl_surf: *wl.struct_wl_surface = @ptrCast(@alignCast(surf_raw));
+
+        const registry = wl.wl_display_get_registry(display) orelse return null;
+
+        const self = allocator.create(WaylandDragSource) catch {
+            wl.wl_registry_destroy(registry);
+            return null;
+        };
+        self.* = .{
+            .allocator = allocator,
+            .display   = display,
+            .sdl_surf  = sdl_surf,
+            .registry  = registry,
+        };
+
+        _ = wl.wl_registry_add_listener(registry, &registry_listener, self);
+        _ = wl.wl_display_roundtrip(display);
+
+        if (self.seat == null or self.ddm == null or self.shm == null or self.compositor == null) {
+            std.log.warn("dnd/wl: missing globals (seat={} ddm={} shm={} comp={})",
+                .{ self.seat != null, self.ddm != null, self.shm != null, self.compositor != null });
+            wl.wl_registry_destroy(registry);
+            allocator.destroy(self);
+            return null;
+        }
+
+        self.pointer = wl.wl_seat_get_pointer(self.seat.?);
+        if (self.pointer) |ptr| {
+            _ = wl.wl_pointer_add_listener(ptr, &pointer_listener, self);
+        }
+
+        self.data_device = wl.wl_data_device_manager_get_data_device(self.ddm.?, self.seat.?);
+        if (self.data_device) |dd| {
+            _ = wl.wl_data_device_add_listener(dd, &data_device_listener, self);
+        }
+
+        _ = wl.wl_display_roundtrip(display);
+
+        std.log.debug("dnd/wl: init ok (ddm_ver={d})", .{self.ddm_version});
+        return self;
+    }
+
+    fn deinit(self: *WaylandDragSource) void {
+        if (self.phase != .idle) self.resetToIdle();
+        self.freeUriList();
+        if (self.pointer)     |p| { wl.wl_pointer_destroy(p);               self.pointer     = null; }
+        if (self.data_device) |d| { wl.wl_data_device_destroy(d);           self.data_device = null; }
+        if (self.ddm)         |d| { wl.wl_data_device_manager_destroy(d);   self.ddm         = null; }
+        if (self.shm)         |s| { wl.wl_shm_destroy(s);                   self.shm         = null; }
+        if (self.compositor)  |c| { wl.wl_compositor_destroy(c);            self.compositor  = null; }
+        if (self.seat)        |s| { wl.wl_seat_destroy(s);                  self.seat        = null; }
+        wl.wl_registry_destroy(self.registry);
+        _ = wl.wl_display_flush(self.display);
+        self.allocator.destroy(self);
+    }
+
+    fn isDragging(self: *const WaylandDragSource) bool {
+        return self.phase != .idle;
+    }
+
+    fn startDrag(self: *WaylandDragSource, items: []const DragItem) void {
+        if (self.phase != .idle or items.len == 0) return;
+        if (self.last_serial == 0) {
+            std.log.warn("dnd/wl: startDrag called with no button serial — ignored", .{});
+            return;
+        }
+
+        self.freeUriList();
+        self.uri_list = buildUriList(self.allocator, items) catch return;
+
+        const source = wl.wl_data_device_manager_create_data_source(self.ddm.?) orelse {
+            self.freeUriList();
+            return;
+        };
+        wl.wl_data_source_offer(source, "text/uri-list");
+        if (self.ddm_version >= 3)
+            wl.wl_data_source_set_actions(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+        _ = wl.wl_data_source_add_listener(source, &data_source_listener, self);
+        self.data_source = source;
+
+        // Build ghost icon (best-effort; null → compositor shows default cursor).
+        var icon_surf: ?*wl.struct_wl_surface = null;
+        if (composeGhost(self.allocator, items)) |ghost| {
+            defer self.allocator.free(ghost.pixels);
+            icon_surf = self.buildIconSurface(ghost.pixels, ghost.width, ghost.height) catch |err| blk: {
+                std.log.warn("dnd/wl: icon surface failed: {}", .{err});
+                break :blk null;
+            };
+        }
+
+        wl.wl_data_device_start_drag(
+            self.data_device.?,
+            source,
+            self.sdl_surf,
+            icon_surf,
+            self.last_serial,
+        );
+        _ = wl.wl_display_flush(self.display);
+
+        self.phase = .dragging;
+        std.log.debug("dnd/wl: startDrag {d} item(s) serial={d}", .{ items.len, self.last_serial });
+    }
+
+    fn pumpEvents(self: *WaylandDragSource) void {
+        _ = wl.wl_display_dispatch_pending(self.display);
+    }
+
+    fn tick(self: *WaylandDragSource, io: std.Io) void {
+        _ = io;
+        // Wayland is event-driven; state transitions happen in data_source callbacks.
+        // pumpEvents() drives dispatch; nothing to poll here.
+        _ = self;
+    }
+
+    fn getSdlCursor(_: *const WaylandDragSource) ?*SDLBackend.c.SDL_Cursor {
+        return null; // compositor renders the icon surface
+    }
+
+    fn notifyButtonUp(_: *WaylandDragSource) void {}
+
+    // ── private ──────────────────────────────────────────────────────────────
+
+    fn buildIconSurface(
+        self: *WaylandDragSource,
+        rgba: []const u8,
+        w: u32,
+        h: u32,
+    ) !*wl.struct_wl_surface {
+        const size = w * h * 4;
+
+        const fd = try std.posix.memfd_create("diffkeep-dnd-icon", 0);
+        errdefer _ = std.os.linux.close(fd);
+        const ftr = std.os.linux.ftruncate(fd, @intCast(size));
+        if (std.posix.errno(ftr) != .SUCCESS) return error.FtruncateFailed;
+
+        const ptr = try std.posix.mmap(
+            null, size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd, 0,
+        );
+        errdefer std.posix.munmap(ptr);
+
+        // RGBA → Wayland ARGB8888 (wire format is little-endian BGRA in memory)
+        for (0..w * h) |px| {
+            ptr[px * 4 + 0] = rgba[px * 4 + 2]; // B
+            ptr[px * 4 + 1] = rgba[px * 4 + 1]; // G
+            ptr[px * 4 + 2] = rgba[px * 4 + 0]; // R
+            ptr[px * 4 + 3] = rgba[px * 4 + 3]; // A
+        }
+
+        const pool = wl.wl_shm_create_pool(self.shm.?, fd, @intCast(size)) orelse
+            return error.WlShmPoolFailed;
+        defer wl.wl_shm_pool_destroy(pool);
+
+        const buf = wl.wl_shm_pool_create_buffer(
+            pool, 0, @intCast(w), @intCast(h), @intCast(w * 4), WL_SHM_FORMAT_ARGB8888,
+        ) orelse return error.WlBufferFailed;
+
+        const surf = wl.wl_compositor_create_surface(self.compositor.?) orelse {
+            wl.wl_buffer_destroy(buf);
+            return error.WlSurfaceFailed;
+        };
+        wl.wl_surface_attach(surf, buf, 0, 0);
+        wl.wl_surface_damage(surf, 0, 0, @intCast(w), @intCast(h));
+        wl.wl_surface_commit(surf);
+
+        self.icon_surface  = surf;
+        self.icon_buffer   = buf;
+        self.icon_shm_fd   = fd;
+        self.icon_shm_size = size;
+        self.icon_shm_ptr  = ptr;
+        return surf;
+    }
+
+    fn destroyIconSurface(self: *WaylandDragSource) void {
+        if (self.icon_surface) |s| { wl.wl_surface_destroy(s); self.icon_surface = null; }
+        if (self.icon_buffer)  |b| { wl.wl_buffer_destroy(b);  self.icon_buffer  = null; }
+        if (self.icon_shm_ptr) |p| { std.posix.munmap(p);      self.icon_shm_ptr = null; }
+        if (self.icon_shm_fd >= 0) { _ = std.os.linux.close(self.icon_shm_fd); self.icon_shm_fd = -1; }
+        self.icon_shm_size = 0;
+    }
+
+    fn resetToIdle(self: *WaylandDragSource) void {
+        if (self.data_source) |s| { wl.wl_data_source_destroy(s); self.data_source = null; }
+        self.destroyIconSurface();
+        _ = wl.wl_display_flush(self.display);
+        self.phase = .idle;
+        self.freeUriList();
+    }
+
+    fn freeUriList(self: *WaylandDragSource) void {
+        if (self.uri_list.len > 0) {
+            self.allocator.free(self.uri_list);
+            self.uri_list = &.{};
+        }
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// X11 drag source
+// ═══════════════════════════════════════════════════════════════════════════
 
 const Atoms = struct {
     XdndAware:      xlib.Atom,
@@ -33,31 +582,29 @@ const Atoms = struct {
     TARGETS:        xlib.Atom,
 };
 
-const Phase = enum { idle, dragging, finishing };
+const X11DragSource = struct {
+    allocator: std.mem.Allocator,
+    dnd_dpy:  *xlib.Display,
+    src_win:  xlib.Window,
+    sdl_win:  xlib.Window,
+    root_win: xlib.Window,
+    atoms:    Atoms,
 
-pub const DragItem = struct {
-    path:       []const u8,
-    thumb_jpeg: []const u8,
-};
+    xi_opcode: c_int = 0,
 
-pub const DragSource = struct {
-    allocator:       std.mem.Allocator,
-    // Private display — SDL3 never touches this queue, so XCheckIfEvent always wins.
-    dnd_dpy:         *xlib.Display,
-    src_win:         xlib.Window, // helper window; targets send responses here
-    sdl_win:         xlib.Window, // SDL3's window (skip as drag target)
-    root_win:        xlib.Window,
-    atoms:           Atoms,
-    // Pre-created font cursor; applied via XDefineCursor to the window we enter.
-    drag_x11_cursor: xlib.Cursor,
+    phase:           Phase = .idle,
+    target:          xlib.Window = 0,
+    accepted:        bool = false,
+    uri_list:        []u8 = &.{},
+    finish_ns:       i96 = 0,
+    button_released: bool = false,
+    drag_x11_cursor: xlib.Cursor = 0,
+    drag_sdl_cursor: ?*SDLBackend.c.SDL_Cursor = null,
+    wakeup_event_type: u32 = 0,
+    watcher_stop:      std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    watcher_thread:    ?std.Thread = null,
 
-    phase:     Phase = .idle,
-    target:    xlib.Window = 0,
-    accepted:  bool = false,
-    uri_list:  []u8 = &.{},
-    finish_ns: i96 = 0,
-
-    pub fn init(allocator: std.mem.Allocator, sdl_window: *SDLBackend.c.SDL_Window) ?DragSource {
+    fn init(allocator: std.mem.Allocator, sdl_window: *SDLBackend.c.SDL_Window) ?X11DragSource {
         const props = SDLBackend.c.SDL_GetWindowProperties(sdl_window);
         const dpy_opaque = SDLBackend.c.SDL_GetPointerProperty(
             props, SDLBackend.c.SDL_PROP_WINDOW_X11_DISPLAY_POINTER, null) orelse return null;
@@ -68,19 +615,15 @@ pub const DragSource = struct {
         const sdl_dpy: *xlib.Display = @ptrCast(@alignCast(dpy_opaque));
         const sdl_win: xlib.Window = @intCast(win_num);
 
-        // Mark the SDL3 window XdndAware so DiffKeep can receive drops from other apps.
         const sdl_aware = xlib.XInternAtom(sdl_dpy, "XdndAware", 0);
         var ver: c_long = xdnd_version;
         _ = xlib.XChangeProperty(sdl_dpy, sdl_win, sdl_aware, XA_ATOM, 32,
             PropModeReplace, @ptrCast(&ver), 1);
         _ = xlib.XFlush(sdl_dpy);
 
-        // Private display connection — SDL3 only drains its own connection, so
-        // XdndStatus, XdndFinished, and SelectionRequest land here undisturbed.
         const dnd_dpy = xlib.XOpenDisplay(null) orelse return null;
         const root_win = xlib.DefaultRootWindow(dnd_dpy);
 
-        // Tiny invisible override-redirect window on dnd_dpy.
         const src_win = xlib.XCreateSimpleWindow(dnd_dpy, root_win, -2, -2, 1, 1, 0, 0, 0);
         var attrs = std.mem.zeroes(xlib.XSetWindowAttributes);
         attrs.override_redirect = 1;
@@ -104,55 +647,92 @@ pub const DragSource = struct {
 
         _ = xlib.XChangeProperty(dnd_dpy, src_win, atoms.XdndAware, XA_ATOM, 32,
             PropModeReplace, @ptrCast(&ver), 1);
+
+        var xi_opcode: c_int = 0;
+        var xi_event_base: c_int = 0;
+        var xi_error_base: c_int = 0;
+        if (xlib.XQueryExtension(dnd_dpy, "XInputExtension",
+                &xi_opcode, &xi_event_base, &xi_error_base) != 0)
+        {
+            var major: c_int = 2;
+            var minor: c_int = 0;
+            if (xlib.XIQueryVersion(dnd_dpy, &major, &minor) == 0) {
+                var mask_bytes = [_]u8{ 0, 0, 1, 0 };
+                var evmask = xlib.XIEventMask{
+                    .deviceid = xlib.XIAllMasterDevices,
+                    .mask_len = mask_bytes.len,
+                    .mask     = &mask_bytes,
+                };
+                _ = xlib.XISelectEvents(dnd_dpy, root_win, &evmask, 1);
+            } else {
+                xi_opcode = 0;
+            }
+        }
         _ = xlib.XFlush(dnd_dpy);
 
-        // Create the drag cursor once; reused for every drag.
-        const drag_x11_cursor = xlib.XCreateFontCursor(dnd_dpy, XC_hand2);
+        const wakeup_type: u32 = @bitCast(SDLBackend.c.SDL_RegisterEvents(1));
 
-        std.log.debug("dnd: X11 DragSource init sdl_win=0x{x} src_win=0x{x}", .{ sdl_win, src_win });
+        std.log.debug("dnd: X11 DragSource init sdl_win=0x{x} src_win=0x{x} xi2={}", .{ sdl_win, src_win, xi_opcode != 0 });
         return .{
-            .allocator       = allocator,
-            .dnd_dpy         = dnd_dpy,
-            .src_win         = src_win,
-            .sdl_win         = sdl_win,
-            .root_win        = root_win,
-            .atoms           = atoms,
-            .drag_x11_cursor = drag_x11_cursor,
+            .allocator         = allocator,
+            .dnd_dpy           = dnd_dpy,
+            .src_win           = src_win,
+            .sdl_win           = sdl_win,
+            .root_win          = root_win,
+            .atoms             = atoms,
+            .xi_opcode         = xi_opcode,
+            .wakeup_event_type = wakeup_type,
         };
     }
 
-    pub fn deinit(self: *DragSource) void {
+    fn deinit(self: *X11DragSource) void {
         if (self.phase != .idle) self.abort();
         self.freeUriList();
-        _ = xlib.XFreeCursor(self.dnd_dpy, self.drag_x11_cursor);
+        self.freeDragCursors();
         _ = xlib.XDestroyWindow(self.dnd_dpy, self.src_win);
         _ = xlib.XCloseDisplay(self.dnd_dpy);
     }
 
-    pub fn isDragging(self: *const DragSource) bool {
+    fn getSdlCursor(self: *const X11DragSource) ?*SDLBackend.c.SDL_Cursor {
+        return self.drag_sdl_cursor;
+    }
+
+    fn notifyButtonUp(self: *X11DragSource) void {
+        if (self.phase == .dragging) self.button_released = true;
+    }
+
+    fn isDragging(self: *const X11DragSource) bool {
         return self.phase != .idle;
     }
 
-    pub fn startDrag(self: *DragSource, items: []const DragItem) void {
+    fn startDrag(self: *X11DragSource, items: []const DragItem) void {
         if (self.phase != .idle or items.len == 0) return;
         self.freeUriList();
         self.uri_list = buildUriList(self.allocator, items) catch return;
         _ = xlib.XSetSelectionOwner(self.dnd_dpy, self.atoms.XdndSelection, self.src_win, 0);
         _ = xlib.XFlush(self.dnd_dpy);
+        self.createDragCursors(items[0].thumb_jpeg);
         self.phase    = .dragging;
         self.target   = 0;
         self.accepted = false;
+        self.watcher_stop.store(false, .release);
+        self.watcher_thread = std.Thread.spawn(.{}, dndWatcher, .{self}) catch null;
         std.log.debug("dnd: startDrag {d} item(s), uri_list={d}b", .{ items.len, self.uri_list.len });
     }
 
-    pub fn pumpEvents(self: *DragSource) void {
+    fn pumpEvents(self: *X11DragSource) void {
         var event: xlib.XEvent = undefined;
         while (xlib.XCheckIfEvent(self.dnd_dpy, &event, xdndPredicate, @ptrCast(self)) != 0) {
             self.handleX11Event(&event);
         }
+        if (self.phase == .dragging) {
+            while (xlib.XCheckIfEvent(self.dnd_dpy, &event, anyEventPredicate, null) != 0) {
+                std.log.debug("dnd: unhandled event type={d} window=0x{x}", .{ event.type, event.xany.window });
+            }
+        }
     }
 
-    pub fn tick(self: *DragSource, io: std.Io) void {
+    fn tick(self: *X11DragSource, io: std.Io) void {
         switch (self.phase) {
             .idle      => {},
             .dragging  => self.tickDragging(io),
@@ -163,9 +743,9 @@ pub const DragSource = struct {
         }
     }
 
-    // ── private ───────────────────────────────────────────────────────────────
+    // ── private ──────────────────────────────────────────────────────────────
 
-    fn tickDragging(self: *DragSource, io: std.Io) void {
+    fn tickDragging(self: *X11DragSource, io: std.Io) void {
         var dummy: xlib.Window = undefined;
         var top_child: xlib.Window = 0;
         var rx: c_int = 0; var ry: c_int = 0;
@@ -178,7 +758,9 @@ pub const DragSource = struct {
             return;
         }
 
-        if (mask & Button1Mask == 0) {
+        const sdl_buttons = SDLBackend.c.SDL_GetGlobalMouseState(null, null);
+        if (self.button_released or sdl_buttons & 1 == 0 or mask & Button1Mask == 0) {
+            self.button_released = false;
             self.finishDrag(io);
             return;
         }
@@ -186,7 +768,6 @@ pub const DragSource = struct {
         const new_target = self.findTarget(top_child, rx, ry);
         if (new_target != self.target) {
             std.log.debug("dnd: target 0x{x} → 0x{x}", .{ self.target, new_target });
-            // Update cursor: remove from old target, set on new target.
             if (self.target != 0) _ = xlib.XUndefineCursor(self.dnd_dpy, self.target);
             if (new_target != 0) _ = xlib.XDefineCursor(self.dnd_dpy, new_target, self.drag_x11_cursor);
             if (self.target != 0)
@@ -210,7 +791,7 @@ pub const DragSource = struct {
         _ = xlib.XFlush(self.dnd_dpy);
     }
 
-    fn finishDrag(self: *DragSource, io: std.Io) void {
+    fn finishDrag(self: *X11DragSource, io: std.Io) void {
         std.log.debug("dnd: finishDrag target=0x{x} accepted={}", .{ self.target, self.accepted });
         if (self.target != 0 and self.accepted) {
             self.sendMsg(self.target, self.atoms.XdndDrop,
@@ -227,7 +808,7 @@ pub const DragSource = struct {
         _ = xlib.XFlush(self.dnd_dpy);
     }
 
-    fn abort(self: *DragSource) void {
+    fn abort(self: *X11DragSource) void {
         if (self.target != 0)
             self.sendMsg(self.target, self.atoms.XdndLeave,
                 @bitCast(self.src_win), 0, 0, 0, 0);
@@ -235,23 +816,78 @@ pub const DragSource = struct {
         self.resetToIdle();
     }
 
-    fn resetToIdle(self: *DragSource) void {
+    fn resetToIdle(self: *X11DragSource) void {
+        self.watcher_stop.store(true, .release);
+        if (self.watcher_thread) |t| { t.join(); self.watcher_thread = null; }
         _ = xlib.XSetSelectionOwner(self.dnd_dpy, self.atoms.XdndSelection, 0, 0);
         if (self.target != 0) _ = xlib.XUndefineCursor(self.dnd_dpy, self.target);
         _ = xlib.XFlush(self.dnd_dpy);
         self.phase  = .idle;
         self.target = 0;
         self.freeUriList();
+        self.freeDragCursors();
     }
 
-    fn freeUriList(self: *DragSource) void {
+    fn createDragCursors(self: *X11DragSource, thumb_jpeg: []const u8) void {
+        if (thumb_jpeg.len == 0) return;
+
+        const decoded = vips.jpegBytesToRgba(self.allocator, thumb_jpeg, cursor_size)
+            catch return;
+        defer self.allocator.free(decoded.pixels);
+
+        const w = decoded.width;
+        const h = decoded.height;
+        const hot_x: c_int = @intCast(w / 2);
+        const hot_y: c_int = @intCast(h / 2);
+
+        const surface = SDLBackend.c.SDL_CreateSurfaceFrom(
+            @intCast(w), @intCast(h),
+            SDLBackend.c.SDL_PIXELFORMAT_RGBA32,
+            decoded.pixels.ptr,
+            @intCast(w * 4),
+        );
+        if (surface != null) {
+            self.drag_sdl_cursor = SDLBackend.c.SDL_CreateColorCursor(surface, hot_x, hot_y);
+            SDLBackend.c.SDL_DestroySurface(surface);
+        }
+
+        const ximg = xlib.XcursorImageCreate(@intCast(w), @intCast(h)) orelse return;
+        defer xlib.XcursorImageDestroy(ximg);
+        ximg.*.xhot = @intCast(w / 2);
+        ximg.*.yhot = @intCast(h / 2);
+        const pixels = decoded.pixels;
+        var i: usize = 0;
+        while (i < w * h) : (i += 1) {
+            const r = pixels[i * 4 + 0];
+            const g = pixels[i * 4 + 1];
+            const b = pixels[i * 4 + 2];
+            const a = pixels[i * 4 + 3];
+            ximg.*.pixels[i] = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
+                                (@as(u32, g) << 8)  |  @as(u32, b);
+        }
+        self.drag_x11_cursor = xlib.XcursorImageLoadCursor(self.dnd_dpy, ximg);
+    }
+
+    fn freeDragCursors(self: *X11DragSource) void {
+        if (self.drag_x11_cursor != 0) {
+            _ = xlib.XFreeCursor(self.dnd_dpy, self.drag_x11_cursor);
+            self.drag_x11_cursor = 0;
+        }
+        if (self.drag_sdl_cursor) |c| {
+            _ = SDLBackend.c.SDL_SetCursor(null);
+            SDLBackend.c.SDL_DestroyCursor(c);
+            self.drag_sdl_cursor = null;
+        }
+    }
+
+    fn freeUriList(self: *X11DragSource) void {
         if (self.uri_list.len > 0) {
             self.allocator.free(self.uri_list);
             self.uri_list = &.{};
         }
     }
 
-    fn findTarget(self: *DragSource, top_win: xlib.Window, root_x: c_int, root_y: c_int) xlib.Window {
+    fn findTarget(self: *X11DragSource, top_win: xlib.Window, root_x: c_int, root_y: c_int) xlib.Window {
         if (top_win == 0 or top_win == self.sdl_win) return 0;
 
         var candidate: xlib.Window = 0;
@@ -271,7 +907,7 @@ pub const DragSource = struct {
         return self.getXdndProxy(top_win);
     }
 
-    fn xdndVersion(self: *DragSource, win: xlib.Window) ?u32 {
+    fn xdndVersion(self: *X11DragSource, win: xlib.Window) ?u32 {
         var actual_type: xlib.Atom = undefined;
         var actual_fmt: c_int = undefined;
         var nitems: c_ulong = undefined;
@@ -286,7 +922,7 @@ pub const DragSource = struct {
         return @intCast(ver);
     }
 
-    fn getXdndProxy(self: *DragSource, win: xlib.Window) xlib.Window {
+    fn getXdndProxy(self: *X11DragSource, win: xlib.Window) xlib.Window {
         var actual_type: xlib.Atom = undefined;
         var actual_fmt: c_int = undefined;
         var nitems: c_ulong = undefined;
@@ -301,7 +937,7 @@ pub const DragSource = struct {
         return if (self.xdndVersion(proxy) != null) proxy else 0;
     }
 
-    fn sendMsg(self: *DragSource, win: xlib.Window, kind: xlib.Atom,
+    fn sendMsg(self: *X11DragSource, win: xlib.Window, kind: xlib.Atom,
         d0: c_long, d1: c_long, d2: c_long, d3: c_long, d4: c_long) void
     {
         var ev = std.mem.zeroes(xlib.XEvent);
@@ -318,7 +954,7 @@ pub const DragSource = struct {
         _ = xlib.XSendEvent(self.dnd_dpy, win, 0, 0, &ev);
     }
 
-    fn handleX11Event(self: *DragSource, ev: *xlib.XEvent) void {
+    fn handleX11Event(self: *X11DragSource, ev: *xlib.XEvent) void {
         switch (ev.type) {
             ClientMessage => {
                 const mt = ev.xclient.message_type;
@@ -336,11 +972,22 @@ pub const DragSource = struct {
                 if (ev.xselectionrequest.selection == self.atoms.XdndSelection)
                     self.answerSelectionRequest(ev.xselectionrequest);
             },
+            GenericEvent => {
+                if (xlib.XGetEventData(self.dnd_dpy, &ev.xcookie) != 0) {
+                    defer xlib.XFreeEventData(self.dnd_dpy, &ev.xcookie);
+                    if (ev.xcookie.evtype == XI_RawButtonRelease) {
+                        const re: *xlib.XIRawEvent = @ptrCast(@alignCast(ev.xcookie.data));
+                        if (re.detail == 1 and self.phase == .dragging) {
+                            self.button_released = true;
+                        }
+                    }
+                }
+            },
             else => {},
         }
     }
 
-    fn answerSelectionRequest(self: *DragSource, sr: xlib.XSelectionRequestEvent) void {
+    fn answerSelectionRequest(self: *X11DragSource, sr: xlib.XSelectionRequestEvent) void {
         var resp = std.mem.zeroes(xlib.XEvent);
         resp.xselection.type      = SelectionNotify;
         resp.xselection.requestor = sr.requestor;
@@ -372,7 +1019,7 @@ pub const DragSource = struct {
         _ = xlib.XFlush(self.dnd_dpy);
     }
 
-    fn answerMultiple(self: *DragSource, sr: xlib.XSelectionRequestEvent, resp: *xlib.XEvent) void {
+    fn answerMultiple(self: *X11DragSource, sr: xlib.XSelectionRequestEvent, resp: *xlib.XEvent) void {
         var actual_type: xlib.Atom = undefined;
         var actual_fmt: c_int = undefined;
         var nitems: c_ulong = undefined;
@@ -414,32 +1061,28 @@ pub const DragSource = struct {
     }
 };
 
-/// Build a text/uri-list payload.  Each path is percent-encoded as "file:///path\r\n".
-fn buildUriList(allocator: std.mem.Allocator, items: []const DragItem) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    for (items) |item| {
-        try list.appendSlice(allocator, "file://");
-        for (item.path) |byte| {
-            switch (byte) {
-                'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '/' =>
-                    try list.append(allocator, byte),
-                else => {
-                    const hex = "0123456789ABCDEF";
-                    try list.append(allocator, '%');
-                    try list.append(allocator, hex[byte >> 4]);
-                    try list.append(allocator, hex[byte & 0xf]);
-                },
-            }
+fn dndWatcher(self: *X11DragSource) void {
+    const fd = xlib.XConnectionNumber(self.dnd_dpy);
+    var pfd = std.posix.pollfd{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+    while (!self.watcher_stop.load(.acquire)) {
+        _ = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 50) catch break;
+        if (pfd.revents & std.posix.POLL.IN != 0) {
+            var ev = std.mem.zeroes(SDLBackend.c.SDL_Event);
+            ev.type = self.wakeup_event_type;
+            _ = SDLBackend.c.SDL_PushEvent(&ev);
+            pfd.revents = 0;
         }
-        try list.appendSlice(allocator, "\r\n");
     }
-    return list.toOwnedSlice(allocator);
+}
+
+fn anyEventPredicate(dpy: ?*xlib.Display, ev: ?*xlib.XEvent, arg: xlib.XPointer) callconv(.c) xlib.Bool {
+    _ = dpy; _ = arg; _ = ev;
+    return 1;
 }
 
 fn xdndPredicate(dpy: ?*xlib.Display, ev: ?*xlib.XEvent, arg: xlib.XPointer) callconv(.c) xlib.Bool {
     _ = dpy;
-    const self: *DragSource = @ptrCast(@alignCast(arg));
+    const self: *X11DragSource = @ptrCast(@alignCast(arg));
     const e = ev orelse return 0;
     if (e.type == ClientMessage) {
         const mt = e.xclient.message_type;
@@ -447,5 +1090,78 @@ fn xdndPredicate(dpy: ?*xlib.Display, ev: ?*xlib.XEvent, arg: xlib.XPointer) cal
     }
     if (e.type == SelectionRequest and
         e.xselectionrequest.selection == self.atoms.XdndSelection) return 1;
+    if (e.type == GenericEvent and self.xi_opcode != 0 and
+        e.xcookie.extension == self.xi_opcode and
+        e.xcookie.evtype == XI_RawButtonRelease) return 1;
     return 0;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public dispatch
+// ═══════════════════════════════════════════════════════════════════════════
+
+const Backend = union(enum) {
+    x11:     X11DragSource,
+    wayland: *WaylandDragSource,
+};
+
+pub const DragSource = struct {
+    backend: Backend,
+
+    pub fn init(allocator: std.mem.Allocator, sdl_window: *SDLBackend.c.SDL_Window) ?DragSource {
+        if (X11DragSource.init(allocator, sdl_window)) |x11|
+            return .{ .backend = .{ .x11 = x11 } };
+        if (WaylandDragSource.init(allocator, sdl_window)) |wld|
+            return .{ .backend = .{ .wayland = wld } };
+        return null;
+    }
+
+    pub fn deinit(self: *DragSource) void {
+        switch (self.backend) {
+            .x11     => |*x| x.deinit(),
+            .wayland => |w|  w.deinit(),
+        }
+    }
+
+    pub fn isDragging(self: *const DragSource) bool {
+        return switch (self.backend) {
+            .x11     => |*x| x.isDragging(),
+            .wayland => |w|  w.isDragging(),
+        };
+    }
+
+    pub fn startDrag(self: *DragSource, items: []const DragItem) void {
+        switch (self.backend) {
+            .x11     => |*x| x.startDrag(items),
+            .wayland => |w|  w.startDrag(items),
+        }
+    }
+
+    pub fn pumpEvents(self: *DragSource) void {
+        switch (self.backend) {
+            .x11     => |*x| x.pumpEvents(),
+            .wayland => |w|  w.pumpEvents(),
+        }
+    }
+
+    pub fn tick(self: *DragSource, io: std.Io) void {
+        switch (self.backend) {
+            .x11     => |*x| x.tick(io),
+            .wayland => |w|  w.tick(io),
+        }
+    }
+
+    pub fn getSdlCursor(self: *const DragSource) ?*SDLBackend.c.SDL_Cursor {
+        return switch (self.backend) {
+            .x11     => |*x| x.getSdlCursor(),
+            .wayland => |w|  w.getSdlCursor(),
+        };
+    }
+
+    pub fn notifyButtonUp(self: *DragSource) void {
+        switch (self.backend) {
+            .x11     => |*x| x.notifyButtonUp(),
+            .wayland => |w|  w.notifyButtonUp(),
+        }
+    }
+};

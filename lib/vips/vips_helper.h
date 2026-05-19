@@ -25,3 +25,15 @@ int diffkeep_load_image_rgba(
     int *width,
     int *height
 );
+
+/* Decode JPEG bytes to packed RGBA8, scaled to fit within `size` x `size` pixels.
+   Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
+int diffkeep_jpeg_bytes_to_rgba(
+    const void *data,
+    size_t data_len,
+    int size,
+    void **buf,
+    size_t *out_len,
+    int *out_width,
+    int *out_height
+);

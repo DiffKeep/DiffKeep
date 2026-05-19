@@ -1454,6 +1454,13 @@ fn routeAllSDLEvents(main_back: *SDLBackend, main_win: *dvui.Window) void {
     const main_id = SDLBackend.c.SDL_GetWindowID(main_back.window);
     var event: SDLBackend.c.SDL_Event = undefined;
     while (SDLBackend.c.SDL_PollEvent(&event)) {
+        // Notify DnD of button release before routing — SDL's event is more
+        // timely than XQueryPointer on XWayland.
+        if (event.type == SDLBackend.c.SDL_EVENT_MOUSE_BUTTON_UP and
+            event.button.button == 1)
+        {
+            if (g_dnd) |*dnd| dnd.notifyButtonUp();
+        }
         const eid = sdlEventWindowID(event);
         if (eid == 0 or eid == main_id) {
             _ = main_back.addEvent(main_win, event) catch {};
@@ -1708,13 +1715,18 @@ pub fn main(init: std.process.Init) !void {
         try back.setCursor(win.cursorRequested());
         if (g_dnd) |*dnd| {
             if (dnd.isDragging()) {
-                if (g_dnd_drag_cursor == null)
-                    g_dnd_drag_cursor = SDLBackend.c.SDL_CreateSystemCursor(SDLBackend.c.SDL_SYSTEM_CURSOR_MOVE);
-                if (g_dnd_drag_cursor) |c| _ = SDLBackend.c.SDL_SetCursor(c);
+                const thumb_cursor = dnd.getSdlCursor();
+                if (thumb_cursor != null) {
+                    _ = SDLBackend.c.SDL_SetCursor(thumb_cursor);
+                } else {
+                    if (g_dnd_drag_cursor == null)
+                        g_dnd_drag_cursor = SDLBackend.c.SDL_CreateSystemCursor(SDLBackend.c.SDL_SYSTEM_CURSOR_MOVE);
+                    if (g_dnd_drag_cursor) |c| _ = SDLBackend.c.SDL_SetCursor(c);
+                }
             } else if (g_dnd_drag_cursor) |c| {
+                _ = SDLBackend.c.SDL_SetCursor(null);
                 SDLBackend.c.SDL_DestroyCursor(c);
                 g_dnd_drag_cursor = null;
-                _ = SDLBackend.c.SDL_SetCursor(null);
             }
         }
         try back.textInputRect(win.textInputRequested());

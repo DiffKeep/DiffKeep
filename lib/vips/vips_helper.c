@@ -52,6 +52,54 @@ void diffkeep_vips_free(void *buf) {
     g_free(buf);
 }
 
+int diffkeep_jpeg_bytes_to_rgba(
+    const void *data,
+    size_t data_len,
+    int size,
+    void **buf,
+    size_t *out_len,
+    int *out_width,
+    int *out_height
+) {
+    VipsImage *image = NULL;
+    if (vips_jpegload_buffer((void *)data, data_len, &image, NULL) != 0)
+        return -1;
+
+    VipsImage *thumb = NULL;
+    if (vips_thumbnail_image(image, &thumb, size,
+            "height", size,
+            "size", VIPS_SIZE_DOWN,
+            NULL) != 0) {
+        g_object_unref(image);
+        return -1;
+    }
+    g_object_unref(image);
+
+    if (!vips_image_hasalpha(thumb)) {
+        VipsImage *rgba = NULL;
+        if (vips_addalpha(thumb, &rgba, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = rgba;
+    }
+
+    size_t len = 0;
+    void *pixels = vips_image_write_to_memory(thumb, &len);
+    if (!pixels) {
+        g_object_unref(thumb);
+        return -1;
+    }
+
+    *out_width  = vips_image_get_width(thumb);
+    *out_height = vips_image_get_height(thumb);
+    *buf        = pixels;
+    *out_len    = len;
+    g_object_unref(thumb);
+    return 0;
+}
+
 int diffkeep_load_image_rgba(
     const char *filename,
     void **buf,

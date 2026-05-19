@@ -41,6 +41,9 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.link_libcpp = true;
     if (target.result.os.tag == .linux) {
         exe.root_module.linkSystemLibrary("X11", .{});
+        exe.root_module.linkSystemLibrary("Xcursor", .{});
+        exe.root_module.linkSystemLibrary("Xi", .{});
+        exe.root_module.linkSystemLibrary("wayland-client", .{});
     }
 
     b.installArtifact(exe);
