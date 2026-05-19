@@ -39,11 +39,26 @@ pub fn build(b: *std.Build) !void {
     const icons_dep = b.dependency("icons", .{ .target = target, .optimize = optimize });
     exe.root_module.addImport("icons", icons_dep.module("icons"));
     exe.root_module.link_libcpp = true;
-    if (target.result.os.tag == .linux) {
+    const os = target.result.os.tag;
+    if (os == .linux) {
         exe.root_module.linkSystemLibrary("X11", .{});
         exe.root_module.linkSystemLibrary("Xcursor", .{});
         exe.root_module.linkSystemLibrary("Xi", .{});
         exe.root_module.linkSystemLibrary("wayland-client", .{});
+    } else if (os == .windows) {
+        exe.root_module.linkSystemLibrary("ole32", .{});
+        exe.root_module.linkSystemLibrary("shell32", .{});
+        exe.root_module.linkSystemLibrary("uuid", .{});
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("lib/dnd/dnd_win32.c"),
+            .flags = &.{ "-DUNICODE", "-D_UNICODE" },
+        });
+    } else if (os == .macos) {
+        exe.root_module.linkFramework("AppKit", .{});
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("lib/dnd/dnd_macos.m"),
+            .flags = &.{ "-fobjc-arc" },
+        });
     }
 
     b.installArtifact(exe);
