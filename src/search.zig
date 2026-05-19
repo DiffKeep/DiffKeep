@@ -1,0 +1,248 @@
+const std = @import("std");
+const dvui = @import("dvui");
+const llama_mod = @import("llama.zig");
+const mtmd_mod = @import("mtmd.zig");
+const image_grid_mod = @import("image_grid.zig");
+const config_mod = @import("config.zig");
+
+const log = std.log.scoped(.search);
+
+const RERANK_INSTRUCTION = "Retrieve AI-generated images that visually match the user's search query.";
+
+const RerankTaskCtx = struct {
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    image_paths: [][]u8,
+    image_ids: []u64,
+    generation: u64,
+    reranker: *mtmd_mod.RerankContext,
+    result_ids: *?[]u64,
+    result_gen: *u64,
+    done: *std.atomic.Value(bool),
+    current_gen: *std.atomic.Value(u64),
+};
+
+fn rerankTask(ctx: RerankTaskCtx) void {
+    defer {
+        ctx.allocator.free(ctx.query);
+        for (ctx.image_paths) |p| ctx.allocator.free(p);
+        ctx.allocator.free(ctx.image_paths);
+        ctx.allocator.free(ctx.image_ids);
+    }
+    if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+
+    const ScoreEntry = struct { id: u64, score: f32 };
+    var scored: std.ArrayList(ScoreEntry) = .empty;
+    defer scored.deinit(ctx.allocator);
+
+    for (ctx.image_paths, ctx.image_ids) |path, id| {
+        if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+        const score = ctx.reranker.scoreImageFile(ctx.allocator, ctx.query, RERANK_INSTRUCTION, path) catch 0.0;
+        scored.append(ctx.allocator, .{ .id = id, .score = score }) catch break;
+    }
+    if (ctx.current_gen.load(.acquire) != ctx.generation) return;
+
+    std.sort.pdq(ScoreEntry, scored.items, {}, struct {
+        fn lt(_: void, a: ScoreEntry, b: ScoreEntry) bool { return a.score > b.score; }
+    }.lt);
+
+    const ids = ctx.allocator.alloc(u64, scored.items.len) catch return;
+    for (scored.items, 0..) |s, i| ids[i] = s.id;
+
+    ctx.result_ids.* = ids;
+    ctx.result_gen.* = ctx.generation;
+    ctx.done.store(true, .release);
+}
+
+pub const SearchState = struct {
+    buf: [256]u8 = std.mem.zeroes([256]u8),
+    prev: [256]u8 = std.mem.zeroes([256]u8),
+    mode: image_grid_mod.SearchMode = .combined,
+    text_pool: ?llama_mod.Pool = null,
+    vl_ctx: ?mtmd_mod.VlContext = null,
+    query_embedding: ?[]const f32 = null,
+    reranker: ?mtmd_mod.RerankContext = null,
+    rerank_group: std.Io.Group = .init,
+    rerank_done: std.atomic.Value(bool) = .init(false),
+    rerank_result_ids: ?[]u64 = null,
+    rerank_result_gen: u64 = 0,
+    generation: std.atomic.Value(u64) = .init(0),
+
+    pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
+        if (self.reranker) |*rr| rr.deinit();
+        if (self.vl_ctx) |*vc| vc.deinit();
+        if (self.text_pool) |*tp| tp.deinit();
+        if (self.query_embedding) |emb| gpa.free(emb);
+        if (self.rerank_result_ids) |ids| gpa.free(ids);
+    }
+
+    pub fn awaitRerank(self: *SearchState, io: std.Io) void {
+        self.rerank_group.await(io) catch {};
+    }
+
+    pub fn applyResultsIfDone(self: *SearchState, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+        if (!self.rerank_done.load(.acquire)) return;
+        self.rerank_done.store(false, .release);
+        self.applyRerankResults(allocator, grid);
+    }
+
+    fn applyRerankResults(self: *SearchState, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+        const ids = self.rerank_result_ids orelse return;
+        defer {
+            allocator.free(ids);
+            self.rerank_result_ids = null;
+        }
+        if (self.rerank_result_gen != self.generation.load(.acquire)) return;
+
+        var pos_map = std.AutoHashMap(u64, usize).init(allocator);
+        defer pos_map.deinit();
+        for (grid.images.items, 0..) |entry, i| {
+            pos_map.put(entry.id, i) catch {};
+        }
+
+        var reordered: std.ArrayList(image_grid_mod.ImageEntry) = .empty;
+        defer reordered.deinit(allocator);
+        reordered.ensureTotalCapacity(allocator, grid.images.items.len) catch return;
+        var seen = std.AutoHashMap(u64, void).init(allocator);
+        defer seen.deinit();
+
+        for (ids) |id| {
+            if (pos_map.get(id)) |pos| {
+                reordered.append(allocator, grid.images.items[pos]) catch {};
+                seen.put(id, {}) catch {};
+            }
+        }
+        for (grid.images.items) |entry| {
+            if (!seen.contains(entry.id)) {
+                reordered.append(allocator, entry) catch {};
+            }
+        }
+        if (reordered.items.len == grid.images.items.len) {
+            @memcpy(grid.images.items, reordered.items);
+            grid.focused_idx = null;
+            grid.selection.clearRetainingCapacity();
+        }
+    }
+
+    pub fn maybeSpawnRerank(self: *SearchState, grid: *image_grid_mod.GridState, query: []const u8, cfg: *const config_mod.Config) void {
+        const init = dvui.App.main_init orelse return;
+        const reranker_model = cfg.reranker_model_path orelse return;
+        const reranker_mmproj = cfg.reranker_mmproj_path orelse return;
+        if (self.mode == .fts) return;
+        if (grid.images.items.len == 0) return;
+
+        if (self.reranker == null) {
+            self.reranker = mtmd_mod.RerankContext.init(init.gpa, reranker_model, reranker_mmproj) catch |err| {
+                log.warn("reranker init: {}", .{err});
+                return;
+            };
+        }
+
+        const gen = self.generation.fetchAdd(1, .acq_rel) + 1;
+        self.rerank_done.store(false, .release);
+        if (self.rerank_result_ids) |ids| { init.gpa.free(ids); self.rerank_result_ids = null; }
+
+        const top_k = @min(grid.images.items.len, cfg.rerank_top_k);
+        var image_paths = init.gpa.alloc([]u8, top_k) catch return;
+        const image_ids = init.gpa.alloc(u64, top_k) catch { init.gpa.free(image_paths); return; };
+        var n: usize = 0;
+        for (grid.images.items[0..top_k]) |entry| {
+            image_paths[n] = init.gpa.dupe(u8, entry.path) catch break;
+            image_ids[n] = entry.id;
+            n += 1;
+        }
+        if (n < top_k) {
+            for (image_paths[0..n]) |p| init.gpa.free(p);
+            init.gpa.free(image_paths);
+            init.gpa.free(image_ids);
+            return;
+        }
+
+        const query_copy = init.gpa.dupe(u8, query) catch {
+            for (image_paths) |p| init.gpa.free(p);
+            init.gpa.free(image_paths);
+            init.gpa.free(image_ids);
+            return;
+        };
+
+        const ctx = RerankTaskCtx{
+            .allocator = init.gpa,
+            .query = query_copy,
+            .image_paths = image_paths,
+            .image_ids = image_ids,
+            .generation = gen,
+            .reranker = &self.reranker.?,
+            .result_ids = &self.rerank_result_ids,
+            .result_gen = &self.rerank_result_gen,
+            .done = &self.rerank_done,
+            .current_gen = &self.generation,
+        };
+        self.rerank_group.concurrent(init.io, rerankTask, .{ctx}) catch |err| {
+            log.warn("spawn rerank task: {}", .{err});
+            init.gpa.free(query_copy);
+            for (image_paths) |p| init.gpa.free(p);
+            init.gpa.free(image_paths);
+            init.gpa.free(image_ids);
+        };
+    }
+
+    pub fn embedQuery(
+        self: *SearchState,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        mode: image_grid_mod.SearchMode,
+        cfg: *const config_mod.Config,
+        grid: *image_grid_mod.GridState,
+    ) !void {
+        const model_path = cfg.embedding_model_path orelse return error.NoModelPath;
+        switch (mode) {
+            .fts => {},
+            .semantic, .combined => {
+                if (self.text_pool == null) {
+                    self.text_pool = llama_mod.Pool.init(allocator, .{
+                        .embeddings   = true,
+                        .pooling_type = 1,
+                        .n_ctx        = 2048,
+                        .n_batch      = 512,
+                        .n_ubatch     = 512,
+                        .n_gpu_layers = 999,
+                    });
+                }
+                const tp = &self.text_pool.?;
+                const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
+                defer allocator.free(q_text);
+                const tc = try tp.get(model_path, 60_000, null);
+                defer tp.release(tc);
+                var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
+                defer {
+                    for (chunks.items) |e| allocator.free(e);
+                    chunks.deinit(allocator);
+                }
+                if (chunks.items.len > 0) {
+                    self.query_embedding = chunks.orderedRemove(0);
+                    grid.query_embedding = self.query_embedding.?;
+                }
+            },
+            .visual => {
+                const mmproj_path = cfg.embedding_mmproj_path orelse return error.NoMmprojPath;
+                if (self.vl_ctx == null) {
+                    self.vl_ctx = try mtmd_mod.VlContext.init(allocator, model_path, mmproj_path);
+                }
+                const vc = &self.vl_ctx.?;
+                const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
+                defer allocator.free(q_text);
+                const tc = try vc.pool.get(model_path, 60_000, null);
+                defer vc.pool.release(tc);
+                var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
+                defer {
+                    for (chunks.items) |e| allocator.free(e);
+                    chunks.deinit(allocator);
+                }
+                if (chunks.items.len > 0) {
+                    self.query_embedding = chunks.orderedRemove(0);
+                    grid.query_embedding = self.query_embedding.?;
+                }
+            },
+        }
+    }
+};

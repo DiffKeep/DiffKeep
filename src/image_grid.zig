@@ -384,6 +384,9 @@ pub const GridState = struct {
     }
 
     pub fn applySortOrder(self: *GridState) void {
+        // Remember focused image ID so we can restore focused_idx after reorder.
+        const focused_id: ?u64 = if (self.focused_idx) |fi| self.images.items[fi].id else null;
+
         switch (self.sort_mode) {
             .date => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageDateLt),
             .name => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageNameLt),
@@ -398,6 +401,17 @@ pub const GridState = struct {
                     }
                 }.lt);
             },
+        }
+
+        // Re-anchor focused_idx to the same image after sort.
+        if (focused_id) |fid| {
+            self.focused_idx = null;
+            for (self.images.items, 0..) |img, i| {
+                if (img.id == fid) {
+                    self.focused_idx = i;
+                    break;
+                }
+            }
         }
     }
 
