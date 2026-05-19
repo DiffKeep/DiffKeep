@@ -424,6 +424,16 @@ pub const VectorDb = struct {
         _ = try stmt.step();
     }
 
+    pub fn getLibraryIdByPath(self: *VectorDb, path: []const u8) !?u64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = self.db.statements.find_library;
+        try stmt.reset();
+        try stmt.bind(1, path);
+        if (try stmt.step()) return @intCast(stmt.columnInt64(0));
+        return null;
+    }
+
     pub fn removeLibrary(self: *VectorDb, path: []const u8) !void {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);

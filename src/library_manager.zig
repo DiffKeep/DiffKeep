@@ -2,6 +2,7 @@ const std = @import("std");
 const db_mod = @import("db.zig");
 const scan_mod = @import("scan.zig");
 const notifier_mod = @import("notifier.zig");
+const fs_watch_mod = @import("fs_watch.zig");
 const log = std.log.scoped(.library_manager);
 
 const ScanRequest = struct {
@@ -25,8 +26,15 @@ pub const LibraryManager = struct {
     prompt_embeddings: bool,
     image_embeddings: bool,
     notifier: ?*notifier_mod.ImageNotifier,
+    watcher: ?*fs_watch_mod.FsWatcher,
+    /// Called from any thread after a single-file task completes, to wake the render loop.
+    wakeup_fn: ?*const fn () void = null,
+    /// Set to true when a file is deleted so frame() can call grid.reloadImages().
+    reload_requested: std.atomic.Value(bool) = .init(false),
+    /// Separate io group for single-file processing tasks spawned by the watcher.
+    file_group: std.Io.Group,
 
-    pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool, notifier: ?*notifier_mod.ImageNotifier) LibraryManager {
+    pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool, notifier: ?*notifier_mod.ImageNotifier, watcher: ?*fs_watch_mod.FsWatcher) LibraryManager {
         return .{
             .allocator = allocator,
             .db = db,
@@ -40,6 +48,8 @@ pub const LibraryManager = struct {
             .prompt_embeddings = prompt_embeddings,
             .image_embeddings = image_embeddings,
             .notifier = notifier,
+            .watcher = watcher,
+            .file_group = .init,
         };
     }
 
@@ -48,21 +58,58 @@ pub const LibraryManager = struct {
     pub fn deinit(self: *LibraryManager, io: std.Io) void {
         self.stop_scan.store(true, .release);
         self.scan_group.await(io) catch {};
+        self.file_group.await(io) catch {};
         self.queue_mutex.lockUncancelable(io);
         for (self.pending.items) |req| self.allocator.free(req.library_path);
         self.pending.deinit(self.allocator);
         self.queue_mutex.unlock(io);
     }
 
-    /// Persist to DB and queue a background scan.  Returns the library's DB id.
+    /// Process one file reported by the fs watcher.  `path` is heap-allocated
+    /// and owned by this call (freed when the background task completes).
+    /// Pass `deleted = true` to remove the file from the DB instead.
+    pub fn processFileEvent(
+        self: *LibraryManager,
+        io: std.Io,
+        library_id: u64,
+        path: []const u8,
+        deleted: bool,
+    ) void {
+        if (deleted) {
+            self.db.deleteImageByPath(library_id, path) catch |err|
+                log.warn("delete {s}: {}", .{ std.fs.path.basename(path), err });
+            self.allocator.free(path);
+            self.reload_requested.store(true, .release);
+            if (self.wakeup_fn) |wake| wake();
+            return;
+        }
+        const ctx = FileEventCtx{
+            .manager = self,
+            .io = io,
+            .library_id = library_id,
+            .path = path,
+        };
+        self.file_group.concurrent(io, processFileEventTask, .{ctx}) catch |err| {
+            log.warn("spawn file event task: {}", .{err});
+            self.allocator.free(path);
+        };
+    }
+
+    /// Persist to DB, queue a background scan, and register with the watcher.
+    /// Returns the library's DB id.
     pub fn addLibrary(self: *LibraryManager, io: std.Io, path: []const u8) !u64 {
         const id = try self.db.storeLibrary(path);
         try self.enqueue(io, id, path);
+        if (self.watcher) |w| w.addLibrary(id, path) catch {};
         return id;
     }
 
-    /// Remove from DB (cascades to images).
+    /// Remove from DB (cascades to images) and unregister from the watcher.
     pub fn removeLibrary(self: *LibraryManager, path: []const u8) !void {
+        if (self.watcher) |w| {
+            if (self.db.getLibraryIdByPath(path) catch null) |lib_id|
+                w.removeLibrary(lib_id);
+        }
         try self.db.removeLibrary(path);
     }
 
@@ -116,6 +163,30 @@ pub const LibraryManager = struct {
         }
     }
 };
+
+const FileEventCtx = struct {
+    manager: *LibraryManager,
+    io: std.Io,
+    library_id: u64,
+    path: []const u8, // owned; freed here
+};
+
+fn processFileEventTask(ctx: FileEventCtx) void {
+    defer ctx.manager.allocator.free(ctx.path);
+    var scanner = scan_mod.LibraryScanner.init(ctx.manager.allocator, ctx.manager.db, ctx.manager.notifier);
+    defer scanner.deinit();
+    scanner.processSingleFile(
+        ctx.io,
+        ctx.library_id,
+        ctx.path,
+        &ctx.manager.stop_scan,
+        ctx.manager.thumbnails_in_db,
+        ctx.manager.prompt_embeddings,
+        ctx.manager.image_embeddings,
+    );
+    // Wake the render loop so grid.update() drains the notifier and shows the new image.
+    if (ctx.manager.wakeup_fn) |wake| wake();
+}
 
 fn drainQueue(manager: *LibraryManager, io: std.Io) void {
     while (true) {

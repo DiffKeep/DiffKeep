@@ -9,6 +9,7 @@ const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
 const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
+const fs_watch_mod = @import("fs_watch.zig");
 const image_grid_mod = @import("image_grid.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
@@ -28,6 +29,13 @@ var g_db: ?db_mod.VectorDb = null;
 var g_data_dir: ?[]const u8 = null;
 
 var g_library_manager: ?library_manager_mod.LibraryManager = null;
+var g_fs_watcher: ?fs_watch_mod.FsWatcher = null;
+/// Pending per-file events collected from the watcher, waiting for the short
+/// debounce window to expire before being dispatched to LibraryManager.
+var g_pending_file_events: std.ArrayList(fs_watch_mod.DirtyEvent) = .empty;
+/// Absolute nanosecond timestamp (Io.Clock.real) after which pending file
+/// events should be flushed.  0 means nothing is pending.
+var g_rescan_deadline_ns: i96 = 0;
 var g_grid: ?image_grid_mod.GridState = null;
 var g_wakeup_event_type: u32 = 0;
 
@@ -203,15 +211,49 @@ fn appInit(win: *dvui.Window) !void {
                 try grid.startWorker();
             }
 
+            // Start the fs watcher before the library manager so it's ready to
+            // receive addLibrary commands as soon as the manager is created.
+            // init() only creates fds; start() spawns the thread.  start() must
+            // be called AFTER the value is stored in g_fs_watcher so the thread
+            // receives a stable pointer (same rule as GridState.startWorker).
+            g_fs_watcher = fs_watch_mod.FsWatcher.init(init.gpa) catch |err| blk: {
+                std.log.warn("fs_watch init failed: {}; live watching disabled", .{err});
+                break :blk null;
+            };
+            if (g_fs_watcher) |*watcher| {
+                watcher.start() catch |err| {
+                    std.log.warn("fs_watch start failed: {}; live watching disabled", .{err});
+                    watcher.deinit();
+                    g_fs_watcher = null;
+                };
+                // Wake dvui's event loop whenever the watcher pushes a new file event,
+                // so frame() is called even when the user isn't moving the mouse.
+                if (g_fs_watcher != null) g_fs_watcher.?.on_dirty = wakeupFrame;
+            }
+
             // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s
             // concurrent task receives &g_library_manager.? (stable global address)
             // rather than a pointer to a stack-local that becomes dangling after appInit returns.
             const notifier = if (g_grid) |*grid| &grid.notifier else null;
-            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings, notifier);
+            const watcher_ptr: ?*fs_watch_mod.FsWatcher = if (g_fs_watcher != null) &g_fs_watcher.? else null;
+            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings, notifier, watcher_ptr);
             if (g_library_manager) |*mgr| {
+                mgr.wakeup_fn = wakeupFrame;
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
                 };
+            }
+
+            // Register all existing libraries with the watcher.
+            if (g_fs_watcher) |*watcher| {
+                const libs = db.listLibraries(init.gpa) catch &[_]db_mod.LibraryInfo{};
+                defer {
+                    for (libs) |li| init.gpa.free(li.path);
+                    init.gpa.free(libs);
+                }
+                for (libs) |li| {
+                    watcher.addLibrary(li.id, li.path) catch {};
+                }
             }
 
             // Initialize counts and trash stats.
@@ -232,6 +274,9 @@ fn appInit(win: *dvui.Window) !void {
 
 fn appDeinit() void {
     if (g_dnd) |*dnd| dnd.deinit();
+    // Stop the fs watcher thread before anything else so it can't fire callbacks
+    // against already-freed state.
+    if (g_fs_watcher) |*watcher| watcher.deinit();
     // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
         if (g_library_manager) |*mgr| mgr.deinit(init.io);
@@ -255,6 +300,8 @@ fn appDeinit() void {
         if (g_data_dir) |d| init.gpa.free(d);
         for (g_active_filters.items) |f| init.gpa.free(f.value);
         g_active_filters.deinit(init.gpa);
+        for (g_pending_file_events.items) |ev| init.gpa.free(ev.path);
+        g_pending_file_events.deinit(init.gpa);
         if (g_filter_modal_options) |opts| {
             for (opts) |s| init.gpa.free(s);
             init.gpa.free(opts);
@@ -1015,6 +1062,13 @@ fn frame() !dvui.App.Result {
     if (g_grid) |*grid| {
         const prev_len = grid.images.items.len;
         grid.update();
+        // Reload grid when a watcher-triggered deletion has been committed to the DB.
+        if (g_library_manager) |*mgr| {
+            if (mgr.reload_requested.load(.acquire)) {
+                mgr.reload_requested.store(false, .release);
+                if (g_db) |*db| grid.reloadImages(db) catch {};
+            }
+        }
         if (grid.images.items.len != prev_len) {
             if (g_db) |*db| {
                 g_total_image_count = db.getTotalImageCount() catch g_total_image_count;
@@ -1101,6 +1155,52 @@ fn frame() !dvui.App.Result {
             if (g_library_manager) |*mgr| mgr else null,
             if (g_db) |*db| db else null,
         );
+    }
+
+    // ── Watcher-driven per-file processing (200 ms debounce) ─────────────
+    if (dvui.App.main_init) |init| {
+        if (g_fs_watcher) |*watcher| {
+            var new_events = watcher.drainEvents();
+            defer new_events.deinit(init.gpa);
+            if (new_events.items.len > 0) {
+                const now_ns = std.Io.Clock.real.now(init.io).nanoseconds;
+                g_rescan_deadline_ns = now_ns + 200 * std.time.ns_per_ms;
+                // Merge into pending list, deduplicating by path.
+                for (new_events.items) |ev| {
+                    var dup = false;
+                    for (g_pending_file_events.items) |*existing| {
+                        if (std.mem.eql(u8, existing.path, ev.path)) {
+                            existing.deleted = ev.deleted;
+                            init.gpa.free(ev.path);
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        g_pending_file_events.append(init.gpa, ev) catch {
+                            init.gpa.free(ev.path);
+                        };
+                    }
+                }
+            }
+        }
+        if (g_rescan_deadline_ns != 0) {
+            const now_ns = std.Io.Clock.real.now(init.io).nanoseconds;
+            if (now_ns >= g_rescan_deadline_ns) {
+                g_rescan_deadline_ns = 0;
+                if (g_library_manager) |*mgr| {
+                    for (g_pending_file_events.items) |ev| {
+                        mgr.processFileEvent(init.io, ev.library_id, ev.path, ev.deleted);
+                    }
+                } else {
+                    for (g_pending_file_events.items) |ev| init.gpa.free(ev.path);
+                }
+                g_pending_file_events.clearRetainingCapacity();
+            } else {
+                // Deadline not yet elapsed: keep frame() running so we don't miss it.
+                wakeupFrame();
+            }
+        }
     }
 
     // ── Main column ──────────────────────────────────────────────────────

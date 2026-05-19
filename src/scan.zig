@@ -29,7 +29,7 @@ pub const ScanStats = struct {
     unchanged: u32 = 0,
 };
 
-const ScanCtx = struct {
+pub const ScanCtx = struct {
     path: []const u8,
     library_id: u64,
     db: *db_mod.VectorDb,
@@ -45,7 +45,7 @@ const ScanCtx = struct {
     notifier: ?*notifier_mod.ImageNotifier,
 };
 
-const AtomicStats = struct {
+pub const AtomicStats = struct {
     added: std.atomic.Value(u32) = .init(0),
     updated: std.atomic.Value(u32) = .init(0),
     unchanged: std.atomic.Value(u32) = .init(0),
@@ -72,6 +72,41 @@ pub const LibraryScanner = struct {
     }
 
     pub fn deinit(_: *LibraryScanner) void {}
+
+    /// Process a single file path that was reported as new or changed by the
+    /// fs watcher.  Runs synchronously; caller is responsible for spawning a
+    /// background task if needed.
+    pub fn processSingleFile(
+        self: *LibraryScanner,
+        io: std.Io,
+        library_id: u64,
+        path: []const u8,
+        stop: *std.atomic.Value(bool),
+        thumbnails_in_db: bool,
+        prompt_embeddings: bool,
+        image_embeddings: bool,
+    ) void {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
+        const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
+        const path_owned = self.allocator.dupe(u8, path) catch return;
+        var dummy_stats: AtomicStats = .{};
+        var dummy_count: std.atomic.Value(u32) = .init(0);
+        processFile(.{
+            .path = path_owned,
+            .library_id = library_id,
+            .db = self.db,
+            .allocator = self.allocator,
+            .stats = &dummy_stats,
+            .io = io,
+            .stop = stop,
+            .files_scanned = &dummy_count,
+            .thumbnails_in_db = thumbnails_in_db,
+            .prompt_embeddings = prompt_embeddings,
+            .image_embeddings = image_embeddings,
+            .precomputed_mtime = mtime,
+            .notifier = self.notifier,
+        });
+    }
 
     /// Walk `library_path`, process new/changed PNGs, and remove DB entries for
     /// files that no longer exist on disk.
@@ -225,7 +260,7 @@ pub const LibraryScanner = struct {
     }
 };
 
-fn processFile(ctx: ScanCtx) void {
+pub fn processFile(ctx: ScanCtx) void {
     defer ctx.allocator.free(ctx.path);
     defer _ = ctx.files_scanned.fetchAdd(1, .acq_rel);
 
