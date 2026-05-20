@@ -102,12 +102,12 @@ pub const Pool = struct {
     /// Returns a context for the given model. The context must be released
     /// after use. This function is thread-safe. Fails if the context is busy
     /// for more than `timeout` milliseconds, or immediately if `stop` is set.
-    pub fn get(self: *Pool, model_path: []const u8, timeout: u64, stop: ?*const std.atomic.Value(bool)) !*Context {
+    pub fn get(self: *Pool, io: std.Io, model_path: []const u8, timeout: u64, stop: ?*const std.atomic.Value(bool)) !*Context {
         const deadline = nanoNow() + @as(i64, @intCast(timeout)) * std.time.ns_per_ms;
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             if (nanoNow() > deadline) return error.ContextBusy;
             if (stop) |s| if (s.load(.acquire)) return error.Stopped;
-            std.atomic.spinLoopHint();
+            std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .real) catch {};
         }
         errdefer self.locked.store(false, .release);
 

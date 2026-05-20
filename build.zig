@@ -247,9 +247,59 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // *** Integration tests (headless dvui + in-memory SQLite) ***
+    const dvui_testing_dep = b.dependency("dvui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .testing,
+    });
+
+    // Library module rooted at diffkeep.zig, wired with the headless backend.
+    const diffkeep_test_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diffkeep.zig"),
+    });
+    diffkeep_test_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+    diffkeep_test_module.addImport("sqlite", sqlite_module_zig);
+    diffkeep_test_module.addImport("vips", vips_module);
+
+    const integration_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/integration.zig"),
+    });
+    integration_module.addImport("diffkeep", diffkeep_test_module);
+    integration_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+
+    const integration_tests = b.addTest(.{
+        .name = "diffkeep-integration-tests",
+        .root_module = integration_module,
+    });
+    integration_tests.root_module.link_libcpp = true;
+    integration_tests.root_module.linkLibrary(sqlite_lib);
+    integration_tests.root_module.addIncludePath(b.path("lib/sqlite"));
+    integration_tests.root_module.addIncludePath(b.path("lib/sqlite-vec"));
+    integration_tests.root_module.linkLibrary(vips_helper_lib);
+    integration_tests.root_module.addIncludePath(b.path("lib/vips"));
+    integration_tests.root_module.linkSystemLibrary("vips", .{});
+    // llama_cpp import goes to diffkeep_test_module (where llama.zig lives);
+    // library linkage goes to integration_tests.root_module.
+    try addLlamaEx(b, integration_tests, diffkeep_test_module);
+    try addMtmd(b, integration_tests);
+
+    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }
 
 fn addLlama(b: *std.Build, exe: anytype) !void {
+    try addLlamaEx(b, exe, exe.root_module);
+}
+
+/// Like addLlama but adds the llama_cpp Zig import to `import_mod` instead of
+/// exe.root_module. Used for the integration test build where the import must
+/// land on diffkeep_test_module (not the test runner's root module).
+fn addLlamaEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void {
     const target = exe.root_module.resolved_target.?;
     const dep = b.dependency("llama_cpp", .{});
 
@@ -300,7 +350,7 @@ fn addLlama(b: *std.Build, exe: anytype) !void {
         }
     }
 
-    exe.root_module.addImport("llama_cpp", llama_cpp.createModule());
+    import_mod.addImport("llama_cpp", llama_cpp.createModule());
 }
 
 fn addMtmd(b: *std.Build, exe: anytype) !void {

@@ -104,6 +104,15 @@ pub const LibraryManager = struct {
         };
     }
 
+    /// Force re-parse of a single image: resets its mtime in the DB (so the
+    /// scanner treats it as changed) then dispatches a background file-event task.
+    pub fn reparseImage(self: *LibraryManager, io: std.Io, id: u64, library_id: u64, path: []const u8) void {
+        self.db.resetImageMtimeById(id) catch |err|
+            log.warn("resetImageMtime {s}: {}", .{ std.fs.path.basename(path), err });
+        const path_owned = self.allocator.dupe(u8, path) catch return;
+        self.processFileEvent(io, library_id, path_owned, false);
+    }
+
     /// Persist to DB, queue a background scan, and register with the watcher.
     /// Returns the library's DB id.
     pub fn addLibrary(self: *LibraryManager, io: std.Io, path: []const u8) !u64 {
@@ -222,7 +231,7 @@ fn drainQueue(manager: *LibraryManager, io: std.Io) void {
         if (manager.embedding_model_path) |mp| {
             if (manager.embedding_mmproj_path) |mmp| {
                 if (manager.vl_ctx) |*old| old.deinit();
-                manager.vl_ctx = mtmd_mod.VlContext.init(manager.allocator, mp, mmp) catch |err| blk: {
+                manager.vl_ctx = mtmd_mod.VlContext.init(io, manager.allocator, mp, mmp) catch |err| blk: {
                     log.warn("VlContext init failed: {}", .{err});
                     break :blk null;
                 };

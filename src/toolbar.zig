@@ -52,6 +52,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
             .text = .{ .buffer = ctx.search.buf[0..] },
             .placeholder = i18n.t(.search_placeholder),
         }, .{
+            .tag = "search-box",
             .expand = .horizontal,
             .gravity_y = 0.5,
             .corner_radius = dvui.Rect.all(5),
@@ -274,6 +275,15 @@ pub fn renderContent(ctx: RenderCtx) !void {
         if (dvui.App.main_init) |init| {
             if (ctx.db.*) |*db| ctx.detail.update(focused_id, db, init.gpa, init.io);
             ctx.detail.renderPanel(ctx.right_w.*, filename, init.gpa, init.io);
+            if (ctx.detail.reparse_requested) {
+                ctx.detail.reparse_requested = false;
+                if (ctx.detail.detail) |d| {
+                    if (ctx.library_manager.*) |*mgr| {
+                        mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
+                        ctx.detail.id = null; // force detail reload after reparse completes
+                    }
+                }
+            }
         }
     }
 }

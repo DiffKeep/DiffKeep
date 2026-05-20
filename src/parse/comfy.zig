@@ -687,6 +687,21 @@ pub const ComfyParser = struct {
         return null;
     }
 
+    // Parse a "prompt" tEXt chunk whose content is a plain JSON-encoded string
+    // (not a ComfyUI execution graph object). Some tools store the user's subject
+    // prompt this way as a second "prompt" chunk alongside the full workflow JSON.
+    pub fn parsePlainPromptString(self: *ComfyParser, text: []const u8) !?ParseResult {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, text, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .string) return null;
+        const prompt = std.mem.trim(u8, parsed.value.string, " \t\r\n");
+        if (prompt.len == 0) return null;
+        var result = ParseResult{};
+        errdefer result.deinit(self.allocator);
+        result.positive_prompt = try self.allocator.dupe(u8, prompt);
+        return result;
+    }
+
     // Parse A1111-style parameters text (from PNG iTXt "parameters" chunk).
     // Format:
     //   <positive prompt>
@@ -829,6 +844,79 @@ fn promptExtractSamplerInputs(inp: std.json.ObjectMap, result: *ParseResult) voi
             else => null,
         };
     }
+}
+
+test "comfy: A1111 basic parse" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    const text =
+        \\masterpiece, 1girl, blonde hair
+        \\Negative prompt: bad quality, blurry
+        \\Steps: 20, Sampler: Euler a, Scheduler: Karras, CFG scale: 7.5, Seed: 12345, Model: deliberate_v2
+    ;
+    var result = (try parser.parseA1111Parameters(text)).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("masterpiece, 1girl, blonde hair", result.positive_prompt.?);
+    try std.testing.expectEqualStrings("bad quality, blurry",             result.negative_prompt.?);
+    try std.testing.expectEqualStrings("Euler a",                         result.sampler.?);
+    try std.testing.expectEqualStrings("Karras",                          result.scheduler.?);
+    try std.testing.expectEqualStrings("deliberate_v2",                   result.model.?);
+    try std.testing.expectEqual(@as(?i64, 20),    result.steps);
+    try std.testing.expectEqual(@as(?i64, 12345), result.seed);
+    try std.testing.expect(result.cfg != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.5), result.cfg.?, 0.001);
+}
+
+test "comfy: A1111 plain text with no settings line becomes positive prompt" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    // Text with no "Steps: / Sampler: / CFG scale:" line is treated as a bare positive prompt.
+    var result = (try parser.parseA1111Parameters("just some text")).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("just some text", result.positive_prompt.?);
+    try std.testing.expect(result.steps == null);
+    try std.testing.expect(result.seed == null);
+}
+
+test "comfy: A1111 returns null for blank input" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    const result = try parser.parseA1111Parameters("   \n  ");
+    try std.testing.expect(result == null);
+}
+
+test "comfy: A1111 multiline positive prompt" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    const text =
+        \\line one,
+        \\line two,
+        \\line three
+        \\Negative prompt: ugly
+        \\Steps: 10, Sampler: DPM++ 2M, CFG scale: 5
+    ;
+    var result = (try parser.parseA1111Parameters(text)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.positive_prompt.?, "line one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.positive_prompt.?, "line three") != null);
+    try std.testing.expectEqualStrings("ugly", result.negative_prompt.?);
+    try std.testing.expectEqual(@as(?i64, 10), result.steps);
+}
+
+test "comfy: parsePlainPromptString extracts JSON string" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parsePlainPromptString("\"a beautiful landscape\"")).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a beautiful landscape", result.positive_prompt.?);
+}
+
+test "comfy: parsePlainPromptString returns null for non-string JSON" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    const result = try parser.parsePlainPromptString("{\"key\": \"value\"}");
+    try std.testing.expect(result == null);
+}
+
+test "comfy: parsePlainPromptString returns null for empty string" {
+    var parser = ComfyParser.init(std.testing.allocator);
+    const result = try parser.parsePlainPromptString("\"   \"");
+    try std.testing.expect(result == null);
 }
 
 test "parse ComfyUI workflow" {

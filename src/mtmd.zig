@@ -65,7 +65,7 @@ pub const VlContext = struct {
     /// 0 means no resize. Typical values: 336, 448, 672.
     max_image_size: u32 = 448,
 
-    pub fn init(allocator: std.mem.Allocator, model_path: []const u8, mmproj_path: []const u8) !VlContext {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, model_path: []const u8, mmproj_path: []const u8) !VlContext {
         const log = std.log.scoped(.mtmd);
         const H = struct {
             fn trampoline(level: c.enum_ggml_log_level, data: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
@@ -86,7 +86,7 @@ pub const VlContext = struct {
         });
 
         // Load the model so we can hand the llama_model* to mtmd.
-        const ctx = try pool.get(model_path, 30_000, null);
+        const ctx = try pool.get(io, model_path, 30_000, null);
 
         const model_ptr = pool.model.?.ptr;
         const mmproj_z = try allocator.dupeZ(u8, mmproj_path);
@@ -116,12 +116,13 @@ pub const VlContext = struct {
     /// Embed an image file. Returns a caller-owned normalized slice.
     pub fn embedImageFile(
         self: *VlContext,
+        io: std.Io,
         allocator: std.mem.Allocator,
         image_path: []const u8,
         prefix: []const u8,
         stop: ?*const std.atomic.Value(bool),
     ) ![]f32 {
-        const ctx = try self.pool.get(self.model_path, 30_000, stop);
+        const ctx = try self.pool.get(io, self.model_path, 30_000, stop);
         defer self.pool.release(ctx);
 
         const n_embd: usize = @intCast(c.llama_model_n_embd(self.pool.model.?.ptr));
@@ -152,13 +153,14 @@ pub const VlContext = struct {
     /// Embed raw RGB pixels (RGBRGB..., len = nx*ny*3).
     pub fn embedRgb(
         self: *VlContext,
+        io: std.Io,
         allocator: std.mem.Allocator,
         rgb: []const u8,
         nx: u32,
         ny: u32,
         prefix: []const u8,
     ) ![]f32 {
-        const ctx = try self.pool.get(self.model_path, 30_000, null);
+        const ctx = try self.pool.get(io, self.model_path, 30_000, null);
         defer self.pool.release(ctx);
 
         const n_embd: usize = @intCast(c.llama_model_n_embd(self.pool.model.?.ptr));
@@ -194,7 +196,7 @@ pub const RerankContext = struct {
     yes_id: i32,
     no_id: i32,
 
-    pub fn init(allocator: std.mem.Allocator, model_path: []const u8, mmproj_path: []const u8) !RerankContext {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, model_path: []const u8, mmproj_path: []const u8) !RerankContext {
         const log = std.log.scoped(.reranker);
         const H = struct {
             fn trampoline(level: c.enum_ggml_log_level, data: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
@@ -215,7 +217,7 @@ pub const RerankContext = struct {
             .n_gpu_layers = 999,
         });
 
-        const ctx = try pool.get(model_path, 30_000, null);
+        const ctx = try pool.get(io, model_path, 30_000, null);
         const model_ptr = pool.model.?.ptr;
 
         var yes_id: i32 = -1;
@@ -256,12 +258,13 @@ pub const RerankContext = struct {
     /// Score a (query, image) pair. Returns logit_yes - logit_no (higher = more relevant).
     pub fn scoreImageFile(
         self: *RerankContext,
+        io: std.Io,
         allocator: std.mem.Allocator,
         query: []const u8,
         instruction: []const u8,
         image_path: []const u8,
     ) !f32 {
-        const ctx = try self.pool.get(self.model_path, 60_000, null);
+        const ctx = try self.pool.get(io, self.model_path, 60_000, null);
         defer self.pool.release(ctx);
 
         const query_z = try allocator.dupeZ(u8, query);

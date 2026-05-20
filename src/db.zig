@@ -45,6 +45,7 @@ pub const RawChunk = struct {
 /// Full metadata for a single image, used by the detail panel.
 pub const ImageDetails = struct {
     id: u64,
+    library_id: u64,
     library_path: []const u8,
     creation_date: ?[]const u8,
     positive_prompt_text: ?[]const u8,
@@ -475,7 +476,7 @@ pub const VectorDb = struct {
             .id = @intCast(self.db.getLastInsertRowID()),
             .libraryId = library_id,
             .libraryPath = try allocator.dupe(u8, image_path),
-            .creationDate = try allocator.dupe(u8, try self.getCurrentTimestamp(allocator)),
+            .creationDate = try self.getCurrentTimestamp(allocator),
             .positivePromptText = null,
             .negativePromptText = null,
             .generatedDescription = null,
@@ -1174,7 +1175,7 @@ pub const VectorDb = struct {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare(
-            \\SELECT library_path, creation_date, positive_prompt_text, negative_prompt_text,
+            \\SELECT library_id, library_path, creation_date, positive_prompt_text, negative_prompt_text,
             \\       model, cfg, steps, seed, sampler, scheduler, loras,
             \\       DATETIME(trashed_at, 'unixepoch')
             \\FROM images WHERE id = ?
@@ -1183,47 +1184,50 @@ pub const VectorDb = struct {
         try stmt.bind(1, id);
         if (!try stmt.step()) return null;
 
-        const library_path = try allocator.dupe(u8, stmt.columnText(0));
+        const library_id_val: u64 = @intCast(stmt.columnInt64(0));
+
+        const library_path = try allocator.dupe(u8, stmt.columnText(1));
         errdefer allocator.free(library_path);
 
-        const creation_date: ?[]const u8 = if (stmt.columnIsNull(1)) null else
-            try allocator.dupe(u8, stmt.columnText(1));
+        const creation_date: ?[]const u8 = if (stmt.columnIsNull(2)) null else
+            try allocator.dupe(u8, stmt.columnText(2));
         errdefer if (creation_date) |s| allocator.free(s);
 
-        const positive_prompt_text: ?[]const u8 = if (stmt.columnIsNull(2)) null else
-            try allocator.dupe(u8, stmt.columnText(2));
+        const positive_prompt_text: ?[]const u8 = if (stmt.columnIsNull(3)) null else
+            try allocator.dupe(u8, stmt.columnText(3));
         errdefer if (positive_prompt_text) |s| allocator.free(s);
 
-        const negative_prompt_text: ?[]const u8 = if (stmt.columnIsNull(3)) null else
-            try allocator.dupe(u8, stmt.columnText(3));
+        const negative_prompt_text: ?[]const u8 = if (stmt.columnIsNull(4)) null else
+            try allocator.dupe(u8, stmt.columnText(4));
         errdefer if (negative_prompt_text) |s| allocator.free(s);
 
-        const model: ?[]const u8 = if (stmt.columnIsNull(4)) null else
-            try allocator.dupe(u8, stmt.columnText(4));
+        const model: ?[]const u8 = if (stmt.columnIsNull(5)) null else
+            try allocator.dupe(u8, stmt.columnText(5));
         errdefer if (model) |s| allocator.free(s);
 
-        const cfg: ?f64 = if (stmt.columnIsNull(5)) null else stmt.columnDouble(5);
-        const steps: ?i64 = if (stmt.columnIsNull(6)) null else stmt.columnInt64(6);
-        const seed: ?i64 = if (stmt.columnIsNull(7)) null else stmt.columnInt64(7);
+        const cfg: ?f64 = if (stmt.columnIsNull(6)) null else stmt.columnDouble(6);
+        const steps: ?i64 = if (stmt.columnIsNull(7)) null else stmt.columnInt64(7);
+        const seed: ?i64 = if (stmt.columnIsNull(8)) null else stmt.columnInt64(8);
 
-        const sampler: ?[]const u8 = if (stmt.columnIsNull(8)) null else
-            try allocator.dupe(u8, stmt.columnText(8));
+        const sampler: ?[]const u8 = if (stmt.columnIsNull(9)) null else
+            try allocator.dupe(u8, stmt.columnText(9));
         errdefer if (sampler) |s| allocator.free(s);
 
-        const scheduler: ?[]const u8 = if (stmt.columnIsNull(9)) null else
-            try allocator.dupe(u8, stmt.columnText(9));
+        const scheduler: ?[]const u8 = if (stmt.columnIsNull(10)) null else
+            try allocator.dupe(u8, stmt.columnText(10));
         errdefer if (scheduler) |s| allocator.free(s);
 
-        const loras: ?[]const u8 = if (stmt.columnIsNull(10)) null else
-            try allocator.dupe(u8, stmt.columnText(10));
+        const loras: ?[]const u8 = if (stmt.columnIsNull(11)) null else
+            try allocator.dupe(u8, stmt.columnText(11));
         errdefer if (loras) |s| allocator.free(s);
 
-        const trashed_at: ?[]const u8 = if (stmt.columnIsNull(11)) null else
-            try allocator.dupe(u8, stmt.columnText(11));
+        const trashed_at: ?[]const u8 = if (stmt.columnIsNull(12)) null else
+            try allocator.dupe(u8, stmt.columnText(12));
         errdefer if (trashed_at) |s| allocator.free(s);
 
         return ImageDetails{
             .id = id,
+            .library_id = library_id_val,
             .library_path = library_path,
             .creation_date = creation_date,
             .positive_prompt_text = positive_prompt_text,
@@ -1237,5 +1241,15 @@ pub const VectorDb = struct {
             .loras = loras,
             .trashed_at = trashed_at,
         };
+    }
+
+    /// Reset an image's mtime to 0 so the next scan unconditionally re-parses it.
+    pub fn resetImageMtimeById(self: *VectorDb, id: u64) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("UPDATE images SET mtime = 0 WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        _ = try stmt.step();
     }
 };

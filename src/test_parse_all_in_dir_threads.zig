@@ -178,7 +178,7 @@ fn embedResults(
         });
         defer pool.deinit();
 
-        const ctx = try pool.get(model_path, 30_000, null);
+        const ctx = try pool.get(io, model_path, 30_000, null);
         defer pool.release(ctx);
 
         const t0 = std.Io.Timestamp.now(io, .awake);
@@ -207,7 +207,7 @@ fn embedResults(
 
     // ── VL image embedding ─────────────────────────────────────────────
     if (vl_model_path) |model_path| {
-        var vl = try mtmd.VlContext.init(allocator, model_path, mmproj_path.?);
+        var vl = try mtmd.VlContext.init(io, allocator, model_path, mmproj_path.?);
         defer vl.deinit();
 
         const t0 = std.Io.Timestamp.now(io, .awake);
@@ -216,7 +216,7 @@ fn embedResults(
 
         for (results) |r| {
             const item = r orelse continue;
-            const embd = vl.embedImageFile(allocator, item.path, "", null) catch {
+            const embd = vl.embedImageFile(io, allocator, item.path, "", null) catch {
                 n_err += 1;
                 continue;
             };

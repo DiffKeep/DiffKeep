@@ -66,6 +66,7 @@ fn prettyJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
 pub const DetailState = struct {
     id: ?u64 = null,
     detail: ?db_mod.ImageDetails = null,
+    reparse_requested: bool = false,
 
     pub fn deinit(self: *DetailState, allocator: std.mem.Allocator) void {
         if (self.detail) |*d| {
@@ -177,7 +178,7 @@ pub const DetailState = struct {
         }
     }
 
-    pub fn renderPanel(self: *const DetailState, panel_w: f32, filename: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
+    pub fn renderPanel(self: *DetailState, panel_w: f32, filename: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
         var meta = dvui.box(@src(), .{}, .{
             .min_size_content = .{ .w = panel_w, .h = 0 },
             .max_size_content = .{ .w = panel_w, .h = 0 },
@@ -204,6 +205,11 @@ pub const DetailState = struct {
                 dvui.label(@src(), "{s}", .{i18n.t(.detail_no_image)}, .{ .font = bold, .expand = .horizontal });
             }
             if (self.detail) |d| {
+                if (dvui.buttonIcon(@src(), i18n.t(.action_reparse), icons.tvg.lucide.@"refresh-cw", .{}, .{},
+                    .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
+                {
+                    self.reparse_requested = true;
+                }
                 if (dvui.buttonIcon(@src(), i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", .{}, .{},
                     .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
                 {

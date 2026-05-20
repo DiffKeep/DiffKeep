@@ -26,18 +26,15 @@ const viewer_manager_mod = @import("viewer_manager.zig");
 const search_mod = @import("search.zig");
 const image_ops_mod = @import("image_ops.zig");
 const toolbar_mod = @import("toolbar.zig");
+const dk = @import("diffkeep.zig");
 
 const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
 const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
 
 // Path to the config file: set from --config/-c flag, otherwise resolved from known folders.
 var g_config: ?[]const u8 = null;
-var g_cfg: config_mod.Config = .{};
-var g_db: ?db_mod.VectorDb = null;
 // Directory that contains the DB file — also used as root for the trash folder.
 var g_data_dir: ?[]const u8 = null;
-
-var g_library_manager: ?library_manager_mod.LibraryManager = null;
 var g_fs_watcher: ?fs_watch_mod.FsWatcher = null;
 /// Pending per-file events collected from the watcher, waiting for the short
 /// debounce window to expire before being dispatched to LibraryManager.
@@ -45,7 +42,6 @@ var g_pending_file_events: std.ArrayList(fs_watch_mod.DirtyEvent) = .empty;
 /// Absolute nanosecond timestamp (Io.Clock.real) after which pending file
 /// events should be flushed.  0 means nothing is pending.
 var g_rescan_deadline_ns: i96 = 0;
-var g_grid: ?image_grid_mod.GridState = null;
 var g_wakeup_event_type: u32 = 0;
 
 fn wakeupFrame() void {
@@ -80,7 +76,7 @@ var g_filter_modal: filter_modal_mod.FilterModalState = .{};
 /// Called at init and after any operation that changes counts.
 fn refreshCounts() void {
     if (dvui.App.main_init) |init| {
-        if (g_db) |*db| {
+        if (dk.g_db) |*db| {
             g_total_image_count = db.getTotalImageCount() catch 0;
             g_trash_stats = db.getTrashStats() catch null;
             g_sidebar.refreshLibraryCounts(db, init.gpa);
@@ -124,9 +120,9 @@ fn appStart() dvui.App.StartOptions {
 fn appInit(win: *dvui.Window) !void {
     _ = win;
     image_ops_mod.init(.{
-        .db = &g_db,
+        .db = &dk.g_db,
         .data_dir = &g_data_dir,
-        .cfg = &g_cfg,
+        .cfg = &dk.g_cfg,
         .on_counts_changed = refreshCounts,
     });
 
@@ -139,13 +135,13 @@ fn appInit(win: *dvui.Window) !void {
         }
 
         if (g_config) |cfg_path| {
-            g_cfg = try config_mod.load(init.gpa, init.io, cfg_path);
+            dk.g_cfg = try config_mod.load(init.gpa, init.io, cfg_path);
         }
 
-        g_settings.initFromConfig(&g_cfg);
+        g_settings.initFromConfig(&dk.g_cfg);
 
         const db_path = blk: {
-            if (g_cfg.data_path) |p| {
+            if (dk.g_cfg.data_path) |p| {
                 break :blk try init.gpa.dupe(u8, p);
             }
             if (try known_folders.getPath(init.io, init.gpa, init.environ_map, .data)) |data_base| {
@@ -162,7 +158,7 @@ fn appInit(win: *dvui.Window) !void {
             if (std.fs.path.dirname(p)) |dir| {
                 g_data_dir = try init.gpa.dupe(u8, dir);
             }
-            g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
+            dk.g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
         }
 
         // Ensure trash directory exists and purge entries older than 30 days.
@@ -171,7 +167,7 @@ fn appInit(win: *dvui.Window) !void {
             defer dd.close(init.io);
             dd.createDirPath(init.io, "trash") catch {};
 
-            if (g_db) |*db| {
+            if (dk.g_db) |*db| {
                 const now_s: i64 = @intCast(@divTrunc(
                     std.Io.Clock.real.now(init.io).nanoseconds, std.time.ns_per_s,
                 ));
@@ -194,7 +190,7 @@ fn appInit(win: *dvui.Window) !void {
         // VIPS must be initialized before any worker threads start calling vips_thumbnail.
         try vips_mod.init();
 
-        if (g_db) |*db| {
+        if (dk.g_db) |*db| {
             try g_sidebar.loadLibraries(init.gpa, db);
 
             // Register a custom SDL event so the worker thread can wake the render loop
@@ -203,8 +199,8 @@ fn appInit(win: *dvui.Window) !void {
 
             // Init grid before library manager so we can pass the notifier pointer.
             // Grid must be at its final global address before startWorker() is called.
-            g_grid = try image_grid_mod.GridState.init(init.io, init.gpa, db, g_cfg.thumbnails_in_db, wakeupFrame);
-            if (g_grid) |*grid| {
+            dk.g_grid = try image_grid_mod.GridState.init(init.io, init.gpa, db, dk.g_cfg.thumbnails_in_db, wakeupFrame);
+            if (dk.g_grid) |*grid| {
                 grid.data_dir = g_data_dir;
                 try grid.startWorker();
             }
@@ -230,14 +226,14 @@ fn appInit(win: *dvui.Window) !void {
             }
 
             // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s
-            // concurrent task receives &g_library_manager.? (stable global address)
+            // concurrent task receives &dk.g_library_manager.? (stable global address)
             // rather than a pointer to a stack-local that becomes dangling after appInit returns.
-            const notifier = if (g_grid) |*grid| &grid.notifier else null;
+            const notifier = if (dk.g_grid) |*grid| &grid.notifier else null;
             const watcher_ptr: ?*fs_watch_mod.FsWatcher = if (g_fs_watcher != null) &g_fs_watcher.? else null;
-            g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, g_cfg.thumbnails_in_db, g_cfg.prompt_embeddings, g_cfg.image_embeddings, notifier, watcher_ptr);
-            if (g_library_manager) |*mgr| {
-                mgr.embedding_model_path = g_cfg.embedding_model_path;
-                mgr.embedding_mmproj_path = g_cfg.embedding_mmproj_path;
+            dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
+            if (dk.g_library_manager) |*mgr| {
+                mgr.embedding_model_path = dk.g_cfg.embedding_model_path;
+                mgr.embedding_mmproj_path = dk.g_cfg.embedding_mmproj_path;
                 mgr.wakeup_fn = wakeupFrame;
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
@@ -279,16 +275,16 @@ fn appDeinit() void {
     if (g_fs_watcher) |*watcher| watcher.deinit();
     // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
-        if (g_library_manager) |*mgr| mgr.deinit(init.io);
+        if (dk.g_library_manager) |*mgr| mgr.deinit(init.io);
     }
     if (dvui.App.main_init) |init| {
         g_search.awaitRerank(init.io);
         g_settings.awaitDownloads(init.io);
         g_search.deinit(init.gpa);
     }
-    if (g_grid) |*grid| grid.deinit();
+    if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
-    if (g_db) |*database| {
+    if (dk.g_db) |*database| {
         database.deinit();
         database.pool.deinit();
     }
@@ -296,12 +292,12 @@ fn appDeinit() void {
         g_detail.deinit(init.gpa);
         g_sidebar.deinit(init.gpa);
         if (g_config) |cfg_path| {
-            config_mod.save(g_cfg, init.io, cfg_path) catch |err| {
+            config_mod.save(dk.g_cfg, init.io, cfg_path) catch |err| {
                 std.log.warn("failed to save config: {}", .{err});
             };
             init.gpa.free(cfg_path);
         }
-        g_cfg.deinit(init.gpa);
+        dk.g_cfg.deinit(init.gpa);
         if (g_data_dir) |d| init.gpa.free(d);
         for (g_active_filters.items) |f| init.gpa.free(f.value);
         g_active_filters.deinit(init.gpa);
@@ -347,16 +343,16 @@ fn openDeleteDialog(grid: *const image_grid_mod.GridState, force: bool) void {
         g_delete_dialog.name_len = len;
     }
 
-    const permanent = force or !g_cfg.trash_enabled;
+    const permanent = force or !dk.g_cfg.trash_enabled;
     if (count == 1) {
         if (!permanent and g_delete_dialog.skip_delete_confirm) {
-            if (g_grid) |*grid_mut| {
+            if (dk.g_grid) |*grid_mut| {
                 if (dvui.App.main_init) |init| image_ops_mod.performTrash(init.io, init.gpa, grid_mut);
             }
             return;
         }
         if (permanent and g_delete_dialog.skip_permanent_delete_confirm) {
-            if (g_grid) |*grid_mut| {
+            if (dk.g_grid) |*grid_mut| {
                 if (dvui.App.main_init) |init| image_ops_mod.performDelete(init.io, init.gpa, grid_mut);
             }
             return;
@@ -373,18 +369,18 @@ fn frame() !dvui.App.Result {
     }
 
     // Drain new images from scan threads and update thumbnail cache
-    if (g_grid) |*grid| {
+    if (dk.g_grid) |*grid| {
         const prev_len = grid.images.items.len;
         grid.update();
         // Reload grid when a watcher-triggered deletion has been committed to the DB.
-        if (g_library_manager) |*mgr| {
+        if (dk.g_library_manager) |*mgr| {
             if (mgr.reload_requested.load(.acquire)) {
                 mgr.reload_requested.store(false, .release);
-                if (g_db) |*db| grid.reloadImages(db) catch {};
+                if (dk.g_db) |*db| grid.reloadImages(db) catch {};
             }
         }
         if (grid.images.items.len != prev_len) {
-            if (g_db) |*db| {
+            if (dk.g_db) |*db| {
                 g_total_image_count = db.getTotalImageCount() catch g_total_image_count;
                 for (g_sidebar.libraries.items) |*lib| {
                     lib.image_count = db.getLibraryImageCount(lib.id) catch lib.image_count;
@@ -395,14 +391,14 @@ fn frame() !dvui.App.Result {
 
     // Apply rerank results when the background task completes
     if (dvui.App.main_init) |init| {
-        if (g_grid) |*grid| g_search.applyResultsIfDone(init.gpa, grid);
+        if (dk.g_grid) |*grid| g_search.applyResultsIfDone(init.gpa, grid);
     }
 
     // Apply completed model downloads (auto-fill config paths)
-    g_settings.applyCompletedDownloads(&g_cfg, g_data_dir);
+    g_settings.applyCompletedDownloads(&dk.g_cfg, g_data_dir);
 
     // Consume pending delete/restore requests raised by keyboard handlers
-    if (g_grid) |*grid| {
+    if (dk.g_grid) |*grid| {
         if (grid.delete_requested) {
             grid.delete_requested = false;
             openDeleteDialog(grid, grid.delete_force);
@@ -413,13 +409,13 @@ fn frame() !dvui.App.Result {
         }
         if (grid.open_viewer_requested) {
             grid.open_viewer_requested = false;
-            g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (g_db) |*db| db else null, wakeupFrame);
+            g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (dk.g_db) |*db| db else null, wakeupFrame);
             grid.viewer_start_id = null;
         }
         if (grid.copy_prompt_requested) {
             grid.copy_prompt_requested = false;
             if (dvui.App.main_init) |init| {
-                if (g_db) |*db| {
+                if (dk.g_db) |*db| {
                     if (db.getPositivePromptText(init.gpa, grid.copy_prompt_id) catch null) |prompt| {
                         defer init.gpa.free(prompt);
                         if (init.gpa.dupeZ(u8, prompt)) |c_str| {
@@ -464,7 +460,7 @@ fn frame() !dvui.App.Result {
     if (!std.mem.eql(u8, &g_search.buf, &g_search.prev)) {
         @memcpy(&g_search.prev, &g_search.buf);
         const q = std.mem.sliceTo(&g_search.buf, 0);
-        if (g_grid) |*grid| {
+        if (dk.g_grid) |*grid| {
             grid.search_mode = g_search.mode;
             switch (g_search.mode) {
                 .fts => {
@@ -474,7 +470,7 @@ fn frame() !dvui.App.Result {
                         if (dvui.App.main_init) |init| init.gpa.free(emb);
                         g_search.query_embedding = null;
                     }
-                    if (g_db) |*db| grid.reloadImages(db) catch {};
+                    if (dk.g_db) |*db| grid.reloadImages(db) catch {};
                 },
                 .semantic, .visual, .combined => {
                     grid.search_query = null;
@@ -485,13 +481,13 @@ fn frame() !dvui.App.Result {
                     grid.query_embedding = null;
                     if (q.len > 0) {
                         if (dvui.App.main_init) |init| {
-                            g_search.embedQuery(init.gpa, q, g_search.mode, &g_cfg, grid) catch |err| {
+                            g_search.embedQuery(init.io, init.gpa, q, g_search.mode, &dk.g_cfg, grid) catch |err| {
                                 log.warn("search embed: {}", .{err});
                             };
                         }
                     }
-                    if (g_db) |*db| grid.reloadImages(db) catch {};
-                    if (q.len > 0) g_search.maybeSpawnRerank(grid, q, &g_cfg);
+                    if (dk.g_db) |*db| grid.reloadImages(db) catch {};
+                    if (q.len > 0) g_search.maybeSpawnRerank(grid, q, &dk.g_cfg);
                 },
             }
         }
@@ -501,8 +497,8 @@ fn frame() !dvui.App.Result {
         try g_sidebar.drainPendingLibrary(
             init.gpa,
             init.io,
-            if (g_library_manager) |*mgr| mgr else null,
-            if (g_db) |*db| db else null,
+            if (dk.g_library_manager) |*mgr| mgr else null,
+            if (dk.g_db) |*db| db else null,
         );
     }
 
@@ -537,7 +533,7 @@ fn frame() !dvui.App.Result {
             const now_ns = std.Io.Clock.real.now(init.io).nanoseconds;
             if (now_ns >= g_rescan_deadline_ns) {
                 g_rescan_deadline_ns = 0;
-                if (g_library_manager) |*mgr| {
+                if (dk.g_library_manager) |*mgr| {
                     for (g_pending_file_events.items) |ev| {
                         mgr.processFileEvent(init.io, ev.library_id, ev.path, ev.deleted);
                     }
@@ -560,15 +556,15 @@ fn frame() !dvui.App.Result {
         .search = &g_search,
         .active_filters = &g_active_filters,
         .filter_modal = &g_filter_modal,
-        .grid = &g_grid,
-        .db = &g_db,
-        .cfg = &g_cfg,
+        .grid = &dk.g_grid,
+        .db = &dk.g_db,
+        .cfg = &dk.g_cfg,
         .settings = &g_settings,
         .db_stats = &g_db_stats,
         .trash_stats = &g_trash_stats,
         .sidebar = &g_sidebar,
         .detail = &g_detail,
-        .library_manager = &g_library_manager,
+        .library_manager = &dk.g_library_manager,
         .left_w = &g_left_w,
         .left_w_open = &g_left_w_open,
         .right_w = &g_right_w,
@@ -582,22 +578,22 @@ fn frame() !dvui.App.Result {
 
     // ── Settings modal ────────────────────────────────────────────────────────
     const settings_was_open = g_settings.open;
-    try g_settings.render(&g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
-        if (g_db) |*db| db else null,
-        if (g_grid) |*g| g else null);
+    try g_settings.render(&dk.g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
+        if (dk.g_db) |*db| db else null,
+        if (dk.g_grid) |*g| g else null);
     if (settings_was_open and !g_settings.open)
-        g_settings.onClosed(&g_cfg, &g_library_manager, &g_search);
+        g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
 
     // ── Delete confirmation modal ─────────────────────────────────────────────
-    try g_delete_dialog.render(g_cfg.trash_enabled,
-        if (g_grid) |*g| g else null,
+    try g_delete_dialog.render(dk.g_cfg.trash_enabled,
+        if (dk.g_grid) |*g| g else null,
         image_ops_mod.performTrash, image_ops_mod.performDelete);
 
     // ── Filter modal ──────────────────────────────────────────────────────────
     try g_filter_modal.render(
         &g_active_filters,
-        if (g_db) |*db| db else null,
-        if (g_grid) |*g| g else null,
+        if (dk.g_db) |*db| db else null,
+        if (dk.g_grid) |*g| g else null,
     );
 
     return .ok;
@@ -673,7 +669,7 @@ fn performViewerDeleteEntry(
 ) void {
     const data_dir = g_data_dir orelse return;
 
-    if (force or !g_cfg.trash_enabled) {
+    if (force or !dk.g_cfg.trash_enabled) {
         const file_path: []const u8 = if (entry.trash_name) |tn|
             std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
         else
@@ -681,7 +677,7 @@ fn performViewerDeleteEntry(
         defer if (entry.trash_name != null) allocator.free(file_path);
         std.Io.Dir.cwd().deleteFile(io, file_path) catch |err|
             log.warn("delete {s}: {}", .{ entry.filename, err });
-        if (g_db) |*db| db.deleteImage(entry.id) catch |err|
+        if (dk.g_db) |*db| db.deleteImage(entry.id) catch |err|
             log.warn("deleteImage {d}: {}", .{ entry.id, err });
     } else {
         const now_s: i64 = @intCast(@divTrunc(
@@ -701,14 +697,14 @@ fn performViewerDeleteEntry(
             log.warn("trash {s}: {}", .{ entry.filename, err });
             return;
         };
-        if (g_db) |*db| db.trashImage(entry.id, trash_name, file_size, now_s) catch |err|
+        if (dk.g_db) |*db| db.trashImage(entry.id, trash_name, file_size, now_s) catch |err|
             log.warn("trashImage {d}: {}", .{ entry.id, err });
     }
 
     var ids = std.AutoHashMap(u64, void).init(allocator);
     defer ids.deinit();
     ids.put(entry.id, {}) catch {};
-    if (g_grid) |*grid| image_ops_mod.removeFromGrid(grid, &ids);
+    if (dk.g_grid) |*grid| image_ops_mod.removeFromGrid(grid, &ids);
     g_viewer_manager.removeImages(&ids);
     refreshCounts();
 }
@@ -717,7 +713,7 @@ fn openViewerDeleteDialog(state: *image_viewer_mod.ViewerState, force: bool) voi
     const init = dvui.App.main_init orelse return;
     const img = state.currentImage() orelse return;
 
-    const permanent = force or !g_cfg.trash_enabled;
+    const permanent = force or !dk.g_cfg.trash_enabled;
 
     if (!permanent and g_delete_dialog.skip_delete_confirm) {
         performViewerDeleteEntry(init.io, init.gpa, img.*, force);

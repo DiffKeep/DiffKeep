@@ -214,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
         });
         defer pool.deinit();
 
-        const ctx = try pool.get(model_path, 60_000, null);
+        const ctx = try pool.get(io, model_path, 60_000, null);
         defer pool.release(ctx);
 
         for (ALL_MODES, 0..) |mode, moi| {

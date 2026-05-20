@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
         try println(io, "Max image size: none (no resize)", .{});
     }
 
-    var vl = try mtmd.VlContext.init(allocator, model_path, mmproj_path);
+    var vl = try mtmd.VlContext.init(io, allocator, model_path, mmproj_path);
     defer vl.deinit();
     vl.max_image_size = max_size;
 
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (image_paths.items) |path| {
         try println(io, "Embedding: {s}", .{path});
-        const embd = try vl.embedImageFile(allocator, path, "", null);
+        const embd = try vl.embedImageFile(io, allocator, path, "", null);
         try embeddings.append(allocator, embd);
 
         // Print first 8 values as a sanity check.

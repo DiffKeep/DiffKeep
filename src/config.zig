@@ -55,6 +55,52 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config 
     return config;
 }
 
+test "config: missing file returns defaults" {
+    var cfg = try load(std.testing.allocator, std.testing.io, "/tmp/diffkeep_test_nonexistent_cfg.json");
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.data_path == null);
+    try std.testing.expectEqual(false, cfg.fullscreen);
+    try std.testing.expectEqual(@as(u32, 1200), cfg.window_width);
+}
+
+test "config: round-trip preserves all fields" {
+    const tmp = "/tmp/diffkeep_test_roundtrip.json";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
+
+    const original = Config{
+        .fullscreen = true,
+        .window_width = 1920,
+        .window_height = 1080,
+        .thumbnails_in_db = true,
+        .rerank_top_k = 7,
+    };
+    try save(original, std.testing.io, tmp);
+
+    var loaded = try load(std.testing.allocator, std.testing.io, tmp);
+    defer loaded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(original.fullscreen, loaded.fullscreen);
+    try std.testing.expectEqual(original.window_width, loaded.window_width);
+    try std.testing.expectEqual(original.window_height, loaded.window_height);
+    try std.testing.expectEqual(original.thumbnails_in_db, loaded.thumbnails_in_db);
+    try std.testing.expectEqual(original.rerank_top_k, loaded.rerank_top_k);
+}
+
+test "config: unknown keys are ignored" {
+    const tmp = "/tmp/diffkeep_test_unknown_keys.json";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = tmp,
+        .data = "{\"fullscreen\":true,\"unknown_key_xyz\":42}",
+    });
+    var cfg = try load(std.testing.allocator, std.testing.io, tmp);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, cfg.fullscreen);
+}
+
 /// Writes the config to `path`, creating parent directories as needed.
 pub fn save(config: Config, io: std.Io, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| {

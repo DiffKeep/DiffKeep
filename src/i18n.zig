@@ -82,6 +82,7 @@ pub const Strings = struct {
     action_remove: [:0]const u8,
     action_copy: [:0]const u8,
     action_copy_image: [:0]const u8,
+    action_reparse: [:0]const u8,
 
     pane_click_to_expand: [:0]const u8,
     pane_drag_to_resize: [:0]const u8,
@@ -214,6 +215,7 @@ pub const en: Strings = .{
     .action_remove = "Remove",
     .action_copy = "Copy",
     .action_copy_image = "Copy Image",
+    .action_reparse = "Re-parse metadata",
 
     .pane_click_to_expand = "Click to expand",
     .pane_drag_to_resize = "Click to collapse \u{00b7} Drag to resize",

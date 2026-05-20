@@ -10,6 +10,7 @@ const log = std.log.scoped(.search);
 const RERANK_INSTRUCTION = "Retrieve AI-generated images that visually match the user's search query.";
 
 const RerankTaskCtx = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     query: []const u8,
     image_paths: [][]u8,
@@ -37,7 +38,7 @@ fn rerankTask(ctx: RerankTaskCtx) void {
 
     for (ctx.image_paths, ctx.image_ids) |path, id| {
         if (ctx.current_gen.load(.acquire) != ctx.generation) return;
-        const score = ctx.reranker.scoreImageFile(ctx.allocator, ctx.query, RERANK_INSTRUCTION, path) catch 0.0;
+        const score = ctx.reranker.scoreImageFile(ctx.io, ctx.allocator, ctx.query, RERANK_INSTRUCTION, path) catch 0.0;
         scored.append(ctx.allocator, .{ .id = id, .score = score }) catch break;
     }
     if (ctx.current_gen.load(.acquire) != ctx.generation) return;
@@ -132,7 +133,7 @@ pub const SearchState = struct {
         if (grid.images.items.len == 0) return;
 
         if (self.reranker == null) {
-            self.reranker = mtmd_mod.RerankContext.init(init.gpa, reranker_model, reranker_mmproj) catch |err| {
+            self.reranker = mtmd_mod.RerankContext.init(init.io, init.gpa, reranker_model, reranker_mmproj) catch |err| {
                 log.warn("reranker init: {}", .{err});
                 return;
             };
@@ -166,6 +167,7 @@ pub const SearchState = struct {
         };
 
         const ctx = RerankTaskCtx{
+            .io = init.io,
             .allocator = init.gpa,
             .query = query_copy,
             .image_paths = image_paths,
@@ -188,6 +190,7 @@ pub const SearchState = struct {
 
     pub fn embedQuery(
         self: *SearchState,
+        io: std.Io,
         allocator: std.mem.Allocator,
         query: []const u8,
         mode: image_grid_mod.SearchMode,
@@ -211,7 +214,7 @@ pub const SearchState = struct {
                 const tp = &self.text_pool.?;
                 const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
                 defer allocator.free(q_text);
-                const tc = try tp.get(model_path, 60_000, null);
+                const tc = try tp.get(io, model_path, 60_000, null);
                 defer tp.release(tc);
                 var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
                 defer {
@@ -226,12 +229,12 @@ pub const SearchState = struct {
             .visual => {
                 const mmproj_path = cfg.embedding_mmproj_path orelse return error.NoMmprojPath;
                 if (self.vl_ctx == null) {
-                    self.vl_ctx = try mtmd_mod.VlContext.init(allocator, model_path, mmproj_path);
+                    self.vl_ctx = try mtmd_mod.VlContext.init(io, allocator, model_path, mmproj_path);
                 }
                 const vc = &self.vl_ctx.?;
                 const q_text = try std.fmt.allocPrint(allocator, "search_query: {s}", .{query});
                 defer allocator.free(q_text);
-                const tc = try vc.pool.get(model_path, 60_000, null);
+                const tc = try vc.pool.get(io, model_path, 60_000, null);
                 defer vc.pool.release(tc);
                 var chunks = try llama_mod.createEmbeddingFromPrompt(allocator, tc, q_text, 2048);
                 defer {

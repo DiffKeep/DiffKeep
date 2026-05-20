@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     const corpus = entries.items;
 
     // ── Init embedding models ─────────────────────────────────────────
-    var vl = try mtmd.VlContext.init(allocator, model_arg, mmproj_arg);
+    var vl = try mtmd.VlContext.init(io, allocator, model_arg, mmproj_arg);
     defer vl.deinit();
     vl.max_image_size = max_image_size;
     std.log.info("Image max size: {d}px", .{max_image_size});
@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
         .n_gpu_layers = 999,
     });
     defer text_pool.deinit();
-    const text_ctx = try text_pool.get(model_arg, 30_000, null);
+    const text_ctx = try text_pool.get(io, model_arg, 30_000, null);
     defer text_pool.release(text_ctx);
 
     // ── Optionally init reranker ──────────────────────────────────────
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
     if (reranker_arg) |rpath| {
         const rmmproj = reranker_mmproj orelse return argErr("--reranker requires --reranker-mmproj");
         std.log.info("Loading reranker: {s}", .{rpath});
-        var r = try mtmd.RerankContext.init(allocator, rpath, rmmproj);
+        var r = try mtmd.RerankContext.init(io, allocator, rpath, rmmproj);
         r.max_image_size = max_image_size;
         reranker = r;
         std.log.info("Reranker loaded. Reranking top-{d} per query.", .{rerank_k});
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(img_embds);
     }
     for (corpus, 0..) |e, i| {
-        img_embds[i] = try vl.embedImageFile(allocator, e.path, "", null);
+        img_embds[i] = try vl.embedImageFile(io, allocator, e.path, "", null);
     }
     std.log.info("Done embedding. Running queries...", .{});
 
@@ -228,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
             for (0..k) |i| {
                 rr_ranking[i] = i; // index into top-k, not corpus
                 rr_scores[i] = rr.scoreImageFile(
-                    allocator, q.text, RERANK_INSTRUCTION, corpus[ranking[i]].path,
+                    io, allocator, q.text, RERANK_INSTRUCTION, corpus[ranking[i]].path,
                 ) catch |err| blk: {
                     std.log.warn("rerank failed for {s}: {}", .{ corpus[ranking[i]].path, err });
                     break :blk -std.math.floatMax(f32);

@@ -487,6 +487,18 @@ pub const GridState = struct {
         // Focusable container: receives keyboard events after any cell is clicked.
         var grid_box = dvui.box(@src(), .{}, .{ .expand = .both });
         defer grid_box.deinit();
+
+        if (n == 0) {
+            dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
+                .tag = "grid-empty",
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .expand = .both,
+            });
+            return;
+        }
+
+        // grid_id is used for keyboard event routing — only valid when n > 0.
         const grid_id = grid_box.data().id;
 
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll_info }, .{ .expand = .both });

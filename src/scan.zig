@@ -144,7 +144,10 @@ pub const LibraryScanner = struct {
             known.deinit();
         }
 
-        const max_concurrent = std.Thread.getCpuCount() catch 4;
+        // With embeddings, GPU inference serializes through Pool.get() anyway;
+        // extra concurrent tasks just spin-poll for the lock with no throughput gain.
+        const max_concurrent: usize = if (prompt_embeddings or image_embeddings) 1
+                                      else (std.Thread.getCpuCount() catch 4);
         var group: std.Io.Group = .init;
         var in_flight: usize = 0;
         try self.walkDirectory(
@@ -324,7 +327,7 @@ pub fn processFile(ctx: ScanCtx) void {
                 const model_path = ctx.text_model_path orelse break :embed_prompt_backfill;
                 const prompt = image.positivePromptText orelse break :embed_prompt_backfill;
                 if (ctx.stop.load(.acquire)) break :embed_prompt_backfill;
-                const tc = tp.get(model_path, 30_000, ctx.stop) catch break :embed_prompt_backfill;
+                const tc = tp.get(ctx.io, model_path, 30_000, ctx.stop) catch break :embed_prompt_backfill;
                 defer tp.release(tc);
                 var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, prompt, 2048) catch break :embed_prompt_backfill;
                 defer {
@@ -342,7 +345,7 @@ pub fn processFile(ctx: ScanCtx) void {
                 if (!ctx.image_embeddings or ctx.has_image_embedding) break :embed_image_backfill;
                 if (ctx.stop.load(.acquire)) break :embed_image_backfill;
                 const vc = ctx.vl_ctx orelse break :embed_image_backfill;
-                const embd = vc.embedImageFile(ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image_backfill;
+                const embd = vc.embedImageFile(ctx.io, ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image_backfill;
                 defer ctx.allocator.free(embd);
                 ctx.db.storeImageEmbedding(image.id, embd) catch |err| {
                     log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
@@ -401,13 +404,19 @@ pub fn processFile(ctx: ScanCtx) void {
     defer aa.free(text_chunks);
     var workflow_text: ?[]const u8 = null;
     var prompt_text: ?[]const u8 = null;
+    var plain_prompt_text: ?[]const u8 = null;
     for (text_chunks) |chunk| {
         var content = png_parser.parseTExtChunk(chunk) catch continue;
         defer content.deinit(aa);
         if (std.mem.eql(u8, content.keyword, "parameters") and a1111_text == null)
             a1111_text = aa.dupe(u8, content.text) catch null;
-        if (std.mem.eql(u8, content.keyword, "prompt") and prompt_text == null)
-            prompt_text = aa.dupe(u8, content.text) catch null;
+        if (std.mem.eql(u8, content.keyword, "prompt")) {
+            if (prompt_text == null) {
+                prompt_text = aa.dupe(u8, content.text) catch null;
+            } else if (plain_prompt_text == null) {
+                plain_prompt_text = aa.dupe(u8, content.text) catch null;
+            }
+        }
         if (std.mem.eql(u8, content.keyword, "workflow") and workflow_text == null)
             workflow_text = aa.dupe(u8, content.text) catch null;
     }
@@ -420,6 +429,23 @@ pub fn processFile(ctx: ScanCtx) void {
     }
     if (maybe_result == null) {
         if (prompt_text) |t| maybe_result = parser.parsePromptChunk(t) catch null;
+    }
+    // Last resort: treat a prompt chunk as a plain JSON string.
+    if (maybe_result == null) {
+        if (prompt_text) |t| maybe_result = parser.parsePlainPromptString(t) catch null;
+    }
+    // A plain prompt string in a secondary "prompt" chunk takes priority for
+    // positive_prompt while preserving any richer metadata from the other parsers.
+    if (plain_prompt_text) |t| {
+        if (parser.parsePlainPromptString(t) catch null) |plain| {
+            if (plain.positive_prompt) |p| {
+                if (maybe_result) |*r| {
+                    r.positive_prompt = p;
+                } else {
+                    maybe_result = plain;
+                }
+            }
+        }
     }
 
     var result = maybe_result orelse {
@@ -483,7 +509,7 @@ pub fn processFile(ctx: ScanCtx) void {
         const model_path = ctx.text_model_path orelse break :embed_prompt;
         const prompt = image.positivePromptText orelse break :embed_prompt;
         if (ctx.stop.load(.acquire)) break :embed_prompt;
-        const tc = tp.get(model_path, 30_000, ctx.stop) catch break :embed_prompt;
+        const tc = tp.get(ctx.io, model_path, 30_000, ctx.stop) catch break :embed_prompt;
         defer tp.release(tc);
         var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, prompt, 2048) catch break :embed_prompt;
         defer {
@@ -501,7 +527,7 @@ pub fn processFile(ctx: ScanCtx) void {
         if (!ctx.image_embeddings) break :embed_image;
         if (ctx.stop.load(.acquire)) break :embed_image;
         const vc = ctx.vl_ctx orelse break :embed_image;
-        const embd = vc.embedImageFile(ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image;
+        const embd = vc.embedImageFile(ctx.io, ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image;
         defer ctx.allocator.free(embd);
         ctx.db.storeImageEmbedding(image.id, embd) catch |err| {
             log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
