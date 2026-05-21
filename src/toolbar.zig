@@ -87,6 +87,18 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     }
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 4, .h = 0 } });
 
+    if (ctx.search.isSearchLoading()) {
+        _ = dvui.spinner(@src(), .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 12, .h = 12 },
+            .margin = .{ .x = 4 },
+        });
+        dvui.label(@src(), "{s}", .{i18n.t(.search_loading)}, .{
+            .gravity_y = 0.5,
+            .margin = .{ .w = 4 },
+        });
+    }
+
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
     const chip: dvui.Options = .{
@@ -335,10 +347,8 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
                 .prompt_embeddings = ctx.cfg.prompt_embeddings,
                 .image_embeddings = ctx.cfg.image_embeddings,
             };
-            @memcpy(&ctx.settings.model_snapshot.model, &ctx.settings.embedding_model_buf);
-            @memcpy(&ctx.settings.model_snapshot.mmproj, &ctx.settings.embedding_mmproj_buf);
-            @memcpy(&ctx.settings.model_snapshot.reranker, &ctx.settings.reranker_model_buf);
-            @memcpy(&ctx.settings.model_snapshot.reranker_mmproj, &ctx.settings.reranker_mmproj_buf);
+            @memcpy(&ctx.settings.model_snapshot.text_dir, &ctx.settings.text_model_dir_buf);
+            @memcpy(&ctx.settings.model_snapshot.visual_dir, &ctx.settings.visual_model_dir_buf);
         }
     }
 }

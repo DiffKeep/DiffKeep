@@ -111,28 +111,11 @@ pub const Strings = struct {
     search_mode_semantic: [:0]const u8,
     search_mode_visual: [:0]const u8,
     search_mode_combined: [:0]const u8,
+    search_loading: [:0]const u8,
     settings_mmproj_path: [:0]const u8,
     settings_model_placeholder: [:0]const u8,
     settings_mmproj_placeholder: [:0]const u8,
     search_no_model: [:0]const u8,
-
-    settings_reranker_section: [:0]const u8,
-    settings_reranker_model_path: [:0]const u8,
-    settings_reranker_mmproj_path: [:0]const u8,
-    settings_reranker_model_placeholder: [:0]const u8,
-    settings_reranker_mmproj_placeholder: [:0]const u8,
-    settings_rerank_top_k: [:0]const u8,
-
-    settings_download_section: [:0]const u8,
-    settings_download_quantization: [:0]const u8,
-    settings_download_embedding: [:0]const u8,
-    settings_download_mmproj: [:0]const u8,
-    settings_download_reranker: [:0]const u8,
-    settings_download_reranker_mmproj: [:0]const u8,
-    settings_download_idle: [:0]const u8,
-    settings_download_running: [:0]const u8,
-    settings_download_done: [:0]const u8,
-    settings_download_failed: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -170,7 +153,7 @@ pub const en: Strings = .{
     .detail_no_image = "No image selected",
 
     .settings_config_dir = "Config directory",
-    .settings_model_path = "Embedding model",
+    .settings_model_path = "Text model directory",
     .settings_heading = "Settings",
     .settings_scan_section = "Scan",
     .settings_thumbnails_in_db = "Store thumbnails in database",
@@ -244,28 +227,11 @@ pub const en: Strings = .{
     .search_mode_semantic = "Semantic",
     .search_mode_visual = "Visual",
     .search_mode_combined = "Combined",
-    .settings_mmproj_path = "Vision projector",
-    .settings_model_placeholder = "Path to embedding model .gguf",
-    .settings_mmproj_placeholder = "Path to vision projector .gguf",
+    .search_loading = "Searching\u{2026}",
+    .settings_mmproj_path = "Visual model directory",
+    .settings_model_placeholder = "Path to snowflake-arctic-embed-m-v2.0 directory",
+    .settings_mmproj_placeholder = "Path to ViT-B-16-SigLIP2 directory",
     .search_no_model = "No model configured",
-
-    .settings_reranker_section = "Reranker",
-    .settings_reranker_model_path = "Reranker model",
-    .settings_reranker_mmproj_path = "Reranker projector",
-    .settings_reranker_model_placeholder = "Path to reranker model .gguf",
-    .settings_reranker_mmproj_placeholder = "Path to reranker projector .gguf",
-    .settings_rerank_top_k = "Re-rank top K results",
-
-    .settings_download_section = "Download Models",
-    .settings_download_quantization = "Quantization",
-    .settings_download_embedding = "Embedding model",
-    .settings_download_mmproj = "Vision projector",
-    .settings_download_reranker = "Reranker model",
-    .settings_download_reranker_mmproj = "Reranker projector",
-    .settings_download_idle = "Download",
-    .settings_download_running = "Downloading\u{2026}",
-    .settings_download_done = "Done",
-    .settings_download_failed = "Failed",
 };
 
 pub var active: *const Strings = &en;

@@ -17,18 +17,13 @@ pub const Config = struct {
     prompt_embeddings: bool = false,
     image_embeddings: bool = false,
     trash_enabled: bool = true,
-    embedding_model_path: ?[]const u8 = null,   // path to Qwen3-VL-Embedding-2B text gguf
-    embedding_mmproj_path: ?[]const u8 = null,  // path to mmproj gguf for image embeddings
-    reranker_model_path: ?[]const u8 = null,    // path to Qwen3-VL-Reranker-2B gguf
-    reranker_mmproj_path: ?[]const u8 = null,   // path to reranker mmproj gguf
-    rerank_top_k: u32 = 15,                     // number of bi-encoder results to rerank
+    text_model_dir: ?[]const u8 = null,    // path to snowflake-arctic-embed-m-v2.0 dir
+    visual_model_dir: ?[]const u8 = null,  // path to ViT-B-16-SigLIP2__webli dir
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.data_path) |p| allocator.free(p);
-        if (self.embedding_model_path) |p| allocator.free(p);
-        if (self.embedding_mmproj_path) |p| allocator.free(p);
-        if (self.reranker_model_path) |p| allocator.free(p);
-        if (self.reranker_mmproj_path) |p| allocator.free(p);
+        if (self.text_model_dir) |p| allocator.free(p);
+        if (self.visual_model_dir) |p| allocator.free(p);
     }
 };
 
@@ -48,10 +43,8 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config 
 
     var config = parsed.value;
     if (config.data_path) |p| config.data_path = try allocator.dupe(u8, p);
-    if (config.embedding_model_path) |p| config.embedding_model_path = try allocator.dupe(u8, p);
-    if (config.embedding_mmproj_path) |p| config.embedding_mmproj_path = try allocator.dupe(u8, p);
-    if (config.reranker_model_path) |p| config.reranker_model_path = try allocator.dupe(u8, p);
-    if (config.reranker_mmproj_path) |p| config.reranker_mmproj_path = try allocator.dupe(u8, p);
+    if (config.text_model_dir) |p| config.text_model_dir = try allocator.dupe(u8, p);
+    if (config.visual_model_dir) |p| config.visual_model_dir = try allocator.dupe(u8, p);
     return config;
 }
 
@@ -73,7 +66,6 @@ test "config: round-trip preserves all fields" {
         .window_width = 1920,
         .window_height = 1080,
         .thumbnails_in_db = true,
-        .rerank_top_k = 7,
     };
     try save(original, std.testing.io, tmp);
 
@@ -84,7 +76,6 @@ test "config: round-trip preserves all fields" {
     try std.testing.expectEqual(original.window_width, loaded.window_width);
     try std.testing.expectEqual(original.window_height, loaded.window_height);
     try std.testing.expectEqual(original.thumbnails_in_db, loaded.thumbnails_in_db);
-    try std.testing.expectEqual(original.rerank_top_k, loaded.rerank_top_k);
 }
 
 test "config: unknown keys are ignored" {

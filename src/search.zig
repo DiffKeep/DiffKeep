@@ -1,99 +1,110 @@
 const std = @import("std");
-const dvui = @import("dvui");
-const llama_mod = @import("llama.zig");
-const mtmd_mod = @import("mtmd.zig");
+const onnx_mod = @import("onnx_embedder.zig");
 const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
-const config_mod = @import("config.zig");
 
 const log = std.log.scoped(.search);
 
-const RERANK_INSTRUCTION = "Retrieve AI-generated images that visually match the user's search query.";
+// ── FTS5 sanitization ─────────────────────────────────────────────────────────
 
-// ── Rerank task ───────────────────────────────────────────────────────────────
+/// Strip FTS5 syntax characters that cause parse errors in user-supplied queries.
+/// Returns null if the result is empty (query was all operators/whitespace).
+/// Caller owns the returned slice.
+fn sanitizeFtsQuery(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.ensureTotalCapacity(allocator, raw.len);
+    for (raw) |c| {
+        buf.appendAssumeCapacity(switch (c) {
+            '(', ')', '"', '*', '^' => ' ',
+            else => c,
+        });
+    }
+    const trimmed = std.mem.trim(u8, buf.items, " \t\n\r");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
 
-const RerankTaskCtx = struct {
+// ── Query task ────────────────────────────────────────────────────────────────
+
+const QueryTaskCtx = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
-    query: []const u8,
-    image_paths: [][]u8,
-    image_ids: []u64,
+    db: *db_mod.VectorDb,
+    mode: image_grid_mod.SearchMode,
+    fts_query: ?[]u8,           // owned; freed by task
+    embedding: ?[]const f32,    // owned; freed by task
+    filter_library_id: ?u64,
+    filter_folder_path: ?[]u8,  // owned; freed by task
+    filters: []db_mod.ActiveFilter, // owned (each .value duped); freed by task
     generation: u64,
-    reranker: *?mtmd_mod.RerankContext,
-    reranker_model: []const u8,
-    reranker_mmproj: []const u8,
-    init_mutex: *std.Io.Mutex,
-    result_ids: *?[]u64,
+    current_gen: *std.atomic.Value(u64),
+    result: *?[]db_mod.VectorDb.GridEntry,
     result_gen: *u64,
     done: *std.atomic.Value(bool),
-    current_gen: *std.atomic.Value(u64),
+    wakeup_fn: ?*const fn () void,
 };
 
-fn rerankTask(ctx: RerankTaskCtx) void {
+fn runQuery(ctx: QueryTaskCtx) ![]db_mod.VectorDb.GridEntry {
+    if (ctx.embedding) |embd| {
+        return switch (ctx.mode) {
+            .semantic => try ctx.db.searchByPromptEmbedding(ctx.allocator, embd, 200),
+            .visual   => try ctx.db.searchByImageEmbedding(ctx.allocator, embd, 200),
+            .combined => try ctx.db.searchCombined(ctx.allocator, embd, 200),
+            .fts      => error.InvalidMode,
+        };
+    }
+    const has_text = if (ctx.fts_query) |q| q.len > 0 else false;
+    if (has_text or ctx.filters.len > 0) {
+        return try ctx.db.listImagesFiltered(
+            ctx.allocator,
+            ctx.filter_library_id,
+            ctx.filter_folder_path,
+            if (has_text) ctx.fts_query else null,
+            ctx.filters,
+        );
+    }
+    if (ctx.filter_folder_path) |fp| {
+        const lib_id = ctx.filter_library_id orelse return try ctx.db.listAllImages(ctx.allocator);
+        return try ctx.db.listImagesInFolder(ctx.allocator, lib_id, fp);
+    }
+    if (ctx.filter_library_id) |lib_id| return try ctx.db.listLibraryImages(ctx.allocator, lib_id);
+    return try ctx.db.listAllImages(ctx.allocator);
+}
+
+fn queryTask(ctx: QueryTaskCtx) void {
     defer {
-        ctx.allocator.free(ctx.query);
-        for (ctx.image_paths) |p| ctx.allocator.free(p);
-        ctx.allocator.free(ctx.image_paths);
-        ctx.allocator.free(ctx.image_ids);
-    }
-    log.info("rerank task start: gen={d} query=\"{s}\" n={d}", .{ ctx.generation, ctx.query, ctx.image_ids.len });
-    if (ctx.current_gen.load(.acquire) != ctx.generation) {
-        log.info("rerank task gen={d} stale, exiting", .{ctx.generation});
-        return;
-    }
-
-    ctx.init_mutex.lockUncancelable(ctx.io);
-    if (ctx.reranker.* == null) {
-        log.info("reranker init starting (gen={d})", .{ctx.generation});
-        if (mtmd_mod.RerankContext.init(ctx.io, ctx.allocator, ctx.reranker_model, ctx.reranker_mmproj)) |rr| {
-            ctx.reranker.* = rr;
-            log.info("reranker init done", .{});
-        } else |err| {
-            log.warn("reranker init: {}", .{err});
-        }
-    }
-    ctx.init_mutex.unlock(ctx.io);
-    const reranker = if (ctx.reranker.*) |*rr| rr else {
-        log.warn("reranker unavailable, aborting rerank gen={d}", .{ctx.generation});
-        return;
-    };
-
-    const ScoreEntry = struct { id: u64, score: f32 };
-    var scored: std.ArrayList(ScoreEntry) = .empty;
-    defer scored.deinit(ctx.allocator);
-
-    for (ctx.image_paths, ctx.image_ids) |path, id| {
-        if (ctx.current_gen.load(.acquire) != ctx.generation) return;
-        const score = reranker.scoreImageFile(ctx.io, ctx.allocator, ctx.query, RERANK_INSTRUCTION, path) catch 0.0;
-        scored.append(ctx.allocator, .{ .id = id, .score = score }) catch break;
+        if (ctx.fts_query) |q| ctx.allocator.free(q);
+        if (ctx.embedding) |e| ctx.allocator.free(e);
+        if (ctx.filter_folder_path) |p| ctx.allocator.free(p);
+        for (ctx.filters) |f| ctx.allocator.free(f.value);
+        ctx.allocator.free(ctx.filters);
     }
     if (ctx.current_gen.load(.acquire) != ctx.generation) return;
 
-    std.sort.pdq(ScoreEntry, scored.items, {}, struct {
-        fn lt(_: void, a: ScoreEntry, b: ScoreEntry) bool { return a.score > b.score; }
-    }.lt);
-
-    const ids = ctx.allocator.alloc(u64, scored.items.len) catch return;
-    for (scored.items, 0..) |s, i| ids[i] = s.id;
-
-    log.info("rerank task done: gen={d} ranked {d} images", .{ ctx.generation, ids.len });
-    ctx.result_ids.* = ids;
+    if (runQuery(ctx)) |entries| {
+        if (ctx.current_gen.load(.acquire) != ctx.generation) {
+            for (entries) |e| ctx.allocator.free(e.path);
+            ctx.allocator.free(entries);
+            return;
+        }
+        ctx.result.* = entries;
+    } else |err| {
+        log.warn("queryTask gen={d} failed: {}", .{ ctx.generation, err });
+        ctx.result.* = null;
+    }
     ctx.result_gen.* = ctx.generation;
     ctx.done.store(true, .release);
+    if (ctx.wakeup_fn) |w| w();
 }
 
 // ── Embed task ────────────────────────────────────────────────────────────────
 
 const EmbedTaskCtx = struct {
-    io: std.Io,
     allocator: std.mem.Allocator,
     query: []const u8,        // owned; freed by task
     mode: image_grid_mod.SearchMode,
-    model_path: []const u8,   // borrowed from config
-    mmproj_path: []const u8,  // borrowed from config; used for visual VlContext init
-    text_pool: *?llama_mod.Pool,
-    vl_ctx: *?mtmd_mod.VlContext,
-    init_mutex: *std.Io.Mutex,
+    embedder: *onnx_mod.OnnxEmbedder,
     generation: u64,
     current_gen: *std.atomic.Value(u64),
     result: *?[]const f32,
@@ -110,87 +121,20 @@ fn embedTask(ctx: EmbedTaskCtx) void {
         return;
     }
 
-    const q_text = std.fmt.allocPrint(ctx.allocator, "search_query: {s}", .{ctx.query}) catch return;
-    defer ctx.allocator.free(q_text);
-
     var embedding: ?[]const f32 = null;
     switch (ctx.mode) {
         .fts => {},
-        .semantic, .combined => embed: {
-            ctx.init_mutex.lockUncancelable(ctx.io);
-            if (ctx.text_pool.* == null) {
-                log.info("text pool init starting (gen={d})", .{ctx.generation});
-                ctx.text_pool.* = llama_mod.Pool.init(ctx.allocator, .{
-                    .embeddings   = true,
-                    .pooling_type = 1,
-                    .n_ctx        = 2048,
-                    .n_batch      = 512,
-                    .n_ubatch     = 512,
-                    .n_gpu_layers = 999,
-                });
-                log.info("text pool init done", .{});
-            }
-            ctx.init_mutex.unlock(ctx.io);
-            const tp = if (ctx.text_pool.*) |*p| p else break :embed;
-            log.info("loading text model (gen={d})", .{ctx.generation});
-            const tc = tp.get(ctx.io, ctx.model_path, 60_000, null) catch |err| {
-                log.warn("text pool.get failed: {}", .{err});
-                break :embed;
+        .semantic, .combined => {
+            embedding = ctx.embedder.embedPrompt(ctx.allocator, ctx.query) catch |err| blk: {
+                log.warn("embedPrompt failed: {}", .{err});
+                break :blk null;
             };
-            defer tp.release(tc);
-            if (ctx.current_gen.load(.acquire) != ctx.generation) {
-                log.info("embed task gen={d} stale after model load", .{ctx.generation});
-                break :embed;
-            }
-            log.info("creating text embedding (gen={d})", .{ctx.generation});
-            var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, q_text, 2048) catch |err| {
-                log.warn("createEmbeddingFromPrompt failed: {}", .{err});
-                break :embed;
-            };
-            defer {
-                for (chunks.items) |e| ctx.allocator.free(e);
-                chunks.deinit(ctx.allocator);
-            }
-            if (chunks.items.len > 0) embedding = chunks.orderedRemove(0);
-            log.info("text embedding done: dim={d}", .{if (embedding) |e| e.len else 0});
         },
-        .visual => embed: {
-            ctx.init_mutex.lockUncancelable(ctx.io);
-            if (ctx.vl_ctx.* == null) {
-                log.info("vl_ctx init starting (gen={d})", .{ctx.generation});
-                if (mtmd_mod.VlContext.init(ctx.io, ctx.allocator, ctx.model_path, ctx.mmproj_path)) |vc| {
-                    ctx.vl_ctx.* = vc;
-                    log.info("vl_ctx init done", .{});
-                } else |err| {
-                    log.warn("vl_ctx init: {}", .{err});
-                }
-            }
-            ctx.init_mutex.unlock(ctx.io);
-            const vc = if (ctx.vl_ctx.*) |*v| v else {
-                log.warn("vl_ctx unavailable, aborting embed gen={d}", .{ctx.generation});
-                break :embed;
+        .visual => {
+            embedding = ctx.embedder.embedQueryForVisual(ctx.allocator, ctx.query) catch |err| blk: {
+                log.warn("embedQueryForVisual failed: {}", .{err});
+                break :blk null;
             };
-            log.info("loading vl model context (gen={d})", .{ctx.generation});
-            const tc = vc.pool.get(ctx.io, ctx.model_path, 60_000, null) catch |err| {
-                log.warn("vl pool.get failed: {}", .{err});
-                break :embed;
-            };
-            defer vc.pool.release(tc);
-            if (ctx.current_gen.load(.acquire) != ctx.generation) {
-                log.info("embed task gen={d} stale after vl model load", .{ctx.generation});
-                break :embed;
-            }
-            log.info("creating visual text embedding (gen={d})", .{ctx.generation});
-            var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, q_text, 2048) catch |err| {
-                log.warn("visual createEmbeddingFromPrompt failed: {}", .{err});
-                break :embed;
-            };
-            defer {
-                for (chunks.items) |e| ctx.allocator.free(e);
-                chunks.deinit(ctx.allocator);
-            }
-            if (chunks.items.len > 0) embedding = chunks.orderedRemove(0);
-            log.info("visual embedding done: dim={d}", .{if (embedding) |e| e.len else 0});
         },
     }
 
@@ -215,15 +159,8 @@ pub const SearchState = struct {
     // Only changes to buf (vs last_buf) reset the debounce deadline.
     last_buf: [256]u8 = std.mem.zeroes([256]u8),
     mode: image_grid_mod.SearchMode = .combined,
-    text_pool: ?llama_mod.Pool = null,
-    vl_ctx: ?mtmd_mod.VlContext = null,
+    embedder: ?*onnx_mod.OnnxEmbedder = null,
     query_embedding: ?[]const f32 = null,
-    reranker: ?mtmd_mod.RerankContext = null,
-    rerank_group: std.Io.Group = .init,
-    rerank_done: std.atomic.Value(bool) = .init(false),
-    rerank_result_ids: ?[]u64 = null,
-    rerank_result_gen: u64 = 0,
-    generation: std.atomic.Value(u64) = .init(0),
 
     // Debounce: fire search 300 ms after the last keystroke.
     // Set to 1 to fire on the very next frame (used by mode-button clicks).
@@ -231,28 +168,36 @@ pub const SearchState = struct {
     // Set by mode-button clicks to bypass the debounce timer entirely.
     force_search: bool = false,
 
-    // Async query embedding
+    // Async embedding generation
     embed_group: std.Io.Group = .init,
     embed_done: std.atomic.Value(bool) = .init(false),
     embed_generation: std.atomic.Value(u64) = .init(0),
     embed_in_flight: usize = 0,  // tasks spawned since last full drain
+    embed_pending: bool = false,  // true while an embed task is in flight
     pending_embedding: ?[]const f32 = null,
     pending_embedding_gen: u64 = 0,
     wakeup_fn: ?*const fn () void = null,
-    embed_init_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    rerank_init_mutex: std.Io.Mutex = std.Io.Mutex.init,
+
+    // Async DB query (runs after embed for vector modes, immediately for FTS)
+    query_group: std.Io.Group = .init,
+    query_done: std.atomic.Value(bool) = .init(false),
+    query_result: ?[]db_mod.VectorDb.GridEntry = null,
+    query_result_gen: u64 = 0,
+    query_generation: std.atomic.Value(u64) = .init(0),
+    query_in_flight: usize = 0,
+    query_pending: bool = false,  // true while a query task is in flight
 
     pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
-        if (self.reranker) |*rr| rr.deinit();
-        if (self.vl_ctx) |*vc| vc.deinit();
-        if (self.text_pool) |*tp| tp.deinit();
         if (self.query_embedding) |emb| gpa.free(emb);
-        if (self.rerank_result_ids) |ids| gpa.free(ids);
         if (self.pending_embedding) |emb| gpa.free(emb);
+        if (self.query_result) |r| {
+            for (r) |e| gpa.free(e.path);
+            gpa.free(r);
+        }
     }
 
-    pub fn awaitRerank(self: *SearchState, io: std.Io) void {
-        self.rerank_group.await(io) catch {};
+    pub fn isSearchLoading(self: *const SearchState) bool {
+        return self.embed_pending or self.query_pending;
     }
 
     pub fn awaitEmbed(self: *SearchState, io: std.Io) void {
@@ -264,61 +209,25 @@ pub const SearchState = struct {
         }
     }
 
-    pub fn applyResultsIfDone(self: *SearchState, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
-        if (!self.rerank_done.load(.acquire)) return;
-        self.rerank_done.store(false, .release);
-        self.applyRerankResults(allocator, grid);
-    }
-
-    fn applyRerankResults(self: *SearchState, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
-        const ids = self.rerank_result_ids orelse return;
-        defer {
-            allocator.free(ids);
-            self.rerank_result_ids = null;
-        }
-        if (self.rerank_result_gen != self.generation.load(.acquire)) return;
-
-        var pos_map = std.AutoHashMap(u64, usize).init(allocator);
-        defer pos_map.deinit();
-        for (grid.images.items, 0..) |entry, i| {
-            pos_map.put(entry.id, i) catch {};
-        }
-
-        var reordered: std.ArrayList(image_grid_mod.ImageEntry) = .empty;
-        defer reordered.deinit(allocator);
-        reordered.ensureTotalCapacity(allocator, grid.images.items.len) catch return;
-        var seen = std.AutoHashMap(u64, void).init(allocator);
-        defer seen.deinit();
-
-        for (ids) |id| {
-            if (pos_map.get(id)) |pos| {
-                reordered.append(allocator, grid.images.items[pos]) catch {};
-                seen.put(id, {}) catch {};
-            }
-        }
-        for (grid.images.items) |entry| {
-            if (!seen.contains(entry.id)) {
-                reordered.append(allocator, entry) catch {};
-            }
-        }
-        if (reordered.items.len == grid.images.items.len) {
-            @memcpy(grid.images.items, reordered.items);
-            grid.focused_idx = null;
-            grid.selection.clearRetainingCapacity();
+    pub fn awaitQuery(self: *SearchState, io: std.Io) void {
+        while (self.query_in_flight > 0) {
+            self.query_group.await(io) catch {};
+            self.query_in_flight -= 1;
         }
     }
 
     /// Called from the main thread every frame; applies a completed query
-    /// embedding to the grid and triggers a reload + optional rerank.
+    /// embedding to the grid and spawns the DB query task.
     pub fn applyEmbedIfDone(
         self: *SearchState,
         allocator: std.mem.Allocator,
+        io: std.Io,
         grid: *image_grid_mod.GridState,
         db: *db_mod.VectorDb,
-        cfg: *const config_mod.Config,
     ) void {
         if (!self.embed_done.load(.acquire)) return;
         self.embed_done.store(false, .release);
+        self.embed_pending = false;
         log.info("applyEmbedIfDone: pending_gen={d} current_gen={d}", .{ self.pending_embedding_gen, self.embed_generation.load(.acquire) });
 
         if (self.query_embedding) |old| allocator.free(old);
@@ -333,83 +242,110 @@ pub const SearchState = struct {
             self.pending_embedding = null;
         }
 
-        log.info("applyEmbedIfDone: reloading grid, embedding={s}", .{if (self.query_embedding != null) "present" else "null"});
+        log.info("applyEmbedIfDone: spawning query task, embedding={s}", .{if (self.query_embedding != null) "present" else "null"});
         grid.query_embedding = self.query_embedding;
-        grid.reloadImages(db) catch |err| {
-            log.warn("reloadImages failed: {}", .{err});
+        self.spawnQueryTask(io, allocator, db, grid) catch |err| {
+            log.warn("applyEmbedIfDone: spawnQueryTask failed: {}", .{err});
         };
-
-        const q = std.mem.sliceTo(&self.buf, 0);
-        if (q.len > 0) self.maybeSpawnRerank(grid, q, cfg);
     }
 
-    pub fn maybeSpawnRerank(self: *SearchState, grid: *image_grid_mod.GridState, query: []const u8, cfg: *const config_mod.Config) void {
-        const init = dvui.App.main_init orelse return;
-        const reranker_model = cfg.reranker_model_path orelse {
-            log.info("maybeSpawnRerank: no reranker_model_path, skipping", .{});
-            return;
-        };
-        const reranker_mmproj = cfg.reranker_mmproj_path orelse {
-            log.info("maybeSpawnRerank: no reranker_mmproj_path, skipping", .{});
-            return;
-        };
-        if (self.mode == .fts) return;
-        if (grid.images.items.len == 0) {
-            log.info("maybeSpawnRerank: grid empty, skipping", .{});
-            return;
-        }
-        log.info("maybeSpawnRerank: spawning rerank gen query=\"{s}\" n={d}", .{ query, grid.images.items.len });
+    /// Spawn a background task that runs the DB search query.
+    /// Snapshots all parameters from `grid`; keeps the old results visible
+    /// until applyQueryIfDone() swaps them in.
+    pub fn spawnQueryTask(
+        self: *SearchState,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        db: *db_mod.VectorDb,
+        grid: *const image_grid_mod.GridState,
+    ) !void {
+        const fts_query: ?[]u8 = if (grid.search_query) |q| blk: {
+            break :blk try sanitizeFtsQuery(allocator, q) orelse null;
+        } else null;
+        errdefer if (fts_query) |q| allocator.free(q);
 
-        const gen = self.generation.fetchAdd(1, .acq_rel) + 1;
-        self.rerank_done.store(false, .release);
-        if (self.rerank_result_ids) |ids| { init.gpa.free(ids); self.rerank_result_ids = null; }
+        const folder_path: ?[]u8 = if (grid.filter_folder_path) |p|
+            try allocator.dupe(u8, p)
+        else null;
+        errdefer if (folder_path) |p| allocator.free(p);
 
-        const top_k = @min(grid.images.items.len, cfg.rerank_top_k);
-        var image_paths = init.gpa.alloc([]u8, top_k) catch return;
-        const image_ids = init.gpa.alloc(u64, top_k) catch { init.gpa.free(image_paths); return; };
+        const filters_copy = try allocator.alloc(db_mod.ActiveFilter, grid.filters.len);
+        errdefer allocator.free(filters_copy);
         var n: usize = 0;
-        for (grid.images.items[0..top_k]) |entry| {
-            image_paths[n] = init.gpa.dupe(u8, entry.path) catch break;
-            image_ids[n] = entry.id;
+        errdefer for (filters_copy[0..n]) |f| allocator.free(f.value);
+        for (grid.filters) |f| {
+            filters_copy[n] = .{ .column = f.column, .value = try allocator.dupe(u8, f.value) };
             n += 1;
         }
-        if (n < top_k) {
-            for (image_paths[0..n]) |p| init.gpa.free(p);
-            init.gpa.free(image_paths);
-            init.gpa.free(image_ids);
+
+        const embedding: ?[]const f32 = if (grid.query_embedding) |e| blk: {
+            const copy = try allocator.alloc(f32, e.len);
+            @memcpy(copy, e);
+            break :blk copy;
+        } else null;
+        errdefer if (embedding) |e| allocator.free(e);
+
+        const gen = self.query_generation.fetchAdd(1, .acq_rel) + 1;
+        self.query_done.store(false, .release);
+        if (self.query_result) |r| {
+            for (r) |e| allocator.free(e.path);
+            allocator.free(r);
+            self.query_result = null;
+        }
+        self.query_pending = true;
+
+        const ctx = QueryTaskCtx{
+            .io = io,
+            .allocator = allocator,
+            .db = db,
+            .mode = grid.search_mode,
+            .fts_query = fts_query,
+            .embedding = embedding,
+            .filter_library_id = grid.filter_library_id,
+            .filter_folder_path = folder_path,
+            .filters = filters_copy,
+            .generation = gen,
+            .current_gen = &self.query_generation,
+            .result = &self.query_result,
+            .result_gen = &self.query_result_gen,
+            .done = &self.query_done,
+            .wakeup_fn = self.wakeup_fn,
+        };
+        try self.query_group.concurrent(io, queryTask, .{ctx});
+        self.query_in_flight += 1;
+        log.info("query task spawned: gen={d} mode={s} fts={s} embed={s}", .{
+            gen, @tagName(grid.search_mode),
+            if (fts_query != null) "yes" else "no",
+            if (embedding != null) "yes" else "no",
+        });
+    }
+
+    /// Apply a completed background query result to the grid.
+    pub fn applyQueryIfDone(
+        self: *SearchState,
+        allocator: std.mem.Allocator,
+        grid: *image_grid_mod.GridState,
+    ) void {
+        if (!self.query_done.load(.acquire)) return;
+        self.query_done.store(false, .release);
+        self.query_pending = false;
+
+        const result = self.query_result;
+        self.query_result = null;
+
+        if (self.query_result_gen != self.query_generation.load(.acquire)) {
+            if (result) |r| {
+                for (r) |e| allocator.free(e.path);
+                allocator.free(r);
+            }
             return;
         }
 
-        const query_copy = init.gpa.dupe(u8, query) catch {
-            for (image_paths) |p| init.gpa.free(p);
-            init.gpa.free(image_paths);
-            init.gpa.free(image_ids);
-            return;
-        };
-
-        const ctx = RerankTaskCtx{
-            .io = init.io,
-            .allocator = init.gpa,
-            .query = query_copy,
-            .image_paths = image_paths,
-            .image_ids = image_ids,
-            .generation = gen,
-            .reranker = &self.reranker,
-            .reranker_model = reranker_model,
-            .reranker_mmproj = reranker_mmproj,
-            .init_mutex = &self.rerank_init_mutex,
-            .result_ids = &self.rerank_result_ids,
-            .result_gen = &self.rerank_result_gen,
-            .done = &self.rerank_done,
-            .current_gen = &self.generation,
-        };
-        self.rerank_group.concurrent(init.io, rerankTask, .{ctx}) catch |err| {
-            log.warn("spawn rerank task: {}", .{err});
-            init.gpa.free(query_copy);
-            for (image_paths) |p| init.gpa.free(p);
-            init.gpa.free(image_paths);
-            init.gpa.free(image_ids);
-        };
+        if (result) |r| {
+            grid.applySearchResults(r);
+            allocator.free(r);
+        }
+        // null result = query failed; keep stale grid intact.
     }
 
     /// Spawn a background task to compute a query embedding.
@@ -420,18 +356,16 @@ pub const SearchState = struct {
         allocator: std.mem.Allocator,
         query: []const u8,
         mode: image_grid_mod.SearchMode,
-        cfg: *const config_mod.Config,
     ) !void {
         if (mode == .fts) return;
-        const model_path = cfg.embedding_model_path orelse {
-            log.warn("spawnEmbedQuery: no embedding_model_path configured", .{});
-            return error.NoModelPath;
+        const embedder = self.embedder orelse {
+            log.warn("spawnEmbedQuery: no embedder configured", .{});
+            return error.NoEmbedder;
         };
-        const mmproj_path = cfg.embedding_mmproj_path orelse "";
-        log.info("spawnEmbedQuery: mode={s} query=\"{s}\" model={s}", .{ @tagName(mode), query, model_path });
 
         const gen = self.embed_generation.fetchAdd(1, .acq_rel) + 1;
         self.embed_done.store(false, .release);
+        self.embed_pending = true;
         if (self.pending_embedding) |e| {
             allocator.free(e);
             self.pending_embedding = null;
@@ -441,15 +375,10 @@ pub const SearchState = struct {
         errdefer allocator.free(query_copy);
 
         const task_ctx = EmbedTaskCtx{
-            .io = io,
             .allocator = allocator,
             .query = query_copy,
             .mode = mode,
-            .model_path = model_path,
-            .mmproj_path = mmproj_path,
-            .text_pool = &self.text_pool,
-            .vl_ctx = &self.vl_ctx,
-            .init_mutex = &self.embed_init_mutex,
+            .embedder = embedder,
             .generation = gen,
             .current_gen = &self.embed_generation,
             .result = &self.pending_embedding,

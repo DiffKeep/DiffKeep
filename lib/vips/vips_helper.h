@@ -26,6 +26,16 @@ int diffkeep_load_image_rgba(
     int *height
 );
 
+/* Load image, center-crop to square, resize to size×size.
+   Returns packed RGB uint8 (HWC, 3 bytes/pixel) of exactly size*size*3 bytes.
+   Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
+int diffkeep_image_to_rgb_square(
+    const char *filename,
+    int size,
+    void **buf,
+    size_t *len
+);
+
 /* Decode JPEG bytes to packed RGBA8, scaled to fit within `size` x `size` pixels.
    Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
 int diffkeep_jpeg_bytes_to_rgba(

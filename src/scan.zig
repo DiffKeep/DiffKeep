@@ -4,8 +4,7 @@ const png_mod = @import("image/png-data.zig");
 const comfy_mod = @import("parse/comfy.zig");
 const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
-const llama_mod = @import("llama.zig");
-const mtmd_mod = @import("mtmd.zig");
+const onnx_mod = @import("onnx_embedder.zig");
 const log = std.log.scoped(.scan);
 
 /// Join a slice of lora names into a single newline-separated string.
@@ -45,9 +44,7 @@ pub const ScanCtx = struct {
     image_embeddings: bool,
     precomputed_mtime: i64,
     notifier: ?*notifier_mod.ImageNotifier,
-    text_pool: ?*llama_mod.Pool = null,
-    text_model_path: ?[]const u8 = null,
-    vl_ctx: ?*mtmd_mod.VlContext = null,
+    embedder: ?*onnx_mod.OnnxEmbedder = null,
     has_prompt_embedding: bool = false,
     has_image_embedding: bool = false,
 };
@@ -71,9 +68,7 @@ pub const LibraryScanner = struct {
     allocator: std.mem.Allocator,
     db: *db_mod.VectorDb,
     notifier: ?*notifier_mod.ImageNotifier,
-    text_pool: ?*llama_mod.Pool = null,           // borrowed, not owned
-    text_model_path: ?[]const u8 = null,          // borrowed, not owned
-    vl_ctx: ?*mtmd_mod.VlContext = null,           // borrowed, not owned
+    embedder: ?*onnx_mod.OnnxEmbedder = null,  // borrowed, not owned
 
     pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb, notifier: ?*notifier_mod.ImageNotifier) LibraryScanner {
         // c_allocator (glibc malloc) is used throughout because processFile tasks
@@ -115,9 +110,7 @@ pub const LibraryScanner = struct {
             .image_embeddings = image_embeddings,
             .precomputed_mtime = mtime,
             .notifier = self.notifier,
-            .text_pool = self.text_pool,
-            .text_model_path = self.text_model_path,
-            .vl_ctx = self.vl_ctx,
+            .embedder = self.embedder,
         });
     }
 
@@ -144,10 +137,7 @@ pub const LibraryScanner = struct {
             known.deinit();
         }
 
-        // With embeddings, GPU inference serializes through Pool.get() anyway;
-        // extra concurrent tasks just spin-poll for the lock with no throughput gain.
-        const max_concurrent: usize = if (prompt_embeddings or image_embeddings) 1
-                                      else (std.Thread.getCpuCount() catch 4);
+        const max_concurrent: usize = 1;
         var group: std.Io.Group = .init;
         var in_flight: usize = 0;
         try self.walkDirectory(
@@ -274,9 +264,7 @@ pub const LibraryScanner = struct {
                 .image_embeddings = image_embeddings,
                 .precomputed_mtime = current_mtime,
                 .notifier = self.notifier,
-                .text_pool = self.text_pool,
-                .text_model_path = self.text_model_path,
-                .vl_ctx = self.vl_ctx,
+                .embedder = self.embedder,
                 .has_prompt_embedding = if (meta_ptr) |m| m.has_prompt_embedding else false,
                 .has_image_embedding = if (meta_ptr) |m| m.has_image_embedding else false,
             }}) catch |err| {
@@ -323,31 +311,25 @@ pub fn processFile(ctx: ScanCtx) void {
             }
             embed_prompt_backfill: {
                 if (!ctx.prompt_embeddings or ctx.has_prompt_embedding) break :embed_prompt_backfill;
-                const tp = ctx.text_pool orelse break :embed_prompt_backfill;
-                const model_path = ctx.text_model_path orelse break :embed_prompt_backfill;
+                const emb = ctx.embedder orelse break :embed_prompt_backfill;
                 const prompt = image.positivePromptText orelse break :embed_prompt_backfill;
                 if (ctx.stop.load(.acquire)) break :embed_prompt_backfill;
-                const tc = tp.get(ctx.io, model_path, 30_000, ctx.stop) catch break :embed_prompt_backfill;
-                defer tp.release(tc);
-                var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, prompt, 2048) catch break :embed_prompt_backfill;
-                defer {
-                    for (chunks.items) |e| ctx.allocator.free(e);
-                    chunks.deinit(ctx.allocator);
-                }
-                if (chunks.items.len > 0) {
-                    ctx.db.storePromptEmbedding(image.id, chunks.items[0]) catch |err| {
-                        log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-                    };
-                }
+                const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt_backfill;
+                defer ctx.allocator.free(vec);
+                ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
+                    log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+                };
                 did_work = true;
             }
             embed_image_backfill: {
                 if (!ctx.image_embeddings or ctx.has_image_embedding) break :embed_image_backfill;
                 if (ctx.stop.load(.acquire)) break :embed_image_backfill;
-                const vc = ctx.vl_ctx orelse break :embed_image_backfill;
-                const embd = vc.embedImageFile(ctx.io, ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image_backfill;
-                defer ctx.allocator.free(embd);
-                ctx.db.storeImageEmbedding(image.id, embd) catch |err| {
+                const emb = ctx.embedder orelse break :embed_image_backfill;
+                const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image_backfill;
+                defer ctx.allocator.free(path_z);
+                const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image_backfill;
+                defer ctx.allocator.free(vec);
+                ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
                     log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
                 };
                 did_work = true;
@@ -505,31 +487,25 @@ pub fn processFile(ctx: ScanCtx) void {
 
     embed_prompt: {
         if (!ctx.prompt_embeddings) break :embed_prompt;
-        const tp = ctx.text_pool orelse break :embed_prompt;
-        const model_path = ctx.text_model_path orelse break :embed_prompt;
+        const emb = ctx.embedder orelse break :embed_prompt;
         const prompt = image.positivePromptText orelse break :embed_prompt;
         if (ctx.stop.load(.acquire)) break :embed_prompt;
-        const tc = tp.get(ctx.io, model_path, 30_000, ctx.stop) catch break :embed_prompt;
-        defer tp.release(tc);
-        var chunks = llama_mod.createEmbeddingFromPrompt(ctx.allocator, tc, prompt, 2048) catch break :embed_prompt;
-        defer {
-            for (chunks.items) |e| ctx.allocator.free(e);
-            chunks.deinit(ctx.allocator);
-        }
-        if (chunks.items.len > 0) {
-            ctx.db.storePromptEmbedding(image.id, chunks.items[0]) catch |err| {
-                log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-            };
-        }
+        const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt;
+        defer ctx.allocator.free(vec);
+        ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
+            log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        };
     }
 
     embed_image: {
         if (!ctx.image_embeddings) break :embed_image;
         if (ctx.stop.load(.acquire)) break :embed_image;
-        const vc = ctx.vl_ctx orelse break :embed_image;
-        const embd = vc.embedImageFile(ctx.io, ctx.allocator, ctx.path, "", ctx.stop) catch break :embed_image;
-        defer ctx.allocator.free(embd);
-        ctx.db.storeImageEmbedding(image.id, embd) catch |err| {
+        const emb = ctx.embedder orelse break :embed_image;
+        const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image;
+        defer ctx.allocator.free(path_z);
+        const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image;
+        defer ctx.allocator.free(vec);
+        ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
             log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
         };
     }

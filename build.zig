@@ -142,11 +142,11 @@ pub fn build(b: *std.Build) !void {
     vips_module.addIncludePath(b.path("lib/vips"));
 
     exe.root_module.linkLibrary(vips_helper_lib);
+    exe.root_module.addIncludePath(b.path("lib/vips"));
     exe.root_module.addImport("vips", vips_module);
 
-    // *** llama ***
-    try addLlama(b, exe);
-    try addMtmd(b, exe);
+    // *** ONNX Runtime (embeddings) ***
+    try addOnnxRuntime(b, exe);
 
     // *** Dev/research tools (not part of the GUI, useful for data pipeline work) ***
 
@@ -235,6 +235,60 @@ pub fn build(b: *std.Build) !void {
     const cross_modal_step = b.step("test_cross_modal", "Test text→image cross-modal search quality");
     cross_modal_step.dependOn(&run_cross_modal.step);
 
+    const onnx_search_exe = b.addExecutable(.{
+        .name = "test_onnx_search",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_onnx_search.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    try addOnnxRuntime(b, onnx_search_exe);
+    onnx_search_exe.root_module.linkLibrary(vips_helper_lib);
+    onnx_search_exe.root_module.addIncludePath(b.path("lib/vips"));
+    onnx_search_exe.root_module.linkSystemLibrary("vips", .{});
+    b.installArtifact(onnx_search_exe);
+    const run_onnx_search = b.addRunArtifact(onnx_search_exe);
+    run_onnx_search.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_onnx_search.addArgs(args);
+    const onnx_search_step = b.step("test_onnx_search", "Test ONNX Runtime + SigLIP2 search quality");
+    onnx_search_step.dependOn(&run_onnx_search.step);
+
+    const text_search_exe = b.addExecutable(.{
+        .name = "test_text_search",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_text_search.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    try addLlama(b, text_search_exe);
+    b.installArtifact(text_search_exe);
+    const run_text_search = b.addRunArtifact(text_search_exe);
+    run_text_search.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_text_search.addArgs(args);
+    const text_search_step = b.step("test_text_search", "Test text retrieval quality across embedding models");
+    text_search_step.dependOn(&run_text_search.step);
+
+    const onnx_text_search_exe = b.addExecutable(.{
+        .name = "test_onnx_text_search",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_onnx_text_search.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    try addOnnxRuntime(b, onnx_text_search_exe);
+    b.installArtifact(onnx_text_search_exe);
+    const run_onnx_text_search = b.addRunArtifact(onnx_text_search_exe);
+    run_onnx_text_search.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_onnx_text_search.addArgs(args);
+    const onnx_text_search_step = b.step("test_onnx_text_search", "Test ONNX text retrieval: nomic vs snowflake");
+    onnx_text_search_step.dependOn(&run_onnx_text_search.step);
+
     const exe_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test.zig"),
@@ -264,6 +318,7 @@ pub fn build(b: *std.Build) !void {
     diffkeep_test_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
     diffkeep_test_module.addImport("sqlite", sqlite_module_zig);
     diffkeep_test_module.addImport("vips", vips_module);
+    diffkeep_test_module.addIncludePath(b.path("lib/vips"));
 
     const integration_module = b.createModule(.{
         .target = target,
@@ -284,10 +339,9 @@ pub fn build(b: *std.Build) !void {
     integration_tests.root_module.linkLibrary(vips_helper_lib);
     integration_tests.root_module.addIncludePath(b.path("lib/vips"));
     integration_tests.root_module.linkSystemLibrary("vips", .{});
-    // llama_cpp import goes to diffkeep_test_module (where llama.zig lives);
+    // onnxruntime import goes to diffkeep_test_module (where onnx_embedder.zig lives);
     // library linkage goes to integration_tests.root_module.
-    try addLlamaEx(b, integration_tests, diffkeep_test_module);
-    try addMtmd(b, integration_tests);
+    try addOnnxRuntimeEx(b, integration_tests, diffkeep_test_module);
 
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }
@@ -391,6 +445,45 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
         .root_source_file = b.path("src/mtmd.zig"),
     });
     exe.root_module.addImport("mtmd", mtmd_zig);
+}
+
+fn addOnnxRuntime(b: *std.Build, exe: anytype) !void {
+    try addOnnxRuntimeEx(b, exe, exe.root_module);
+}
+
+fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void {
+    const target = exe.root_module.resolved_target.?;
+
+    const dep_name = switch (target.result.os.tag) {
+        .linux => "onnxruntime_linux",
+        else => return error.OnnxRuntimeUnsupportedPlatform,
+    };
+    const dep = b.lazyDependency(dep_name, .{}) orelse return;
+    const bin_path = dep.path(".");
+
+    const ort_c = b.addTranslateC(.{
+        .root_source_file = bin_path.path(b, "include/onnxruntime_c_api.h"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    ort_c.addIncludePath(bin_path.path(b, "include"));
+
+    // Library linkage on the exe; import goes to import_mod (may differ for integration tests).
+    exe.root_module.addLibraryPath(bin_path.path(b, "lib"));
+    exe.root_module.linkSystemLibrary("onnxruntime", .{});
+    import_mod.addImport("onnxruntime_c", ort_c.createModule());
+
+    // Install shared libraries alongside the binary
+    for ([_][]const u8{
+        "libonnxruntime.so",
+        "libonnxruntime.so.1",
+        "libonnxruntime.so.1.26.0",
+        "libonnxruntime_providers_shared.so",
+    }) |lib| {
+        const step = b.addInstallBinFile(bin_path.path(b, b.fmt("lib/{s}", .{lib})), lib);
+        b.getInstallStep().dependOn(&step.step);
+    }
 }
 
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {

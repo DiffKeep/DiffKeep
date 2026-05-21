@@ -3,8 +3,7 @@ const db_mod = @import("db.zig");
 const scan_mod = @import("scan.zig");
 const notifier_mod = @import("notifier.zig");
 const fs_watch_mod = @import("fs_watch.zig");
-const llama_mod = @import("llama.zig");
-const mtmd_mod = @import("mtmd.zig");
+const onnx_mod = @import("onnx_embedder.zig");
 const log = std.log.scoped(.library_manager);
 
 const ScanRequest = struct {
@@ -35,11 +34,7 @@ pub const LibraryManager = struct {
     reload_requested: std.atomic.Value(bool) = .init(false),
     /// Separate io group for single-file processing tasks spawned by the watcher.
     file_group: std.Io.Group,
-    text_pool: ?llama_mod.Pool = null,
-    embedding_model_path: ?[]const u8 = null,   // borrowed from config, not owned
-    embedding_mmproj_path: ?[]const u8 = null,  // borrowed from config, not owned
-    vl_ctx: ?mtmd_mod.VlContext = null,
-    vl_ctx_initialized: std.atomic.Value(bool) = .init(false),
+    embedder: ?*onnx_mod.OnnxEmbedder = null,  // borrowed from dk.g_embedder, not owned
 
     pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool, notifier: ?*notifier_mod.ImageNotifier, watcher: ?*fs_watch_mod.FsWatcher) LibraryManager {
         return .{
@@ -66,8 +61,6 @@ pub const LibraryManager = struct {
         self.stop_scan.store(true, .release);
         self.scan_group.await(io) catch {};
         self.file_group.await(io) catch {};
-        if (self.vl_ctx) |*vc| vc.deinit();
-        if (self.text_pool) |*tp| tp.deinit();
         self.queue_mutex.lockUncancelable(io);
         for (self.pending.items) |req| self.allocator.free(req.library_path);
         self.pending.deinit(self.allocator);
@@ -198,9 +191,7 @@ fn processFileEventTask(ctx: FileEventCtx) void {
     defer file_db.deinit();
     var scanner = scan_mod.LibraryScanner.init(ctx.manager.allocator, &file_db, ctx.manager.notifier);
     defer scanner.deinit();
-    scanner.text_pool = if (ctx.manager.text_pool) |*tp| tp else null;
-    scanner.text_model_path = ctx.manager.embedding_model_path;
-    scanner.vl_ctx = if (ctx.manager.vl_ctx) |*vc| vc else null;
+    scanner.embedder = ctx.manager.embedder;
     scanner.processSingleFile(
         ctx.io,
         ctx.library_id,
@@ -215,31 +206,6 @@ fn processFileEventTask(ctx: FileEventCtx) void {
 }
 
 fn drainQueue(manager: *LibraryManager, io: std.Io) void {
-    // Lazily init text pool for prompt embeddings
-    if (manager.prompt_embeddings and manager.embedding_model_path != null and manager.text_pool == null) {
-        manager.text_pool = llama_mod.Pool.init(manager.allocator, .{
-            .embeddings   = true,
-            .pooling_type = 1,
-            .n_ctx        = 2048,
-            .n_batch      = 512,
-            .n_ubatch     = 512,
-            .n_gpu_layers = 999,
-        });
-    }
-    // Lazily init VlContext for image embeddings
-    if (manager.image_embeddings and !manager.vl_ctx_initialized.load(.acquire)) {
-        if (manager.embedding_model_path) |mp| {
-            if (manager.embedding_mmproj_path) |mmp| {
-                if (manager.vl_ctx) |*old| old.deinit();
-                manager.vl_ctx = mtmd_mod.VlContext.init(io, manager.allocator, mp, mmp) catch |err| blk: {
-                    log.warn("VlContext init failed: {}", .{err});
-                    break :blk null;
-                };
-                manager.vl_ctx_initialized.store(true, .release);
-            }
-        }
-    }
-
     while (true) {
         manager.queue_mutex.lockUncancelable(io);
         const maybe_req: ?ScanRequest = if (manager.pending.items.len > 0)
@@ -264,9 +230,7 @@ fn drainQueue(manager: *LibraryManager, io: std.Io) void {
         defer scan_db.deinit();
         var scanner = scan_mod.LibraryScanner.init(manager.allocator, &scan_db, manager.notifier);
         defer scanner.deinit();
-        scanner.text_pool = if (manager.text_pool) |*tp| tp else null;
-        scanner.text_model_path = manager.embedding_model_path;
-        scanner.vl_ctx = if (manager.vl_ctx) |*vc| vc else null;
+        scanner.embedder = manager.embedder;
         _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
             log.err("scan {s}: {}", .{ std.fs.path.basename(req.library_path), err });
         };

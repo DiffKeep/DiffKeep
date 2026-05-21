@@ -126,7 +126,7 @@ const migrations = [_][]const u8{
     \\  FOREIGN KEY (library_id) REFERENCES libraries(id) ON DELETE CASCADE
     \\) STRICT;
     ,
-    // v3: embedding tables (2048-dim). vec0 virtual tables are not STRICT.
+    // v3: embedding tables (will be replaced at v8). vec0 virtual tables are not STRICT.
     \\CREATE VIRTUAL TABLE image_embeddings USING vec0(vector float[2048]);
     \\CREATE VIRTUAL TABLE positive_prompt_embeddings USING vec0(vector float[2048]);
     ,
@@ -154,6 +154,12 @@ const migrations = [_][]const u8{
     \\  INSERT INTO prompt_fts(prompt_fts, rowid, positive_prompt_text) VALUES ('delete', old.id, old.positive_prompt_text);
     \\  INSERT INTO prompt_fts(rowid, positive_prompt_text) VALUES (new.id, new.positive_prompt_text);
     \\END;
+    ,
+    // v8: resize embedding vectors from 2048 to 768 (switched from Qwen3-VL to SigLIP2/snowflake)
+    \\DROP TABLE IF EXISTS image_embeddings;
+    \\DROP TABLE IF EXISTS positive_prompt_embeddings;
+    \\CREATE VIRTUAL TABLE image_embeddings USING vec0(vector float[768]);
+    \\CREATE VIRTUAL TABLE positive_prompt_embeddings USING vec0(vector float[768]);
     ,
 };
 
@@ -832,9 +838,10 @@ pub const VectorDb = struct {
         var stmt = try self.db.prepare(
             \\SELECT i.id, i.library_path, i.mtime
             \\FROM images i
-            \\WHERE i.id IN (SELECT rowid FROM prompt_fts WHERE prompt_fts MATCH ?)
-            \\  AND i.trashed_at IS NULL
-            \\ORDER BY i.id
+            \\JOIN (SELECT rowid, rank FROM prompt_fts WHERE prompt_fts MATCH ?) fts
+            \\  ON fts.rowid = i.id
+            \\WHERE i.trashed_at IS NULL
+            \\ORDER BY fts.rank
             \\LIMIT 1000
         );
         defer stmt.deinit();
@@ -892,21 +899,37 @@ pub const VectorDb = struct {
 
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(allocator);
-        try sql.appendSlice(allocator, "SELECT id, library_path, mtime FROM images WHERE trashed_at IS NULL");
-        if (library_id != null) try sql.appendSlice(allocator, " AND library_id = ?");
-        if (folder_path != null) try sql.appendSlice(allocator, " AND library_path LIKE ?");
-        if (search_query != null) try sql.appendSlice(allocator, " AND id IN (SELECT rowid FROM prompt_fts WHERE prompt_fts MATCH ?)");
+        // When an FTS query is present, JOIN the virtual table so we can ORDER BY BM25 rank.
+        // The FTS param appears first in the SQL, so it must be bound first.
+        try sql.appendSlice(allocator, "SELECT images.id, images.library_path, images.mtime FROM images");
+        if (search_query != null) {
+            try sql.appendSlice(allocator,
+                " JOIN (SELECT rowid, rank FROM prompt_fts WHERE prompt_fts MATCH ?) fts" ++
+                " ON fts.rowid = images.id");
+        }
+        try sql.appendSlice(allocator, " WHERE images.trashed_at IS NULL");
+        if (library_id != null) try sql.appendSlice(allocator, " AND images.library_id = ?");
+        if (folder_path != null) try sql.appendSlice(allocator, " AND images.library_path LIKE ?");
         for (filters) |f| {
-            try sql.appendSlice(allocator, " AND ");
+            try sql.appendSlice(allocator, " AND images.");
             try sql.appendSlice(allocator, f.column.name());
             try sql.appendSlice(allocator, " = ?");
         }
-        try sql.appendSlice(allocator, " ORDER BY id LIMIT 10000");
+        if (search_query != null) {
+            try sql.appendSlice(allocator, " ORDER BY fts.rank LIMIT 10000");
+        } else {
+            try sql.appendSlice(allocator, " ORDER BY images.id LIMIT 10000");
+        }
 
         var stmt = try self.db.prepare(sql.items);
         defer stmt.deinit();
 
         var param: u32 = 1;
+        // FTS query bound first (JOIN appears before WHERE)
+        if (search_query) |q| {
+            try stmt.bind(param, q);
+            param += 1;
+        }
         if (library_id) |lib_id| {
             try stmt.bind(param, lib_id);
             param += 1;
@@ -915,10 +938,6 @@ pub const VectorDb = struct {
             const pattern = try std.fmt.allocPrint(allocator, "{s}/%", .{fp});
             defer allocator.free(pattern);
             try stmt.bind(param, @as([]const u8, pattern));
-            param += 1;
-        }
-        if (search_query) |q| {
-            try stmt.bind(param, q);
             param += 1;
         }
         for (filters) |f| {

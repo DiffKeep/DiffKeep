@@ -11,8 +11,7 @@ const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
 const fs_watch_mod = @import("fs_watch.zig");
 const image_grid_mod = @import("image_grid.zig");
-const llama_mod = @import("llama.zig");
-const mtmd_mod = @import("mtmd.zig");
+const onnx_mod = @import("onnx_embedder.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 const detail_panel_mod = @import("detail_panel.zig");
@@ -233,9 +232,13 @@ fn appInit(win: *dvui.Window) !void {
             dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
             g_search.wakeup_fn = wakeupFrame;
 
+            // Initialize ONNX embedder and wire it to search + library manager.
+            initEmbedder(init.io, init.gpa, &dk.g_cfg);
+            const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
+            g_search.embedder = emb_ptr;
+
             if (dk.g_library_manager) |*mgr| {
-                mgr.embedding_model_path = dk.g_cfg.embedding_model_path;
-                mgr.embedding_mmproj_path = dk.g_cfg.embedding_mmproj_path;
+                mgr.embedder = emb_ptr;
                 mgr.wakeup_fn = wakeupFrame;
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
@@ -280,11 +283,11 @@ fn appDeinit() void {
         if (dk.g_library_manager) |*mgr| mgr.deinit(init.io);
     }
     if (dvui.App.main_init) |init| {
+        g_search.awaitQuery(init.io);
         g_search.awaitEmbed(init.io);
-        g_search.awaitRerank(init.io);
-        g_settings.awaitDownloads(init.io);
         g_search.deinit(init.gpa);
     }
+    if (dk.g_embedder) |*emb| emb.deinit();
     if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
     if (dk.g_db) |*database| {
@@ -392,11 +395,11 @@ fn frame() !dvui.App.Result {
         }
     }
 
-    // Apply completed background search tasks (rerank + query embedding)
+    // Apply completed background search tasks
     if (dvui.App.main_init) |init| {
         if (dk.g_grid) |*grid| {
-            g_search.applyResultsIfDone(init.gpa, grid);
-            if (dk.g_db) |*db| g_search.applyEmbedIfDone(init.gpa, grid, db, &dk.g_cfg);
+            g_search.applyQueryIfDone(init.gpa, grid);
+            if (dk.g_db) |*db| g_search.applyEmbedIfDone(init.gpa, init.io, grid, db);
         }
     }
 
@@ -488,8 +491,10 @@ fn frame() !dvui.App.Result {
                             init.gpa.free(emb);
                             g_search.query_embedding = null;
                         }
-                        log.info("fts reload: query={?s}", .{grid.search_query});
-                        if (dk.g_db) |*db| grid.reloadImages(db) catch {};
+                        log.info("fts search: query={?s}", .{grid.search_query});
+                        if (dk.g_db) |*db| g_search.spawnQueryTask(init.io, init.gpa, db, grid) catch |err| {
+                            log.warn("spawnQueryTask (fts): {}", .{err});
+                        };
                     },
                     .semantic, .visual, .combined => {
                         grid.search_query = null;
@@ -500,13 +505,17 @@ fn frame() !dvui.App.Result {
                         grid.query_embedding = null;
                         if (q.len > 0) {
                             log.info("spawning embed query: mode={s}", .{@tagName(g_search.mode)});
-                            g_search.spawnEmbedQuery(init.io, init.gpa, q, g_search.mode, &dk.g_cfg) catch |err| {
+                            g_search.spawnEmbedQuery(init.io, init.gpa, q, g_search.mode) catch |err| {
                                 log.warn("search embed spawn: {}", .{err});
                             };
+                            // Keep showing current results while embedding is generated.
+                            // applyEmbedIfDone → spawnQueryTask will update the grid.
+                        } else {
+                            // Empty query: show all/library images without embedding.
+                            if (dk.g_db) |*db| g_search.spawnQueryTask(init.io, init.gpa, db, grid) catch |err| {
+                                log.warn("spawnQueryTask (clear): {}", .{err});
+                            };
                         }
-                        // Show empty/cleared results immediately; applyEmbedIfDone
-                        // will reload the grid with results once the embedding arrives.
-                        if (dk.g_db) |*db| grid.reloadImages(db) catch {};
                     },
                 }
             } else {
@@ -603,8 +612,19 @@ fn frame() !dvui.App.Result {
     try g_settings.render(&dk.g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
         if (dk.g_db) |*db| db else null,
         if (dk.g_grid) |*g| g else null);
-    if (settings_was_open and !g_settings.open)
+    if (settings_was_open and !g_settings.open) {
         g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
+        if (g_settings.model_paths_changed) {
+            g_settings.model_paths_changed = false;
+            if (dvui.App.main_init) |init| {
+                if (dk.g_embedder) |*emb| { emb.deinit(); dk.g_embedder = null; }
+                initEmbedder(init.io, init.gpa, &dk.g_cfg);
+                const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
+                g_search.embedder = emb_ptr;
+                if (dk.g_library_manager) |*mgr| mgr.embedder = emb_ptr;
+            }
+        }
+    }
 
     // ── Delete confirmation modal ─────────────────────────────────────────────
     try g_delete_dialog.render(dk.g_cfg.trash_enabled,
@@ -759,6 +779,14 @@ fn pickMinWait(a: ?u32, b: ?u32) ?u32 {
     const av = a orelse return b;
     const bv = b orelse return a;
     return @min(av, bv);
+}
+
+fn initEmbedder(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.Config) void {
+    if (cfg.text_model_dir == null and cfg.visual_model_dir == null) return;
+    dk.g_embedder = onnx_mod.OnnxEmbedder.init(io, gpa, cfg.text_model_dir, cfg.visual_model_dir) catch |err| {
+        std.log.warn("embedder init failed: {}", .{err});
+        return;
+    };
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -52,6 +52,52 @@ void diffkeep_vips_free(void *buf) {
     g_free(buf);
 }
 
+int diffkeep_image_to_rgb_square(
+    const char *filename,
+    int size,
+    void **buf,
+    size_t *len
+) {
+    VipsImage *thumb = NULL;
+    if (vips_thumbnail(filename, &thumb, size,
+            "height", size,
+            "size", VIPS_SIZE_FORCE,
+            "no_rotate", TRUE,
+            NULL) != 0)
+        return -1;
+
+    /* Flatten alpha; we want plain RGB */
+    if (vips_image_hasalpha(thumb)) {
+        VipsImage *flat = NULL;
+        if (vips_flatten(thumb, &flat, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = flat;
+    }
+
+    /* Ensure 3-band sRGB */
+    if (vips_image_get_bands(thumb) != 3) {
+        VipsImage *rgb = NULL;
+        if (vips_colourspace(thumb, &rgb, VIPS_INTERPRETATION_sRGB, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = rgb;
+    }
+
+    size_t out_len = 0;
+    void *pixels = vips_image_write_to_memory(thumb, &out_len);
+    g_object_unref(thumb);
+    if (!pixels) return -1;
+
+    *buf = pixels;
+    *len = out_len;
+    return 0;
+}
+
 int diffkeep_jpeg_bytes_to_rgba(
     const void *data,
     size_t data_len,

@@ -248,6 +248,40 @@ pub const GridState = struct {
         self.images.deinit(self.allocator);
     }
 
+    /// Replace the image list with pre-fetched entries from a background query task.
+    /// Takes ownership of all path strings in `entries`; the caller must free the
+    /// slice backing array itself (not the individual paths).
+    pub fn applySearchResults(self: *GridState, entries: []db_mod.VectorDb.GridEntry) void {
+        {
+            self.queue_mutex.lockUncancelable(self.io);
+            for (self.high_queue.items) |r| self.allocator.free(r.path);
+            for (self.low_queue.items) |r| self.allocator.free(r.path);
+            self.high_queue.clearRetainingCapacity();
+            self.low_queue.clearRetainingCapacity();
+            self.queued.clearRetainingCapacity();
+            self.queue_mutex.unlock(self.io);
+        }
+        for (self.images.items) |e| {
+            self.allocator.free(e.path);
+            if (e.trash_name) |tn| self.allocator.free(tn);
+        }
+        self.images.clearRetainingCapacity();
+        self.selection.clearRetainingCapacity();
+        self.focused_idx = null;
+        self.anchor_idx = null;
+
+        self.images.ensureTotalCapacity(self.allocator, entries.len) catch {};
+        for (entries) |e| {
+            self.images.appendAssumeCapacity(.{
+                .id = e.id,
+                .path = e.path,
+                .filename = std.fs.path.basename(e.path),
+                .mtime = e.mtime,
+            });
+        }
+        self.applySortOrder();
+    }
+
     /// Reload the image list from DB for the current view_mode.
     /// Clears selection and resets navigation state.
     pub fn reloadImages(self: *GridState, db: *db_mod.VectorDb) !void {

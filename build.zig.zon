@@ -43,6 +43,16 @@
             .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-x64.tar.gz",
             .hash = "N-V-__8AAHatcwLEIVRuflEdmWeiMTDCc8LITSOe6LZ1WZHd",
         },
+        .onnxruntime_linux = .{
+            .optional = true,
+            .url = "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/onnxruntime-linux-x64-1.26.0.tgz",
+            .hash = "N-V-__8AABGrcwEs1N1SUwyZ4Ll4IGMIMGF-h6ouVB8fbQ3l",
+        },
+        .onnxruntime_linux_gpu = .{
+            .optional = true,
+            .url = "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/onnxruntime-linux-x64-gpu-1.26.0.tgz",
+            .hash = "N-V-__8AANHPMxbyHo1pqXpIDJGaJAF3jHqCnVCVaPN68X-C",
+        },
         .known_folders = .{
             .url = "git+https://github.com/ziglibs/known-folders.git#207c34a16e4365edc20d92c7892f962b3bed46e8",
             .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
