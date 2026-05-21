@@ -122,6 +122,11 @@ pub const Pool = struct {
             self.context = try Context.init(self.allocator, &self.model.?, self.contextParams());
         }
 
+        // Refresh the context's model pointer — guards against the pool struct
+        // being moved (e.g. copied out of a local in VlContext/RerankContext init)
+        // which leaves context.model dangling at the old address.
+        if (self.context) |*ctx| ctx.model = &self.model.?;
+
         return &self.context.?;
     }
 

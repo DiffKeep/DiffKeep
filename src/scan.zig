@@ -78,7 +78,7 @@ pub const LibraryScanner = struct {
     pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb, notifier: ?*notifier_mod.ImageNotifier) LibraryScanner {
         // c_allocator (glibc malloc) is used throughout because processFile tasks
         // run on concurrent OS threads — the GPA is not thread-safe.
-        return .{ .allocator = std.heap.c_allocator, .db = db, .notifier = notifier };
+        return .{ .allocator = std.heap.smp_allocator, .db = db, .notifier = notifier };
     }
 
     pub fn deinit(_: *LibraryScanner) void {}
@@ -295,7 +295,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     if (ctx.stop.load(.acquire)) return;
 
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 

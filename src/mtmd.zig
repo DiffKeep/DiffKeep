@@ -87,6 +87,10 @@ pub const VlContext = struct {
 
         // Load the model so we can hand the llama_model* to mtmd.
         const ctx = try pool.get(io, model_path, 30_000, null);
+        errdefer {
+            pool.release(ctx);
+            pool.deinit();
+        }
 
         const model_ptr = pool.model.?.ptr;
         const mmproj_z = try allocator.dupeZ(u8, mmproj_path);

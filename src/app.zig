@@ -231,6 +231,8 @@ fn appInit(win: *dvui.Window) !void {
             const notifier = if (dk.g_grid) |*grid| &grid.notifier else null;
             const watcher_ptr: ?*fs_watch_mod.FsWatcher = if (g_fs_watcher != null) &g_fs_watcher.? else null;
             dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
+            g_search.wakeup_fn = wakeupFrame;
+
             if (dk.g_library_manager) |*mgr| {
                 mgr.embedding_model_path = dk.g_cfg.embedding_model_path;
                 mgr.embedding_mmproj_path = dk.g_cfg.embedding_mmproj_path;
@@ -278,6 +280,7 @@ fn appDeinit() void {
         if (dk.g_library_manager) |*mgr| mgr.deinit(init.io);
     }
     if (dvui.App.main_init) |init| {
+        g_search.awaitEmbed(init.io);
         g_search.awaitRerank(init.io);
         g_settings.awaitDownloads(init.io);
         g_search.deinit(init.gpa);
@@ -389,9 +392,12 @@ fn frame() !dvui.App.Result {
         }
     }
 
-    // Apply rerank results when the background task completes
+    // Apply completed background search tasks (rerank + query embedding)
     if (dvui.App.main_init) |init| {
-        if (dk.g_grid) |*grid| g_search.applyResultsIfDone(init.gpa, grid);
+        if (dk.g_grid) |*grid| {
+            g_search.applyResultsIfDone(init.gpa, grid);
+            if (dk.g_db) |*db| g_search.applyEmbedIfDone(init.gpa, grid, db, &dk.g_cfg);
+        }
     }
 
     // Apply completed model downloads (auto-fill config paths)
@@ -456,39 +462,55 @@ fn frame() !dvui.App.Result {
         }
     }
 
-    // Detect search text changes and reload the grid
-    if (!std.mem.eql(u8, &g_search.buf, &g_search.prev)) {
-        @memcpy(&g_search.prev, &g_search.buf);
-        const q = std.mem.sliceTo(&g_search.buf, 0);
-        if (dk.g_grid) |*grid| {
-            grid.search_mode = g_search.mode;
-            switch (g_search.mode) {
-                .fts => {
-                    grid.search_query = if (q.len > 0) q else null;
-                    grid.query_embedding = null;
-                    if (g_search.query_embedding) |emb| {
-                        if (dvui.App.main_init) |init| init.gpa.free(emb);
-                        g_search.query_embedding = null;
-                    }
-                    if (dk.g_db) |*db| grid.reloadImages(db) catch {};
-                },
-                .semantic, .visual, .combined => {
-                    grid.search_query = null;
-                    if (g_search.query_embedding) |emb| {
-                        if (dvui.App.main_init) |init| init.gpa.free(emb);
-                        g_search.query_embedding = null;
-                    }
-                    grid.query_embedding = null;
-                    if (q.len > 0) {
-                        if (dvui.App.main_init) |init| {
-                            g_search.embedQuery(init.io, init.gpa, q, g_search.mode, &dk.g_cfg, grid) catch |err| {
-                                log.warn("search embed: {}", .{err});
+    // Detect search text changes — debounced 300 ms after the last keystroke.
+    // Mode-button clicks set force_search=true to bypass the timer entirely.
+    if (dvui.App.main_init) |init| {
+        const now_ns: i96 = std.Io.Clock.real.now(init.io).nanoseconds;
+        if (!std.mem.eql(u8, &g_search.buf, &g_search.last_buf)) {
+            g_search.debounce_deadline_ns = now_ns + 300 * std.time.ns_per_ms;
+            @memcpy(&g_search.last_buf, &g_search.buf);
+        }
+        const fire_search = g_search.force_search or
+            (g_search.debounce_deadline_ns != 0 and now_ns >= g_search.debounce_deadline_ns);
+        if (fire_search) {
+            g_search.force_search = false;
+            g_search.debounce_deadline_ns = 0;
+            @memcpy(&g_search.prev, &g_search.buf);
+            const q = std.mem.sliceTo(&g_search.buf, 0);
+            log.info("search fired: mode={s} query=\"{s}\"", .{ @tagName(g_search.mode), q });
+            if (dk.g_grid) |*grid| {
+                grid.search_mode = g_search.mode;
+                switch (g_search.mode) {
+                    .fts => {
+                        grid.search_query = if (q.len > 0) q else null;
+                        grid.query_embedding = null;
+                        if (g_search.query_embedding) |emb| {
+                            init.gpa.free(emb);
+                            g_search.query_embedding = null;
+                        }
+                        log.info("fts reload: query={?s}", .{grid.search_query});
+                        if (dk.g_db) |*db| grid.reloadImages(db) catch {};
+                    },
+                    .semantic, .visual, .combined => {
+                        grid.search_query = null;
+                        if (g_search.query_embedding) |emb| {
+                            init.gpa.free(emb);
+                            g_search.query_embedding = null;
+                        }
+                        grid.query_embedding = null;
+                        if (q.len > 0) {
+                            log.info("spawning embed query: mode={s}", .{@tagName(g_search.mode)});
+                            g_search.spawnEmbedQuery(init.io, init.gpa, q, g_search.mode, &dk.g_cfg) catch |err| {
+                                log.warn("search embed spawn: {}", .{err});
                             };
                         }
-                    }
-                    if (dk.g_db) |*db| grid.reloadImages(db) catch {};
-                    if (q.len > 0) g_search.maybeSpawnRerank(grid, q, &dk.g_cfg);
-                },
+                        // Show empty/cleared results immediately; applyEmbedIfDone
+                        // will reload the grid with results once the embedding arrives.
+                        if (dk.g_db) |*db| grid.reloadImages(db) catch {};
+                    },
+                }
+            } else {
+                log.warn("search fired but g_grid is null", .{});
             }
         }
     }
@@ -858,6 +880,17 @@ pub fn main(init: std.process.Init) !void {
                 _ = g_viewer_manager.windows.swapRemove(vi);
             } else {
                 vi += 1;
+            }
+        }
+
+        // If a search debounce is pending, cap the event-wait to the deadline so
+        // the render loop fires even when the user has stopped generating events.
+        if (g_search.debounce_deadline_ns != 0) {
+            if (dvui.App.main_init) |app_init| {
+                const now = std.Io.Clock.real.now(app_init.io).nanoseconds;
+                const remaining_ns = g_search.debounce_deadline_ns - now;
+                const cap_us: u32 = if (remaining_ns <= 0) 0 else @intCast(@min(@divTrunc(remaining_ns, 1000) + 1, std.math.maxInt(u32)));
+                end_micros = pickMinWait(end_micros, cap_us);
             }
         }
 

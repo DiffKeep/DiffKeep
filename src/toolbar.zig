@@ -80,12 +80,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
             })) {
                 if (ctx.search.mode != m.mode) {
                     ctx.search.mode = m.mode;
-                    if (ctx.grid.*) |*grid| {
-                        grid.search_mode = m.mode;
-                        if (m.mode == .fts) grid.query_embedding = null;
-                        if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
-                    }
-                    ctx.search.prev = std.mem.zeroes([256]u8);
+                    ctx.search.force_search = true;
                 }
             }
         }
