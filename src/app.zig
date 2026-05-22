@@ -65,6 +65,19 @@ var g_search: search_mod.SearchState = .{};
 // Settings modal state (includes model path buffers, download state)
 var g_settings: settings_modal_mod.SettingsModalState = .{};
 
+// Background embedder loader — init runs on a dedicated thread so the main thread never blocks.
+var g_embedder_thread: ?std.Thread = null;
+var g_embedder_task_result: ?onnx_mod.OnnxEmbedder = null;
+var g_embedder_task_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+// Pending reload: set when startEmbedderLoad is called while a thread is already in flight.
+var g_embedder_pending: bool = false;
+var g_embedder_pending_io: std.Io = undefined;
+var g_embedder_pending_gpa: std.mem.Allocator = undefined;
+var g_embedder_pending_text_dir: ?[]const u8 = null;
+var g_embedder_pending_visual_dir: ?[]const u8 = null;
+var g_embedder_pending_use_gpu: bool = false;
+var g_embedder_pending_gpu_device_id: u32 = 0;
+
 // Active metadata filters
 var g_active_filters: std.ArrayList(db_mod.ActiveFilter) = .empty;
 
@@ -232,13 +245,13 @@ fn appInit(win: *dvui.Window) !void {
             dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
             g_search.wakeup_fn = wakeupFrame;
 
-            // Initialize ONNX embedder and wire it to search + library manager.
-            initEmbedder(init.io, init.gpa, &dk.g_cfg);
-            const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
-            g_search.embedder = emb_ptr;
+            // Start loading the ONNX embedder on a background thread.
+            // search.embedder and mgr.embedder stay null until pollEmbedderLoad() wires them.
+            g_search.embedder = null;
+            startEmbedderLoad(init.io, init.gpa, &dk.g_cfg);
 
             if (dk.g_library_manager) |*mgr| {
-                mgr.embedder = emb_ptr;
+                mgr.embedder = null;
                 mgr.wakeup_fn = wakeupFrame;
                 mgr.scanAllLibraries(init.io) catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
@@ -287,6 +300,18 @@ fn appDeinit() void {
         g_search.awaitEmbed(init.io);
         g_search.deinit(init.gpa);
     }
+    // Join the background embedder load thread (if running) and discard any result.
+    if (g_embedder_thread) |t| {
+        t.join();
+        g_embedder_thread = null;
+    }
+    if (g_embedder_task_result) |*emb| { emb.deinit(); g_embedder_task_result = null; }
+    if (dvui.App.main_init) |init| {
+        if (g_embedder_pending_text_dir) |p| init.gpa.free(p);
+        if (g_embedder_pending_visual_dir) |p| init.gpa.free(p);
+    }
+    g_embedder_pending_text_dir = null;
+    g_embedder_pending_visual_dir = null;
     if (dk.g_embedder) |*emb| emb.deinit();
     if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
@@ -405,6 +430,18 @@ fn frame() !dvui.App.Result {
 
     // Apply completed model downloads (auto-fill config paths)
     g_settings.applyCompletedDownloads(&dk.g_cfg, g_data_dir);
+    if (g_settings.model_paths_changed and !g_settings.open) {
+        g_settings.model_paths_changed = false;
+        if (dvui.App.main_init) |init| {
+            if (dk.g_embedder) |*emb| { emb.deinit(); dk.g_embedder = null; }
+            g_search.embedder = null;
+            if (dk.g_library_manager) |*mgr| mgr.embedder = null;
+            startEmbedderLoad(init.io, init.gpa, &dk.g_cfg);
+        }
+    }
+
+    // Check if background embedder load has completed.
+    pollEmbedderLoad();
 
     // Consume pending delete/restore requests raised by keyboard handlers
     if (dk.g_grid) |*grid| {
@@ -602,6 +639,7 @@ fn frame() !dvui.App.Result {
         .right_w_open = &g_right_w_open,
         .total_image_count = &g_total_image_count,
         .on_refresh_counts = refreshCounts,
+        .embedder_loading = g_embedder_thread != null,
     };
     toolbar_mod.renderToolbar(render_ctx);
     try toolbar_mod.renderContent(render_ctx);
@@ -611,17 +649,17 @@ fn frame() !dvui.App.Result {
     const settings_was_open = g_settings.open;
     try g_settings.render(&dk.g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
         if (dk.g_db) |*db| db else null,
-        if (dk.g_grid) |*g| g else null);
+        if (dk.g_grid) |*g| g else null,
+        wakeupFrame);
     if (settings_was_open and !g_settings.open) {
         g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
         if (g_settings.model_paths_changed) {
             g_settings.model_paths_changed = false;
             if (dvui.App.main_init) |init| {
                 if (dk.g_embedder) |*emb| { emb.deinit(); dk.g_embedder = null; }
-                initEmbedder(init.io, init.gpa, &dk.g_cfg);
-                const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
-                g_search.embedder = emb_ptr;
-                if (dk.g_library_manager) |*mgr| mgr.embedder = emb_ptr;
+                g_search.embedder = null;
+                if (dk.g_library_manager) |*mgr| mgr.embedder = null;
+                startEmbedderLoad(init.io, init.gpa, &dk.g_cfg);
             }
         }
     }
@@ -781,12 +819,113 @@ fn pickMinWait(a: ?u32, b: ?u32) ?u32 {
     return @min(av, bv);
 }
 
-fn initEmbedder(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.Config) void {
+const EmbedderLoadArgs = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    text_dir: ?[]const u8,   // heap-allocated, freed by the thread
+    visual_dir: ?[]const u8, // heap-allocated, freed by the thread
+    use_gpu: bool,
+    gpu_device_id: u32,
+};
+
+fn embedderLoadThread(args: EmbedderLoadArgs) void {
+    defer if (args.text_dir) |p| args.gpa.free(p);
+    defer if (args.visual_dir) |p| args.gpa.free(p);
+    g_embedder_task_result = onnx_mod.OnnxEmbedder.init(
+        args.io, args.gpa, args.text_dir, args.visual_dir, args.use_gpu, args.gpu_device_id,
+    ) catch |err| blk: {
+        log.warn("embedder init failed: {}", .{err});
+        break :blk null;
+    };
+    g_embedder_task_done.store(true, .release);
+    wakeupFrame();
+}
+
+/// Kicks off a background thread to initialize the ONNX embedder.
+/// Non-blocking: if a load is already in flight, the new config is queued
+/// and the thread will pick it up after it finishes the current load.
+fn startEmbedderLoad(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.Config) void {
     if (cfg.text_model_dir == null and cfg.visual_model_dir == null) return;
-    dk.g_embedder = onnx_mod.OnnxEmbedder.init(io, gpa, cfg.text_model_dir, cfg.visual_model_dir) catch |err| {
-        std.log.warn("embedder init failed: {}", .{err});
+    if (g_embedder_thread != null) {
+        // Already loading: queue a pending reload with the new paths.
+        if (g_embedder_pending_text_dir) |p| gpa.free(p);
+        if (g_embedder_pending_visual_dir) |p| gpa.free(p);
+        g_embedder_pending_io = io;
+        g_embedder_pending_gpa = gpa;
+        g_embedder_pending_text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null;
+        g_embedder_pending_visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null;
+        g_embedder_pending_use_gpu = cfg.use_gpu;
+        g_embedder_pending_gpu_device_id = cfg.gpu_device_id;
+        g_embedder_pending = true;
+        return;
+    }
+    g_embedder_task_done.store(false, .release);
+    g_embedder_task_result = null;
+    const args = EmbedderLoadArgs{
+        .io = io,
+        .gpa = gpa,
+        .text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null,
+        .visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null,
+        .use_gpu = cfg.use_gpu,
+        .gpu_device_id = cfg.gpu_device_id,
+    };
+    g_embedder_thread = std.Thread.spawn(.{}, embedderLoadThread, .{args}) catch |err| {
+        log.warn("embedder thread spawn failed: {}", .{err});
+        if (args.text_dir) |p| gpa.free(p);
+        if (args.visual_dir) |p| gpa.free(p);
         return;
     };
+}
+
+/// Called each frame to check whether the background embedder load has completed.
+/// When done, swaps the new embedder into g_embedder and re-wires search/library_manager.
+fn pollEmbedderLoad() void {
+    if (!g_embedder_task_done.load(.acquire)) return;
+    g_embedder_task_done.store(false, .release);
+    if (g_embedder_thread) |t| {
+        t.join();
+        g_embedder_thread = null;
+    }
+    if (dk.g_embedder) |*old| old.deinit();
+    dk.g_embedder = g_embedder_task_result;
+    g_embedder_task_result = null;
+    const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
+    g_search.embedder = emb_ptr;
+    if (dk.g_library_manager) |*mgr| mgr.embedder = emb_ptr;
+    // If a reload was queued while this load was in flight, kick it off now.
+    // The next pollEmbedderLoad() after that reload will handle the backfill scan.
+    if (g_embedder_pending) {
+        g_embedder_pending = false;
+        const io = g_embedder_pending_io;
+        const gpa = g_embedder_pending_gpa;
+        const td = g_embedder_pending_text_dir; g_embedder_pending_text_dir = null;
+        const vd = g_embedder_pending_visual_dir; g_embedder_pending_visual_dir = null;
+        const ug = g_embedder_pending_use_gpu;
+        const gid = g_embedder_pending_gpu_device_id;
+        g_embedder_task_done.store(false, .release);
+        g_embedder_task_result = null;
+        const args = EmbedderLoadArgs{ .io = io, .gpa = gpa, .text_dir = td, .visual_dir = vd, .use_gpu = ug, .gpu_device_id = gid };
+        g_embedder_thread = std.Thread.spawn(.{}, embedderLoadThread, .{args}) catch |err| {
+            log.warn("embedder thread respawn failed: {}", .{err});
+            if (args.text_dir) |p| gpa.free(p);
+            if (args.visual_dir) |p| gpa.free(p);
+            return;
+        };
+        return;
+    }
+    // Trigger a backfill scan so any embeddings missed while the embedder was loading
+    // get generated now. Files that already have embeddings are fast-pathed in the scanner.
+    if (emb_ptr != null) {
+        if (dk.g_library_manager) |*mgr| {
+            if (mgr.prompt_embeddings or mgr.image_embeddings) {
+                if (dvui.App.main_init) |init| {
+                    mgr.scanAllLibraries(init.io) catch |err| {
+                        log.warn("embedder-ready backfill scan failed: {}", .{err});
+                    };
+                }
+            }
+        }
+    }
 }
 
 pub fn main(init: std.process.Init) !void {

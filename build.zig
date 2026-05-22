@@ -6,8 +6,11 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_gpu = b.option(bool, "gpu", "Enable ONNX Runtime GPU (CUDA) acceleration") orelse false;
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", git_version);
+    options.addOption(bool, "gpu", use_gpu);
 
     const known_folders = b.dependency("known_folders", .{
         .target = target,
@@ -146,7 +149,7 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("vips", vips_module);
 
     // *** ONNX Runtime (embeddings) ***
-    try addOnnxRuntime(b, exe);
+    try addOnnxRuntime(b, exe, use_gpu);
 
     // *** Dev/research tools (not part of the GUI, useful for data pipeline work) ***
 
@@ -244,7 +247,7 @@ pub fn build(b: *std.Build) !void {
             .link_libc = true,
         }),
     });
-    try addOnnxRuntime(b, onnx_search_exe);
+    try addOnnxRuntime(b, onnx_search_exe, use_gpu);
     onnx_search_exe.root_module.linkLibrary(vips_helper_lib);
     onnx_search_exe.root_module.addIncludePath(b.path("lib/vips"));
     onnx_search_exe.root_module.linkSystemLibrary("vips", .{});
@@ -281,7 +284,7 @@ pub fn build(b: *std.Build) !void {
             .link_libc = true,
         }),
     });
-    try addOnnxRuntime(b, onnx_text_search_exe);
+    try addOnnxRuntime(b, onnx_text_search_exe, use_gpu);
     b.installArtifact(onnx_text_search_exe);
     const run_onnx_text_search = b.addRunArtifact(onnx_text_search_exe);
     run_onnx_text_search.step.dependOn(b.getInstallStep());
@@ -319,6 +322,7 @@ pub fn build(b: *std.Build) !void {
     diffkeep_test_module.addImport("sqlite", sqlite_module_zig);
     diffkeep_test_module.addImport("vips", vips_module);
     diffkeep_test_module.addIncludePath(b.path("lib/vips"));
+    diffkeep_test_module.addOptions("build_options", options);
 
     const integration_module = b.createModule(.{
         .target = target,
@@ -341,7 +345,7 @@ pub fn build(b: *std.Build) !void {
     integration_tests.root_module.linkSystemLibrary("vips", .{});
     // onnxruntime import goes to diffkeep_test_module (where onnx_embedder.zig lives);
     // library linkage goes to integration_tests.root_module.
-    try addOnnxRuntimeEx(b, integration_tests, diffkeep_test_module);
+    try addOnnxRuntimeEx(b, integration_tests, diffkeep_test_module, use_gpu);
 
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }
@@ -447,15 +451,15 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
     exe.root_module.addImport("mtmd", mtmd_zig);
 }
 
-fn addOnnxRuntime(b: *std.Build, exe: anytype) !void {
-    try addOnnxRuntimeEx(b, exe, exe.root_module);
+fn addOnnxRuntime(b: *std.Build, exe: anytype, use_gpu: bool) !void {
+    try addOnnxRuntimeEx(b, exe, exe.root_module, use_gpu);
 }
 
-fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void {
+fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module, use_gpu: bool) !void {
     const target = exe.root_module.resolved_target.?;
 
     const dep_name = switch (target.result.os.tag) {
-        .linux => "onnxruntime_linux",
+        .linux => if (use_gpu) "onnxruntime_linux_gpu" else "onnxruntime_linux",
         else => return error.OnnxRuntimeUnsupportedPlatform,
     };
     const dep = b.lazyDependency(dep_name, .{}) orelse return;
@@ -474,7 +478,7 @@ fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) 
     exe.root_module.linkSystemLibrary("onnxruntime", .{});
     import_mod.addImport("onnxruntime_c", ort_c.createModule());
 
-    // Install shared libraries alongside the binary
+    // Install core shared libraries alongside the binary
     for ([_][]const u8{
         "libonnxruntime.so",
         "libonnxruntime.so.1",
@@ -483,6 +487,17 @@ fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) 
     }) |lib| {
         const step = b.addInstallBinFile(bin_path.path(b, b.fmt("lib/{s}", .{lib})), lib);
         b.getInstallStep().dependOn(&step.step);
+    }
+
+    // GPU build: install CUDA/TensorRT execution provider libraries
+    if (use_gpu) {
+        for ([_][]const u8{
+            "libonnxruntime_providers_cuda.so",
+            "libonnxruntime_providers_tensorrt.so",
+        }) |lib| {
+            const step = b.addInstallBinFile(bin_path.path(b, b.fmt("lib/{s}", .{lib})), lib);
+            b.getInstallStep().dependOn(&step.step);
+        }
     }
 }
 

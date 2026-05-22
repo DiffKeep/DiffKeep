@@ -523,7 +523,11 @@ pub const GridState = struct {
         defer grid_box.deinit();
 
         if (n == 0) {
-            dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
+            const is_searching = self.search_query != null or
+                self.query_embedding != null or
+                self.filters.len > 0;
+            const empty_text = if (is_searching) i18n.t(.search_no_results) else i18n.t(.library_empty);
+            dvui.label(@src(), "{s}", .{empty_text}, .{
                 .tag = "grid-empty",
                 .gravity_x = 0.5,
                 .gravity_y = 0.5,

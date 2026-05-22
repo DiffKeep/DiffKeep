@@ -8,9 +8,10 @@
 /// All three are optional: pass null dirs to skip loading a model.
 /// OrtSession.Run() is thread-safe; the public embed functions may be called
 /// from multiple threads concurrently.
-const std  = @import("std");
-const ort  = @import("onnxruntime_c");
-const vips = @cImport(@cInclude("vips_helper.h"));
+const std          = @import("std");
+const ort          = @import("onnxruntime_c");
+const vips         = @cImport(@cInclude("vips_helper.h"));
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.onnx_embedder);
 
@@ -32,6 +33,23 @@ fn ortCheck(status: ?*ort.OrtStatus, api: *const OrtApi) !void {
     log.err("ORT: {s}", .{msg});
     api.ReleaseStatus.?(s);
     return error.OrtError;
+}
+
+fn logAvailableProviders(api: *const OrtApi) void {
+    var providers: [*c][*c]u8 = null;
+    var count: c_int = 0;
+    const status = api.GetAvailableProviders.?(&providers, &count);
+    if (status != null) {
+        api.ReleaseStatus.?(status);
+        log.warn("GetAvailableProviders failed", .{});
+        return;
+    }
+    defer _ = api.ReleaseAvailableProviders.?(providers, count);
+    log.info("ORT available providers ({d}):", .{count});
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(count))) : (i += 1) {
+        log.info("  [{d}] {s}", .{ i, std.mem.span(providers[i]) });
+    }
 }
 
 // ── UnigramTokenizer (Snowflake Arctic Embed) ─────────────────────────────────
@@ -348,11 +366,15 @@ pub const OnnxEmbedder = struct {
     /// Initialise.  Pass absolute paths to model dirs; null = skip that model.
     ///   text_dir   : snowflake-arctic-embed-m-v2.0 dir (onnx/model_int8.onnx + tokenizer.json)
     ///   visual_dir : ViT-B-16-SigLIP2__webli dir (visual/model.onnx + textual/model.onnx + textual/tokenizer.json)
+    ///   use_gpu    : try to add the CUDA execution provider (requires GPU build)
+    ///   gpu_device_id : CUDA device index (0 = first GPU)
     pub fn init(
-        io:         std.Io,
-        allocator:  std.mem.Allocator,
-        text_dir:   ?[]const u8,
-        visual_dir: ?[]const u8,
+        io:           std.Io,
+        allocator:    std.mem.Allocator,
+        text_dir:     ?[]const u8,
+        visual_dir:   ?[]const u8,
+        use_gpu:      bool,
+        gpu_device_id: u32,
     ) !OnnxEmbedder {
         const api: *const OrtApi = @ptrCast(
             ort.OrtGetApiBase().*.GetApi.?(ort.ORT_API_VERSION).?,
@@ -360,18 +382,70 @@ pub const OnnxEmbedder = struct {
 
         var env: ?*ort.OrtEnv = null;
         try ortCheck(api.CreateEnv.?(ort.ORT_LOGGING_LEVEL_WARNING, "diffkeep", &env), api);
-        errdefer api.ReleaseEnv.?(env);
+        var env_owned = true;
+        errdefer if (env_owned) api.ReleaseEnv.?(env);
 
         var opts: ?*ort.OrtSessionOptions = null;
         try ortCheck(api.CreateSessionOptions.?(&opts), api);
-        errdefer api.ReleaseSessionOptions.?(opts);
+        var opts_owned = true;
+        errdefer if (opts_owned) api.ReleaseSessionOptions.?(opts);
         try ortCheck(api.SetSessionGraphOptimizationLevel.?(opts, ort.ORT_ENABLE_ALL), api);
+
+        log.info("ORT init: use_gpu={} build_gpu={} gpu_device_id={}", .{ use_gpu, build_options.gpu, gpu_device_id });
+        logAvailableProviders(api);
+
+        var gpu_registered = false;
+        if (build_options.gpu and use_gpu) {
+            log.info("GPU path: attempting CUDA execution provider on device {d}", .{gpu_device_id});
+            if (api.SessionOptionsAppendExecutionProvider_CUDA) |append_cuda| {
+                log.info("  SessionOptionsAppendExecutionProvider_CUDA API present, calling...", .{});
+                var cuda_opts = std.mem.zeroes(ort.struct_OrtCUDAProviderOptions);
+                cuda_opts.device_id = @intCast(gpu_device_id);
+                cuda_opts.gpu_mem_limit = std.math.maxInt(usize);
+                cuda_opts.do_copy_in_default_stream = 1;
+                if (ortCheck(append_cuda(opts.?, &cuda_opts), api)) {
+                    log.info("  CUDA execution provider registered on device {d}", .{gpu_device_id});
+                    gpu_registered = true;
+                } else |err| {
+                    log.warn("  CUDA provider append failed ({}); sessions will run on CPU", .{err});
+                }
+            } else {
+                log.warn("  SessionOptionsAppendExecutionProvider_CUDA function pointer is null in this ORT build", .{});
+            }
+        } else if (use_gpu and !build_options.gpu) {
+            log.warn("GPU requested in config but binary was not built with -Dgpu=true; running on CPU", .{});
+        } else {
+            log.info("running on CPU (use_gpu={} build_gpu={})", .{ use_gpu, build_options.gpu });
+        }
+
+        // When the GPU provider is active, ORT's CPU thread pool only manages kernel
+        // submission and completion signalling — not the actual compute. The default
+        // (one thread per core) causes excessive spinning. Cap to 1.
+        if (gpu_registered) {
+            try ortCheck(api.SetIntraOpNumThreads.?(opts, 1), api);
+            try ortCheck(api.SetInterOpNumThreads.?(opts, 1), api);
+            log.info("ORT GPU mode: capped inter/intra-op thread pool to 1", .{});
+        }
+
+        // CPU-only fallback opts — only needed when GPU provider was registered.
+        // Sessions don't hold a reference to opts after CreateSession returns, so
+        // we can release cpu_opts as soon as all sessions are loaded (via defer).
+        var cpu_opts: ?*ort.OrtSessionOptions = null;
+        if (gpu_registered) {
+            var co: ?*ort.OrtSessionOptions = null;
+            try ortCheck(api.CreateSessionOptions.?(&co), api);
+            errdefer api.ReleaseSessionOptions.?(co);
+            try ortCheck(api.SetSessionGraphOptimizationLevel.?(co, ort.ORT_ENABLE_ALL), api);
+            cpu_opts = co;
+        }
+        defer if (cpu_opts) |co| api.ReleaseSessionOptions.?(co);
 
         var mem: ?*ort.OrtMemoryInfo = null;
         try ortCheck(api.CreateCpuMemoryInfo.?(
             ort.OrtDeviceAllocator, ort.OrtMemTypeDefault, &mem,
         ), api);
-        errdefer api.ReleaseMemoryInfo.?(mem);
+        var mem_owned = true;
+        errdefer if (mem_owned) api.ReleaseMemoryInfo.?(mem);
 
         var self = OnnxEmbedder{
             .allocator = allocator,
@@ -380,28 +454,59 @@ pub const OnnxEmbedder = struct {
             .opts      = opts.?,
             .mem_info  = mem.?,
         };
+        env_owned  = false;
+        opts_owned = false;
+        mem_owned  = false;
         errdefer self.deinit();
+
+        // Which session opts to use: start with GPU opts, switch to CPU on first failure.
+        var try_gpu = gpu_registered;
 
         // Load Snowflake text encoder
         if (text_dir) |dir| {
-            self.snow_session = try loadSession(allocator, api, env.?, opts.?,
-                dir, "onnx/model_int8.onnx");
+            const cur_opts = if (try_gpu) opts.? else cpu_opts orelse opts.?;
+            self.snow_session = loadSession(allocator, api, env.?, cur_opts, dir, "onnx/model_int8.onnx") catch |err| blk: {
+                if (try_gpu) {
+                    log.warn("snowflake GPU session failed ({}); falling back to CPU for all remaining sessions", .{err});
+                    try_gpu = false;
+                    break :blk try loadSession(allocator, api, env.?, cpu_opts.?, dir, "onnx/model_int8.onnx");
+                }
+                return err;
+            };
             const tok_json = try readFile(io, allocator, dir, "tokenizer.json");
             defer allocator.free(tok_json);
             self.snow_tok = try UnigramTokenizer.initFromJson(allocator, tok_json);
-            log.info("snowflake loaded from {s}", .{dir});
+            log.info("snowflake loaded from {s} (gpu={})", .{ dir, try_gpu });
         }
 
         // Load SigLIP2 visual + textual encoders
         if (visual_dir) |dir| {
-            self.siglip_visual = try loadSession(allocator, api, env.?, opts.?,
-                dir, "visual/model.onnx");
-            self.siglip_text = try loadSession(allocator, api, env.?, opts.?,
-                dir, "textual/model.onnx");
+            {
+                const cur_opts = if (try_gpu) opts.? else cpu_opts orelse opts.?;
+                self.siglip_visual = loadSession(allocator, api, env.?, cur_opts, dir, "visual/model.onnx") catch |err| blk: {
+                    if (try_gpu) {
+                        log.warn("siglip2 visual GPU session failed ({}); falling back to CPU for all remaining sessions", .{err});
+                        try_gpu = false;
+                        break :blk try loadSession(allocator, api, env.?, cpu_opts.?, dir, "visual/model.onnx");
+                    }
+                    return err;
+                };
+            }
+            {
+                const cur_opts = if (try_gpu) opts.? else cpu_opts orelse opts.?;
+                self.siglip_text = loadSession(allocator, api, env.?, cur_opts, dir, "textual/model.onnx") catch |err| blk: {
+                    if (try_gpu) {
+                        log.warn("siglip2 textual GPU session failed ({}); falling back to CPU", .{err});
+                        try_gpu = false;
+                        break :blk try loadSession(allocator, api, env.?, cpu_opts.?, dir, "textual/model.onnx");
+                    }
+                    return err;
+                };
+            }
             const tok_json = try readFile(io, allocator, dir, "textual/tokenizer.json");
             defer allocator.free(tok_json);
             self.siglip_tok = try BpeTokenizer.initFromJson(allocator, tok_json);
-            log.info("siglip2 loaded from {s}", .{dir});
+            log.info("siglip2 loaded from {s} (gpu={})", .{ dir, try_gpu });
         }
 
         return self;
@@ -452,6 +557,48 @@ pub const OnnxEmbedder = struct {
         const ids64   = try tok.encode(allocator, text, SIGLIP_MAX_TOKENS - 4);
         defer allocator.free(ids64);
         return runSigLipText(self, allocator, session, ids64);
+    }
+
+    // ── Batch inference ───────────────────────────────────────────────────────
+    //
+    // These models were exported with a static batch dimension of 1 and cannot
+    // accept a larger batch tensor directly.  The batch methods below run N
+    // sequential GPU calls so that the scan pipeline can keep CPU and GPU busy
+    // concurrently: EMBED_BATCH_SIZE files are parsed in parallel, then their
+    // embeddings are generated here one at a time before the next CPU batch starts.
+
+    /// Embed a slice of prompt texts sequentially. Caller owns the returned
+    /// slice and every sub-slice (free each vec then the outer slice).
+    pub fn embedPromptBatch(
+        self:      *OnnxEmbedder,
+        allocator: std.mem.Allocator,
+        texts:     []const []const u8,
+    ) ![][]f32 {
+        const results = try allocator.alloc([]f32, texts.len);
+        errdefer {
+            for (results) |r| allocator.free(r);
+            allocator.free(results);
+        }
+        for (texts, 0..) |text, i|
+            results[i] = try self.embedPrompt(allocator, text);
+        return results;
+    }
+
+    /// Embed a slice of images sequentially. Caller owns the returned slice
+    /// and every sub-slice.
+    pub fn embedImageBatch(
+        self:      *OnnxEmbedder,
+        allocator: std.mem.Allocator,
+        paths:     []const [:0]const u8,
+    ) ![][]f32 {
+        const results = try allocator.alloc([]f32, paths.len);
+        errdefer {
+            for (results) |r| allocator.free(r);
+            allocator.free(results);
+        }
+        for (paths, 0..) |path, i|
+            results[i] = try self.embedImage(allocator, path);
+        return results;
     }
 
     // ── Internal runner functions ─────────────────────────────────────────────

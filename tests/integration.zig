@@ -260,5 +260,5 @@ test "grid: render with images doesn't crash" {
 
     try dvui.testing.settle(gridFrame);
     // "grid-empty" should not be registered when images are present
-    try std.testing.expectError(error.TagNotFound, dvui.testing.tagGet("grid-empty"));
+    try std.testing.expect(dvui.tagGet("grid-empty") == null);
 }

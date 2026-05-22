@@ -23,11 +23,80 @@ fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]co
     return buf;
 }
 
+/// Number of files processed concurrently per batch. After each batch of CPU
+/// work (parse + thumbnail) completes, embeddings are run in a single GPU call.
+pub const EMBED_BATCH_SIZE: usize = 8;
+
 pub const ScanStats = struct {
     added: u32 = 0,
     updated: u32 = 0,
     removed: u32 = 0,
     unchanged: u32 = 0,
+};
+
+/// Holds the inputs needed to embed a single file. Written by processFile in
+/// batch mode; consumed by batchEmbedAndStore after the concurrent group completes.
+pub const EmbedInput = struct {
+    image_id: u64,
+    prompt_text:  ?[]const u8,    // owned; null = no prompt embedding needed
+    image_path_z: ?[:0]const u8,  // owned; null = no image embedding needed
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *EmbedInput) void {
+        if (self.prompt_text)  |p| self.allocator.free(p);
+        if (self.image_path_z) |p| self.allocator.free(p);
+    }
+};
+
+/// Thread-safe FIFO queue of EmbedInputs. CPU tasks push; a dedicated embed
+/// consumer goroutine pops and calls the embedder, letting CPU work and GPU
+/// inference overlap instead of running strictly serially.
+const EmbedQueue = struct {
+    mutex:       std.Io.Mutex                 = .init,
+    cond:        std.Io.Condition             = .init,
+    items:       std.ArrayList(EmbedInput)    = .empty,
+    done:        bool                         = false,
+    allocator:   std.mem.Allocator,
+    embed_done:  *std.atomic.Value(u32),
+    embed_total: *std.atomic.Value(u32),
+
+    fn deinit(q: *EmbedQueue, io: std.Io) void {
+        q.mutex.lockUncancelable(io);
+        for (q.items.items) |*item| item.deinit();
+        q.items.deinit(q.allocator);
+        q.mutex.unlock(io);
+    }
+
+    fn push(q: *EmbedQueue, io: std.Io, item: EmbedInput) void {
+        q.mutex.lockUncancelable(io);
+        q.items.append(q.allocator, item) catch {
+            q.mutex.unlock(io);
+            var it = item;
+            it.deinit();
+            return;
+        };
+        _ = q.embed_total.fetchAdd(1, .acq_rel);
+        q.cond.signal(io);
+        q.mutex.unlock(io);
+    }
+
+    fn finish(q: *EmbedQueue, io: std.Io) void {
+        q.mutex.lockUncancelable(io);
+        q.done = true;
+        log.debug("embed queue: finish called, broadcasting (items remaining: {d})", .{q.items.items.len});
+        q.cond.broadcast(io);
+        q.mutex.unlock(io);
+    }
+
+    /// Blocks until an item is available. Returns null when done and empty.
+    fn pop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        while (q.items.items.len == 0 and !q.done)
+            q.cond.waitUncancelable(io, &q.mutex);
+        if (q.items.items.len > 0) return q.items.pop();
+        return null;
+    }
 };
 
 pub const ScanCtx = struct {
@@ -47,6 +116,10 @@ pub const ScanCtx = struct {
     embedder: ?*onnx_mod.OnnxEmbedder = null,
     has_prompt_embedding: bool = false,
     has_image_embedding: bool = false,
+    /// Queue mode: when non-null, processFile pushes EmbedInputs here instead
+    /// of calling the embedder inline. A separate consumer goroutine drains
+    /// the queue concurrently. Null for single-file watcher paths.
+    embed_queue: ?*EmbedQueue = null,
 };
 
 pub const AtomicStats = struct {
@@ -123,6 +196,8 @@ pub const LibraryScanner = struct {
         library_path: []const u8,
         stop: *std.atomic.Value(bool),
         files_scanned: *std.atomic.Value(u32),
+        embed_done: *std.atomic.Value(u32),
+        embed_total: *std.atomic.Value(u32),
         thumbnails_in_db: bool,
         prompt_embeddings: bool,
         image_embeddings: bool,
@@ -137,15 +212,42 @@ pub const LibraryScanner = struct {
             known.deinit();
         }
 
-        const max_concurrent: usize = 1;
+        // Embed consumer: runs concurrently with CPU tasks, draining the queue
+        // as processFile tasks push EmbedInputs into it.
+        var embed_queue: EmbedQueue = .{
+            .allocator   = self.allocator,
+            .embed_done  = embed_done,
+            .embed_total = embed_total,
+        };
+        var embed_group: std.Io.Group = .init;
+        if (self.embedder) |emb| {
+            embed_group.concurrent(io, embedConsumer, .{EmbedConsumerCtx{
+                .queue     = &embed_queue,
+                .db        = self.db,
+                .emb       = emb,
+                .allocator = self.allocator,
+                .stop      = stop,
+                .io        = io,
+            }}) catch |err| log.warn("spawn embed consumer: {}", .{err});
+        }
+
         var group: std.Io.Group = .init;
         var in_flight: usize = 0;
-        try self.walkDirectory(
+        const walk_err = self.walkDirectory(
             io, library_id, library_path, &stats, &known,
             stop, files_scanned, thumbnails_in_db, prompt_embeddings, image_embeddings,
-            &group, &in_flight, max_concurrent,
+            &group, &in_flight, &embed_queue,
         );
-        group.await(io) catch |err| log.warn("final group.await: {}", .{err});
+        group.await(io) catch |err| log.warn("final cpu group.await: {}", .{err});
+        log.debug("scanLibrary: all cpu tasks done, signaling embed consumer", .{});
+
+        // Signal consumer that no more items are coming, then wait for it to drain.
+        embed_queue.finish(io);
+        embed_group.await(io) catch |err| log.warn("embed group.await: {}", .{err});
+        log.debug("scanLibrary: embed consumer joined", .{});
+        embed_queue.deinit(io);
+
+        try walk_err;
 
         // Reconciliation: any entry not marked seen no longer exists on disk.
         // Skip if the scan was stopped early — unseen entries may simply not have
@@ -183,7 +285,7 @@ pub const LibraryScanner = struct {
         image_embeddings: bool,
         group: *std.Io.Group,
         in_flight: *usize,
-        max_concurrent: usize,
+        embed_queue: *EmbedQueue,
     ) !void {
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{
             .access_sub_paths = true,
@@ -201,7 +303,7 @@ pub const LibraryScanner = struct {
                 try self.walkDirectory(
                     io, library_id, full_path, stats, known,
                     stop, files_scanned, thumbnails_in_db, prompt_embeddings, image_embeddings,
-                    group, in_flight, max_concurrent,
+                    group, in_flight, embed_queue,
                 );
                 continue;
             }
@@ -242,8 +344,9 @@ pub const LibraryScanner = struct {
                 }
             }
 
-            // Flush the current batch before exceeding the concurrent cap.
-            if (in_flight.* >= max_concurrent) {
+            // Throttle CPU task concurrency: await the current batch before
+            // spawning more, so we don't accumulate unlimited in-flight tasks.
+            if (in_flight.* >= EMBED_BATCH_SIZE) {
                 group.await(io) catch |err| log.warn("group.await: {}", .{err});
                 group.* = .init;
                 in_flight.* = 0;
@@ -267,6 +370,7 @@ pub const LibraryScanner = struct {
                 .embedder = self.embedder,
                 .has_prompt_embedding = if (meta_ptr) |m| m.has_prompt_embedding else false,
                 .has_image_embedding = if (meta_ptr) |m| m.has_image_embedding else false,
+                .embed_queue = if (self.embedder != null) embed_queue else null,
             }}) catch |err| {
                 log.warn("spawn {s}: {}", .{ std.fs.path.basename(full_path), err });
                 self.allocator.free(full_path);
@@ -276,6 +380,56 @@ pub const LibraryScanner = struct {
         }
     }
 };
+
+const EmbedConsumerCtx = struct {
+    queue:     *EmbedQueue,
+    db:        *db_mod.VectorDb,
+    emb:       *onnx_mod.OnnxEmbedder,
+    allocator: std.mem.Allocator,
+    stop:      *std.atomic.Value(bool),
+    io:        std.Io,
+};
+
+/// Runs as a concurrent goroutine alongside CPU tasks. Drains the EmbedQueue
+/// and calls the embedder for each item, then stores the result in the DB.
+fn embedConsumer(ctx: EmbedConsumerCtx) void {
+    log.debug("embed consumer: started", .{});
+    var n: u32 = 0;
+    while (ctx.queue.pop(ctx.io)) |item| {
+        var ei = item;
+        defer ei.deinit();
+        n += 1;
+        if (!ctx.stop.load(.acquire)) embedSingle(ctx.allocator, ctx.db, ctx.emb, &ei);
+        _ = ctx.queue.embed_done.fetchAdd(1, .acq_rel);
+    }
+    log.debug("embed consumer: exiting after {d} items", .{n});
+}
+
+fn embedSingle(
+    allocator: std.mem.Allocator,
+    db:        *db_mod.VectorDb,
+    emb:       *onnx_mod.OnnxEmbedder,
+    item:      *const EmbedInput,
+) void {
+    if (item.prompt_text) |text| {
+        if (emb.embedPrompt(allocator, text)) |vec| {
+            defer allocator.free(vec);
+            db.storePromptEmbedding(item.image_id, vec) catch |err|
+                log.warn("store prompt embed: {}", .{err});
+        } else |err| {
+            log.warn("prompt embed failed ({}); skipped", .{err});
+        }
+    }
+    if (item.image_path_z) |path| {
+        if (emb.embedImage(allocator, path)) |vec| {
+            defer allocator.free(vec);
+            db.storeImageEmbedding(item.image_id, vec) catch |err|
+                log.warn("store image embed: {}", .{err});
+        } else |err| {
+            log.warn("image embed failed ({}); skipped", .{err});
+        }
+    }
+}
 
 pub fn processFile(ctx: ScanCtx) void {
     defer ctx.allocator.free(ctx.path);
@@ -309,30 +463,51 @@ pub fn processFile(ctx: ScanCtx) void {
                 };
                 did_work = true;
             }
-            embed_prompt_backfill: {
-                if (!ctx.prompt_embeddings or ctx.has_prompt_embedding) break :embed_prompt_backfill;
-                const emb = ctx.embedder orelse break :embed_prompt_backfill;
-                const prompt = image.positivePromptText orelse break :embed_prompt_backfill;
-                if (ctx.stop.load(.acquire)) break :embed_prompt_backfill;
-                const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt_backfill;
-                defer ctx.allocator.free(vec);
-                ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
-                    log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-                };
-                did_work = true;
-            }
-            embed_image_backfill: {
-                if (!ctx.image_embeddings or ctx.has_image_embedding) break :embed_image_backfill;
-                if (ctx.stop.load(.acquire)) break :embed_image_backfill;
-                const emb = ctx.embedder orelse break :embed_image_backfill;
-                const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image_backfill;
-                defer ctx.allocator.free(path_z);
-                const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image_backfill;
-                defer ctx.allocator.free(vec);
-                ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
-                    log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-                };
-                did_work = true;
+            const needs_prompt_backfill = ctx.prompt_embeddings and !ctx.has_prompt_embedding;
+            const needs_image_backfill  = ctx.image_embeddings  and !ctx.has_image_embedding;
+
+            if (ctx.embed_queue) |q| {
+                // Queue mode: push embedding inputs to the concurrent consumer.
+                if (needs_prompt_backfill or needs_image_backfill) {
+                    q.push(ctx.io, EmbedInput{
+                        .image_id     = image.id,
+                        .prompt_text  = if (needs_prompt_backfill)
+                            if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
+                            else null,
+                        .image_path_z = if (needs_image_backfill)
+                            ctx.allocator.dupeZ(u8, ctx.path) catch null
+                            else null,
+                        .allocator    = ctx.allocator,
+                    });
+                    did_work = true;
+                }
+            } else {
+                // Inline mode (single-file from watcher): embed directly.
+                embed_prompt_backfill: {
+                    if (!needs_prompt_backfill) break :embed_prompt_backfill;
+                    const emb = ctx.embedder orelse break :embed_prompt_backfill;
+                    const prompt = image.positivePromptText orelse break :embed_prompt_backfill;
+                    if (ctx.stop.load(.acquire)) break :embed_prompt_backfill;
+                    const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt_backfill;
+                    defer ctx.allocator.free(vec);
+                    ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
+                        log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+                    };
+                    did_work = true;
+                }
+                embed_image_backfill: {
+                    if (!needs_image_backfill) break :embed_image_backfill;
+                    if (ctx.stop.load(.acquire)) break :embed_image_backfill;
+                    const emb = ctx.embedder orelse break :embed_image_backfill;
+                    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image_backfill;
+                    defer ctx.allocator.free(path_z);
+                    const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image_backfill;
+                    defer ctx.allocator.free(vec);
+                    ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
+                        log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+                    };
+                    did_work = true;
+                }
             }
             if (did_work) {
                 _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
@@ -485,6 +660,27 @@ pub fn processFile(ctx: ScanCtx) void {
         return;
     };
 
+    if (ctx.embed_queue) |q| {
+        // Queue mode: push embedding inputs to the concurrent consumer.
+        if (ctx.prompt_embeddings or ctx.image_embeddings) {
+            q.push(ctx.io, EmbedInput{
+                .image_id     = image.id,
+                .prompt_text  = if (ctx.prompt_embeddings)
+                    if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
+                    else null,
+                .image_path_z = if (ctx.image_embeddings)
+                    ctx.allocator.dupeZ(u8, ctx.path) catch null
+                    else null,
+                .allocator    = ctx.allocator,
+            });
+        }
+        if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
+        else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
+        log.debug("processed {s}", .{std.fs.path.basename(ctx.path)});
+        return;
+    }
+
+    // Inline mode (single-file from watcher): embed directly.
     embed_prompt: {
         if (!ctx.prompt_embeddings) break :embed_prompt;
         const emb = ctx.embedder orelse break :embed_prompt;

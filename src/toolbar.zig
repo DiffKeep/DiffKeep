@@ -37,6 +37,7 @@ pub const RenderCtx = struct {
     right_w_open: *f32,
     total_image_count: *i64,
     on_refresh_counts: *const fn () void,
+    embedder_loading: bool,
 };
 
 pub fn renderToolbar(ctx: RenderCtx) void {
@@ -48,17 +49,37 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     defer toolbar.deinit();
 
     {
-        var te = dvui.textEntry(@src(), .{
-            .text = .{ .buffer = ctx.search.buf[0..] },
-            .placeholder = i18n.t(.search_placeholder),
-        }, .{
-            .tag = "search-box",
+        var search_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
             .expand = .horizontal,
             .gravity_y = 0.5,
-            .corner_radius = dvui.Rect.all(5),
-            .min_size_content = .{ .h = 22 },
         });
-        defer te.deinit();
+        defer search_row.deinit();
+
+        {
+            var te = dvui.textEntry(@src(), .{
+                .text = .{ .buffer = ctx.search.buf[0..] },
+                .placeholder = i18n.t(.search_placeholder),
+            }, .{
+                .tag = "search-box",
+                .expand = .horizontal,
+                .gravity_y = 0.5,
+                .corner_radius = dvui.Rect.all(5),
+                .min_size_content = .{ .h = 22 },
+            });
+            defer te.deinit();
+        }
+
+        if (ctx.search.buf[0] != 0) {
+            if (dvui.buttonIcon(@src(), "search_clear", dvui.entypo.cross, .{}, .{}, .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 16, .h = 16 },
+                .padding = dvui.Rect.all(3),
+                .margin = .{ .x = 4 },
+            })) {
+                @memset(&ctx.search.buf, 0);
+                ctx.search.force_search = true;
+            }
+        }
     }
 
     {
@@ -70,18 +91,41 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         };
         for (modes, 0..) |m, mi| {
             const active = ctx.search.mode == m.mode;
-            if (dvui.button(@src(), m.label, .{}, .{
+            const enabled: bool = switch (m.mode) {
+                .fts      => true,
+                .semantic => if (ctx.search.embedder) |e| e.hasPromptEncoder() else false,
+                .visual   => if (ctx.search.embedder) |e| e.hasVisualEncoder() else false,
+                .combined => if (ctx.search.embedder) |e| e.hasPromptEncoder() and e.hasVisualEncoder() else false,
+            };
+            var bw: dvui.ButtonWidget = undefined;
+            bw.init(@src(), .{}, .{
                 .id_extra = mi,
                 .gravity_y = 0.5,
                 .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
                 .corner_radius = dvui.Rect.all(4),
                 .margin = .{ .x = 2, .w = 2 },
                 .color_fill = if (active) dvui.themeGet().focus else null,
-            })) {
+            });
+            defer bw.deinit();
+            bw.processEvents();
+            bw.drawBackground();
+            dvui.label(@src(), "{s}", .{m.label}, .{
+                .id_extra = mi,
+                .gravity_y = 0.5,
+                .color_text = if (enabled) null else dvui.Color{ .r = 110, .g = 110, .b = 110, .a = 255 },
+            });
+            if (bw.clicked() and enabled) {
                 if (ctx.search.mode != m.mode) {
                     ctx.search.mode = m.mode;
                     ctx.search.force_search = true;
                 }
+            }
+            bw.drawFocus();
+            if (!enabled) {
+                dvui.tooltip(@src(), .{
+                    .active_rect = bw.data().rectScale().r,
+                    .delay = 200_000,
+                }, "{s}", .{i18n.t(.search_no_model_hint)}, .{});
             }
         }
     }
@@ -303,32 +347,94 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     });
     defer statusbar.deinit();
 
-    if (ctx.library_manager.*) |*mgr| {
-        if (mgr.isScanActive()) {
+    // ── Section 1: image count ──────────────────────────────────────────────
+    {
+        var count_box = dvui.box(@src(), .{}, .{
+            .min_size_content = .{ .w = 160 },
+            .gravity_y = 0.5,
+        });
+        defer count_box.deinit();
+
+        if (ctx.library_manager.* != null) {
+            const displayed: usize = if (ctx.grid.*) |*grid| grid.images.items.len else 0;
+            const total: i64 = ctx.total_image_count.*;
+            if (@as(i64, @intCast(displayed)) < total) {
+                dvui.label(@src(), "{d} {s} {s} {d}", .{
+                    displayed,
+                    i18n.t(.status_out_of),
+                    i18n.t(.status_images),
+                    total,
+                }, .{ .gravity_y = 0.5 });
+            } else {
+                dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
+            }
+        } else {
+            dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
+        }
+    }
+
+    // ── Section 2: current activity ─────────────────────────────────────────
+    {
+        var activity_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .min_size_content = .{ .w = 220 },
+            .gravity_y = 0.5,
+        });
+        defer activity_box.deinit();
+
+        const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
+        const is_searching = ctx.search.isSearchLoading();
+        const is_downloading = ctx.settings.snowflake_dl_running.load(.acquire) or
+            ctx.settings.siglip2_dl_running.load(.acquire);
+
+        if (is_scanning) {
             _ = dvui.spinner(@src(), .{
                 .gravity_y = 0.5,
                 .min_size_content = .{ .w = 12, .h = 12 },
             });
-            dvui.label(@src(), "scanning\u{2026} {d} files", .{mgr.filesScanned()}, .{
+            const embed_total = if (ctx.library_manager.*) |*mgr| mgr.embedsTotal() else 0;
+            if (embed_total > 0) {
+                const embed_done = if (ctx.library_manager.*) |*mgr| mgr.embedsDone() else 0;
+                dvui.label(@src(), "{s}: {d} / {d}", .{ i18n.t(.status_embedding), embed_done, embed_total }, .{
+                    .gravity_y = 0.5,
+                    .margin = .{ .x = 4 },
+                });
+            } else {
+                const scanned = if (ctx.library_manager.*) |*mgr| mgr.filesScanned() else 0;
+                dvui.label(@src(), "{s}: {d}", .{ i18n.t(.status_indexing), scanned }, .{
+                    .gravity_y = 0.5,
+                    .margin = .{ .x = 4 },
+                });
+            }
+        } else if (is_searching) {
+            _ = dvui.spinner(@src(), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 12, .h = 12 },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.search_loading)}, .{
+                .gravity_y = 0.5,
+                .margin = .{ .x = 4 },
+            });
+        } else if (ctx.embedder_loading) {
+            _ = dvui.spinner(@src(), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 12, .h = 12 },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.status_loading_model)}, .{
+                .gravity_y = 0.5,
+                .margin = .{ .x = 4 },
+            });
+        } else if (is_downloading) {
+            _ = dvui.spinner(@src(), .{
+                .gravity_y = 0.5,
+                .min_size_content = .{ .w = 12, .h = 12 },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.settings_download_running)}, .{
                 .gravity_y = 0.5,
                 .margin = .{ .x = 4 },
             });
         }
-        const displayed: usize = if (ctx.grid.*) |*grid| grid.images.items.len else 0;
-        const is_filtered = ctx.sidebar.filter_library_id != null or ctx.sidebar.filter_folder != null;
-        if (is_filtered) {
-            dvui.label(@src(), "{d} {s} ({s} {d})", .{
-                displayed,
-                i18n.t(.status_images),
-                i18n.t(.status_out_of),
-                ctx.total_image_count.*,
-            }, .{ .gravity_y = 0.5 });
-        } else {
-            dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
-        }
-    } else {
-        dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
     }
+
     _ = dvui.spacer(@src(), .{ .expand = .horizontal });
     if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
         .min_size_content = .{ .w = 14, .h = 14 },
@@ -349,6 +455,10 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
             };
             @memcpy(&ctx.settings.model_snapshot.text_dir, &ctx.settings.text_model_dir_buf);
             @memcpy(&ctx.settings.model_snapshot.visual_dir, &ctx.settings.visual_model_dir_buf);
+            ctx.settings.gpu_snapshot = .{
+                .use_gpu = ctx.cfg.use_gpu,
+                .gpu_device_id = ctx.cfg.gpu_device_id,
+            };
         }
     }
 }

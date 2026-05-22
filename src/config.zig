@@ -19,6 +19,8 @@ pub const Config = struct {
     trash_enabled: bool = true,
     text_model_dir: ?[]const u8 = null,    // path to snowflake-arctic-embed-m-v2.0 dir
     visual_model_dir: ?[]const u8 = null,  // path to ViT-B-16-SigLIP2__webli dir
+    use_gpu: bool = false,
+    gpu_device_id: u32 = 0,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.data_path) |p| allocator.free(p);

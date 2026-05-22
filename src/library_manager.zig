@@ -32,6 +32,9 @@ pub const LibraryManager = struct {
     wakeup_fn: ?*const fn () void = null,
     /// Set to true when a file is deleted so frame() can call grid.reloadImages().
     reload_requested: std.atomic.Value(bool) = .init(false),
+    /// Embedding progress counters — updated by the scan embed consumer.
+    embed_done:  std.atomic.Value(u32) = .init(0),
+    embed_total: std.atomic.Value(u32) = .init(0),
     /// Separate io group for single-file processing tasks spawned by the watcher.
     file_group: std.Io.Group,
     embedder: ?*onnx_mod.OnnxEmbedder = null,  // borrowed from dk.g_embedder, not owned
@@ -144,6 +147,14 @@ pub const LibraryManager = struct {
         return self.files_scanned.load(.acquire);
     }
 
+    pub fn embedsDone(self: *const LibraryManager) u32 {
+        return self.embed_done.load(.acquire);
+    }
+
+    pub fn embedsTotal(self: *const LibraryManager) u32 {
+        return self.embed_total.load(.acquire);
+    }
+
     fn enqueue(self: *LibraryManager, io: std.Io, library_id: u64, path: []const u8) !void {
         const path_copy = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_copy);
@@ -163,6 +174,8 @@ pub const LibraryManager = struct {
         if (!already_active) {
             self.stop_scan.store(false, .release);
             self.files_scanned.store(0, .release);
+            self.embed_done.store(0, .release);
+            self.embed_total.store(0, .release);
             // Clean up the previous drain task (it has just set active=false and is
             // returning, so this await completes almost instantly).
             self.scan_group.await(io) catch {};
@@ -231,7 +244,7 @@ fn drainQueue(manager: *LibraryManager, io: std.Io) void {
         var scanner = scan_mod.LibraryScanner.init(manager.allocator, &scan_db, manager.notifier);
         defer scanner.deinit();
         scanner.embedder = manager.embedder;
-        _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
+        _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, &manager.embed_done, &manager.embed_total, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
             log.err("scan {s}: {}", .{ std.fs.path.basename(req.library_path), err });
         };
     }

@@ -116,6 +116,19 @@ pub const Strings = struct {
     settings_model_placeholder: [:0]const u8,
     settings_mmproj_placeholder: [:0]const u8,
     search_no_model: [:0]const u8,
+    search_no_model_hint: [:0]const u8,
+
+    settings_download_snowflake: [:0]const u8,
+    settings_download_siglip2: [:0]const u8,
+    settings_download_running: [:0]const u8,
+
+    settings_gpu_section: [:0]const u8,
+    settings_use_gpu: [:0]const u8,
+    settings_gpu_device_id: [:0]const u8,
+
+    status_indexing: [:0]const u8,
+    status_embedding: [:0]const u8,
+    status_loading_model: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -232,6 +245,19 @@ pub const en: Strings = .{
     .settings_model_placeholder = "Path to snowflake-arctic-embed-m-v2.0 directory",
     .settings_mmproj_placeholder = "Path to ViT-B-16-SigLIP2 directory",
     .search_no_model = "No model configured",
+    .search_no_model_hint = "No model configured \u{2014} open Settings to add a model path",
+
+    .settings_download_snowflake = "Download Snowflake Arctic",
+    .settings_download_siglip2 = "Download SigLIP2",
+    .settings_download_running = "Downloading\u{2026}",
+
+    .settings_gpu_section = "GPU",
+    .settings_use_gpu = "Use GPU acceleration (CUDA)",
+    .settings_gpu_device_id = "Device ID",
+
+    .status_indexing = "Indexing",
+    .status_embedding = "Embedding",
+    .status_loading_model = "Loading model\u{2026}",
 };
 
 pub var active: *const Strings = &en;
