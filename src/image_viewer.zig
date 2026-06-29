@@ -379,6 +379,14 @@ pub const ViewerState = struct {
                     e.handled = true;
                     if (self.current_idx + 1 < self.images.items.len) self.navigateTo(self.current_idx + 1);
                 },
+                .home => {
+                    e.handled = true;
+                    if (self.images.items.len > 0) self.navigateTo(0);
+                },
+                .end => {
+                    e.handled = true;
+                    if (self.images.items.len > 0) self.navigateTo(self.images.items.len - 1);
+                },
                 .equal, .kp_add => {
                     e.handled = true;
                     self.zoom = std.math.clamp(self.zoom * 1.25, 0.05, 32.0);
@@ -480,16 +488,28 @@ pub const ViewerState = struct {
         });
         defer tb.deinit();
 
-        if (dvui.buttonIcon(@src(), "prev", icons.tvg.lucide.@"chevron-left", .{}, .{},
+        if (dvui.buttonIcon(@src(), i18n.t(.viewer_first), icons.tvg.lucide.@"chevrons-left", .{}, .{},
+            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
+        {
+            if (self.images.items.len > 0) self.navigateTo(0);
+        }
+
+        if (dvui.buttonIcon(@src(), i18n.t(.viewer_prev), icons.tvg.lucide.@"chevron-left", .{}, .{},
             .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
         {
             if (self.current_idx > 0) self.navigateTo(self.current_idx - 1);
         }
 
-        if (dvui.buttonIcon(@src(), "next", icons.tvg.lucide.@"chevron-right", .{}, .{},
+        if (dvui.buttonIcon(@src(), i18n.t(.viewer_next), icons.tvg.lucide.@"chevron-right", .{}, .{},
             .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
         {
             if (self.current_idx + 1 < self.images.items.len) self.navigateTo(self.current_idx + 1);
+        }
+
+        if (dvui.buttonIcon(@src(), i18n.t(.viewer_last), icons.tvg.lucide.@"chevrons-right", .{}, .{},
+            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
+        {
+            if (self.images.items.len > 0) self.navigateTo(self.images.items.len - 1);
         }
 
         const filename: []const u8 = if (self.images.items.len > 0)
@@ -608,7 +628,7 @@ pub const ViewerState = struct {
             }
         }
 
-        dvui.icon(@src(), i18n.t(.viewer_drag), icons.tvg.lucide.@"grip-vertical", .{}, .{
+        dvui.icon(@src(), i18n.t(.viewer_drag), icons.tvg.lucide.grab, .{}, .{
             .min_size_content = .{ .w = 16, .h = 16 },
             .gravity_x = 0.5,
             .gravity_y = 0.5,
