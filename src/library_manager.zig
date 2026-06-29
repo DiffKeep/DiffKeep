@@ -30,8 +30,10 @@ pub const LibraryManager = struct {
     watcher: ?*fs_watch_mod.FsWatcher,
     /// Called from any thread after a single-file task completes, to wake the render loop.
     wakeup_fn: ?*const fn () void = null,
-    /// Set to true when a file is deleted so frame() can call grid.reloadImages().
-    reload_requested: std.atomic.Value(bool) = .init(false),
+    /// Image ids removed by the watcher (file deleted on disk).  Drained by frame()
+    /// to drop them from the grid and viewers incrementally — no full reload.
+    removed_ids: std.ArrayListUnmanaged(u64) = .empty,
+    removed_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Embedding progress counters — updated by the scan embed consumer.
     embed_done:  std.atomic.Value(u32) = .init(0),
     embed_total: std.atomic.Value(u32) = .init(0),
@@ -68,6 +70,17 @@ pub const LibraryManager = struct {
         for (self.pending.items) |req| self.allocator.free(req.library_path);
         self.pending.deinit(self.allocator);
         self.queue_mutex.unlock(io);
+        self.removed_ids.deinit(self.allocator);
+    }
+
+    /// Move all watcher-removed image ids into `out` (owned by `self.allocator`).
+    /// Main-thread only; called once per frame.
+    pub fn drainRemovedIds(self: *LibraryManager, io: std.Io, out: *std.ArrayListUnmanaged(u64)) void {
+        self.removed_mutex.lockUncancelable(io);
+        defer self.removed_mutex.unlock(io);
+        if (self.removed_ids.items.len == 0) return;
+        out.appendSlice(self.allocator, self.removed_ids.items) catch {};
+        self.removed_ids.clearRetainingCapacity();
     }
 
     /// Process one file reported by the fs watcher.  `path` is heap-allocated
@@ -81,10 +94,16 @@ pub const LibraryManager = struct {
         deleted: bool,
     ) void {
         if (deleted) {
-            self.db.deleteImageByPath(library_id, path) catch |err|
+            const removed_id = self.db.deleteImageByPath(library_id, path) catch |err| blk: {
                 log.warn("delete {s}: {}", .{ std.fs.path.basename(path), err });
+                break :blk null;
+            };
             self.allocator.free(path);
-            self.reload_requested.store(true, .release);
+            if (removed_id) |id| {
+                self.removed_mutex.lockUncancelable(io);
+                self.removed_ids.append(self.allocator, id) catch {};
+                self.removed_mutex.unlock(io);
+            }
             if (self.wakeup_fn) |wake| wake();
             return;
         }

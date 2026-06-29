@@ -257,7 +257,7 @@ pub const LibraryScanner = struct {
             var kit = known.iterator();
             while (kit.next()) |entry| {
                 if (!entry.value_ptr.seen) {
-                    self.db.deleteImageByPath(library_id, entry.key_ptr.*) catch |err| {
+                    _ = self.db.deleteImageByPath(library_id, entry.key_ptr.*) catch |err| {
                         log.warn("delete {s}: {}", .{ std.fs.path.basename(entry.key_ptr.*), err });
                     };
                     removed += 1;

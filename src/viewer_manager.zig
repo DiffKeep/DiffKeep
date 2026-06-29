@@ -6,6 +6,7 @@ const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
 const config_mod = @import("config.zig");
 const window_state = @import("window_state.zig");
+const dnd_mod = @import("dnd.zig");
 
 pub const ViewerWindow = struct {
     back: SDLBackend,
@@ -13,8 +14,16 @@ pub const ViewerWindow = struct {
     sdl_window_id: u32,
     state: image_viewer_mod.ViewerState,
     fonts_initialized: bool = false,
+    // Native drag source bound to this window, for dragging the current image
+    // out to other apps.  null if the platform DnD backend is unavailable.
+    dnd: ?dnd_mod.DragSource = null,
+    // Fallback "move" cursor shown while a drag is in progress (when the backend
+    // does not provide a thumbnail cursor).  Owned here; destroyed at deinit.
+    dnd_drag_cursor: ?*SDLBackend.c.SDL_Cursor = null,
 
     pub fn deinit(self: *ViewerWindow) void {
+        if (self.dnd) |*d| d.deinit();
+        if (self.dnd_drag_cursor) |c| SDLBackend.c.SDL_DestroyCursor(c);
         self.state.deinit();
         self.win.deinit();
         // Destroy the SDL renderer and window manually, then suppress SDL_Quit.
@@ -129,6 +138,8 @@ pub const ViewerManager = struct {
                 return;
             };
         vw.sdl_window_id = SDLBackend.c.SDL_GetWindowID(vw.back.window);
+        vw.dnd = dnd_mod.DragSource.init(init.gpa, vw.back.window);
+        vw.state.dnd_available = vw.dnd != null;
 
         self.windows.append(init.gpa, vw) catch {
             vw.deinit();

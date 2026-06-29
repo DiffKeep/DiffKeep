@@ -788,9 +788,21 @@ pub const VectorDb = struct {
         return map;
     }
 
-    pub fn deleteImageByPath(self: *VectorDb, library_id: u64, path: []const u8) !void {
+    /// Deletes the image matching (library_id, path) and returns its id, or null
+    /// if no row matched. The id lets the caller drop the image from the grid /
+    /// viewers incrementally instead of reloading the whole list.
+    pub fn deleteImageByPath(self: *VectorDb, library_id: u64, path: []const u8) !?u64 {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
+
+        var sel = try self.db.prepare(
+            "SELECT id FROM images WHERE library_id = ? AND library_path = ?",
+        );
+        defer sel.deinit();
+        try sel.bind(1, library_id);
+        try sel.bind(2, path);
+        const id: ?u64 = if (try sel.step()) @intCast(sel.columnInt64(0)) else null;
+
         var stmt = try self.db.prepare(
             "DELETE FROM images WHERE library_id = ? AND library_path = ?",
         );
@@ -798,6 +810,7 @@ pub const VectorDb = struct {
         try stmt.bind(1, library_id);
         try stmt.bind(2, path);
         _ = try stmt.step();
+        return id;
     }
 
     fn getCurrentTimestamp(self: *VectorDb, allocator: std.mem.Allocator) ![]const u8 {

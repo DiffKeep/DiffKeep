@@ -65,6 +65,10 @@ pub const ViewerState = struct {
     // Pending actions consumed by app.zig
     delete_requested: bool = false,
     delete_force: bool = false,
+    // Set when the toolbar drag handle gesture fires; app.zig starts the native
+    // drag of the current image.  dnd_available gates showing the handle at all.
+    drag_requested: bool = false,
+    dnd_available: bool = false,
     // Confirmation dialog state.  app.zig sets delete_confirm_open; viewer renders
     // the dialog; app.zig consumes delete_confirmed / delete_no_ask.
     delete_confirm_open: bool = false,
@@ -545,12 +549,71 @@ pub const ViewerState = struct {
             self.persistPrefs();
         }
 
+        if (self.dnd_available and self.images.items.len > 0) self.renderDragHandle();
+
         if (dvui.buttonIcon(@src(), i18n.t(.viewer_delete), icons.tvg.lucide.trash, .{}, .{},
             .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
         {
             self.delete_requested = true;
             self.delete_force = false;
         }
+    }
+
+    // A grip the user presses and drags to export the current image to another
+    // app via native drag-and-drop.  Mirrors the grid's drag-to-external gesture:
+    // capture on press, fire once the drag threshold is exceeded.
+    fn renderDragHandle(self: *ViewerState) void {
+        var handle = dvui.box(@src(), .{}, .{
+            .min_size_content = .{ .w = 22, .h = 22 },
+            .gravity_y = 0.5,
+            .background = true,
+            .corner_radius = dvui.Rect.all(3),
+            .margin = .all(2),
+        });
+        defer handle.deinit();
+
+        const wd = handle.data();
+        const id = wd.id;
+
+        for (dvui.events()) |*e| {
+            if (e.evt != .mouse) continue;
+            const me = e.evt.mouse;
+            switch (me.action) {
+                .position => {
+                    if (dvui.eventMatchSimple(e, wd)) dvui.cursorSet(.hand);
+                },
+                .press => {
+                    if (me.button.pointer() and dvui.eventMatchSimple(e, wd)) {
+                        e.handled = true;
+                        dvui.captureMouse(wd, e.num);
+                        dvui.dragPreStart(me.p, .{ .cursor = .hand });
+                    }
+                },
+                .motion => {
+                    if (dvui.captured(id) and dvui.dragging(me.p, null) != null) {
+                        e.handled = true;
+                        dvui.captureMouse(null, e.num);
+                        dvui.dragEnd();
+                        self.drag_requested = true;
+                    }
+                },
+                .release => {
+                    if (dvui.captured(id)) {
+                        e.handled = true;
+                        dvui.captureMouse(null, e.num);
+                        dvui.dragEnd();
+                    }
+                },
+                else => {},
+            }
+        }
+
+        dvui.icon(@src(), i18n.t(.viewer_drag), icons.tvg.lucide.@"grip-vertical", .{}, .{
+            .min_size_content = .{ .w = 16, .h = 16 },
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+            .expand = .both,
+        });
     }
 
     fn renderImageArea(self: *ViewerState) void {

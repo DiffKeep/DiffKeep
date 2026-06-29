@@ -10,6 +10,9 @@ pub const AppCtx = struct {
     data_dir: *?[]const u8,
     cfg: *const config_mod.Config,
     on_counts_changed: *const fn () void,
+    /// Called after images are removed from the grid so open viewer windows can
+    /// drop the same images without reopening.
+    on_images_removed: *const fn (ids: *const std.AutoHashMap(u64, void)) void,
 };
 
 var g_ctx: ?AppCtx = null;
@@ -110,6 +113,7 @@ pub fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_
     }
 
     removeFromGrid(grid, &ids);
+    ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
 }
 
@@ -140,6 +144,7 @@ pub fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid
     }
 
     removeFromGrid(grid, &ids);
+    ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
 }
 
@@ -170,5 +175,6 @@ pub fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_gri
     }
 
     removeFromGrid(grid, &ids);
+    ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
 }

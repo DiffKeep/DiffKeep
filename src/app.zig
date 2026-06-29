@@ -132,6 +132,7 @@ fn appInit(win: *dvui.Window) !void {
         .data_dir = &g_data_dir,
         .cfg = &dk.g_cfg,
         .on_counts_changed = refreshCounts,
+        .on_images_removed = removeImagesFromViewers,
     });
 
     if (dvui.App.main_init) |init| {
@@ -407,11 +408,20 @@ fn frame() !dvui.App.Result {
     if (dk.g_grid) |*grid| {
         const prev_len = grid.images.items.len;
         grid.update();
-        // Reload grid when a watcher-triggered deletion has been committed to the DB.
+        // Drop images removed by the filesystem watcher from the grid and any open
+        // viewers incrementally — no full reload, so scroll/focus are preserved.
         if (dk.g_library_manager) |*mgr| {
-            if (mgr.reload_requested.load(.acquire)) {
-                mgr.reload_requested.store(false, .release);
-                if (dk.g_db) |*db| grid.reloadImagesKeepFocus(db) catch {};
+            if (dvui.App.main_init) |init| {
+                var removed: std.ArrayListUnmanaged(u64) = .empty;
+                defer removed.deinit(init.gpa);
+                mgr.drainRemovedIds(init.io, &removed);
+                if (removed.items.len > 0) {
+                    var ids = std.AutoHashMap(u64, void).init(init.gpa);
+                    defer ids.deinit();
+                    for (removed.items) |id| ids.put(id, {}) catch {};
+                    image_ops_mod.removeFromGrid(grid, &ids);
+                    g_viewer_manager.removeImages(&ids);
+                }
             }
         }
         if (grid.images.items.len != prev_len) {
@@ -702,17 +712,29 @@ fn initWindowFontsAndTheme() !void {
 
 var g_viewer_manager: viewer_manager_mod.ViewerManager = .{};
 
+/// Drop images from any open viewer windows after they are removed from the grid.
+fn removeImagesFromViewers(ids: *const std.AutoHashMap(u64, void)) void {
+    g_viewer_manager.removeImages(ids);
+}
+
 fn routeAllSDLEvents(main_back: *SDLBackend, main_win: *dvui.Window) void {
     if (g_dnd) |*dnd| dnd.pumpEvents();
+    for (g_viewer_manager.windows.items) |vw| {
+        if (vw.dnd) |*dnd| dnd.pumpEvents();
+    }
     const main_id = SDLBackend.c.SDL_GetWindowID(main_back.window);
     var event: SDLBackend.c.SDL_Event = undefined;
     while (SDLBackend.c.SDL_PollEvent(&event)) {
-        // Notify DnD of button release before routing — SDL's event is more
-        // timely than XQueryPointer on XWayland.
+        // Notify the active DnD of button release before routing — SDL's event is
+        // more timely than XQueryPointer on XWayland.  Only one drag is ever in
+        // progress, so notify whichever source is currently dragging.
         if (event.type == SDLBackend.c.SDL_EVENT_MOUSE_BUTTON_UP and
             event.button.button == 1)
         {
-            if (g_dnd) |*dnd| dnd.notifyButtonUp();
+            if (g_dnd) |*dnd| { if (dnd.isDragging()) dnd.notifyButtonUp(); }
+            for (g_viewer_manager.windows.items) |vw| {
+                if (vw.dnd) |*dnd| { if (dnd.isDragging()) dnd.notifyButtonUp(); }
+            }
         }
         const eid = sdlEventWindowID(event);
         if (eid == 0 or eid == main_id) {
@@ -1013,6 +1035,7 @@ pub fn main(init: std.process.Init) !void {
         while (vi < g_viewer_manager.windows.items.len) {
             const vw = g_viewer_manager.windows.items[vi];
             try vw.win.begin(nstime);
+            if (vw.dnd) |*d| d.tick(init.io);
 
             if (!vw.fonts_initialized) {
                 vw.fonts_initialized = true;
@@ -1046,6 +1069,20 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            if (vw.state.drag_requested) {
+                vw.state.drag_requested = false;
+                if (vw.dnd) |*d| {
+                    if (vw.state.currentImage()) |img| {
+                        const thumb = if (dk.g_grid) |*grid| grid.committed.get(img.id) else null;
+                        const drag_item = dnd_mod.DragItem{
+                            .path = img.path,
+                            .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
+                        };
+                        d.startDrag(&.{drag_item});
+                    }
+                }
+            }
+
             var close = !vw.state.open;
             for (dvui.events()) |*e| {
                 if (!e.handled and e.evt == .window and e.evt.window.action == .close)
@@ -1053,6 +1090,21 @@ pub fn main(init: std.process.Init) !void {
             }
             const vw_end: ?u32 = try vw.win.end(.{});
             try vw.back.setCursor(vw.win.cursorRequested());
+            if (vw.dnd) |*d| {
+                if (d.isDragging()) {
+                    if (d.getSdlCursor()) |thumb_cursor| {
+                        _ = SDLBackend.c.SDL_SetCursor(thumb_cursor);
+                    } else {
+                        if (vw.dnd_drag_cursor == null)
+                            vw.dnd_drag_cursor = SDLBackend.c.SDL_CreateSystemCursor(SDLBackend.c.SDL_SYSTEM_CURSOR_MOVE);
+                        if (vw.dnd_drag_cursor) |c| _ = SDLBackend.c.SDL_SetCursor(c);
+                    }
+                } else if (vw.dnd_drag_cursor) |c| {
+                    _ = SDLBackend.c.SDL_SetCursor(null);
+                    SDLBackend.c.SDL_DestroyCursor(c);
+                    vw.dnd_drag_cursor = null;
+                }
+            }
             try vw.back.renderPresent();
 
             end_micros = pickMinWait(end_micros, vw_end);

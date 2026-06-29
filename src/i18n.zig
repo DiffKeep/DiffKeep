@@ -106,6 +106,7 @@ pub const Strings = struct {
     viewer_of: [:0]const u8,
     viewer_loading: [:0]const u8,
     viewer_delete: [:0]const u8,
+    viewer_drag: [:0]const u8,
 
     search_mode_fts: [:0]const u8,
     search_mode_semantic: [:0]const u8,
@@ -235,6 +236,7 @@ pub const en: Strings = .{
     .viewer_of = "of",
     .viewer_loading = "Loading\u{2026}",
     .viewer_delete = "Delete",
+    .viewer_drag = "Drag image to another app",
 
     .search_mode_fts = "Text",
     .search_mode_semantic = "Semantic",
