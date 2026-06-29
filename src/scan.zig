@@ -431,6 +431,40 @@ fn embedSingle(
     }
 }
 
+/// Embed prompt and/or image inline (single-file watcher path) and store the
+/// resulting vectors. `do_prompt`/`do_image` gate each half. Returns true if any
+/// embedding was stored. Errors are logged and swallowed (best-effort). Shared
+/// by the backfill and new-file branches of processFile.
+fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool, do_image: bool) bool {
+    var did_work = false;
+    prompt: {
+        if (!do_prompt) break :prompt;
+        const emb = ctx.embedder orelse break :prompt;
+        const prompt = image.positivePromptText orelse break :prompt;
+        if (ctx.stop.load(.acquire)) break :prompt;
+        const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :prompt;
+        defer ctx.allocator.free(vec);
+        ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
+            log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        };
+        did_work = true;
+    }
+    image_blk: {
+        if (!do_image) break :image_blk;
+        if (ctx.stop.load(.acquire)) break :image_blk;
+        const emb = ctx.embedder orelse break :image_blk;
+        const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :image_blk;
+        defer ctx.allocator.free(path_z);
+        const vec = emb.embedImage(ctx.allocator, path_z) catch break :image_blk;
+        defer ctx.allocator.free(vec);
+        ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
+            log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        };
+        did_work = true;
+    }
+    return did_work;
+}
+
 pub fn processFile(ctx: ScanCtx) void {
     defer ctx.allocator.free(ctx.path);
     defer _ = ctx.files_scanned.fetchAdd(1, .acq_rel);
@@ -483,31 +517,8 @@ pub fn processFile(ctx: ScanCtx) void {
                 }
             } else {
                 // Inline mode (single-file from watcher): embed directly.
-                embed_prompt_backfill: {
-                    if (!needs_prompt_backfill) break :embed_prompt_backfill;
-                    const emb = ctx.embedder orelse break :embed_prompt_backfill;
-                    const prompt = image.positivePromptText orelse break :embed_prompt_backfill;
-                    if (ctx.stop.load(.acquire)) break :embed_prompt_backfill;
-                    const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt_backfill;
-                    defer ctx.allocator.free(vec);
-                    ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
-                        log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-                    };
+                if (embedAndStoreInline(ctx, &image, needs_prompt_backfill, needs_image_backfill))
                     did_work = true;
-                }
-                embed_image_backfill: {
-                    if (!needs_image_backfill) break :embed_image_backfill;
-                    if (ctx.stop.load(.acquire)) break :embed_image_backfill;
-                    const emb = ctx.embedder orelse break :embed_image_backfill;
-                    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image_backfill;
-                    defer ctx.allocator.free(path_z);
-                    const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image_backfill;
-                    defer ctx.allocator.free(vec);
-                    ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
-                        log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-                    };
-                    did_work = true;
-                }
             }
             if (did_work) {
                 _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
@@ -681,30 +692,7 @@ pub fn processFile(ctx: ScanCtx) void {
     }
 
     // Inline mode (single-file from watcher): embed directly.
-    embed_prompt: {
-        if (!ctx.prompt_embeddings) break :embed_prompt;
-        const emb = ctx.embedder orelse break :embed_prompt;
-        const prompt = image.positivePromptText orelse break :embed_prompt;
-        if (ctx.stop.load(.acquire)) break :embed_prompt;
-        const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :embed_prompt;
-        defer ctx.allocator.free(vec);
-        ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
-            log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-        };
-    }
-
-    embed_image: {
-        if (!ctx.image_embeddings) break :embed_image;
-        if (ctx.stop.load(.acquire)) break :embed_image;
-        const emb = ctx.embedder orelse break :embed_image;
-        const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :embed_image;
-        defer ctx.allocator.free(path_z);
-        const vec = emb.embedImage(ctx.allocator, path_z) catch break :embed_image;
-        defer ctx.allocator.free(vec);
-        ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
-            log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-        };
-    }
+    _ = embedAndStoreInline(ctx, &image, ctx.prompt_embeddings, ctx.image_embeddings);
 
     if (is_new) {
         _ = ctx.stats.added.fetchAdd(1, .acq_rel);

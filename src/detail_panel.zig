@@ -229,19 +229,26 @@ pub const DetailState = struct {
     }
 };
 
+// Shared option presets for the metadata layout.
+const meta_bold: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 4, .h = 0 } };
+const meta_label: dvui.Options = .{ .padding = .{ .x = 8, .y = 2, .h = 6 }, .expand = .horizontal, .background = false };
+const meta_val: dvui.Options = .{ .padding = .{ .x = 8, .y = 2, .h = 6 }, .expand = .horizontal };
+
+/// One labelled metadata column: a bold caption above its value. `src` must be
+/// unique per call site (pass @src()) so dvui gives each column a distinct id.
+fn metaColumn(src: std.builtin.SourceLocation, label: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var col = dvui.box(src, .{}, .{ .expand = .horizontal });
+    defer col.deinit();
+    dvui.label(@src(), "{s}", .{label}, meta_bold);
+    dvui.label(@src(), fmt, args, meta_val);
+}
+
 /// Render all metadata fields for one image. Called by renderPanel and by the
 /// viewer's info pane so the same layout is reused without duplication.
 pub fn renderContent(d: db_mod.ImageDetails) void {
-    const bp: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 4, .h = 0 } };
-    const lp: dvui.Options = .{
-        .padding = .{ .x = 8, .y = 2, .h = 6 },
-        .expand = .horizontal,
-        .background = false,
-    };
-    const sp: dvui.Options = .{
-        .padding = .{ .x = 8, .y = 2, .h = 6 },
-        .expand = .horizontal,
-    };
+    const bp = meta_bold;
+    const lp = meta_label;
+    const sp = meta_val;
 
     if (d.positive_prompt_text) |v| {
         {
@@ -288,60 +295,27 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
     if (d.sampler != null or d.scheduler != null) {
         var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer hrow.deinit();
-        if (d.sampler) |v| {
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_sampler)}, bp);
-            dvui.label(@src(), "{s}", .{v}, sp);
-        }
-        if (d.scheduler) |v| {
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_scheduler)}, bp);
-            dvui.label(@src(), "{s}", .{v}, sp);
-        }
+        if (d.sampler) |v| metaColumn(@src(), i18n.t(.detail_sampler), "{s}", .{v});
+        if (d.scheduler) |v| metaColumn(@src(), i18n.t(.detail_scheduler), "{s}", .{v});
     }
 
     if (d.cfg != null or d.steps != null or d.seed != null) {
         var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer hrow.deinit();
-        if (d.cfg) |v| {
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_cfg)}, bp);
-            dvui.label(@src(), "{d:.1}", .{v}, sp);
-        }
-        if (d.steps) |v| {
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_steps)}, bp);
-            dvui.label(@src(), "{d}", .{v}, sp);
-        }
-        if (d.seed) |v| {
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_seed)}, bp);
-            dvui.label(@src(), "{d}", .{v}, sp);
-        }
+        if (d.cfg) |v| metaColumn(@src(), i18n.t(.detail_cfg), "{d:.1}", .{v});
+        if (d.steps) |v| metaColumn(@src(), i18n.t(.detail_steps), "{d}", .{v});
+        if (d.seed) |v| metaColumn(@src(), i18n.t(.detail_seed), "{d}", .{v});
     }
 
     if (d.width != null or d.file_size != null) {
         var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer hrow.deinit();
         if (d.width) |w| {
-            if (d.height) |h| {
-                var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-                defer col.deinit();
-                dvui.label(@src(), "{s}", .{i18n.t(.detail_resolution)}, bp);
-                dvui.label(@src(), "{d}\u{00d7}{d}", .{ w, h }, sp);
-            }
+            if (d.height) |h| metaColumn(@src(), i18n.t(.detail_resolution), "{d}\u{00d7}{d}", .{ w, h });
         }
         if (d.file_size) |sz| {
             const fb = fmtBytes(sz);
-            var col = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            defer col.deinit();
-            dvui.label(@src(), "{s}", .{i18n.t(.detail_size)}, bp);
-            dvui.label(@src(), "{d:.1} {s}", .{ fb.value, fb.unit }, sp);
+            metaColumn(@src(), i18n.t(.detail_size), "{d:.1} {s}", .{ fb.value, fb.unit });
         }
     }
 

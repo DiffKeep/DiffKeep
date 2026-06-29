@@ -4,6 +4,8 @@ const SDLBackend = @import("backend");
 const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
 const detail_panel_mod = @import("detail_panel.zig");
+const config_mod = @import("config.zig");
+const window_state = @import("window_state.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
 const vips_mod = @import("vips");
@@ -74,6 +76,10 @@ pub const ViewerState = struct {
     delete_no_ask: bool = false,
     wakeup_fn: ?*const fn () void = null,
     data_dir: ?[]const u8 = null,
+    // Persisted UI preferences (shared with app config). Changes to fullscreen,
+    // info_open and info_w are written back here so they survive across viewers
+    // and program restarts.
+    cfg: ?*config_mod.Config = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -84,6 +90,7 @@ pub const ViewerState = struct {
         data_dir: ?[]const u8,
         io: std.Io,
         db: ?*db_mod.VectorDb,
+        cfg: ?*config_mod.Config,
     ) ViewerState {
         var state = ViewerState{
             .id = id,
@@ -94,11 +101,19 @@ pub const ViewerState = struct {
             .wakeup_fn = wakeup_fn,
             .data_dir = data_dir,
             .db = db,
+            .cfg = cfg,
             .cache_slots = undefined,
             .cache_threads = undefined,
         };
         for (&state.cache_slots) |*s| s.* = .{};
         for (&state.cache_threads) |*t| t.* = null;
+        // Restore remembered UI preferences.
+        if (cfg) |c| {
+            state.fullscreen = c.viewer_window.fullscreen;
+            state.info_open = c.viewer_info_open;
+            state.info_w = c.viewer_info_w;
+            state.info_w_open = c.viewer_info_w;
+        }
         if (db != null and images.items.len > 0) {
             state.detail_state.update(images.items[start_idx].id, db.?, allocator, io);
         }
@@ -323,6 +338,7 @@ pub const ViewerState = struct {
     }
 
     pub fn render(self: *ViewerState) void {
+        self.captureWindowState();
         self.drainCache();
         self.updateCache();
         self.handleKeyEvents();
@@ -389,6 +405,7 @@ pub const ViewerState = struct {
                 .i => {
                     e.handled = true;
                     self.info_open = !self.info_open;
+                    self.persistPrefs();
                 },
                 .escape => {
                     e.handled = true;
@@ -525,6 +542,7 @@ pub const ViewerState = struct {
             .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
         {
             self.info_open = !self.info_open;
+            self.persistPrefs();
         }
 
         if (dvui.buttonIcon(@src(), i18n.t(.viewer_delete), icons.tvg.lucide.trash, .{}, .{},
@@ -671,6 +689,7 @@ pub const ViewerState = struct {
                             e.handled = true;
                             self.info_w = std.math.clamp(self.info_w - delta.x / scale, 120, 600);
                             self.info_w_open = self.info_w;
+                            self.persistPrefs();
                         }
                     }
                 },
@@ -696,7 +715,26 @@ pub const ViewerState = struct {
         if (self.sdl_window_ptr) |win| {
             self.fullscreen = !self.fullscreen;
             _ = SDLBackend.c.SDL_SetWindowFullscreen(win, self.fullscreen);
+            self.persistPrefs();
         }
+    }
+
+    // Copy the current UI preferences into the shared config so they are
+    // remembered by subsequently-opened viewers and saved on program exit.
+    fn persistPrefs(self: *ViewerState) void {
+        if (self.cfg) |c| {
+            c.viewer_window.fullscreen = self.fullscreen;
+            c.viewer_info_open = self.info_open;
+            c.viewer_info_w = self.info_w;
+        }
+    }
+
+    // Sample the live SDL window each frame and remember its size, position,
+    // maximized and fullscreen state in the shared config.
+    fn captureWindowState(self: *ViewerState) void {
+        const cfg = self.cfg orelse return;
+        const win = self.sdl_window_ptr orelse return;
+        window_state.capture(win, &cfg.viewer_window);
     }
 };
 

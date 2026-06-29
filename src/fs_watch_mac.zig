@@ -122,21 +122,7 @@ const ResolvedSymbols = struct {
     CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
 };
 
-// ── Spinlock ──────────────────────────────────────────────────────────────────
-
-const Spinlock = struct {
-    state: std.atomic.Value(u8) = .init(0),
-
-    fn lock(self: *Spinlock) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    fn unlock(self: *Spinlock) void {
-        self.state.store(0, .release);
-    }
-};
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

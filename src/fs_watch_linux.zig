@@ -21,21 +21,7 @@ const MASK_NEW_DIR: u32 = linux.IN.CREATE | linux.IN.MOVED_TO;
 const WATCH_MASK: u32 = MASK_MODIFY | MASK_DELETE | linux.IN.CREATE |
     linux.IN.DELETE_SELF | linux.IN.MOVE_SELF;
 
-// ── Spinlock ──────────────────────────────────────────────────────────────────
-
-const Spinlock = struct {
-    state: std.atomic.Value(u8) = .init(0),
-
-    fn lock(self: *Spinlock) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    fn unlock(self: *Spinlock) void {
-        self.state.store(0, .release);
-    }
-};
+const Spinlock = @import("spinlock.zig").Spinlock;
 
 // ── Command channel (main → watcher thread) ──────────────────────────────────
 

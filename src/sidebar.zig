@@ -9,6 +9,11 @@ const image_grid_mod = @import("image_grid.zig");
 
 const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
 
+/// Highlight background options for a selected sidebar row; empty when not selected.
+fn focusBg(selected: bool) dvui.Options {
+    return if (selected) .{ .background = true, .color_fill = dvui.themeGet().focus } else .{};
+}
+
 pub const LibraryState = struct {
     id: u64,
     path: []const u8, // owned
@@ -135,10 +140,7 @@ pub const SidebarState = struct {
             self.filter_folder != null and
             std.mem.eql(u8, self.filter_folder.?, node.path);
 
-        const row_bg: dvui.Options = if (is_selected) .{
-            .background = true,
-            .color_fill = dvui.themeGet().focus,
-        } else .{};
+        const row_bg = focusBg(is_selected);
 
         const may_have_children = node.children.len > 0 or !node.loaded;
 
@@ -242,10 +244,7 @@ pub const SidebarState = struct {
         {
             const in_library = if (grid) |g| g.view_mode == .library else true;
             const unfiltered = self.filter_library_id == null and self.filter_folder == null;
-            const bg: dvui.Options = if (in_library and unfiltered) .{
-                .background = true,
-                .color_fill = dvui.themeGet().focus,
-            } else .{};
+            const bg = focusBg(in_library and unfiltered);
             var lib_hdr = dvui.box(@src(), .{ .dir = .horizontal }, bg.override(.{
                 .expand = .horizontal,
                 .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
@@ -296,10 +295,7 @@ pub const SidebarState = struct {
 
                 var row_hov = false;
                 {
-                    const lib_bg: dvui.Options = if (lib_selected and in_lib_view) .{
-                        .background = true,
-                        .color_fill = dvui.themeGet().focus,
-                    } else .{};
+                    const lib_bg = focusBg(lib_selected and in_lib_view);
                     var lib_row = dvui.box(@src(), .{ .dir = .horizontal }, lib_bg.override(.{
                         .id_extra = idx,
                         .expand = .horizontal,
@@ -399,10 +395,7 @@ pub const SidebarState = struct {
             _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
 
             const in_trash = if (grid) |g| g.view_mode == .trash else false;
-            const trash_bg: dvui.Options = if (in_trash) .{
-                .background = true,
-                .color_fill = dvui.themeGet().focus,
-            } else .{};
+            const trash_bg = focusBg(in_trash);
             var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, trash_bg.override(.{
                 .expand = .horizontal,
                 .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },

@@ -1,17 +1,36 @@
 const std = @import("std");
 const log = std.log.scoped(.config);
 
+/// Remembered SDL window geometry (size, position, maximized, fullscreen).
+/// Lives here so config stays free of any SDL dependency; window_state.zig
+/// aliases this type for its capture/apply helpers.
+pub const WindowState = struct {
+    fullscreen: bool = false,
+    maximized: bool = false,
+    width: u32 = 1200,
+    height: u32 = 800,
+    x: ?i32 = null,
+    y: ?i32 = null,
+};
+
 pub const Config = struct {
     /// Override for the database directory. Falls back to the XDG data dir.
     data_path: ?[]const u8 = null,
 
-    fullscreen: bool = false,
+    // Remembered window geometry, persisted across sessions.
+    main_window: WindowState = .{},
     /// Zero-based index of the display to open the window on.
     screen: u32 = 0,
-    window_width: u32 = 1200,
-    window_height: u32 = 800,
-    window_x: ?i32 = null,
-    window_y: ?i32 = null,
+    viewer_window: WindowState = .{},
+    viewer_info_open: bool = false,
+    viewer_info_w: f32 = 280,
+
+    // Remembered main-grid layout, persisted across sessions.
+    grid_thumb_fraction: f32 = 0.25, // 0..1 maps to min..max thumbnail size
+    grid_left_w: f32 = 240,           // current tree-pane width (< 2 = collapsed)
+    grid_left_w_open: f32 = 240,      // last non-collapsed tree-pane width
+    grid_right_w: f32 = 300,          // current info-pane width (< 2 = collapsed)
+    grid_right_w_open: f32 = 300,     // last non-collapsed info-pane width
 
     thumbnails_in_db: bool = false,
     prompt_embeddings: bool = false,
@@ -54,8 +73,8 @@ test "config: missing file returns defaults" {
     var cfg = try load(std.testing.allocator, std.testing.io, "/tmp/diffkeep_test_nonexistent_cfg.json");
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.data_path == null);
-    try std.testing.expectEqual(false, cfg.fullscreen);
-    try std.testing.expectEqual(@as(u32, 1200), cfg.window_width);
+    try std.testing.expectEqual(false, cfg.main_window.fullscreen);
+    try std.testing.expectEqual(@as(u32, 1200), cfg.main_window.width);
 }
 
 test "config: round-trip preserves all fields" {
@@ -64,9 +83,29 @@ test "config: round-trip preserves all fields" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
 
     const original = Config{
-        .fullscreen = true,
-        .window_width = 1920,
-        .window_height = 1080,
+        .main_window = .{
+            .fullscreen = true,
+            .maximized = true,
+            .width = 1920,
+            .height = 1080,
+            .x = -7,
+            .y = 42,
+        },
+        .viewer_window = .{
+            .fullscreen = true,
+            .maximized = true,
+            .width = 1600,
+            .height = 900,
+            .x = 100,
+            .y = 50,
+        },
+        .viewer_info_open = true,
+        .viewer_info_w = 333,
+        .grid_thumb_fraction = 0.6,
+        .grid_left_w = 200,
+        .grid_left_w_open = 260,
+        .grid_right_w = 0,
+        .grid_right_w_open = 360,
         .thumbnails_in_db = true,
     };
     try save(original, std.testing.io, tmp);
@@ -74,9 +113,15 @@ test "config: round-trip preserves all fields" {
     var loaded = try load(std.testing.allocator, std.testing.io, tmp);
     defer loaded.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(original.fullscreen, loaded.fullscreen);
-    try std.testing.expectEqual(original.window_width, loaded.window_width);
-    try std.testing.expectEqual(original.window_height, loaded.window_height);
+    try std.testing.expectEqual(original.main_window, loaded.main_window);
+    try std.testing.expectEqual(original.viewer_window, loaded.viewer_window);
+    try std.testing.expectEqual(original.viewer_info_open, loaded.viewer_info_open);
+    try std.testing.expectEqual(original.viewer_info_w, loaded.viewer_info_w);
+    try std.testing.expectEqual(original.grid_thumb_fraction, loaded.grid_thumb_fraction);
+    try std.testing.expectEqual(original.grid_left_w, loaded.grid_left_w);
+    try std.testing.expectEqual(original.grid_left_w_open, loaded.grid_left_w_open);
+    try std.testing.expectEqual(original.grid_right_w, loaded.grid_right_w);
+    try std.testing.expectEqual(original.grid_right_w_open, loaded.grid_right_w_open);
     try std.testing.expectEqual(original.thumbnails_in_db, loaded.thumbnails_in_db);
 }
 
@@ -87,11 +132,11 @@ test "config: unknown keys are ignored" {
 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = tmp,
-        .data = "{\"fullscreen\":true,\"unknown_key_xyz\":42}",
+        .data = "{\"main_window\":{\"fullscreen\":true},\"unknown_key_xyz\":42}",
     });
     var cfg = try load(std.testing.allocator, std.testing.io, tmp);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqual(true, cfg.fullscreen);
+    try std.testing.expectEqual(true, cfg.main_window.fullscreen);
 }
 
 /// Writes the config to `path`, creating parent directories as needed.

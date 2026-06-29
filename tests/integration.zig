@@ -210,6 +210,76 @@ test "db: listImmediateSubdirs path logic" {
     try std.testing.expectEqual(@as(i64, 1),        subdirs[1].count);
 }
 
+test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
+    const path = "/tmp/diffkeep_test_vec_knn.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+
+    // Three images with one-hot embeddings on distinct axes.
+    const dim = 768;
+    var ids: [3]u64 = undefined;
+    for (0..3) |k| {
+        var img = try db.findOrCreateImage(alloc, lib_id, switch (k) {
+            0 => "/lib/a.png",
+            1 => "/lib/b.png",
+            else => "/lib/c.png",
+        });
+        defer img.deinit(alloc);
+        ids[k] = img.id;
+
+        var prompt_vec = [_]f32{0} ** dim;
+        var image_vec = [_]f32{0} ** dim;
+        prompt_vec[k] = 1.0; // prompt axis k
+        image_vec[k + 10] = 1.0; // image axis k+10 (distinct from prompt axes)
+        try db.storePromptEmbedding(img.id, &prompt_vec);
+        try db.storeImageEmbedding(img.id, &image_vec);
+    }
+
+    // Prompt query nearest to image b (axis 1).
+    {
+        var q = [_]f32{0} ** dim;
+        q[1] = 1.0;
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3);
+        defer {
+            for (hits) |e| alloc.free(e.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 3), hits.len);
+        try std.testing.expectEqual(ids[1], hits[0].id);
+    }
+
+    // Image query nearest to image c (axis 12).
+    {
+        var q = [_]f32{0} ** dim;
+        q[12] = 1.0;
+        const hits = try db.searchByImageEmbedding(alloc, &q, 3);
+        defer {
+            for (hits) |e| alloc.free(e.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 3), hits.len);
+        try std.testing.expectEqual(ids[2], hits[0].id);
+    }
+
+    // Trashed images must be excluded from results.
+    try db.trashImage(ids[1], "b_trash.png", 1024, 1000);
+    {
+        var q = [_]f32{0} ** dim;
+        q[1] = 1.0;
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3);
+        defer {
+            for (hits) |e| alloc.free(e.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        for (hits) |e| try std.testing.expect(e.id != ids[1]);
+    }
+}
+
 // ── Grid tests ────────────────────────────────────────────────────────────────
 
 var g_grid_test_ptr: *dk.GridState = undefined;

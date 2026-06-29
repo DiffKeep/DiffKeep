@@ -22,6 +22,7 @@ const filter_modal_mod = @import("filter_modal.zig");
 const delete_dialog_mod = @import("delete_dialog.zig");
 const settings_modal_mod = @import("settings_modal.zig");
 const viewer_manager_mod = @import("viewer_manager.zig");
+const window_state = @import("window_state.zig");
 const search_mod = @import("search.zig");
 const image_ops_mod = @import("image_ops.zig");
 const toolbar_mod = @import("toolbar.zig");
@@ -69,14 +70,9 @@ var g_settings: settings_modal_mod.SettingsModalState = .{};
 var g_embedder_thread: ?std.Thread = null;
 var g_embedder_task_result: ?onnx_mod.OnnxEmbedder = null;
 var g_embedder_task_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-// Pending reload: set when startEmbedderLoad is called while a thread is already in flight.
-var g_embedder_pending: bool = false;
-var g_embedder_pending_io: std.Io = undefined;
-var g_embedder_pending_gpa: std.mem.Allocator = undefined;
-var g_embedder_pending_text_dir: ?[]const u8 = null;
-var g_embedder_pending_visual_dir: ?[]const u8 = null;
-var g_embedder_pending_use_gpu: bool = false;
-var g_embedder_pending_gpu_device_id: u32 = 0;
+// Pending reload: set when startEmbedderLoad is called while a thread is already
+// in flight. Holds the args (incl. heap-allocated model dirs) for the next load.
+var g_embedder_pending: ?EmbedderLoadArgs = null;
 
 // Active metadata filters
 var g_active_filters: std.ArrayList(db_mod.ActiveFilter) = .empty;
@@ -150,6 +146,12 @@ fn appInit(win: *dvui.Window) !void {
             dk.g_cfg = try config_mod.load(init.gpa, init.io, cfg_path);
         }
 
+        // Restore remembered grid panel widths.
+        g_left_w = dk.g_cfg.grid_left_w;
+        g_left_w_open = dk.g_cfg.grid_left_w_open;
+        g_right_w = dk.g_cfg.grid_right_w;
+        g_right_w_open = dk.g_cfg.grid_right_w_open;
+
         g_settings.initFromConfig(&dk.g_cfg);
 
         const db_path = blk: {
@@ -214,6 +216,7 @@ fn appInit(win: *dvui.Window) !void {
             dk.g_grid = try image_grid_mod.GridState.init(init.io, init.gpa, db, dk.g_cfg.thumbnails_in_db, wakeupFrame);
             if (dk.g_grid) |*grid| {
                 grid.data_dir = g_data_dir;
+                grid.thumb_fraction = std.math.clamp(dk.g_cfg.grid_thumb_fraction, 0, 1);
                 try grid.startWorker();
             }
 
@@ -307,11 +310,12 @@ fn appDeinit() void {
     }
     if (g_embedder_task_result) |*emb| { emb.deinit(); g_embedder_task_result = null; }
     if (dvui.App.main_init) |init| {
-        if (g_embedder_pending_text_dir) |p| init.gpa.free(p);
-        if (g_embedder_pending_visual_dir) |p| init.gpa.free(p);
+        if (g_embedder_pending) |p| {
+            if (p.text_dir) |t| init.gpa.free(t);
+            if (p.visual_dir) |v| init.gpa.free(v);
+        }
     }
-    g_embedder_pending_text_dir = null;
-    g_embedder_pending_visual_dir = null;
+    g_embedder_pending = null;
     if (dk.g_embedder) |*emb| emb.deinit();
     if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
@@ -407,7 +411,7 @@ fn frame() !dvui.App.Result {
         if (dk.g_library_manager) |*mgr| {
             if (mgr.reload_requested.load(.acquire)) {
                 mgr.reload_requested.store(false, .release);
-                if (dk.g_db) |*db| grid.reloadImages(db) catch {};
+                if (dk.g_db) |*db| grid.reloadImagesKeepFocus(db) catch {};
             }
         }
         if (grid.images.items.len != prev_len) {
@@ -455,7 +459,7 @@ fn frame() !dvui.App.Result {
         }
         if (grid.open_viewer_requested) {
             grid.open_viewer_requested = false;
-            g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (dk.g_db) |*db| db else null, wakeupFrame);
+            g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (dk.g_db) |*db| db else null, wakeupFrame, &dk.g_cfg);
             grid.viewer_start_id = null;
         }
         if (grid.copy_prompt_requested) {
@@ -676,6 +680,13 @@ fn frame() !dvui.App.Result {
         if (dk.g_grid) |*g| g else null,
     );
 
+    // Mirror remembered grid layout into the config (flushed to disk on exit).
+    if (dk.g_grid) |*grid| dk.g_cfg.grid_thumb_fraction = grid.thumb_fraction;
+    dk.g_cfg.grid_left_w = g_left_w;
+    dk.g_cfg.grid_left_w_open = g_left_w_open;
+    dk.g_cfg.grid_right_w = g_right_w;
+    dk.g_cfg.grid_right_w_open = g_right_w_open;
+
     return .ok;
 }
 
@@ -848,15 +859,18 @@ fn startEmbedderLoad(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.
     if (cfg.text_model_dir == null and cfg.visual_model_dir == null) return;
     if (g_embedder_thread != null) {
         // Already loading: queue a pending reload with the new paths.
-        if (g_embedder_pending_text_dir) |p| gpa.free(p);
-        if (g_embedder_pending_visual_dir) |p| gpa.free(p);
-        g_embedder_pending_io = io;
-        g_embedder_pending_gpa = gpa;
-        g_embedder_pending_text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null;
-        g_embedder_pending_visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null;
-        g_embedder_pending_use_gpu = cfg.use_gpu;
-        g_embedder_pending_gpu_device_id = cfg.gpu_device_id;
-        g_embedder_pending = true;
+        if (g_embedder_pending) |old| {
+            if (old.text_dir) |p| gpa.free(p);
+            if (old.visual_dir) |p| gpa.free(p);
+        }
+        g_embedder_pending = .{
+            .io = io,
+            .gpa = gpa,
+            .text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null,
+            .visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null,
+            .use_gpu = cfg.use_gpu,
+            .gpu_device_id = cfg.gpu_device_id,
+        };
         return;
     }
     g_embedder_task_done.store(false, .release);
@@ -894,21 +908,14 @@ fn pollEmbedderLoad() void {
     if (dk.g_library_manager) |*mgr| mgr.embedder = emb_ptr;
     // If a reload was queued while this load was in flight, kick it off now.
     // The next pollEmbedderLoad() after that reload will handle the backfill scan.
-    if (g_embedder_pending) {
-        g_embedder_pending = false;
-        const io = g_embedder_pending_io;
-        const gpa = g_embedder_pending_gpa;
-        const td = g_embedder_pending_text_dir; g_embedder_pending_text_dir = null;
-        const vd = g_embedder_pending_visual_dir; g_embedder_pending_visual_dir = null;
-        const ug = g_embedder_pending_use_gpu;
-        const gid = g_embedder_pending_gpu_device_id;
+    if (g_embedder_pending) |args| {
+        g_embedder_pending = null;
         g_embedder_task_done.store(false, .release);
         g_embedder_task_result = null;
-        const args = EmbedderLoadArgs{ .io = io, .gpa = gpa, .text_dir = td, .visual_dir = vd, .use_gpu = ug, .gpu_device_id = gid };
         g_embedder_thread = std.Thread.spawn(.{}, embedderLoadThread, .{args}) catch |err| {
             log.warn("embedder thread respawn failed: {}", .{err});
-            if (args.text_dir) |p| gpa.free(p);
-            if (args.visual_dir) |p| gpa.free(p);
+            if (args.text_dir) |p| args.gpa.free(p);
+            if (args.visual_dir) |p| args.gpa.free(p);
             return;
         };
         return;
@@ -926,6 +933,12 @@ fn pollEmbedderLoad() void {
             }
         }
     }
+}
+
+// Sample the live main window each frame and remember its geometry in the
+// shared config (flushed to disk on exit by appDeinit).
+fn captureMainWindowState(back: *SDLBackend) void {
+    window_state.capture(back.window, &dk.g_cfg.main_window);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -950,6 +963,8 @@ pub fn main(init: std.process.Init) !void {
     try win.begin(win.frame_time_ns);
     try appInit(&win);
     _ = try win.end(.{});
+    // Restore the remembered main-window geometry (config is now loaded).
+    window_state.apply(back.window, dk.g_cfg.main_window);
     g_dnd = dnd_mod.DragSource.init(init.gpa, back.window);
     defer appDeinit();
     defer g_viewer_manager.deinit(init.gpa);
@@ -970,6 +985,7 @@ pub fn main(init: std.process.Init) !void {
             if ((e.evt == .window and e.evt.window.action == .close) or
                 (e.evt == .app and e.evt.app.action == .quit)) res = .close;
         }
+        captureMainWindowState(&back);
         var end_micros: ?u32 = try win.end(.{});
         try back.setCursor(win.cursorRequested());
         if (g_dnd) |*dnd| {

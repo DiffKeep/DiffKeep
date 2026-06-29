@@ -352,6 +352,34 @@ pub const GridState = struct {
         self.applySortOrder();
     }
 
+    /// Reload the image list while keeping the keyboard cursor on the same image
+    /// rather than jumping to the top.  Used after a watcher-triggered deletion:
+    /// `removeFromGrid` has already moved focus to the neighbouring image, so we
+    /// re-anchor to that image; if it is also gone we clamp the previous slot
+    /// (matching the image viewer's behaviour).  The viewport is only scrolled
+    /// when the restored focus ends up outside it.
+    pub fn reloadImagesKeepFocus(self: *GridState, db: *db_mod.VectorDb) !void {
+        const prev_idx = self.focused_idx;
+        const prev_id: ?u64 = if (prev_idx) |fi|
+            (if (fi < self.images.items.len) self.images.items[fi].id else null)
+        else
+            null;
+
+        try self.reloadImages(db);
+
+        if (prev_id == null) return; // nothing was focused; leave reset to top
+        for (self.images.items, 0..) |img, i| {
+            if (img.id == prev_id.?) {
+                self.focused_idx = i;
+                break;
+            }
+        }
+        if (self.focused_idx == null and self.images.items.len > 0) {
+            if (prev_idx) |pi| self.focused_idx = @min(pi, self.images.items.len - 1);
+        }
+        if (self.focused_idx != null) self.scroll_to_focused = true;
+    }
+
     /// Call once per frame before render(), on the main thread.
     pub fn update(self: *GridState) void {
         // 1. Drain new images from scan threads (library view only)

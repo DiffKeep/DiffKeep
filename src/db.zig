@@ -310,47 +310,28 @@ pub const VectorDb = struct {
         try self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), embedding);
     }
 
-    /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 2048-dim.
+    /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 768-dim.
     pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
-        self.db_mutex.lockUncancelable(self.io);
-        defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare(
-            \\SELECT i.id, i.library_path, i.mtime
-            \\FROM images i
-            \\JOIN positive_prompt_embeddings pe ON pe.rowid = i.id
-            \\WHERE i.trashed_at IS NULL
-            \\ORDER BY vec_distance_cosine(pe.vector, ?) ASC
-            \\LIMIT ?
-        );
-        defer stmt.deinit();
-        try stmt.bindBlob(1, std.mem.sliceAsBytes(query));
-        try stmt.bind(2, @as(i64, @intCast(limit)));
-        var list: std.ArrayList(GridEntry) = .empty;
-        errdefer {
-            for (list.items) |e| allocator.free(e.path);
-            list.deinit(allocator);
-        }
-        while (try stmt.step()) {
-            const id: u64 = @intCast(stmt.columnInt64(0));
-            const path = try allocator.dupe(u8, stmt.columnText(1));
-            errdefer allocator.free(path);
-            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
-            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
-        }
-        return list.toOwnedSlice(allocator);
+        return self.searchByEmbedding(allocator, "positive_prompt_embeddings", query, limit);
     }
 
-    /// KNN search on image_embeddings. query must be L2-normalized, 2048-dim.
+    /// KNN search on image_embeddings. query must be L2-normalized, 768-dim.
     pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
+        return self.searchByEmbedding(allocator, "image_embeddings", query, limit);
+    }
+
+    /// Cosine-distance KNN over a vec0 embedding table joined to non-trashed images.
+    /// `table` is a compile-time-trusted internal identifier (not user input).
+    fn searchByEmbedding(self: *VectorDb, allocator: std.mem.Allocator, comptime table: []const u8, query: []const f32, limit: usize) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare(
-            \\SELECT i.id, i.library_path, i.mtime
-            \\FROM images i
-            \\JOIN image_embeddings ie ON ie.rowid = i.id
-            \\WHERE i.trashed_at IS NULL
-            \\ORDER BY vec_distance_cosine(ie.vector, ?) ASC
-            \\LIMIT ?
+            "SELECT i.id, i.library_path, i.mtime\n" ++
+            "FROM images i\n" ++
+            "JOIN " ++ table ++ " e ON e.rowid = i.id\n" ++
+            "WHERE i.trashed_at IS NULL\n" ++
+            "ORDER BY vec_distance_cosine(e.vector, ?) ASC\n" ++
+            "LIMIT ?",
         );
         defer stmt.deinit();
         try stmt.bindBlob(1, std.mem.sliceAsBytes(query));
@@ -373,7 +354,7 @@ pub const VectorDb = struct {
     /// RRF-merged KNN search over both prompt and image embeddings.
     /// Runs both queries independently (top `limit` each), merges via Reciprocal
     /// Rank Fusion (k=60), and returns the top `limit` results sorted by combined
-    /// score descending.  query must be L2-normalized, 2048-dim.
+    /// score descending.  query must be L2-normalized, 768-dim.
     pub fn searchCombined(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
         const prompt_results = try self.searchByPromptEmbedding(allocator, query, limit);
         defer {

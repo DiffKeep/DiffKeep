@@ -81,12 +81,7 @@ pub const ComfyParser = struct {
         }
         const t_val = node.object.get("type") orelse return false;
         if (t_val != .string) return false;
-        const t = t_val.string;
-        return std.mem.startsWith(u8, t, "KSampler") or
-            std.mem.eql(u8, t, "KSamplerAdvanced") or
-            std.mem.eql(u8, t, "SamplerCustomNoise") or
-            std.mem.eql(u8, t, "SamplerCustom") or
-            std.mem.eql(u8, t, "SamplerCustomAdvanced");
+        return isSamplerType(t_val.string);
     }
 
     // Follow a conditioning link to find the text prompt. Returns a newly allocated string or null.
@@ -820,12 +815,19 @@ fn parseA1111Settings(allocator: std.mem.Allocator, line: []const u8, result: *P
     }
 }
 
+/// Whether a node type / class_type name denotes a sampler node. Shared by the
+/// workflow-graph path (isActiveSamplerNode) and the API-prompt path
+/// (parsePromptChunk) so both recognise the same set.
+fn isSamplerType(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "KSampler") or
+        std.mem.eql(u8, name, "KSamplerAdvanced") or
+        std.mem.eql(u8, name, "SamplerCustomNoise") or
+        std.mem.eql(u8, name, "SamplerCustom") or
+        std.mem.eql(u8, name, "SamplerCustomAdvanced");
+}
+
 fn promptIsKSampler(class_type: []const u8) bool {
-    return std.mem.startsWith(u8, class_type, "KSampler") or
-        std.mem.eql(u8, class_type, "KSamplerAdvanced") or
-        std.mem.eql(u8, class_type, "SamplerCustomNoise") or
-        std.mem.eql(u8, class_type, "SamplerCustom") or
-        std.mem.eql(u8, class_type, "SamplerCustomAdvanced");
+    return isSamplerType(class_type);
 }
 
 fn promptExtractSamplerInputs(inp: std.json.ObjectMap, result: *ParseResult) void {
@@ -917,6 +919,32 @@ test "comfy: parsePlainPromptString returns null for empty string" {
     var parser = ComfyParser.init(std.testing.allocator);
     const result = try parser.parsePlainPromptString("\"   \"");
     try std.testing.expect(result == null);
+}
+
+test "comfy: parsePromptChunk extracts prompt, sampler params, and model" {
+    const json =
+        \\{
+        \\  "3": {"class_type": "KSampler", "inputs": {
+        \\    "seed": 12345, "steps": 25, "cfg": 7.0,
+        \\    "sampler_name": "euler", "scheduler": "normal",
+        \\    "positive": ["6", 0], "negative": ["7", 0], "model": ["4", 0]
+        \\  }},
+        \\  "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a fluffy cat"}},
+        \\  "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry"}},
+        \\  "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "model.safetensors"}}
+        \\}
+    ;
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parsePromptChunk(json)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a fluffy cat", result.positive_prompt.?);
+    try std.testing.expectEqualStrings("blurry", result.negative_prompt.?);
+    try std.testing.expectEqualStrings("model.safetensors", result.model.?);
+    try std.testing.expectEqual(@as(i64, 12345), result.seed.?);
+    try std.testing.expectEqual(@as(i64, 25), result.steps.?);
+    try std.testing.expectEqual(@as(f64, 7.0), result.cfg.?);
+    try std.testing.expectEqualStrings("euler", result.sampler.?);
+    try std.testing.expectEqualStrings("normal", result.scheduler.?);
 }
 
 test "parse ComfyUI workflow" {

@@ -4,6 +4,8 @@ const SDLBackend = @import("backend");
 const image_viewer_mod = @import("image_viewer.zig");
 const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
+const config_mod = @import("config.zig");
+const window_state = @import("window_state.zig");
 
 pub const ViewerWindow = struct {
     back: SDLBackend,
@@ -46,6 +48,7 @@ pub const ViewerManager = struct {
         data_dir: ?[]const u8,
         db: ?*db_mod.VectorDb,
         wakeup_fn: *const fn () void,
+        cfg: ?*config_mod.Config,
     ) void {
         const init = dvui.App.main_init orelse return;
 
@@ -87,10 +90,12 @@ pub const ViewerManager = struct {
             return;
         };
 
+        const init_w: f32 = if (cfg) |c| @floatFromInt(c.viewer_window.width) else 1200;
+        const init_h: f32 = if (cfg) |c| @floatFromInt(c.viewer_window.height) else 800;
         const back = SDLBackend.initWindow(.{
             .io = init.io,
             .allocator = init.gpa,
-            .size = .{ .w = 1200, .h = 800 },
+            .size = .{ .w = init_w, .h = init_h },
             .min_size = .{ .w = 400, .h = 300 },
             .vsync = true,
             .title = "DiffKeep Viewer",
@@ -107,10 +112,14 @@ pub const ViewerManager = struct {
             .sdl_window_id = 0,
             .state = image_viewer_mod.ViewerState.init(
                 init.gpa, id, images, start_idx, wakeup_fn, data_dir,
-                init.io, db,
+                init.io, db, cfg,
             ),
         };
         vw.state.sdl_window_ptr = vw.back.window;
+        // Restore the remembered window geometry now that the window exists.
+        if (cfg) |c| {
+            window_state.apply(vw.back.window, c.viewer_window);
+        }
 
         vw.win = dvui.Window.init(@src(), init.gpa, vw.back.backend(), .{ .id_extra = @intCast(id) })
             catch {
