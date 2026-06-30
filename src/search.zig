@@ -158,7 +158,7 @@ pub const SearchState = struct {
     // Tracks buf from the previous frame to detect actual keystrokes.
     // Only changes to buf (vs last_buf) reset the debounce deadline.
     last_buf: [256]u8 = std.mem.zeroes([256]u8),
-    mode: image_grid_mod.SearchMode = .combined,
+    mode: image_grid_mod.SearchMode = .fts,
     embedder: ?*onnx_mod.OnnxEmbedder = null,
     query_embedding: ?[]const f32 = null,
 

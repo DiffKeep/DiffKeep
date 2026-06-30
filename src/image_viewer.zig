@@ -552,7 +552,7 @@ pub const ViewerState = struct {
             self.toggleFullscreen();
         }
 
-        if (iconButton(i18n.t(.viewer_toggle_info), icons.tvg.lucide.info, 8)) {
+        if (iconButton(i18n.t(.viewer_toggle_info), icons.tvg.lucide.@"panel-right", 8)) {
             self.info_open = !self.info_open;
             self.persistPrefs();
         }
