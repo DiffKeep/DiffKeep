@@ -257,11 +257,20 @@ fn watcherFn(self: *FsWatcher) void {
                 const filename = name orelse continue;
                 if (!std.mem.endsWith(u8, filename, ".png")) continue;
 
+                const deleted = mask & MASK_DELETE != 0;
+
+                // Act only on fully-written files (CLOSE_WRITE / MOVED_TO) or
+                // removals. A bare IN.CREATE fires the instant the file appears,
+                // before the writer has finished, so the PNG is still truncated
+                // and would fail to parse with EndOfStream. The matching
+                // CLOSE_WRITE arrives once writing completes and we handle it
+                // then. (IN.CREATE is watched only to detect new subdirectories.)
+                if (!deleted and mask & MASK_MODIFY == 0) continue;
+
                 const parent = wd_path.get(wd) orelse continue;
                 const lib_id = wd_lib.get(wd) orelse continue;
 
                 const full_path = std.fs.path.join(allocator, &.{ parent, filename }) catch continue;
-                const deleted = mask & MASK_DELETE != 0;
 
                 log.info("file event: {s} deleted={}", .{ full_path, deleted });
                 self.pushEvent(.{ .library_id = lib_id, .path = full_path, .deleted = deleted });

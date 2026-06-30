@@ -28,6 +28,7 @@ pub const RenderCtx = struct {
     settings: *settings_modal_mod.SettingsModalState,
     db_stats: *?db_mod.DbStats,
     trash_stats: *?db_mod.TrashStats,
+    duplicate_count: *i64,
     sidebar: *sidebar_mod.SidebarState,
     detail: *detail_panel_mod.DetailState,
     library_manager: *?library_manager_mod.LibraryManager,
@@ -292,6 +293,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
                 if (ctx.library_manager.*) |*mgr| mgr else null,
                 ctx.cfg.trash_enabled,
                 ctx.trash_stats.*,
+                ctx.duplicate_count.*,
             )) ctx.on_refresh_counts();
         }
     }
@@ -324,15 +326,20 @@ pub fn renderContent(ctx: RenderCtx) !void {
             else ""
         else "";
         if (dvui.App.main_init) |init| {
+            // If the focused image was just reparsed/changed, force the detail
+            // panel to reload now that the fresh data is in the DB.
+            if (focused_id) |fid| {
+                if (ctx.grid.*) |*grid| {
+                    if (grid.wasRefreshedThisFrame(fid)) ctx.detail.id = null;
+                }
+            }
             if (ctx.db.*) |*db| ctx.detail.update(focused_id, db, init.gpa, init.io);
             ctx.detail.renderPanel(ctx.right_w.*, filename, init.gpa, init.io);
             if (ctx.detail.reparse_requested) {
                 ctx.detail.reparse_requested = false;
                 if (ctx.detail.detail) |d| {
-                    if (ctx.library_manager.*) |*mgr| {
+                    if (ctx.library_manager.*) |*mgr|
                         mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
-                        ctx.detail.id = null; // force detail reload after reparse completes
-                    }
                 }
             }
         }

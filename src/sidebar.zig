@@ -227,6 +227,7 @@ pub const SidebarState = struct {
         library_manager: ?*library_manager_mod.LibraryManager,
         cfg_trash_enabled: bool,
         trash_stats: ?db_mod.TrashStats,
+        duplicate_count: i64,
     ) !bool {
         var needs_count_refresh = false;
 
@@ -413,6 +414,37 @@ pub const SidebarState = struct {
             if (trash_stats) |ts| {
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 dvui.label(@src(), "{d}", .{ts.count}, .{ .gravity_y = 0.5 });
+            }
+        }
+
+        // ── Duplicates section (only shown when duplicates exist) ─────────
+        if (duplicate_count > 0) {
+            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
+
+            const in_dupes = if (grid) |g| g.view_mode == .duplicates else false;
+            const dupes_bg = focusBg(in_dupes);
+            var dupes_row = dvui.box(@src(), .{ .dir = .horizontal }, dupes_bg.override(.{
+                .expand = .horizontal,
+                .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+            }));
+            defer dupes_row.deinit();
+            if (dvui.clickedEx(dupes_row.data(), .{})) |_| {
+                if (grid) |g| {
+                    if (g.view_mode != .duplicates) {
+                        g.view_mode = .duplicates;
+                        if (db) |d| g.reloadImages(d) catch {};
+                    }
+                }
+            }
+            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_duplicates)}, .{ .font = bold, .gravity_y = 0.5 });
+            _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+            dvui.label(@src(), "{d}", .{duplicate_count}, .{ .gravity_y = 0.5 });
+        } else if (grid) |g| {
+            // No duplicates left but the grid is still showing them: fall back to
+            // the library view so the user isn't stranded on an empty section.
+            if (g.view_mode == .duplicates) {
+                g.view_mode = .library;
+                if (db) |d| g.reloadImages(d) catch {};
             }
         }
 

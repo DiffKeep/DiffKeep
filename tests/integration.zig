@@ -175,6 +175,53 @@ test "db: trash and restore lifecycle" {
     try std.testing.expectEqual(@as(usize, 0), empty_trash.len);
 }
 
+test "db: duplicate detection by hash" {
+    const path = "/tmp/diffkeep_test_dupes.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+
+    // Helper: create an image with a given hash.
+    const make = struct {
+        fn f(d: *dk.VectorDb, lib: u64, p: []const u8, h: []const u8) !u64 {
+            var img = try d.findOrCreateImage(alloc, lib, p);
+            defer img.deinit(alloc);
+            if (img.hash) |old| alloc.free(old);
+            img.hash = try alloc.dupe(u8, h);
+            try d.saveImage(&img);
+            return img.id;
+        }
+    }.f;
+
+    // Two images share hash "aaa"; one is unique ("bbb").
+    const dup1 = try make(&db, lib_id, "/lib/a.png", "aaa");
+    const dup2 = try make(&db, lib_id, "/lib/b.png", "aaa");
+    _ = try make(&db, lib_id, "/lib/c.png", "bbb");
+
+    // The two "aaa" images are duplicates of each other; "bbb" is not counted.
+    try std.testing.expectEqual(@as(i64, 2), try db.getDuplicateCount());
+
+    const dupes = try db.listDuplicateImages(alloc);
+    defer {
+        for (dupes) |e| alloc.free(e.path);
+        alloc.free(dupes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), dupes.len);
+    // Both returned ids are the "aaa" pair (ordered by hash then id).
+    try std.testing.expectEqual(dup1, dupes[0].id);
+    try std.testing.expectEqual(dup2, dupes[1].id);
+
+    // Trashing one of the pair leaves the other unique → no duplicates remain.
+    try db.trashImage(dup2, "b_trash.png", 1, 1000);
+    try std.testing.expectEqual(@as(i64, 0), try db.getDuplicateCount());
+    const after = try db.listDuplicateImages(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
 test "db: listImmediateSubdirs path logic" {
     const path = "/tmp/diffkeep_test_subdirs.db";
     var db = try openDb(path);

@@ -70,6 +70,7 @@ pub const Strings = struct {
     context_delete_permanently: [:0]const u8,
 
     sidebar_trash: [:0]const u8,
+    sidebar_duplicates: [:0]const u8,
 
     status_bar_image_count: [:0]const u8,
     status_no_database: [:0]const u8,
@@ -205,6 +206,7 @@ pub const en: Strings = .{
     .context_delete_permanently = "Delete Permanently",
 
     .sidebar_trash = "Trash",
+    .sidebar_duplicates = "Duplicates",
 
     .status_bar_image_count = "Images: ",
     .status_no_database = "no database",

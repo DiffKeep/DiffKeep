@@ -161,6 +161,9 @@ const migrations = [_][]const u8{
     \\CREATE VIRTUAL TABLE image_embeddings USING vec0(vector float[768]);
     \\CREATE VIRTUAL TABLE positive_prompt_embeddings USING vec0(vector float[768]);
     ,
+    // v9: index on hash so duplicate detection (GROUP BY hash) is cheap.
+    \\CREATE INDEX IF NOT EXISTS idx_images_hash ON images (hash);
+    ,
 };
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables
@@ -1106,6 +1109,55 @@ pub const VectorDb = struct {
             const trashed_at: ?i64 = if (stmt.columnIsNull(3)) null else stmt.columnInt64(3);
             const trash_name: ?[]const u8 = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4));
             try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime, .trashed_at = trashed_at, .trash_name = trash_name });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Number of non-trashed images whose file hash is shared by at least one
+    /// other non-trashed image (i.e. the size of the duplicate set). Zero when
+    /// there are no duplicates.
+    pub fn getDuplicateCount(self: *VectorDb) !i64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            \\SELECT COUNT(*) FROM images
+            \\WHERE trashed_at IS NULL AND hash IS NOT NULL AND hash IN (
+            \\  SELECT hash FROM images
+            \\  WHERE trashed_at IS NULL AND hash IS NOT NULL
+            \\  GROUP BY hash HAVING COUNT(*) > 1
+            \\)
+        );
+        defer stmt.deinit();
+        if (try stmt.step()) return stmt.columnInt64(0);
+        return 0;
+    }
+
+    /// Returns every non-trashed image that shares its hash with another, ordered
+    /// by hash (so duplicate groups are contiguous) then id. Used by the
+    /// Duplicates view. Caller owns each path.
+    pub fn listDuplicateImages(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            \\SELECT id, library_path, mtime FROM images
+            \\WHERE trashed_at IS NULL AND hash IS NOT NULL AND hash IN (
+            \\  SELECT hash FROM images
+            \\  WHERE trashed_at IS NULL AND hash IS NOT NULL
+            \\  GROUP BY hash HAVING COUNT(*) > 1
+            \\)
+            \\ORDER BY hash, id
+        );
+        defer stmt.deinit();
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
         }
         return list.toOwnedSlice(allocator);
     }

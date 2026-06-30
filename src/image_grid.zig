@@ -11,7 +11,7 @@ const log = std.log.scoped(.image_grid);
 
 pub const SortMode = enum { date, name, random };
 pub const SortDir = enum { asc, desc };
-pub const ViewMode = enum { library, trash };
+pub const ViewMode = enum { library, trash, duplicates };
 pub const SearchMode = enum { fts, semantic, visual, combined };
 
 pub const ImageEntry = struct {
@@ -88,6 +88,10 @@ pub const GridState = struct {
     // Incoming images from scan threads — drained each frame in update()
     notifier: ImageNotifier = .{},
     incoming: std.ArrayList(ImageNotifier.Entry) = .empty,
+    // IDs of already-present images that were re-notified (reparse / change) this
+    // frame. Rebuilt each update(); read by dependent UI (detail panel) so it can
+    // reload once the new data has landed. Main-thread only.
+    refreshed: std.AutoHashMap(u64, void),
 
     // Two-tier thumbnail cache
     // committed: main-thread only, no lock needed
@@ -120,6 +124,14 @@ pub const GridState = struct {
     // prevents the full content height from being reported as min_size.h to the
     // parent layout, which would push the statusbar off-screen.
     scroll_info: dvui.ScrollInfo = .{},
+    // Content width (logical px) measured *inside* the scroll area last frame.
+    // Reused to estimate the virtual height before the scroll area is opened this
+    // frame, so the estimated column count matches the actual one. Keying the
+    // estimate off dvui's reconstructed `viewport.w` instead lets the two diverge
+    // by a column, which makes the virtual height (and scrollbar) thrash every
+    // frame — blank gaps when scrolling and thumbnails that reload forever.
+    // 0 until the first paint (estimate falls back to a single column).
+    last_avail_w: f32 = 0,
 
     // Called from worker after each thumbnail is ready, to wake the render loop.
     wakeup_fn: ?*const fn () void = null,
@@ -177,6 +189,7 @@ pub const GridState = struct {
             .committed = std.AutoHashMap(u64, CacheEntry).init(allocator),
             .pending = std.AutoHashMap(u64, []u8).init(allocator),
             .queued = std.AutoHashMap(u64, void).init(allocator),
+            .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = try db.getConnection(),
             .thumbnails_in_db = thumbnails_in_db,
@@ -234,6 +247,7 @@ pub const GridState = struct {
         self.high_queue.deinit(self.allocator);
         self.low_queue.deinit(self.allocator);
         self.queued.deinit();
+        self.refreshed.deinit();
 
         self.loader_db.deinit();
         self.notifier.deinit();
@@ -338,6 +352,7 @@ pub const GridState = struct {
                 }
             },
             .trash => try db.listTrashImages(self.allocator),
+            .duplicates => try db.listDuplicateImages(self.allocator),
         };
         defer self.allocator.free(entries);
         try self.images.ensureTotalCapacity(self.allocator, entries.len);
@@ -356,6 +371,10 @@ pub const GridState = struct {
 
     /// Call once per frame before render(), on the main thread.
     pub fn update(self: *GridState) void {
+        // Refresh set only reflects this frame's re-notifications; the detail
+        // panel consults it later in the same frame.
+        self.refreshed.clearRetainingCapacity();
+
         // 1. Drain new images from scan threads (library view only)
         if (self.view_mode == .library) {
             self.notifier.drain(self.io, self.allocator, &self.incoming);
@@ -370,6 +389,11 @@ pub const GridState = struct {
             for (self.images.items) |img| existing.put(img.id, {}) catch {};
             for (self.incoming.items) |e| {
                 if (existing.contains(e.id)) {
+                    // Already present: a reparse / change re-notified it. Drop the
+                    // now-stale cached thumbnail so it regenerates, and flag the id
+                    // so the detail panel reloads from the freshly-saved DB row.
+                    self.invalidateThumbnail(e.id);
+                    self.refreshed.put(e.id, {}) catch {};
                     self.allocator.free(e.path);
                     continue;
                 }
@@ -432,7 +456,35 @@ pub const GridState = struct {
         }
     }
 
+    /// Drop any cached/queued thumbnail for `id` so the next render re-requests
+    /// it. Used when an image's pixels may have changed (reparse / overwrite).
+    fn invalidateThumbnail(self: *GridState, id: u64) void {
+        if (self.committed.fetchRemove(id)) |kv| self.allocator.free(kv.value.bytes);
+        {
+            // Drop a stale, not-yet-drained worker result so step 2 of update()
+            // doesn't re-commit it; an in-flight load regenerates from disk.
+            self.pending_mutex.lockUncancelable(self.io);
+            defer self.pending_mutex.unlock(self.io);
+            if (self.pending.fetchRemove(id)) |kv| self.allocator.free(kv.value);
+        }
+        {
+            self.queue_mutex.lockUncancelable(self.io);
+            defer self.queue_mutex.unlock(self.io);
+            _ = self.queued.remove(id);
+        }
+    }
+
+    /// True if `id` was re-notified (reparsed / changed) during this frame's
+    /// update(). Lets the detail panel reload exactly when fresh data is ready.
+    pub fn wasRefreshedThisFrame(self: *const GridState, id: u64) bool {
+        return self.refreshed.contains(id);
+    }
+
     pub fn applySortOrder(self: *GridState) void {
+        // Duplicates view keeps the DB order (grouped by hash) so duplicate sets
+        // stay contiguous; user-facing sort controls don't apply there.
+        if (self.view_mode == .duplicates) return;
+
         // Remember focused image ID so we can restore focused_idx after reorder.
         const focused_id: ?u64 = if (self.focused_idx) |fi| self.images.items[fi].id else null;
 
@@ -516,12 +568,17 @@ pub const GridState = struct {
         const n = self.images.items.len;
         const ts = self.thumbSize();
         const cell_w = ts + gap;
-        const cell_h = ts + label_h + gap;
+        // Must match the real laid-out cell height: content (ts + label_h) plus
+        // the border (cell_border on each side) plus the vertical margin (gap).
+        // The label carries no vertical padding so its content fits in label_h.
+        const cell_h = ts + label_h + gap + 2 * cell_border;
 
         // Estimate virtual height before opening so the scrollbar decision is
-        // right on the first paint.  Uses the previous frame's viewport width.
+        // right on the first paint.  Uses the content width measured last frame
+        // (the exact basis used for `cols`) so the estimate can't disagree with
+        // the actual column count once the width is stable.
         {
-            const prev_w = self.scroll_info.viewport.w;
+            const prev_w = self.last_avail_w;
             const est_cols: usize = if (prev_w > 1)
                 @max(1, @as(usize, @intFromFloat(@floor(prev_w / cell_w))))
             else
@@ -560,6 +617,8 @@ pub const GridState = struct {
         const avail_w = dvui.clipGet().w / dvui.windowNaturalScale();
         self.scroll_info.virtual_size.w = avail_w;
         if (avail_w < 1) return;
+        // Remember this frame's content width for next frame's pre-open estimate.
+        self.last_avail_w = avail_w;
 
         const cols: usize = @max(1, @as(usize, @intFromFloat(@floor(avail_w / cell_w))));
         const total_rows: usize = if (n == 0) 0 else (n + cols - 1) / cols;
@@ -828,7 +887,7 @@ pub const GridState = struct {
                     self.copy_image_requested = true;
                     self.copy_image_path = entry.path;
                 }
-                if (self.view_mode == .library) {
+                if (self.view_mode != .trash) { // library or duplicates
                     if (dvui.menuItemLabel(@src(), i18n.t(.context_reparse), .{},
                         .{ .expand = .horizontal }) != null)
                     {
@@ -951,7 +1010,12 @@ pub const GridState = struct {
                 const mx = (ts - rw) / 2.0;
                 const my = (ts - rh) / 2.0;
                 _ = dvui.image(@src(), .{
-                    .source = .{ .imageFile = .{ .bytes = ce.bytes } },
+                    // Key dvui's texture cache on the JPEG *content*, not the byte
+                    // pointer. After a thumbnail is freed (delete / reparse) the
+                    // allocator can hand the same address to a different image's
+                    // bytes; pointer-keyed caching (.ptr, the default) would then
+                    // show the stale texture for the new image.
+                    .source = .{ .imageFile = .{ .bytes = ce.bytes, .invalidation = .bytes } },
                 }, .{
                     .id_extra = idx,
                     .min_size_content = .{ .w = rw, .h = rh },
@@ -987,7 +1051,9 @@ pub const GridState = struct {
             .min_size_content = .{ .w = ts, .h = label_h },
             .max_size_content = .{ .w = ts, .h = dvui.max_float_safe },
             .expand = .horizontal,
-            .padding = .{ .x = 2, .y = 2 },
+            // Horizontal padding only: vertical padding would make the rendered
+            // cell taller than cell_h and desync the virtual scroll height.
+            .padding = .{ .x = 2 },
         });
     }
 };

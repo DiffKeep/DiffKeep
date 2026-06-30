@@ -51,6 +51,7 @@ fn wakeupFrame() void {
 }
 var g_db_stats: ?db_mod.DbStats = null;
 var g_trash_stats: ?db_mod.TrashStats = null;
+var g_duplicate_count: i64 = 0;
 var g_total_image_count: i64 = 0;
 
 var g_sidebar: sidebar_mod.SidebarState = .{};
@@ -87,6 +88,7 @@ fn refreshCounts() void {
         if (dk.g_db) |*db| {
             g_total_image_count = db.getTotalImageCount() catch 0;
             g_trash_stats = db.getTrashStats() catch null;
+            g_duplicate_count = db.getDuplicateCount() catch 0;
             g_sidebar.refreshLibraryCounts(db, init.gpa);
         }
     }
@@ -277,6 +279,7 @@ fn appInit(win: *dvui.Window) !void {
             // Initialize counts and trash stats.
             g_total_image_count = db.getTotalImageCount() catch 0;
             g_trash_stats = db.getTrashStats() catch null;
+            g_duplicate_count = db.getDuplicateCount() catch 0;
         }
     } else {
         try vips_mod.init();
@@ -503,7 +506,8 @@ fn frame() !dvui.App.Result {
                             var d = det;
                             defer d.deinit(init.gpa);
                             mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
-                            g_detail.id = null; // force detail panel to reload after reparse
+                            // The detail panel reloads once the background reparse
+                            // lands its new data (driven by the grid refresh set).
                         }
                     }
                 }
@@ -661,6 +665,7 @@ fn frame() !dvui.App.Result {
         .settings = &g_settings,
         .db_stats = &g_db_stats,
         .trash_stats = &g_trash_stats,
+        .duplicate_count = &g_duplicate_count,
         .sidebar = &g_sidebar,
         .detail = &g_detail,
         .library_manager = &dk.g_library_manager,
