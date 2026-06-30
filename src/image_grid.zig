@@ -106,7 +106,11 @@ pub const GridState = struct {
     // high = visible range, low = prefetch zone
     high_queue: std.ArrayList(LoadRequest) = .empty,
     low_queue: std.ArrayList(LoadRequest) = .empty,
-    queued: std.AutoHashMap(u64, void), // IDs currently in a queue or in-flight
+    queued: std.AutoHashMap(u64, void), // IDs sitting in high_queue/low_queue
+    // IDs a worker has popped and is currently loading. Tracked separately from
+    // `queued` so the per-frame queue rebuild (which drops stale queued requests)
+    // doesn't re-request something already in flight and load it twice.
+    in_flight: std.AutoHashMap(u64, void),
     queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
     queue_cond: std.Io.Condition = std.Io.Condition.init,
 
@@ -189,6 +193,7 @@ pub const GridState = struct {
             .committed = std.AutoHashMap(u64, CacheEntry).init(allocator),
             .pending = std.AutoHashMap(u64, []u8).init(allocator),
             .queued = std.AutoHashMap(u64, void).init(allocator),
+            .in_flight = std.AutoHashMap(u64, void).init(allocator),
             .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = try db.getConnection(),
@@ -247,6 +252,7 @@ pub const GridState = struct {
         self.high_queue.deinit(self.allocator);
         self.low_queue.deinit(self.allocator);
         self.queued.deinit();
+        self.in_flight.deinit();
         self.refreshed.deinit();
 
         self.loader_db.deinit();
@@ -397,6 +403,10 @@ pub const GridState = struct {
                     self.allocator.free(e.path);
                     continue;
                 }
+                // A newly appearing id may be one SQLite recycled from a just-
+                // deleted image; clear any cache entry it left behind (and any
+                // stale in-flight load result) so this image loads its own thumb.
+                self.invalidateThumbnail(e.id);
                 self.images.append(self.allocator, .{
                     .id = e.id,
                     .path = e.path,
@@ -457,8 +467,11 @@ pub const GridState = struct {
     }
 
     /// Drop any cached/queued thumbnail for `id` so the next render re-requests
-    /// it. Used when an image's pixels may have changed (reparse / overwrite).
-    fn invalidateThumbnail(self: *GridState, id: u64) void {
+    /// it. Used when an image's pixels may have changed (reparse / overwrite) and
+    /// when an image is removed — SQLite recycles the deleted row's id for the
+    /// next insert, so a lingering cache entry would show the old thumbnail under
+    /// the new image.
+    pub fn invalidateThumbnail(self: *GridState, id: u64) void {
         if (self.committed.fetchRemove(id)) |kv| self.allocator.free(kv.value.bytes);
         {
             // Drop a stale, not-yet-drained worker result so step 2 of update()
@@ -547,7 +560,7 @@ pub const GridState = struct {
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
 
-        if (self.queued.contains(id)) return;
+        if (self.queued.contains(id) or self.in_flight.contains(id)) return;
 
         const path_copy = self.allocator.dupe(u8, path) catch return;
         const req = LoadRequest{ .id = id, .path = path_copy };
@@ -614,7 +627,14 @@ pub const GridState = struct {
         var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &self.scroll_info }, .{ .expand = .both });
         defer scroll.deinit();
 
-        const avail_w = dvui.clipGet().w / dvui.windowNaturalScale();
+        // Logical content width as computed by the scroll area itself (natural
+        // px, with the scrollbar already subtracted). This is the authoritative
+        // width for column layout. The previous `clipGet().w / windowNaturalScale()`
+        // did a manual physical→logical conversion that is wrong whenever the
+        // cumulative render scale differs from the window's natural scale (e.g.
+        // HiDPI / content scaling): too small an avail_w → too few columns → the
+        // virtual height (and scrollbar) came out roughly doubled.
+        const avail_w = self.scroll_info.viewport.w;
         self.scroll_info.virtual_size.w = avail_w;
         if (avail_w < 1) return;
         // Remember this frame's content width for next frame's pre-open estimate.
@@ -778,6 +798,27 @@ pub const GridState = struct {
         const pf_first = if (first_row > buf_rows) first_row - buf_rows else 0;
         const pf_last = @min(total_rows, last_row + buf_rows);
 
+        // Drop any still-queued (not yet started) loads before re-queueing the
+        // current prefetch zone below. Without this, dragging the scrollbar piles
+        // up requests for rows that have scrolled far away, and the worker chews
+        // through that stale backlog before it reaches what's now on screen — so
+        // visible thumbnails take ages to appear. In-flight loads are tracked
+        // separately and finish on their own.
+        {
+            self.queue_mutex.lockUncancelable(self.io);
+            for (self.high_queue.items) |r| {
+                _ = self.queued.remove(r.id);
+                self.allocator.free(r.path);
+            }
+            for (self.low_queue.items) |r| {
+                _ = self.queued.remove(r.id);
+                self.allocator.free(r.path);
+            }
+            self.high_queue.clearRetainingCapacity();
+            self.low_queue.clearRetainingCapacity();
+            self.queue_mutex.unlock(self.io);
+        }
+
         // Touch last_seen for visible items; queue loads for prefetch zone
         const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         for (pf_first..pf_last) |row| {
@@ -796,11 +837,17 @@ pub const GridState = struct {
             }
         }
 
-        // Top spacer
+        // Top spacer.
+        // max_size_content must be overridden: dvui clamps every widget's size to
+        // max_size (default `max_float_safe` = 2,000,000), so a spacer taller than
+        // 2M px is silently capped — which pinned all content past ~2M px (≈50% of
+        // a 55k-image library) off-screen and made the grid look half-empty. f32
+        // stays integer-exact to 16.7M, so the true height renders fine.
         if (first_row > 0) {
             var sp = dvui.box(@src(), .{}, .{
                 .id_extra = std.math.maxInt(usize),
                 .min_size_content = .{ .w = 0, .h = @as(f32, @floatFromInt(first_row)) * cell_h },
+                .max_size_content = .{ .w = std.math.floatMax(f32), .h = std.math.floatMax(f32) },
             });
             sp.deinit();
         }
@@ -820,12 +867,13 @@ pub const GridState = struct {
             }
         }
 
-        // Bottom spacer
+        // Bottom spacer (same max_size_content override as the top spacer).
         if (last_row < total_rows) {
             const tail = total_rows - last_row;
             var sp = dvui.box(@src(), .{}, .{
                 .id_extra = std.math.maxInt(usize) - 1,
                 .min_size_content = .{ .w = 0, .h = @as(f32, @floatFromInt(tail)) * cell_h },
+                .max_size_content = .{ .w = std.math.floatMax(f32), .h = std.math.floatMax(f32) },
             });
             sp.deinit();
         }
@@ -1095,8 +1143,16 @@ fn workerFn(state: *GridState) void {
         else
             state.low_queue.orderedRemove(0);
 
+        // Move from queued → in_flight so requestLoad won't re-queue it while the
+        // per-frame queue rebuild is dropping stale requests.
         _ = state.queued.remove(req.id);
+        state.in_flight.put(req.id, {}) catch {};
         state.queue_mutex.unlock(state.io);
+        defer {
+            state.queue_mutex.lockUncancelable(state.io);
+            _ = state.in_flight.remove(req.id);
+            state.queue_mutex.unlock(state.io);
+        }
         defer state.allocator.free(req.path);
 
         // Try DB first when thumbnails are stored there (serialized: single shared connection)

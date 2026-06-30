@@ -668,10 +668,14 @@ pub fn processFile(ctx: ScanCtx) void {
         _ = ctx.stats.added.fetchAdd(1, .acq_rel);
     } else {
         _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
-        // Notify the grid that an existing image changed (single-file watcher /
-        // reparse path). The grid invalidates its stale cached thumbnail and the
-        // detail panel reloads once the new data has landed in the DB.
-        if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
     }
+    // Notify the grid now that the parsed metadata and thumbnail are saved. This
+    // second push (new images also get an early one at line ~535 so they appear
+    // instantly) carries the now-complete data: the grid drops its stale cached
+    // thumbnail and the detail panel reloads from the fresh DB row. Critically,
+    // this also fires for a reparse of a previously-unparsed image (is_new=true),
+    // which otherwise only got the pre-parse push and showed stale data until a
+    // second reparse.
+    if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
     log.debug("processed {s}", .{std.fs.path.basename(ctx.path)});
 }

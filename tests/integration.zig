@@ -167,12 +167,33 @@ test "db: trash and restore lifecycle" {
     try std.testing.expectEqual(@as(i64, 1),    stats.count);
     try std.testing.expectEqual(@as(i64, 1024), stats.total_bytes);
 
+    // The fs watcher sees the trashed file leave the library dir and calls
+    // deleteImageByPath. That must NOT remove the trashed row, or the item
+    // vanishes from the trash even though the count still shows it.
+    const removed = try db.deleteImageByPath(lib_id, "/lib/img.png");
+    try std.testing.expect(removed == null);
+    try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
+    const still_there = try db.listTrashImages(alloc);
+    defer {
+        for (still_there) |e| {
+            alloc.free(e.path);
+            if (e.trash_name) |tn| alloc.free(tn);
+        }
+        alloc.free(still_there);
+    }
+    try std.testing.expectEqual(@as(usize, 1), still_there.len);
+
     // Restore it
     try db.restoreImage(img.id);
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
     const empty_trash = try db.listTrashImages(alloc);
     defer alloc.free(empty_trash);
     try std.testing.expectEqual(@as(usize, 0), empty_trash.len);
+
+    // A genuine deletion of a non-trashed file still removes the row.
+    const removed2 = try db.deleteImageByPath(lib_id, "/lib/img.png");
+    try std.testing.expectEqual(img.id, removed2.?);
+    try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
 }
 
 test "db: duplicate detection by hash" {

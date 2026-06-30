@@ -794,12 +794,16 @@ pub const VectorDb = struct {
     /// Deletes the image matching (library_id, path) and returns its id, or null
     /// if no row matched. The id lets the caller drop the image from the grid /
     /// viewers incrementally instead of reloading the whole list.
+    /// Remove the DB row for a file that disappeared from its library directory.
+    /// Only affects non-trashed rows: trashing an image moves its file out of the
+    /// library (which the fs watcher reports as a deletion), but that row must be
+    /// preserved — its `trashed_at` is already set and it lives on in the trash.
     pub fn deleteImageByPath(self: *VectorDb, library_id: u64, path: []const u8) !?u64 {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
 
         var sel = try self.db.prepare(
-            "SELECT id FROM images WHERE library_id = ? AND library_path = ?",
+            "SELECT id FROM images WHERE library_id = ? AND library_path = ? AND trashed_at IS NULL",
         );
         defer sel.deinit();
         try sel.bind(1, library_id);
@@ -807,7 +811,7 @@ pub const VectorDb = struct {
         const id: ?u64 = if (try sel.step()) @intCast(sel.columnInt64(0)) else null;
 
         var stmt = try self.db.prepare(
-            "DELETE FROM images WHERE library_id = ? AND library_path = ?",
+            "DELETE FROM images WHERE library_id = ? AND library_path = ? AND trashed_at IS NULL",
         );
         defer stmt.deinit();
         try stmt.bind(1, library_id);
