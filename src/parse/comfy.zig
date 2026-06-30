@@ -769,6 +769,76 @@ pub const ComfyParser = struct {
         }
         return result;
     }
+
+    /// One PNG text section (tEXt/iTXt), keyword + decoded text, borrowed.
+    pub const RawSection = struct {
+        keyword: []const u8,
+        text: []const u8,
+    };
+
+    /// Choose and parse the best metadata from a PNG's text sections.
+    ///
+    /// Source preference is fixed — A1111 "parameters" → ComfyUI "workflow" →
+    /// "prompt" — and is INDEPENDENT of the order the sections appear in the file:
+    /// the first section of each kind is collected up front, then each source is
+    /// tried in priority order until one yields a positive prompt.  A source that
+    /// can't produce a positive prompt is skipped rather than blocking the rest.
+    ///
+    /// `sections` must already exclude compressed/unreadable chunks; the slices
+    /// are borrowed.  The caller owns the returned `ParseResult`.
+    pub fn parseImageMetadata(self: *ComfyParser, sections: []const RawSection) !?ParseResult {
+        var a1111: ?[]const u8 = null;
+        var workflow: ?[]const u8 = null;
+        var prompt: ?[]const u8 = null;
+        var plain_prompt: ?[]const u8 = null; // a literal positive in a 2nd "prompt" chunk
+        for (sections) |s| {
+            if (std.mem.eql(u8, s.keyword, "parameters")) {
+                if (a1111 == null) a1111 = s.text;
+            } else if (std.mem.eql(u8, s.keyword, "workflow")) {
+                if (workflow == null) workflow = s.text;
+            } else if (std.mem.eql(u8, s.keyword, "prompt")) {
+                if (prompt == null) {
+                    prompt = s.text;
+                } else if (plain_prompt == null) {
+                    plain_prompt = s.text;
+                }
+            }
+        }
+
+        var result: ?ParseResult = null;
+        if (a1111) |t| result = try self.parseA1111Parameters(t);
+        if (result == null) {
+            if (workflow) |t| result = try self.parseWorkflow(t);
+        }
+        if (result == null) {
+            if (prompt) |t| result = try self.parsePromptChunk(t);
+        }
+        if (result == null) {
+            if (prompt) |t| result = try self.parsePlainPromptString(t);
+        }
+
+        // A literal positive prompt stored in a second "prompt" chunk takes
+        // priority for positive_prompt, while preserving richer metadata parsed
+        // from the other sources.
+        if (plain_prompt) |t| {
+            if (try self.parsePlainPromptString(t)) |plain_res| {
+                var plain = plain_res;
+                if (plain.positive_prompt) |p| {
+                    if (result) |*r| {
+                        if (r.positive_prompt) |old| self.allocator.free(old);
+                        r.positive_prompt = p;
+                        plain.positive_prompt = null;
+                        plain.deinit(self.allocator);
+                    } else {
+                        result = plain;
+                    }
+                } else {
+                    plain.deinit(self.allocator);
+                }
+            }
+        }
+        return result;
+    }
 };
 
 // Parse "Steps: N, Sampler: X, CFG scale: F, Seed: N, ..." key-value line.
@@ -980,4 +1050,89 @@ test "parse ComfyUI workflow" {
             try testing.expect(result.positive_prompt != null);
         }
     }
+}
+
+// ── parseImageMetadata: source selection is independent of section order ──────
+
+const a1111_sample =
+    \\ALPHA positive from parameters
+    \\Negative prompt: alpha negative
+    \\Steps: 20, Sampler: Euler a, CFG scale: 7.5, Seed: 1
+;
+// A "prompt" chunk holding a plain JSON-encoded string (a literal subject prompt).
+const prompt_json_string = "\"BETA positive from prompt\"";
+
+test "comfy: parameters wins over prompt regardless of section order" {
+    const orders = [_][3]ComfyParser.RawSection{
+        .{
+            .{ .keyword = "parameters", .text = a1111_sample },
+            .{ .keyword = "prompt", .text = prompt_json_string },
+            .{ .keyword = "workflow", .text = "{}" },
+        },
+        // Same sections, "parameters" last.
+        .{
+            .{ .keyword = "workflow", .text = "{}" },
+            .{ .keyword = "prompt", .text = prompt_json_string },
+            .{ .keyword = "parameters", .text = a1111_sample },
+        },
+        // "parameters" in the middle.
+        .{
+            .{ .keyword = "prompt", .text = prompt_json_string },
+            .{ .keyword = "parameters", .text = a1111_sample },
+            .{ .keyword = "workflow", .text = "{}" },
+        },
+    };
+    for (orders) |sections| {
+        var parser = ComfyParser.init(std.testing.allocator);
+        var result = (try parser.parseImageMetadata(&sections)).?;
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ALPHA positive from parameters", result.positive_prompt.?);
+    }
+}
+
+test "comfy: falls back to prompt when parameters chunk is absent" {
+    const sections = [_]ComfyParser.RawSection{
+        .{ .keyword = "workflow", .text = "{}" },
+        .{ .keyword = "prompt", .text = prompt_json_string },
+    };
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parseImageMetadata(&sections)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("BETA positive from prompt", result.positive_prompt.?);
+}
+
+test "comfy: parameters with no positive falls through to a usable source" {
+    // "parameters" present but its A1111 text yields no positive prompt (it is
+    // only a settings line); the prompt chunk must still be used rather than the
+    // image being left with no prompt.
+    const sections = [_]ComfyParser.RawSection{
+        .{ .keyword = "parameters", .text = "Steps: 20, Sampler: Euler a, CFG scale: 7.5" },
+        .{ .keyword = "prompt", .text = prompt_json_string },
+    };
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parseImageMetadata(&sections)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("BETA positive from prompt", result.positive_prompt.?);
+}
+
+test "comfy: a literal second prompt chunk overrides the positive prompt" {
+    const sections = [_]ComfyParser.RawSection{
+        .{ .keyword = "parameters", .text = a1111_sample },
+        .{ .keyword = "prompt", .text = "{}" }, // graph (no positive here)
+        .{ .keyword = "prompt", .text = "\"literal subject\"" }, // second prompt chunk
+    };
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parseImageMetadata(&sections)).?;
+    defer result.deinit(std.testing.allocator);
+    // Metadata still comes from parameters, but the literal prompt takes priority.
+    try std.testing.expectEqualStrings("literal subject", result.positive_prompt.?);
+    try std.testing.expect(result.steps != null);
+}
+
+test "comfy: returns null when no usable section is present" {
+    const sections = [_]ComfyParser.RawSection{
+        .{ .keyword = "Software", .text = "some tool" },
+    };
+    var parser = ComfyParser.init(std.testing.allocator);
+    try std.testing.expect((try parser.parseImageMetadata(&sections)) == null);
 }

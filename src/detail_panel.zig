@@ -193,18 +193,19 @@ pub const DetailState = struct {
                 .padding = .{ .x = 8, .y = 6 },
             });
             defer header.deinit();
-            if (filename.len > 0) {
-                var tl = dvui.textLayout(@src(), .{}, .{
-                    .font = bold,
-                    .expand = .horizontal,
-                    .background = false,
-                });
-                tl.addText(filename, .{});
-                tl.deinit();
-            } else {
-                dvui.label(@src(), "{s}", .{i18n.t(.detail_no_image)}, .{ .font = bold, .expand = .horizontal });
-            }
+            // Cap the filename width so a long (often space-less) name clips
+            // instead of overflowing and pushing the action buttons off-panel.
+            // A plain label (not textLayout) avoids a stray scrollbar in the header.
+            const btn_reserve: f32 = if (self.detail != null) 64 else 0;
+            const name_w = @max(@as(f32, 0), panel_w - 16 - btn_reserve);
+            const name = if (filename.len > 0) filename else i18n.t(.detail_no_image);
+            dvui.label(@src(), "{s}", .{name}, .{
+                .font = bold,
+                .gravity_y = 0.5,
+                .max_size_content = dvui.Options.MaxSize.width(name_w),
+            });
             if (self.detail) |d| {
+                _ = dvui.spacer(@src(), .{ .expand = .horizontal });
                 if (dvui.buttonIcon(@src(), i18n.t(.action_reparse), icons.tvg.lucide.@"refresh-cw", .{}, .{},
                     .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
                 {

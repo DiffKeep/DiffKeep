@@ -64,6 +64,7 @@ pub const Strings = struct {
 
     context_copy_prompt: [:0]const u8,
     context_copy_image: [:0]const u8,
+    context_reparse: [:0]const u8,
     context_send_to_trash: [:0]const u8,
     context_restore_from_trash: [:0]const u8,
     context_delete_permanently: [:0]const u8,
@@ -198,6 +199,7 @@ pub const en: Strings = .{
 
     .context_copy_prompt = "Copy Prompt",
     .context_copy_image = "Copy Image",
+    .context_reparse = "Reparse Metadata",
     .context_send_to_trash = "Send to Trash",
     .context_restore_from_trash = "Restore from Trash",
     .context_delete_permanently = "Delete Permanently",

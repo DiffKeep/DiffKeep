@@ -555,66 +555,36 @@ pub fn processFile(ctx: ScanCtx) void {
         return;
     };
 
-    var a1111_text: ?[]const u8 = null;
+    // Gather all readable text sections (keyword + text), preserving file order
+    // so the shared selector can pick the first of each kind.  iTXt is collected
+    // before tEXt to match prior behaviour (an iTXt "parameters" wins over tEXt).
+    var sections: std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection) = .empty;
     {
         const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
         defer aa.free(itxt);
         for (itxt) |chunk| {
             var content = png_parser.parseITxtChunk(chunk) catch continue;
             defer content.deinit(aa);
-            if (std.mem.eql(u8, content.keyword, "parameters") and !content.compressed) {
-                if (a1111_text == null) a1111_text = aa.dupe(u8, content.text) catch null;
-            }
+            if (content.compressed) continue;
+            const kw = aa.dupe(u8, content.keyword) catch continue;
+            const tx = aa.dupe(u8, content.text) catch continue;
+            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
         }
     }
-
-    const text_chunks = png_parser.getTExtChunks() catch return;
-    defer aa.free(text_chunks);
-    var workflow_text: ?[]const u8 = null;
-    var prompt_text: ?[]const u8 = null;
-    var plain_prompt_text: ?[]const u8 = null;
-    for (text_chunks) |chunk| {
-        var content = png_parser.parseTExtChunk(chunk) catch continue;
-        defer content.deinit(aa);
-        if (std.mem.eql(u8, content.keyword, "parameters") and a1111_text == null)
-            a1111_text = aa.dupe(u8, content.text) catch null;
-        if (std.mem.eql(u8, content.keyword, "prompt")) {
-            if (prompt_text == null) {
-                prompt_text = aa.dupe(u8, content.text) catch null;
-            } else if (plain_prompt_text == null) {
-                plain_prompt_text = aa.dupe(u8, content.text) catch null;
-            }
+    {
+        const text_chunks = png_parser.getTExtChunks() catch return;
+        defer aa.free(text_chunks);
+        for (text_chunks) |chunk| {
+            var content = png_parser.parseTExtChunk(chunk) catch continue;
+            defer content.deinit(aa);
+            const kw = aa.dupe(u8, content.keyword) catch continue;
+            const tx = aa.dupe(u8, content.text) catch continue;
+            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
         }
-        if (std.mem.eql(u8, content.keyword, "workflow") and workflow_text == null)
-            workflow_text = aa.dupe(u8, content.text) catch null;
     }
 
     var parser = comfy_mod.ComfyParser.init(aa);
-    var maybe_result: ?comfy_mod.ParseResult = null;
-    if (a1111_text) |t| maybe_result = parser.parseA1111Parameters(t) catch null;
-    if (maybe_result == null) {
-        if (workflow_text) |t| maybe_result = parser.parseWorkflow(t) catch null;
-    }
-    if (maybe_result == null) {
-        if (prompt_text) |t| maybe_result = parser.parsePromptChunk(t) catch null;
-    }
-    // Last resort: treat a prompt chunk as a plain JSON string.
-    if (maybe_result == null) {
-        if (prompt_text) |t| maybe_result = parser.parsePlainPromptString(t) catch null;
-    }
-    // A plain prompt string in a secondary "prompt" chunk takes priority for
-    // positive_prompt while preserving any richer metadata from the other parsers.
-    if (plain_prompt_text) |t| {
-        if (parser.parsePlainPromptString(t) catch null) |plain| {
-            if (plain.positive_prompt) |p| {
-                if (maybe_result) |*r| {
-                    r.positive_prompt = p;
-                } else {
-                    maybe_result = plain;
-                }
-            }
-        }
-    }
+    const maybe_result: ?comfy_mod.ParseResult = parser.parseImageMetadata(sections.items) catch null;
 
     var result = maybe_result orelse {
         log.debug("no metadata: {s}", .{std.fs.path.basename(ctx.path)});

@@ -142,6 +142,8 @@ pub const GridState = struct {
     copy_prompt_id: u64 = 0,
     copy_image_requested: bool = false,
     copy_image_path: []const u8 = "",
+    reparse_requested: bool = false,
+    reparse_id: u64 = 0,
     drag_requested: bool = false,
     drag_requested_ids: std.ArrayListUnmanaged(u64) = .empty,
     // Mirrored from config so renderItem can condition the context menu label
@@ -359,16 +361,29 @@ pub const GridState = struct {
             self.notifier.drain(self.io, self.allocator, &self.incoming);
         }
         const before_count = self.images.items.len;
-        for (self.incoming.items) |e| {
-            self.images.append(self.allocator, .{
-                .id = e.id,
-                .path = e.path,
-                .filename = std.fs.path.basename(e.path),
-                .mtime = e.mtime,
-            }) catch {
-                self.allocator.free(e.path);
-                continue;
-            };
+        if (self.incoming.items.len > 0) {
+            // Build a set of ids already in the grid so re-notified images (e.g.
+            // after a reparse) update in place instead of appearing twice.
+            var existing = std.AutoHashMap(u64, void).init(self.allocator);
+            defer existing.deinit();
+            existing.ensureTotalCapacity(@intCast(self.images.items.len)) catch {};
+            for (self.images.items) |img| existing.put(img.id, {}) catch {};
+            for (self.incoming.items) |e| {
+                if (existing.contains(e.id)) {
+                    self.allocator.free(e.path);
+                    continue;
+                }
+                self.images.append(self.allocator, .{
+                    .id = e.id,
+                    .path = e.path,
+                    .filename = std.fs.path.basename(e.path),
+                    .mtime = e.mtime,
+                }) catch {
+                    self.allocator.free(e.path);
+                    continue;
+                };
+                existing.put(e.id, {}) catch {};
+            }
         }
         self.incoming.clearAndFree(self.allocator);
         if (self.images.items.len != before_count) self.applySortOrder();
@@ -814,6 +829,13 @@ pub const GridState = struct {
                     self.copy_image_path = entry.path;
                 }
                 if (self.view_mode == .library) {
+                    if (dvui.menuItemLabel(@src(), i18n.t(.context_reparse), .{},
+                        .{ .expand = .horizontal }) != null)
+                    {
+                        fm.close();
+                        self.reparse_requested = true;
+                        self.reparse_id = entry.id;
+                    }
                     if (self.trash_enabled) {
                         if (dvui.menuItemLabel(@src(), i18n.t(.context_send_to_trash), .{}, .{ .expand = .horizontal }) != null) {
                             fm.close();

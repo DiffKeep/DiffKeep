@@ -136,59 +136,36 @@ fn processFile(path: []const u8, conn: *db.VectorDb, allocator: std.mem.Allocato
         return;
     };
 
-    // Collect A1111 parameters text from iTXt chunks
-    var a1111_text: ?[]const u8 = null;
+    // Gather all readable text sections (iTXt first, then tEXt) and let the
+    // shared selector pick the best source (parameters → workflow → prompt),
+    // independent of the order they appear in the file.
+    var sections: std.ArrayListUnmanaged(ComfyParser.RawSection) = .empty;
     {
         const itxt_chunks = pngParser.getITxtChunks() catch &[_]Chunk{};
         defer arena_allocator.free(itxt_chunks);
         for (itxt_chunks) |chunk| {
             var content = pngParser.parseITxtChunk(chunk) catch continue;
             defer content.deinit(arena_allocator);
-            if (std.mem.eql(u8, content.keyword, "parameters") and !content.compressed) {
-                if (a1111_text == null)
-                    a1111_text = arena_allocator.dupe(u8, content.text) catch null;
-            }
+            if (content.compressed) continue;
+            const kw = arena_allocator.dupe(u8, content.keyword) catch continue;
+            const tx = arena_allocator.dupe(u8, content.text) catch continue;
+            sections.append(arena_allocator, .{ .keyword = kw, .text = tx }) catch {};
+        }
+    }
+    {
+        const text_chunks = pngParser.getTExtChunks() catch return;
+        defer arena_allocator.free(text_chunks);
+        for (text_chunks) |chunk| {
+            var content = pngParser.parseTExtChunk(chunk) catch continue;
+            defer content.deinit(arena_allocator);
+            const kw = arena_allocator.dupe(u8, content.keyword) catch continue;
+            const tx = arena_allocator.dupe(u8, content.text) catch continue;
+            sections.append(arena_allocator, .{ .keyword = kw, .text = tx }) catch {};
         }
     }
 
-    const text_chunks = pngParser.getTExtChunks() catch return;
-    defer arena_allocator.free(text_chunks);
-
-    // Collect workflow and prompt chunk texts (prompt chunk is fallback for complex graphs)
-    var workflow_text: ?[]const u8 = null;
-    var prompt_text: ?[]const u8 = null;
-    var found: i64 = 0;
-    for (text_chunks) |chunk| {
-        var content = pngParser.parseTExtChunk(chunk) catch continue;
-        defer content.deinit(arena_allocator);
-        if (std.mem.eql(u8, content.keyword, "prompt")) {
-            found += 1;
-            if (prompt_text == null) {
-                prompt_text = arena_allocator.dupe(u8, content.text) catch null;
-            }
-        } else if (std.mem.eql(u8, content.keyword, "workflow")) {
-            found += 1;
-            if (workflow_text == null) {
-                workflow_text = arena_allocator.dupe(u8, content.text) catch null;
-            }
-        }
-    }
-
-    // Priority: A1111 parameters chunk → workflow JSON → prompt JSON
-    var maybe_result: ?@import("comfy.zig").ParseResult = null;
-    if (a1111_text) |at| {
-        maybe_result = parser.parseA1111Parameters(at) catch null;
-    }
-    if (maybe_result == null) {
-        if (workflow_text) |wt| {
-            maybe_result = parser.parseWorkflow(wt) catch null;
-        }
-    }
-    if (maybe_result == null) {
-        if (prompt_text) |pt| {
-            maybe_result = parser.parsePromptChunk(pt) catch null;
-        }
-    }
+    const maybe_result: ?@import("comfy.zig").ParseResult =
+        parser.parseImageMetadata(sections.items) catch null;
 
     if (maybe_result == null) {
         log.debug("Could not extract prompt from {s}", .{path});
@@ -233,9 +210,6 @@ fn processFile(path: []const u8, conn: *db.VectorDb, allocator: std.mem.Allocato
         }
     }
 
-    if (found < 2) {
-        log.debug("Chunks not found in {s}", .{path});
-    }
     log.debug("Done processing image {s} in {d:.3}s", .{ path, elapsedSec(io, t0) });
 }
 

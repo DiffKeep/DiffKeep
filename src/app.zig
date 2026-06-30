@@ -492,6 +492,23 @@ fn frame() !dvui.App.Result {
                 detail_panel_mod.copyImageToClipboard(grid.copy_image_path, init.gpa, init.io);
             }
         }
+        if (grid.reparse_requested) {
+            grid.reparse_requested = false;
+            if (dvui.App.main_init) |init| {
+                if (dk.g_db) |*db| {
+                    if (dk.g_library_manager) |*mgr| {
+                        // Look up the library id + path for this image, then queue a
+                        // background re-parse (resets mtime so the scanner re-reads it).
+                        if (db.getImageDetails(init.gpa, grid.reparse_id) catch null) |det| {
+                            var d = det;
+                            defer d.deinit(init.gpa);
+                            mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
+                            g_detail.id = null; // force detail panel to reload after reparse
+                        }
+                    }
+                }
+            }
+        }
         if (grid.drag_requested) {
             grid.drag_requested = false;
             if (g_dnd) |*dnd| {
