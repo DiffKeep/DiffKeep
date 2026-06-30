@@ -31,6 +31,7 @@ pub const LibraryState = struct {
 pub const FolderNode = struct {
     path: []const u8, // full absolute path, heap-allocated, owned
     count: i64,
+    has_children: bool = false, // whether this folder has subdirectories (known before expanding)
     children: []FolderNode = &.{}, // heap-allocated; empty until loaded
     loaded: bool = false,
     expanded: bool = false,
@@ -142,7 +143,9 @@ pub const SidebarState = struct {
 
         const row_bg = focusBg(is_selected);
 
-        const may_have_children = node.children.len > 0 or !node.loaded;
+        // Before a folder is expanded we rely on the has_children flag computed
+        // at list time; once loaded, trust the actual children we found.
+        const may_have_children = if (node.loaded) node.children.len > 0 else node.has_children;
 
         {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, row_bg.override(.{
@@ -160,7 +163,7 @@ pub const SidebarState = struct {
                             if (d.listImmediateSubdirs(gpa, lib.id, node.path)) |subs| {
                                 if (gpa.alloc(FolderNode, subs.len)) |new_nodes| {
                                     for (subs, 0..) |s, i| {
-                                        new_nodes[i] = .{ .path = s.path, .count = s.count };
+                                        new_nodes[i] = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
                                     }
                                     gpa.free(subs);
                                     node.children = new_nodes;
@@ -179,6 +182,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     g.filter_library_id = lib.id;
                     g.filter_folder_path = self.filter_folder;
+                    g.filter_library_path = lib.path;
                     g.view_mode = .library;
                     if (db) |d| g.reloadImages(d) catch {};
                 }
@@ -261,6 +265,7 @@ pub const SidebarState = struct {
                     if (grid) |g| {
                         g.filter_library_id = null;
                         g.filter_folder_path = null;
+                        g.filter_library_path = null;
                         g.view_mode = .library;
                         if (db) |d| g.reloadImages(d) catch {};
                     }
@@ -326,7 +331,7 @@ pub const SidebarState = struct {
                                 if (d.listImmediateSubdirs(gpa, lib.id, lib.path)) |subs| {
                                     if (gpa.alloc(FolderNode, subs.len)) |new_nodes| {
                                         for (subs, 0..) |s, i| {
-                                            new_nodes[i] = .{ .path = s.path, .count = s.count };
+                                            new_nodes[i] = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
                                         }
                                         gpa.free(subs);
                                         lib.top_folders = new_nodes;
@@ -354,6 +359,7 @@ pub const SidebarState = struct {
                             if (grid) |g| {
                                 g.filter_library_id = lib.id;
                                 g.filter_folder_path = null;
+                                g.filter_library_path = lib.path;
                                 g.view_mode = .library;
                                 if (db) |d| g.reloadImages(d) catch {};
                             }
@@ -487,6 +493,7 @@ pub const SidebarState = struct {
                             if (grid) |g| {
                                 g.filter_library_id = null;
                                 g.filter_folder_path = null;
+                                g.filter_library_path = null;
                             }
                         }
                         if (grid) |g| {

@@ -177,6 +177,9 @@ pub const GridState = struct {
     // Filter state — owned by app.zig, not freed by GridState
     filter_library_id: ?u64 = null,
     filter_folder_path: ?[]const u8 = null,
+    // Root path of the selected library (borrowed from the sidebar, not owned).
+    // Used to decide whether a newly scanned image belongs in the current view.
+    filter_library_path: ?[]const u8 = null,
     // FTS5 search query — points into app.zig's g_search_buf; not owned
     search_query: ?[]const u8 = null,
     // Active metadata filters — slice into app.zig's g_active_filters; not owned
@@ -294,6 +297,8 @@ pub const GridState = struct {
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
         self.anchor_idx = null;
+        // Switching to a new view always starts at the top.
+        self.scroll_info.viewport.y = 0;
 
         self.images.ensureTotalCapacity(self.allocator, entries.len) catch {};
         for (entries) |e| {
@@ -328,6 +333,8 @@ pub const GridState = struct {
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
         self.anchor_idx = null;
+        // Switching to a new view always starts at the top.
+        self.scroll_info.viewport.y = 0;
 
         const entries = switch (self.view_mode) {
             .library => blk: {
@@ -378,6 +385,27 @@ pub const GridState = struct {
         self.applySortOrder();
     }
 
+    /// True if `path` names a file directly or transitively inside `root`.
+    fn pathInside(path: []const u8, root: []const u8) bool {
+        return path.len > root.len and
+            std.mem.startsWith(u8, path, root) and
+            path[root.len] == '/';
+    }
+
+    /// Whether a freshly scanned image at `path` belongs in the current view.
+    /// Only the plain library/folder browse views can be updated incrementally;
+    /// when a search, embedding, or metadata filter is active we can't cheaply
+    /// tell whether the new image matches, so we leave it out — it appears the
+    /// next time the query is run.
+    pub fn incomingBelongs(self: *const GridState, path: []const u8) bool {
+        if (self.query_embedding != null) return false;
+        if (self.search_query) |q| if (q.len > 0) return false;
+        if (self.filters.len > 0) return false;
+        if (self.filter_folder_path) |fp| return pathInside(path, fp);
+        if (self.filter_library_path) |lp| return pathInside(path, lp);
+        return true; // unfiltered "all images" view
+    }
+
     /// Call once per frame before render(), on the main thread.
     pub fn update(self: *GridState) void {
         // Refresh set only reflects this frame's re-notifications; the detail
@@ -409,7 +437,15 @@ pub const GridState = struct {
                 // A newly appearing id may be one SQLite recycled from a just-
                 // deleted image; clear any cache entry it left behind (and any
                 // stale in-flight load result) so this image loads its own thumb.
+                // Do this even when the image isn't shown here, so the stale
+                // thumbnail can't resurface when it later appears in its own view.
                 self.invalidateThumbnail(e.id);
+                // Don't inject images that don't belong in the current view
+                // (different folder/library, or not matching the active search).
+                if (!self.incomingBelongs(e.path)) {
+                    self.allocator.free(e.path);
+                    continue;
+                }
                 self.images.append(self.allocator, .{
                     .id = e.id,
                     .path = e.path,

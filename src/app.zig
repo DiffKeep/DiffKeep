@@ -383,7 +383,11 @@ fn openDeleteDialog(grid: *const image_grid_mod.GridState, force: bool) void {
         g_delete_dialog.name_len = len;
     }
 
-    const permanent = force or !dk.g_cfg.trash_enabled;
+    // Items already in the trash (view_mode == .trash) can only ever be deleted
+    // permanently — mirror g_delete_dialog.force so the skip-confirm fast path
+    // doesn't fall into performTrash (which would no-op on an already-trashed
+    // file yet still drop it from the grid, leaving a stale row behind).
+    const permanent = g_delete_dialog.force or !dk.g_cfg.trash_enabled;
     if (count == 1) {
         if (!permanent and g_delete_dialog.skip_delete_confirm) {
             if (dk.g_grid) |*grid_mut| {
@@ -828,7 +832,9 @@ fn performViewerDeleteEntry(
 ) void {
     const data_dir = g_data_dir orelse return;
 
-    if (force or !dk.g_cfg.trash_enabled) {
+    // A trashed entry (trash_name set) is already in the trash; it can only be
+    // deleted permanently, never re-trashed.
+    if (force or entry.trash_name != null or !dk.g_cfg.trash_enabled) {
         const file_path: []const u8 = if (entry.trash_name) |tn|
             std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
         else

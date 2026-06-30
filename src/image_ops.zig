@@ -130,7 +130,13 @@ pub fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_
 fn maybeReloadDuplicates(grid: *image_grid_mod.GridState) void {
     if (grid.view_mode != .duplicates) return;
     const ctx = g_ctx orelse return;
-    if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
+    if (ctx.db.*) |*db| {
+        // This is an in-place refresh of the same view (not a view change), so
+        // keep the user's scroll position rather than snapping back to the top.
+        const saved_y = grid.scroll_info.viewport.y;
+        grid.reloadImages(db) catch {};
+        grid.scroll_info.viewport.y = saved_y;
+    }
 }
 
 pub fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {

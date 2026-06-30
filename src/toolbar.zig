@@ -526,6 +526,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
             };
             @memcpy(&ctx.settings.model_snapshot.text_dir, &ctx.settings.text_model_dir_buf);
             @memcpy(&ctx.settings.model_snapshot.visual_dir, &ctx.settings.visual_model_dir_buf);
+            @memcpy(&ctx.settings.data_path_snapshot, &ctx.settings.data_path_buf);
             ctx.settings.gpu_snapshot = .{
                 .use_gpu = ctx.cfg.use_gpu,
                 .gpu_device_id = ctx.cfg.gpu_device_id,

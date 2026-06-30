@@ -16,6 +16,7 @@ pub const LibraryInfo = struct {
 pub const FolderCount = struct {
     path: []const u8, // heap-allocated; caller frees
     count: i64,
+    has_children: bool = false, // true if this folder has at least one subdirectory
 };
 
 pub const DbStats = struct {
@@ -578,7 +579,8 @@ pub const VectorDb = struct {
         try stmt.bind(1, library_id);
         try stmt.bind(2, @as([]const u8, pattern));
 
-        var map: std.StringHashMap(i64) = .init(allocator);
+        const Agg = struct { count: i64, has_children: bool };
+        var map: std.StringHashMap(Agg) = .init(allocator);
         defer {
             var kit = map.keyIterator();
             while (kit.next()) |k| allocator.free(k.*);
@@ -596,14 +598,18 @@ pub const VectorDb = struct {
             if (slash_pos == 0) continue;
             const child_end = prefix_len + slash_pos;
             const child_path = path[0..child_end];
+            // A further "/" past "child/" means this image lives in a deeper
+            // subdirectory, so the child folder itself has children.
+            const deeper = std.mem.indexOfScalar(u8, path[child_end + 1 ..], '/') != null;
             const gop = try map.getOrPut(child_path);
             if (gop.found_existing) {
-                gop.value_ptr.* += 1;
+                gop.value_ptr.count += 1;
+                if (deeper) gop.value_ptr.has_children = true;
             } else {
                 const owned = try allocator.dupe(u8, child_path);
                 errdefer allocator.free(owned);
                 gop.key_ptr.* = owned;
-                gop.value_ptr.* = 1;
+                gop.value_ptr.* = .{ .count = 1, .has_children = deeper };
             }
         }
 
@@ -617,7 +623,11 @@ pub const VectorDb = struct {
             while (it.next()) |kv| {
                 const path_copy = try allocator.dupe(u8, kv.key_ptr.*);
                 errdefer allocator.free(path_copy);
-                try result.append(allocator, .{ .path = path_copy, .count = kv.value_ptr.* });
+                try result.append(allocator, .{
+                    .path = path_copy,
+                    .count = kv.value_ptr.count,
+                    .has_children = kv.value_ptr.has_children,
+                });
             }
         }
         std.mem.sortUnstable(FolderCount, result.items, {}, struct {

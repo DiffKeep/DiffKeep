@@ -298,10 +298,12 @@ test "db: listImmediateSubdirs path logic" {
 
     const lib_id = try db.storeLibrary("/lib");
 
-    // Images at three locations
+    // Images at several locations. /lib/cats has a deeper subdir (kittens),
+    // /lib/dogs does not.
     for ([_][]const u8{
         "/lib/cats/a.png",
         "/lib/cats/b.png",
+        "/lib/cats/kittens/c.png",
         "/lib/dogs/rex.png",
         // image directly under /lib — no subdirectory, should NOT appear
         "/lib/top.png",
@@ -316,12 +318,25 @@ test "db: listImmediateSubdirs path logic" {
         alloc.free(subdirs);
     }
 
-    // Results are sorted by path; cats×2, dogs×1
+    // Results are sorted by path; cats×3 (2 direct + 1 in kittens), dogs×1.
     try std.testing.expectEqual(@as(usize, 2), subdirs.len);
     try std.testing.expectEqualStrings("/lib/cats", subdirs[0].path);
-    try std.testing.expectEqual(@as(i64, 2),        subdirs[0].count);
+    try std.testing.expectEqual(@as(i64, 3),        subdirs[0].count);
+    // /lib/cats has the "kittens" subdirectory; /lib/dogs has none.
+    try std.testing.expect(subdirs[0].has_children);
     try std.testing.expectEqualStrings("/lib/dogs", subdirs[1].path);
     try std.testing.expectEqual(@as(i64, 1),        subdirs[1].count);
+    try std.testing.expect(!subdirs[1].has_children);
+
+    // Drilling into /lib/cats yields "kittens", which itself has no children.
+    const cats_subs = try db.listImmediateSubdirs(alloc, lib_id, "/lib/cats");
+    defer {
+        for (cats_subs) |fc| alloc.free(fc.path);
+        alloc.free(cats_subs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cats_subs.len);
+    try std.testing.expectEqualStrings("/lib/cats/kittens", cats_subs[0].path);
+    try std.testing.expect(!cats_subs[0].has_children);
 }
 
 test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
@@ -445,4 +460,42 @@ test "grid: render with images doesn't crash" {
     try dvui.testing.settle(gridFrame);
     // "grid-empty" should not be registered when images are present
     try std.testing.expect(dvui.tagGet("grid-empty") == null);
+}
+
+test "grid: incomingBelongs respects the active view filters" {
+    const path = "/tmp/diffkeep_test_grid_belongs.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // Fully unfiltered "all images" view accepts anything.
+    try std.testing.expect(grid.incomingBelongs("/lib/a.png"));
+
+    // Library filter: only images under the library root belong.
+    grid.filter_library_path = "/lib";
+    try std.testing.expect(grid.incomingBelongs("/lib/sub/a.png"));
+    try std.testing.expect(!grid.incomingBelongs("/other/a.png"));
+    try std.testing.expect(!grid.incomingBelongs("/lib")); // the root itself is not "inside"
+    try std.testing.expect(!grid.incomingBelongs("/libfoo/a.png")); // prefix is not containment
+
+    // Folder filter takes precedence over the library root.
+    grid.filter_folder_path = "/lib/cats";
+    try std.testing.expect(grid.incomingBelongs("/lib/cats/x.png"));
+    try std.testing.expect(!grid.incomingBelongs("/lib/dogs/x.png"));
+
+    // An active text search means membership can't be cheaply decided, so new
+    // images are withheld until the query is re-run.
+    grid.search_query = "kitten";
+    try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
+    grid.search_query = null;
+
+    // Same for an active embedding (semantic/visual) query.
+    const dummy_embedding = [_]f32{0.0} ** 4;
+    grid.query_embedding = &dummy_embedding;
+    try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
+    grid.query_embedding = null;
 }

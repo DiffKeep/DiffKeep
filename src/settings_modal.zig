@@ -121,6 +121,8 @@ pub const SettingsModalState = struct {
     } = .{},
     text_model_dir_buf:   [4096:0]u8 = std.mem.zeroes([4096:0]u8),
     visual_model_dir_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    data_path_buf:        [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    data_path_snapshot:   [4096:0]u8 = std.mem.zeroes([4096:0]u8),
     /// Set to true by onClosed() or applyCompletedDownloads() when model paths changed; cleared by app.zig.
     model_paths_changed: bool = false,
 
@@ -139,6 +141,11 @@ pub const SettingsModalState = struct {
             const len = @min(p.len, self.visual_model_dir_buf.len - 1);
             @memcpy(self.visual_model_dir_buf[0..len], p[0..len]);
             self.visual_model_dir_buf[len] = 0;
+        }
+        if (cfg.data_path) |p| {
+            const len = @min(p.len, self.data_path_buf.len - 1);
+            @memcpy(self.data_path_buf[0..len], p[0..len]);
+            self.data_path_buf[len] = 0;
         }
     }
 
@@ -358,11 +365,27 @@ pub const SettingsModalState = struct {
                 }
 
                 dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path)}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
-                if (cfg.data_path) |p| {
-                    dvui.label(@src(), "{s}", .{p}, .{});
-                } else {
-                    dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path_default)}, .{});
+                {
+                    var te = dvui.textEntry(@src(), .{
+                        .text = .{ .buffer = self.data_path_buf[0..] },
+                        .placeholder = i18n.t(.settings_data_path_placeholder),
+                    }, .{
+                        .expand = .horizontal,
+                        .min_size_content = .{ .h = 22 },
+                        .corner_radius = dvui.Rect.all(4),
+                        .margin = .{ .h = 4 },
+                    });
+                    defer te.deinit();
                 }
+                // Show where data currently lives so an empty (default) field is unambiguous.
+                if (data_dir) |dd| {
+                    dvui.label(@src(), "{s} {s}", .{ i18n.t(.settings_data_path_default), dd }, .{
+                        .margin = .{ .h = 4 },
+                    });
+                }
+                dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path_warning)}, .{
+                    .color_text = dvui.themeGet().err.fill orelse dvui.themeGet().border,
+                });
             }
 
             // ── Right column ──────────────────────────────────────────────────
@@ -500,6 +523,17 @@ pub const SettingsModalState = struct {
             cfg.gpu_device_id != self.gpu_snapshot.gpu_device_id;
         if (gpu_changed) {
             self.model_paths_changed = true;
+        }
+
+        // The data path only takes effect on the next launch (the DB and all
+        // derived directories are opened once at startup), so just persist it
+        // into the config here — no live re-init or rescan.
+        if (!std.mem.eql(u8, &self.data_path_buf, &self.data_path_snapshot)) {
+            if (dvui.App.main_init) |init| {
+                if (cfg.data_path) |p| init.gpa.free(p);
+                const data_str = std.mem.sliceTo(&self.data_path_buf, 0);
+                cfg.data_path = if (data_str.len > 0) init.gpa.dupe(u8, data_str) catch null else null;
+            }
         }
 
         if (need_rescan) {

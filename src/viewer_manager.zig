@@ -108,13 +108,25 @@ pub const ViewerManager = struct {
         for (grid.images.items) |e| {
             if (use_selection and !grid.selection.contains(e.id)) continue;
             const path_copy = init.gpa.dupe(u8, e.path) catch continue;
+            // Carry over trash metadata so the viewer can locate trashed files
+            // (which live in <data_dir>/trash/<trash_name>, not at e.path).
+            const trash_name_copy: ?[]const u8 = if (e.trash_name) |tn|
+                init.gpa.dupe(u8, tn) catch {
+                    init.gpa.free(path_copy);
+                    continue;
+                }
+            else
+                null;
             images.append(init.gpa, .{
                 .id = e.id,
                 .path = path_copy,
                 .filename = std.fs.path.basename(path_copy),
                 .mtime = e.mtime,
+                .trashed_at = e.trashed_at,
+                .trash_name = trash_name_copy,
             }) catch {
                 init.gpa.free(path_copy);
+                if (trash_name_copy) |tn| init.gpa.free(tn);
                 continue;
             };
         }
@@ -136,7 +148,7 @@ pub const ViewerManager = struct {
         const id = self.next_id;
         self.next_id += 1;
         const vw = init.gpa.create(ViewerWindow) catch {
-            for (images.items) |e| init.gpa.free(e.path);
+            for (images.items) |e| { init.gpa.free(e.path); if (e.trash_name) |tn| init.gpa.free(tn); }
             images.deinit(init.gpa);
             return;
         };
@@ -151,7 +163,7 @@ pub const ViewerManager = struct {
             .vsync = true,
             .title = "DiffKeep Viewer",
         }) catch {
-            for (images.items) |e| init.gpa.free(e.path);
+            for (images.items) |e| { init.gpa.free(e.path); if (e.trash_name) |tn| init.gpa.free(tn); }
             images.deinit(init.gpa);
             init.gpa.destroy(vw);
             return;

@@ -167,7 +167,10 @@ pub const ViewerState = struct {
         self.orphan_threads.deinit(self.gpa);
 
         if (self.image_pixels) |p| self.gpa.free(p);
-        for (self.images.items) |e| self.gpa.free(e.path);
+        for (self.images.items) |e| {
+            self.gpa.free(e.path);
+            if (e.trash_name) |tn| self.gpa.free(tn);
+        }
         self.images.deinit(self.gpa);
         self.detail_state.deinit(self.gpa);
     }
@@ -266,7 +269,7 @@ pub const ViewerState = struct {
                 }
                 const si = free_i orelse continue;
 
-                const path_copy = self.gpa.dupeZ(u8, self.images.items[wi].path) catch continue;
+                const path_copy = self.diskPathZ(&self.images.items[wi]) catch continue;
                 self.cache_slots[si] = .{ .active = true, .image_idx = wi };
                 if (task_count < cache_size) {
                     tasks[task_count] = .{ .slot_i = si, .image_idx = wi, .path = path_copy };
@@ -322,6 +325,17 @@ pub const ViewerState = struct {
         return &self.images.items[self.current_idx];
     }
 
+    /// Actual on-disk location for an entry. Trashed entries live in
+    /// <data_dir>/trash/<trash_name>; everything else is at entry.path.
+    /// Returns a NUL-terminated heap copy the caller must free.
+    fn diskPathZ(self: *const ViewerState, e: *const image_grid_mod.ImageEntry) std.mem.Allocator.Error![:0]u8 {
+        if (e.trash_name) |tn| {
+            if (self.data_dir) |dd|
+                return std.fs.path.joinZ(self.gpa, &.{ dd, "trash", tn });
+        }
+        return self.gpa.dupeZ(u8, e.path);
+    }
+
     pub fn removeImages(self: *ViewerState, ids: *const std.AutoHashMap(u64, void)) void {
         var i: usize = 0;
         var any_removed = false;
@@ -330,6 +344,7 @@ pub const ViewerState = struct {
             const e = self.images.items[i];
             if (ids.contains(e.id)) {
                 self.gpa.free(e.path);
+                if (e.trash_name) |tn| self.gpa.free(tn);
                 _ = self.images.orderedRemove(i);
                 any_removed = true;
                 if (i == self.current_idx) removed_current = true else if (i < self.current_idx) self.current_idx -|= 1;
@@ -584,8 +599,12 @@ pub const ViewerState = struct {
         if (self.images.items.len > 0 and
             iconButton(i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", 11))
         {
-            if (self.currentImage()) |img|
-                detail_panel_mod.copyImageToClipboard(img.path, self.gpa, self.io);
+            if (self.currentImage()) |img| {
+                if (self.diskPathZ(img)) |p| {
+                    defer self.gpa.free(p);
+                    detail_panel_mod.copyImageToClipboard(p, self.gpa, self.io);
+                } else |_| {}
+            }
         }
 
         if (self.dnd_available and self.images.items.len > 0) {
