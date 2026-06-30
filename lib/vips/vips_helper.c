@@ -2,7 +2,16 @@
 #include <vips/vips.h>
 
 int diffkeep_vips_init(const char *name) {
-    return vips_init(name);
+    int rc = vips_init(name);
+    if (rc == 0) {
+        /* Bound vips's operation cache. We only generate one-shot thumbnails, so
+         * caching prior operations buys nothing but costs memory. The defaults
+         * (1000 ops / ~100MB / 100 open files) are far more than we need. */
+        vips_cache_set_max(0);
+        vips_cache_set_max_mem(0);
+        vips_cache_set_max_files(0);
+    }
+    return rc;
 }
 
 void diffkeep_vips_shutdown(void) {

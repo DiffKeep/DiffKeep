@@ -12,6 +12,7 @@ const sidebar_mod = @import("sidebar.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const widgets_mod = @import("widgets.zig");
+const image_ops_mod = @import("image_ops.zig");
 
 pub const left_w_min: f32 = 160;
 pub const left_w_max: f32 = 400;
@@ -279,6 +280,68 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     }
 }
 
+/// Full-width, accent-coloured action bar shown above the grid in the duplicates
+/// and trash views, explaining the bulk action and offering the button:
+///  * duplicates → accent (highlight) banner: move all but one of each to Trash.
+///  * trash      → danger (err) banner: permanently empty the trash.
+/// While a bulk op runs it shows a "Working…" label in place of the button.
+fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, trash_stats: ?db_mod.TrashStats) void {
+    const Action = enum { dedupe, empty_trash };
+    var action: Action = undefined;
+    var style: dvui.Theme.Style.Name = undefined;
+    var description: [:0]const u8 = undefined;
+    var button_text: [:0]const u8 = undefined;
+    switch (grid.view_mode) {
+        .duplicates => {
+            if (duplicate_count <= 0) return;
+            action = .dedupe;
+            style = .highlight;
+            description = i18n.t(.dupes_banner_text);
+            button_text = i18n.t(.dupes_remove_button);
+        },
+        .trash => {
+            const has_items = if (trash_stats) |ts| ts.count > 0 else false;
+            if (!has_items) return;
+            action = .empty_trash;
+            style = .err;
+            description = i18n.t(.trash_banner_text);
+            button_text = i18n.t(.settings_empty_trash);
+        },
+        .library => return,
+    }
+
+    var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .padding = .{ .x = 12, .y = 8, .w = 12, .h = 8 },
+        .background = true,
+        .style = style,
+    });
+    defer bar.deinit();
+
+    // Description fills the bar and pushes the action to the right edge.
+    dvui.label(@src(), "{s}", .{description}, .{
+        .style = style,
+        .gravity_y = 0.5,
+        .expand = .horizontal,
+    });
+
+    if (image_ops_mod.bulkActive()) {
+        dvui.label(@src(), "{s}", .{i18n.t(.action_working)}, .{ .style = style, .gravity_y = 0.5 });
+        return;
+    }
+
+    if (dvui.button(@src(), button_text, .{}, .{
+        .gravity_y = 0.5,
+        .padding = .{ .x = 12, .y = 4, .w = 12, .h = 4 },
+        .corner_radius = dvui.Rect.all(4),
+    })) {
+        switch (action) {
+            .dedupe => grid.dedupe_requested = true,
+            .empty_trash => grid.empty_trash_requested = true,
+        }
+    }
+}
+
 pub fn renderContent(ctx: RenderCtx) !void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .background = true });
     defer row.deinit();
@@ -306,6 +369,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
 
         if (ctx.grid.*) |*grid| {
             grid.trash_enabled = ctx.cfg.trash_enabled;
+            renderActionBanner(grid, ctx.duplicate_count.*, ctx.trash_stats.*);
             grid.render();
         } else {
             dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });

@@ -154,6 +154,9 @@ pub const GridState = struct {
     delete_requested: bool = false,
     delete_force: bool = false,   // true = Shift+Delete or "Delete Permanently": skip trash
     restore_requested: bool = false,
+    // Bulk view actions — set by the duplicates/trash banners, consumed by app.zig
+    dedupe_requested: bool = false,      // remove all but one of each duplicate
+    empty_trash_requested: bool = false, // permanently delete all trashed images
     copy_prompt_requested: bool = false,
     copy_prompt_id: u64 = 0,
     copy_image_requested: bool = false,
@@ -493,6 +496,27 @@ pub const GridState = struct {
         return self.refreshed.contains(id);
     }
 
+    /// After a removal, focus and single-select a sensible neighbour — the item
+    /// now occupying `target` (clamped to the list), i.e. the one that "slid up"
+    /// into the deleted item's place, or the new last item if we deleted the end.
+    /// Keeps a selected image (and a populated detail panel) instead of leaving
+    /// the grid with nothing selected. Scrolls it into view. `target` is the
+    /// focused index captured *before* the removal.
+    pub fn focusNear(self: *GridState, target: ?usize) void {
+        const n = self.images.items.len;
+        self.selection.clearRetainingCapacity();
+        if (n == 0) {
+            self.focused_idx = null;
+            self.anchor_idx = null;
+            return;
+        }
+        const i = @min(target orelse 0, n - 1);
+        self.focused_idx = i;
+        self.anchor_idx = i;
+        self.selection.put(self.images.items[i].id, {}) catch {};
+        self.scroll_to_focused = true;
+    }
+
     pub fn applySortOrder(self: *GridState) void {
         // Duplicates view keeps the DB order (grouped by hash) so duplicate sets
         // stay contiguous; user-facing sort controls don't apply there.
@@ -611,7 +635,11 @@ pub const GridState = struct {
             const is_searching = self.search_query != null or
                 self.query_embedding != null or
                 self.filters.len > 0;
-            const empty_text = if (is_searching) i18n.t(.search_no_results) else i18n.t(.library_empty);
+            const empty_text = switch (self.view_mode) {
+                .trash => i18n.t(.trash_empty),
+                .duplicates => i18n.t(.duplicates_empty),
+                .library => if (is_searching) i18n.t(.search_no_results) else i18n.t(.library_empty),
+            };
             dvui.label(@src(), "{s}", .{empty_text}, .{
                 .tag = "grid-empty",
                 .gravity_x = 0.5,

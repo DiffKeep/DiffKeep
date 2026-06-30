@@ -13,6 +13,8 @@ pub const AppCtx = struct {
     /// Called after images are removed from the grid so open viewer windows can
     /// drop the same images without reopening.
     on_images_removed: *const fn (ids: *const std.AutoHashMap(u64, void)) void,
+    /// Wakes the render loop (used to surface background bulk-op completion).
+    on_wakeup: *const fn () void,
 };
 
 var g_ctx: ?AppCtx = null;
@@ -79,6 +81,7 @@ pub fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashM
 pub fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
     const ctx = g_ctx orelse return;
     const data_dir = ctx.data_dir.* orelse return;
+    const prev_focus = grid.focused_idx;
     var ids = effectiveIds(grid, allocator) catch return;
     defer ids.deinit();
     if (ids.count() == 0) return;
@@ -118,11 +121,22 @@ pub fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_
     removeFromGrid(grid, &ids);
     ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
+    maybeReloadDuplicates(grid);
+    grid.focusNear(prev_focus);
+}
+
+/// In the duplicates view, removing one copy can leave its former partner with no
+/// remaining duplicate; reload so those now-unique images drop out immediately.
+fn maybeReloadDuplicates(grid: *image_grid_mod.GridState) void {
+    if (grid.view_mode != .duplicates) return;
+    const ctx = g_ctx orelse return;
+    if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
 }
 
 pub fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
     const ctx = g_ctx orelse return;
     const data_dir = ctx.data_dir.* orelse "";
+    const prev_focus = grid.focused_idx;
     var ids = effectiveIds(grid, allocator) catch return;
     defer ids.deinit();
     if (ids.count() == 0) return;
@@ -149,11 +163,14 @@ pub fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid
     removeFromGrid(grid, &ids);
     ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
+    maybeReloadDuplicates(grid);
+    grid.focusNear(prev_focus);
 }
 
 pub fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
     const ctx = g_ctx orelse return;
     const data_dir = ctx.data_dir.* orelse return;
+    const prev_focus = grid.focused_idx;
     var ids = effectiveIds(grid, allocator) catch return;
     defer ids.deinit();
     if (ids.count() == 0) return;
@@ -180,4 +197,139 @@ pub fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_gri
     removeFromGrid(grid, &ids);
     ctx.on_images_removed(&ids);
     ctx.on_counts_changed();
+    grid.focusNear(prev_focus);
+}
+
+// ── Background bulk operations ──────────────────────────────────────────────
+//
+// "Empty trash" and "remove all but one duplicate" can touch thousands of files
+// and DB rows. Doing that on the render thread would freeze the UI, so they run
+// on a dedicated thread; the main loop polls `bulkPoll` each frame and refreshes
+// the grid + counts once the worker finishes. Only one bulk op runs at a time.
+
+const BulkKind = enum { empty_trash, dedupe };
+
+const Bulk = struct {
+    thread: ?std.Thread = null,
+    kind: BulkKind = .empty_trash,
+    done: std.atomic.Value(bool) = .init(false),
+    count: std.atomic.Value(u32) = .init(0),
+};
+var g_bulk: Bulk = .{};
+
+pub fn bulkActive() bool {
+    return g_bulk.thread != null;
+}
+
+/// Move every redundant duplicate copy (all but the lowest-id one of each hash
+/// group) to the trash, on a background thread. Safe: only copies that still have
+/// a surviving sibling are moved, and they go to the trash (recoverable).
+pub fn startRemoveRedundantDuplicates(io: std.Io) void {
+    startBulk(io, .dedupe);
+}
+
+/// Permanently delete every trashed image (DB row + file) on a background thread.
+pub fn startEmptyTrash(io: std.Io) void {
+    startBulk(io, .empty_trash);
+}
+
+fn startBulk(io: std.Io, kind: BulkKind) void {
+    if (g_bulk.thread != null) return; // already running
+    g_bulk.kind = kind;
+    g_bulk.done.store(false, .release);
+    g_bulk.count.store(0, .release);
+    g_bulk.thread = std.Thread.spawn(.{}, bulkWorker, .{io}) catch |err| blk: {
+        log.warn("spawn bulk op: {}", .{err});
+        break :blk null;
+    };
+}
+
+fn bulkWorker(io: std.Io) void {
+    // c_allocator: this runs off the main thread, so it must not touch a
+    // non-thread-safe app allocator.
+    const alloc = std.heap.c_allocator;
+    defer {
+        g_bulk.done.store(true, .release);
+        if (g_ctx) |ctx| ctx.on_wakeup();
+    }
+
+    const ctx = g_ctx orelse return;
+    const data_dir = ctx.data_dir.* orelse return;
+    const db_ptr = if (ctx.db.*) |*d| d else return;
+    var conn = db_ptr.getConnection() catch |err| {
+        log.warn("bulk op db connection: {}", .{err});
+        return;
+    };
+    defer conn.deinit();
+
+    switch (g_bulk.kind) {
+        .empty_trash => {
+            // purgeExpiredTrash with a max cutoff deletes every trashed row and
+            // returns their trash file names so we can unlink the files.
+            const names = conn.purgeExpiredTrash(alloc, std.math.maxInt(i64)) catch return;
+            defer {
+                for (names) |n| alloc.free(n);
+                alloc.free(names);
+            }
+            for (names) |trash_name| {
+                const p = std.fs.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
+                defer alloc.free(p);
+                std.Io.Dir.cwd().deleteFile(io, p) catch |err|
+                    log.warn("empty trash unlink {s}: {}", .{ trash_name, err });
+            }
+            g_bulk.count.store(@intCast(names.len), .release);
+        },
+        .dedupe => {
+            const reds = conn.listRedundantDuplicates(alloc) catch return;
+            defer {
+                for (reds) |r| alloc.free(r.path);
+                alloc.free(reds);
+            }
+            const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+            var moved: u32 = 0;
+            for (reds) |r| {
+                var file_size: i64 = 0;
+                if (std.Io.Dir.cwd().openFile(io, r.path, .{})) |f| {
+                    if (f.length(io)) |len| file_size = @intCast(len) else |_| {}
+                    f.close(io);
+                } else |_| {}
+
+                var name_buf: [768]u8 = undefined;
+                const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ r.id, std.fs.path.basename(r.path) }) catch continue;
+                const dst = std.fs.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
+                defer alloc.free(dst);
+
+                // Mark trashed BEFORE moving. The move fires the fs-watcher's
+                // delete handler on another thread; with the row already trashed,
+                // deleteImageByPath skips it instead of permanently deleting, so a
+                // move-vs-watcher race can never lose an image.
+                conn.trashImage(r.id, trash_name, file_size, now_s) catch |err| {
+                    log.warn("dedupe trashImage {d}: {}", .{ r.id, err });
+                    continue;
+                };
+                moveFile(io, alloc, r.path, dst) catch |err| {
+                    // Row stays trashed; file remains in the library (recoverable).
+                    log.warn("dedupe move {s}: {}", .{ std.fs.path.basename(r.path), err });
+                    continue;
+                };
+                moved += 1;
+            }
+            g_bulk.count.store(moved, .release);
+        },
+    }
+}
+
+/// Call once per frame. When a background bulk op has finished, joins the worker,
+/// refreshes counts, and reloads the current view. Returns true if it just
+/// completed (so the caller can e.g. log the count).
+pub fn bulkPoll(grid: *image_grid_mod.GridState) bool {
+    const t = g_bulk.thread orelse return false;
+    if (!g_bulk.done.load(.acquire)) return false;
+    t.join();
+    g_bulk.thread = null;
+    const ctx = g_ctx orelse return true;
+    if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
+    ctx.on_counts_changed();
+    log.info("bulk {s}: {d} images", .{ @tagName(g_bulk.kind), g_bulk.count.load(.acquire) });
+    return true;
 }

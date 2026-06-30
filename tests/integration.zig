@@ -243,6 +243,52 @@ test "db: duplicate detection by hash" {
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
+test "db: redundant duplicates keep exactly one per hash and never the unique" {
+    const path = "/tmp/diffkeep_test_redundant.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    const make = struct {
+        fn f(d: *dk.VectorDb, lib: u64, p: []const u8, h: ?[]const u8) !u64 {
+            var img = try d.findOrCreateImage(alloc, lib, p);
+            defer img.deinit(alloc);
+            if (img.hash) |old| alloc.free(old);
+            img.hash = if (h) |hh| try alloc.dupe(u8, hh) else null;
+            try d.saveImage(&img);
+            return img.id;
+        }
+    }.f;
+
+    // hash "aaa": 3 copies; hash "bbb": 2 copies; "ccc": unique; one NULL-hash row.
+    const a1 = try make(&db, lib_id, "/lib/a1.png", "aaa");
+    const a2 = try make(&db, lib_id, "/lib/a2.png", "aaa");
+    const a3 = try make(&db, lib_id, "/lib/a3.png", "aaa");
+    const b1 = try make(&db, lib_id, "/lib/b1.png", "bbb");
+    const b2 = try make(&db, lib_id, "/lib/b2.png", "bbb");
+    const c1 = try make(&db, lib_id, "/lib/c1.png", "ccc");
+    const n1 = try make(&db, lib_id, "/lib/n1.png", null);
+
+    // Redundant = all-but-lowest-id of each duplicated group = (a2,a3,b2).
+    try std.testing.expectEqual(@as(i64, 3), try db.getRedundantDuplicateCount());
+    const reds = try db.listRedundantDuplicates(alloc);
+    defer {
+        for (reds) |e| alloc.free(e.path);
+        alloc.free(reds);
+    }
+    var got = std.AutoHashMap(u64, void).init(alloc);
+    defer got.deinit();
+    for (reds) |e| try got.put(e.id, {});
+    try std.testing.expectEqual(@as(usize, 3), got.count());
+    // The kept copies (a1, b1), the unique (c1) and the NULL-hash row (n1) must
+    // NEVER be selected for removal.
+    try std.testing.expect(got.contains(a2) and got.contains(a3) and got.contains(b2));
+    try std.testing.expect(!got.contains(a1) and !got.contains(b1));
+    try std.testing.expect(!got.contains(c1) and !got.contains(n1));
+}
+
 test "db: listImmediateSubdirs path logic" {
     const path = "/tmp/diffkeep_test_subdirs.db";
     var db = try openDb(path);

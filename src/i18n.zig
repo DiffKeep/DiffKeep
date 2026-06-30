@@ -12,6 +12,9 @@ pub const Strings = struct {
     library_scanning: [:0]const u8,
     library_remove_title: [:0]const u8,
 
+    trash_empty: [:0]const u8,
+    duplicates_empty: [:0]const u8,
+
     search_placeholder: [:0]const u8,
     search_no_results: [:0]const u8,
     filter_heading: [:0]const u8,
@@ -61,6 +64,14 @@ pub const Strings = struct {
     confirm_trash_no_ask: [:0]const u8,
     confirm_delete: [:0]const u8,
     confirm_move_to_trash: [:0]const u8,
+    confirm_dedupe_title: [:0]const u8,
+    confirm_dedupe_body: [:0]const u8,
+    confirm_empty_trash_title: [:0]const u8,
+    confirm_empty_trash_body: [:0]const u8,
+    dupes_remove_button: [:0]const u8,
+    dupes_banner_text: [:0]const u8,
+    trash_banner_text: [:0]const u8,
+    action_working: [:0]const u8,
 
     context_copy_prompt: [:0]const u8,
     context_copy_image: [:0]const u8,
@@ -148,6 +159,9 @@ pub const en: Strings = .{
     .library_scanning = "Scanning\u{2026}",
     .library_remove_title = "Remove library?",
 
+    .trash_empty = "Trash is empty.",
+    .duplicates_empty = "No duplicate images.",
+
     .search_placeholder = "Search prompts\u{2026}",
     .search_no_results = "No results.",
     .filter_heading = "Add Filter",
@@ -197,6 +211,14 @@ pub const en: Strings = .{
     .confirm_trash_no_ask = "Move to Trash, don't ask again",
     .confirm_delete = "Delete",
     .confirm_move_to_trash = "Move to Trash",
+    .confirm_dedupe_title = "Remove duplicate copies?",
+    .confirm_dedupe_body = "duplicate copies will be moved to the trash, keeping one of each.",
+    .confirm_empty_trash_title = "Empty the trash?",
+    .confirm_empty_trash_body = "items will be permanently deleted from the trash. This cannot be undone.",
+    .dupes_remove_button = "Remove duplicate copies",
+    .dupes_banner_text = "One copy of each is kept; the rest are moved to the Trash.",
+    .trash_banner_text = "Trashed items are deleted automatically after 30 days.",
+    .action_working = "Working\u{2026}",
 
     .context_copy_prompt = "Copy Prompt",
     .context_copy_image = "Copy Image",

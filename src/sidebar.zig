@@ -417,8 +417,8 @@ pub const SidebarState = struct {
             }
         }
 
-        // ── Duplicates section (only shown when duplicates exist) ─────────
-        if (duplicate_count > 0) {
+        // ── Duplicates section (always shown, like Trash) ─────────────────
+        {
             _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
 
             const in_dupes = if (grid) |g| g.view_mode == .duplicates else false;
@@ -439,13 +439,6 @@ pub const SidebarState = struct {
             dvui.label(@src(), "{s}", .{i18n.t(.sidebar_duplicates)}, .{ .font = bold, .gravity_y = 0.5 });
             _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             dvui.label(@src(), "{d}", .{duplicate_count}, .{ .gravity_y = 0.5 });
-        } else if (grid) |g| {
-            // No duplicates left but the grid is still showing them: fall back to
-            // the library view so the user isn't stranded on an empty section.
-            if (g.view_mode == .duplicates) {
-                g.view_mode = .library;
-                if (db) |d| g.reloadImages(d) catch {};
-            }
         }
 
         // ── Library removal confirmation modal ───────────────────────────

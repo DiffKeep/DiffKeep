@@ -135,6 +135,7 @@ fn appInit(win: *dvui.Window) !void {
         .cfg = &dk.g_cfg,
         .on_counts_changed = refreshCounts,
         .on_images_removed = removeImagesFromViewers,
+        .on_wakeup = wakeupFrame,
     });
 
     if (dvui.App.main_init) |init| {
@@ -445,6 +446,14 @@ fn frame() !dvui.App.Result {
         }
     }
 
+    // When a library scan finishes, hand its transient decode/thumbnail memory
+    // back to the OS (see trimMemory).
+    {
+        const scanning = if (dk.g_library_manager) |*mgr| mgr.isScanActive() else false;
+        if (g_was_scanning and !scanning) trimMemory();
+        g_was_scanning = scanning;
+    }
+
     // Apply completed model downloads (auto-fill config paths)
     g_settings.applyCompletedDownloads(&dk.g_cfg, g_data_dir);
     if (g_settings.model_paths_changed and !g_settings.open) {
@@ -470,6 +479,18 @@ fn frame() !dvui.App.Result {
             grid.restore_requested = false;
             if (dvui.App.main_init) |init| image_ops_mod.performRestore(init.io, init.gpa, grid);
         }
+        if (grid.dedupe_requested) {
+            grid.dedupe_requested = false;
+            if (dk.g_db) |*db| g_pending_bulk_count = db.getRedundantDuplicateCount() catch 0;
+            if (g_pending_bulk_count > 0) g_pending_bulk = .dedupe;
+        }
+        if (grid.empty_trash_requested) {
+            grid.empty_trash_requested = false;
+            g_pending_bulk_count = if (g_trash_stats) |ts| ts.count else 0;
+            if (g_pending_bulk_count > 0) g_pending_bulk = .empty_trash;
+        }
+        // Surface completion of a background bulk op (reloads grid + counts).
+        _ = image_ops_mod.bulkPoll(grid);
         if (grid.open_viewer_requested) {
             grid.open_viewer_requested = false;
             g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (dk.g_db) |*db| db else null, wakeupFrame, &dk.g_cfg);
@@ -704,6 +725,9 @@ fn frame() !dvui.App.Result {
     try g_delete_dialog.render(dk.g_cfg.trash_enabled,
         if (dk.g_grid) |*g| g else null,
         image_ops_mod.performTrash, image_ops_mod.performDelete);
+
+    // ── Bulk action (dedupe / empty trash) confirmation modal ─────────────────
+    renderBulkConfirm();
 
     // ── Filter modal ──────────────────────────────────────────────────────────
     try g_filter_modal.render(
@@ -985,7 +1009,89 @@ fn captureMainWindowState(back: *SDLBackend) void {
     window_state.capture(back.window, &dk.g_cfg.main_window);
 }
 
+/// Cap glibc's per-thread malloc arenas. DiffKeep runs ~60 threads (libvips
+/// threadpool, grid loaders, library scanners, the fs watcher); glibc's default
+/// of up to 8×CPU arenas leaves each thread hoarding freed memory it never
+/// returns to the OS — about 150 MB of idle slack in practice. Capping the arena
+/// count reclaims most of that; 4 keeps enough concurrency that the vips
+/// threadpool isn't serialised on a single malloc lock during scans. Linux/glibc
+/// only (mallopt is a no-op or absent elsewhere); must run before threads spawn.
+fn tuneAllocator() void {
+    if (builtin.os.tag != .linux) return;
+    const glibc = struct {
+        extern "c" fn mallopt(param: c_int, value: c_int) c_int;
+    };
+    _ = glibc.mallopt(-8, 4); // -8 == M_ARENA_MAX
+}
+
+/// Return free heap memory to the OS. A library scan allocates large transient
+/// buffers (full-image decode + thumbnail generation) that glibc otherwise keeps
+/// in its arenas; calling this once a scan finishes hands that slack back.
+fn trimMemory() void {
+    if (builtin.os.tag != .linux) return;
+    const glibc = struct {
+        extern "c" fn malloc_trim(pad: usize) c_int;
+    };
+    _ = glibc.malloc_trim(0);
+}
+
+/// Tracks the scan-active edge so trimMemory() runs once when a scan completes.
+var g_was_scanning: bool = false;
+
+const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
+
+/// Confirmation state for the destructive bulk actions (duplicates / trash banner).
+const PendingBulk = enum { none, dedupe, empty_trash };
+var g_pending_bulk: PendingBulk = .none;
+var g_pending_bulk_count: i64 = 0;
+
+/// Render the bulk-action confirmation modal (no-op unless one is pending). On
+/// confirm it kicks off the background op; the grid + counts refresh when it
+/// finishes (image_ops.bulkPoll).
+fn renderBulkConfirm() void {
+    if (g_pending_bulk == .none) return;
+    const init = dvui.App.main_init orelse return;
+
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 400, .h = 0 } });
+    defer float.deinit();
+    float.autoSize();
+
+    var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+    defer content.deinit();
+
+    const title, const body, const confirm_label = switch (g_pending_bulk) {
+        .dedupe => .{ i18n.t(.confirm_dedupe_title), i18n.t(.confirm_dedupe_body), i18n.t(.action_remove) },
+        .empty_trash => .{ i18n.t(.confirm_empty_trash_title), i18n.t(.confirm_empty_trash_body), i18n.t(.confirm_delete) },
+        .none => unreachable,
+    };
+
+    dvui.label(@src(), "{s}", .{title}, .{ .font = bold, .margin = .{ .h = 8 } });
+    {
+        // "<count> <count-free i18n body>" — fmt must be comptime, so the count
+        // and the translatable text are rendered as two labels on one line.
+        var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 12 } });
+        defer line.deinit();
+        dvui.label(@src(), "{d} ", .{g_pending_bulk_count}, .{ .font = bold, .gravity_y = 0.5 });
+        dvui.label(@src(), "{s}", .{body}, .{ .gravity_y = 0.5 });
+    }
+
+    var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
+    defer btn_row.deinit();
+    if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
+        g_pending_bulk = .none;
+    }
+    if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+        switch (g_pending_bulk) {
+            .dedupe => image_ops_mod.startRemoveRedundantDuplicates(init.io),
+            .empty_trash => image_ops_mod.startEmptyTrash(init.io),
+            .none => unreachable,
+        }
+        g_pending_bulk = .none;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
+    tuneAllocator();
     dvui.App.main_init = init;
     SDLBackend.c.SDL_SetMainReady();
 

@@ -1166,6 +1166,51 @@ pub const VectorDb = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    // The "redundant" duplicates are every copy EXCEPT the lowest-id one of each
+    // hash group — exactly the rows to remove to leave one of each. The
+    // `id NOT IN (MIN(id) per hash)` form is the safety guarantee: a row is only
+    // selected when another row with the same hash (a lower id) is kept, so this
+    // can never remove the last/only copy of any file, and never touches a hash
+    // that isn't duplicated (its single row IS the min).
+    const redundant_dupes_predicate =
+        \\trashed_at IS NULL AND hash IS NOT NULL
+        \\AND id NOT IN (
+        \\  SELECT MIN(id) FROM images
+        \\  WHERE trashed_at IS NULL AND hash IS NOT NULL
+        \\  GROUP BY hash
+        \\)
+    ;
+
+    /// Count of redundant duplicate copies (total to remove for "keep one of each").
+    pub fn getRedundantDuplicateCount(self: *VectorDb) !i64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT COUNT(*) FROM images WHERE " ++ redundant_dupes_predicate);
+        defer stmt.deinit();
+        if (try stmt.step()) return stmt.columnInt64(0);
+        return 0;
+    }
+
+    /// Every redundant duplicate copy (id + path), keeping the lowest id of each
+    /// hash group. Used by "remove all but one". Caller owns each path.
+    pub fn listRedundantDuplicates(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT id, library_path FROM images WHERE " ++ redundant_dupes_predicate ++ " ORDER BY id");
+        defer stmt.deinit();
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = null });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
     pub fn getTrashStats(self: *VectorDb) !TrashStats {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
