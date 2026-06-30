@@ -21,6 +21,14 @@ pub const ViewerWindow = struct {
     // does not provide a thumbnail cursor).  Owned here; destroyed at deinit.
     dnd_drag_cursor: ?*SDLBackend.c.SDL_Cursor = null,
 
+    /// Hide the window so it disappears immediately, and tell background loads to
+    /// discard their results.  The real teardown (`deinit`) happens later, once
+    /// the in-flight decodes have finished, so closing never blocks the UI.
+    pub fn beginClose(self: *ViewerWindow) void {
+        self.state.beginClose();
+        _ = SDLBackend.c.SDL_HideWindow(self.back.window);
+    }
+
     pub fn deinit(self: *ViewerWindow) void {
         if (self.dnd) |*d| d.deinit();
         if (self.dnd_drag_cursor) |c| SDLBackend.c.SDL_DestroyCursor(c);
@@ -40,6 +48,9 @@ pub const ViewerWindow = struct {
 
 pub const ViewerManager = struct {
     windows: std.ArrayList(*ViewerWindow) = .empty,
+    // Windows whose X has been clicked: hidden already, awaiting background loads
+    // to finish before the (now non-blocking) teardown in reapClosing().
+    closing: std.ArrayList(*ViewerWindow) = .empty,
     next_id: u64 = 1,
 
     pub fn deinit(self: *ViewerManager, gpa: std.mem.Allocator) void {
@@ -48,6 +59,37 @@ pub const ViewerManager = struct {
             gpa.destroy(vw);
         }
         self.windows.deinit(gpa);
+        // At process exit, joining the remaining load threads is acceptable.
+        for (self.closing.items) |vw| {
+            vw.deinit();
+            gpa.destroy(vw);
+        }
+        self.closing.deinit(gpa);
+    }
+
+    /// Move a window into the closing set: hide it now, tear it down later.
+    pub fn beginClose(self: *ViewerManager, gpa: std.mem.Allocator, vw: *ViewerWindow) void {
+        vw.beginClose();
+        self.closing.append(gpa, vw) catch {
+            // If we can't track it, fall back to a synchronous teardown.
+            vw.deinit();
+            gpa.destroy(vw);
+        };
+    }
+
+    /// Tear down closing windows whose background loads have finished.  Returns
+    /// true while any window is still pending, so the caller can keep polling.
+    pub fn reapClosing(self: *ViewerManager, gpa: std.mem.Allocator) bool {
+        var i: usize = 0;
+        while (i < self.closing.items.len) {
+            const vw = self.closing.items[i];
+            if (vw.state.closeReady()) {
+                vw.deinit();
+                gpa.destroy(vw);
+                _ = self.closing.swapRemove(i);
+            } else i += 1;
+        }
+        return self.closing.items.len > 0;
     }
 
     pub fn open(

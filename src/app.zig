@@ -1110,12 +1110,20 @@ pub fn main(init: std.process.Init) !void {
             end_micros = pickMinWait(end_micros, vw_end);
 
             if (close) {
-                vw.deinit();
-                init.gpa.destroy(vw);
+                // Hide immediately and defer the (thread-joining) teardown so the
+                // window vanishes at once instead of freezing while loads finish.
+                g_viewer_manager.beginClose(init.gpa, vw);
                 _ = g_viewer_manager.windows.swapRemove(vi);
             } else {
                 vi += 1;
             }
+        }
+
+        // Reap closed windows once their background loads have exited.  Poll
+        // briefly while any remain pending so cleanup isn't stranded until the
+        // next user event.
+        if (g_viewer_manager.reapClosing(init.gpa)) {
+            end_micros = pickMinWait(end_micros, 30_000);
         }
 
         // If a search debounce is pending, cap the event-wait to the deadline so

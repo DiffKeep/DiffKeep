@@ -43,6 +43,9 @@ pub const ViewerState = struct {
     cache_mutex: std.Io.Mutex = std.Io.Mutex.init,
     // Handles for evicted threads (can't join immediately); joined at deinit.
     orphan_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    // Number of load threads that have not yet exited.  Lets the close path defer
+    // joining until the (uncancellable) decodes have finished, so it never blocks.
+    inflight: std.atomic.Value(u32) = .init(0),
 
     // Pan/zoom
     zoom: f32 = 1.0,
@@ -123,6 +126,25 @@ pub const ViewerState = struct {
         }
         // Load threads are spawned on the first render() call, once self is stable.
         return state;
+    }
+
+    /// Begin closing: tell in-flight load threads to discard their results so the
+    /// window can disappear immediately.  The (uncancellable) decodes still run to
+    /// completion in the background; `deinit` joins them later once `inflight`
+    /// reaches 0, so neither this call nor the join blocks the UI.
+    pub fn beginClose(self: *ViewerState) void {
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        for (&self.cache_slots) |*slot| {
+            slot.active = false;
+            slot.ready = false;
+        }
+    }
+
+    /// True once every background load thread has exited; `deinit` can then join
+    /// them without blocking.
+    pub fn closeReady(self: *const ViewerState) bool {
+        return self.inflight.load(.acquire) == 0;
     }
 
     pub fn deinit(self: *ViewerState) void {
@@ -258,9 +280,11 @@ pub const ViewerState = struct {
 
         // Spawn threads outside the lock.
         for (tasks[0..task_count]) |task| {
+            _ = self.inflight.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{}, loadCacheThread, .{
                 self.gpa, self.io, self, task.slot_i, task.image_idx, task.path,
             }) catch {
+                _ = self.inflight.fetchSub(1, .acq_rel);
                 self.gpa.free(task.path);
                 self.cache_mutex.lockUncancelable(self.io);
                 self.cache_slots[task.slot_i].active = false;
@@ -868,6 +892,7 @@ fn loadCacheThread(
     image_idx: usize,
     path: [:0]u8,
 ) void {
+    defer _ = state.inflight.fetchSub(1, .acq_rel);
     defer gpa.free(path);
     defer vips_mod.threadShutdown();
 
