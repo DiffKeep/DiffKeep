@@ -325,6 +325,7 @@ pub const SearchState = struct {
         self: *SearchState,
         allocator: std.mem.Allocator,
         grid: *image_grid_mod.GridState,
+        db: *db_mod.VectorDb,
     ) void {
         if (!self.query_done.load(.acquire)) return;
         self.query_done.store(false, .release);
@@ -342,7 +343,7 @@ pub const SearchState = struct {
         }
 
         if (result) |r| {
-            grid.applySearchResults(r);
+            grid.applySearchResults(db, r);
             allocator.free(r);
         }
         // null result = query failed; keep stale grid intact.

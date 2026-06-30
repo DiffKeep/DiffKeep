@@ -165,6 +165,9 @@ const migrations = [_][]const u8{
     // v9: index on hash so duplicate detection (GROUP BY hash) is cheap.
     \\CREATE INDEX IF NOT EXISTS idx_images_hash ON images (hash);
     ,
+    // v10: per-image favorite flag (0/1) for curation.
+    \\ALTER TABLE images ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+    ,
 };
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables
@@ -1040,6 +1043,7 @@ pub const VectorDb = struct {
         mtime: ?i64,
         trashed_at: ?i64 = null,
         trash_name: ?[]const u8 = null, // heap-allocated; caller owns (only set for trash entries)
+        favorite: bool = false, // populated by listFavorites; otherwise marked by the grid on load
     };
 
     /// Returns all non-trashed images ordered by id. Used to populate the grid on startup.
@@ -1087,6 +1091,64 @@ pub const VectorDb = struct {
         defer stmt.deinit();
         try stmt.bind(1, id);
         _ = try stmt.step();
+    }
+
+    /// Set (or clear) an image's favorite flag.
+    pub fn setFavorite(self: *VectorDb, id: u64, favorite: bool) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("UPDATE images SET favorite = ? WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, @as(i64, if (favorite) 1 else 0));
+        try stmt.bind(2, id);
+        _ = try stmt.step();
+    }
+
+    /// Number of favorited, non-trashed images (for the sidebar badge).
+    pub fn getFavoriteCount(self: *VectorDb) !i64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT COUNT(*) FROM images WHERE favorite = 1 AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        if (try stmt.step()) return stmt.columnInt64(0);
+        return 0;
+    }
+
+    /// All favorited, non-trashed images, ordered by id. Used by the Favorites view.
+    pub fn listFavorites(self: *VectorDb, allocator: std.mem.Allocator) ![]GridEntry {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime FROM images WHERE favorite = 1 AND trashed_at IS NULL ORDER BY id",
+        );
+        defer stmt.deinit();
+        var list: std.ArrayList(GridEntry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const id: u64 = @intCast(stmt.columnInt64(0));
+            const path = try allocator.dupe(u8, stmt.columnText(1));
+            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime, .favorite = true });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// The set of favorited image ids. Used to mark entries when (re)loading a
+    /// view without adding a column to every grid query. Caller owns the slice.
+    pub fn listFavoriteIds(self: *VectorDb, allocator: std.mem.Allocator) ![]u64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT id FROM images WHERE favorite = 1");
+        defer stmt.deinit();
+        var list: std.ArrayList(u64) = .empty;
+        errdefer list.deinit(allocator);
+        while (try stmt.step()) try list.append(allocator, @intCast(stmt.columnInt64(0)));
+        return list.toOwnedSlice(allocator);
     }
 
     /// Permanently delete an image row from the DB.

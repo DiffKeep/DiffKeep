@@ -30,6 +30,7 @@ pub const RenderCtx = struct {
     db_stats: *?db_mod.DbStats,
     trash_stats: *?db_mod.TrashStats,
     duplicate_count: *i64,
+    favorite_count: *i64,
     sidebar: *sidebar_mod.SidebarState,
     detail: *detail_panel_mod.DetailState,
     library_manager: *?library_manager_mod.LibraryManager,
@@ -308,7 +309,7 @@ fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, tra
             description = i18n.t(.trash_banner_text);
             button_text = i18n.t(.settings_empty_trash);
         },
-        .library => return,
+        .library, .favorites => return,
     }
 
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -358,6 +359,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
                 ctx.cfg.trash_enabled,
                 ctx.trash_stats.*,
                 ctx.duplicate_count.*,
+                ctx.favorite_count.*,
             )) ctx.on_refresh_counts();
         }
     }

@@ -474,7 +474,7 @@ var g_sidebar_db: *dk.VectorDb = undefined;
 var g_sidebar_grid: *dk.GridState = undefined;
 
 fn sidebarFrame() anyerror!dvui.App.Result {
-    _ = g_sidebar.render(220, alloc, g_sidebar_db, g_sidebar_grid, null, true, null, 0) catch {};
+    _ = g_sidebar.render(220, alloc, g_sidebar_db, g_sidebar_grid, null, true, null, 0, 0) catch {};
     return .ok;
 }
 
@@ -510,6 +510,11 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
     try dvui.testing.click(.left);
     try dvui.testing.settle(sidebarFrame);
     try std.testing.expect(grid.view_mode == .duplicates);
+
+    try dvui.testing.moveTo("nav-favorites");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(sidebarFrame);
+    try std.testing.expect(grid.view_mode == .favorites);
 }
 
 var g_detail_details: dk.ImageDetails = undefined;
@@ -566,6 +571,7 @@ const ToolbarFix = struct {
     db_stats: ?dk.DbStats = null,
     trash_stats: ?dk.TrashStats = null,
     duplicate_count: i64 = 0,
+    favorite_count: i64 = 0,
     sidebar: dk.sidebar.SidebarState = .{},
     detail: dk.detail_panel.DetailState = .{},
     library_manager: ?dk.LibraryManager = null,
@@ -594,6 +600,7 @@ const ToolbarFix = struct {
             .db_stats = &self.db_stats,
             .trash_stats = &self.trash_stats,
             .duplicate_count = &self.duplicate_count,
+            .favorite_count = &self.favorite_count,
             .sidebar = &self.sidebar,
             .detail = &self.detail,
             .library_manager = &self.library_manager,
@@ -850,4 +857,112 @@ test "toolbar: the clear button empties the search query" {
     try dvui.testing.settle(clearFrame);
 
     try std.testing.expectEqual(@as(u8, 0), fix.search.buf[0]);
+}
+
+// ── Favorites ───────────────────────────────────────────────────────────────────
+
+/// Create a plain image; returns its id.
+fn makeImage(db: *dk.VectorDb, lib: u64, p: []const u8) !u64 {
+    var img = try db.findOrCreateImage(alloc, lib, p);
+    defer img.deinit(alloc);
+    return img.id;
+}
+
+test "db: favorite flag set/count/list lifecycle" {
+    const path = "/tmp/diffkeep_test_favorites.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const a = try makeImage(&db, lib, "/lib/a.png");
+    const b = try makeImage(&db, lib, "/lib/b.png");
+    const c = try makeImage(&db, lib, "/lib/c.png");
+
+    try std.testing.expectEqual(@as(i64, 0), try db.getFavoriteCount());
+
+    try db.setFavorite(a, true);
+    try db.setFavorite(c, true);
+    try std.testing.expectEqual(@as(i64, 2), try db.getFavoriteCount());
+
+    {
+        const favs = try db.listFavorites(alloc);
+        defer {
+            for (favs) |e| alloc.free(e.path);
+            alloc.free(favs);
+        }
+        try std.testing.expectEqual(@as(usize, 2), favs.len);
+        for (favs) |e| try std.testing.expect(e.favorite);
+    }
+
+    // Clearing a favorite drops the count.
+    try db.setFavorite(a, false);
+    try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
+
+    // A trashed favorite is excluded from the (non-trashed) favorite count.
+    try db.setFavorite(b, true); // now b and c are favorites
+    try std.testing.expectEqual(@as(i64, 2), try db.getFavoriteCount());
+    try db.trashImage(b, "b_trash.png", 0, 1000);
+    try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
+}
+
+test "grid: favorites view lists only favorites; markFavorites flags entries" {
+    const path = "/tmp/diffkeep_test_grid_favorites.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const a = try makeImage(&db, lib, "/lib/a.png");
+    const b = try makeImage(&db, lib, "/lib/b.png");
+    const c = try makeImage(&db, lib, "/lib/c.png");
+    try db.setFavorite(a, true);
+    try db.setFavorite(c, true);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // Library view: every entry carries the correct favorite flag.
+    grid.view_mode = .library;
+    try grid.reloadImages(&db);
+    for (grid.images.items) |e| {
+        try std.testing.expectEqual(e.id == a or e.id == c, e.favorite);
+    }
+    _ = b;
+
+    // Favorites view: only favorited images, all flagged.
+    grid.view_mode = .favorites;
+    try grid.reloadImages(&db);
+    try expectGridIds(&grid, &.{ a, c });
+    for (grid.images.items) |e| try std.testing.expect(e.favorite);
+}
+
+test "viewer: setFavorite updates the current image's favorite flag" {
+    var images: std.ArrayList(dk.ImageEntry) = .empty;
+    for ([_]u64{ 10, 11 }, 0..) |id, i| {
+        const p = try std.fmt.allocPrint(alloc, "/lib/img{d}.png", .{i});
+        try images.append(alloc, .{
+            .id = id,
+            .path = p,
+            .filename = std.fs.path.basename(p),
+            .mtime = null,
+        });
+    }
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, images, 0, null, null, io, null, null);
+    defer vs.deinit();
+
+    try std.testing.expect(!vs.currentFavorite()); // id 10
+    vs.setFavorite(10, true);
+    try std.testing.expect(vs.currentFavorite());
+
+    vs.navigateTo(1); // id 11
+    try std.testing.expect(!vs.currentFavorite());
+    vs.setFavorite(11, true);
+    try std.testing.expect(vs.currentFavorite());
+
+    // Toggling an id not present is a no-op (no crash).
+    vs.setFavorite(999, true);
+    try std.testing.expect(vs.currentFavorite());
 }

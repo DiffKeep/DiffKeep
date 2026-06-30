@@ -14,6 +14,9 @@ pub const Strings = struct {
 
     trash_empty: [:0]const u8,
     duplicates_empty: [:0]const u8,
+    favorites_empty: [:0]const u8,
+    sidebar_favorites: [:0]const u8,
+    viewer_favorite: [:0]const u8,
 
     search_placeholder: [:0]const u8,
     search_no_results: [:0]const u8,
@@ -163,6 +166,9 @@ pub const en: Strings = .{
 
     .trash_empty = "Trash is empty.",
     .duplicates_empty = "No duplicate images.",
+    .favorites_empty = "No favorites yet.",
+    .sidebar_favorites = "Favorites",
+    .viewer_favorite = "Favorite",
 
     .search_placeholder = "Search prompts\u{2026}",
     .search_no_results = "No results.",

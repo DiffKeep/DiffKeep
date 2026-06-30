@@ -128,6 +128,7 @@ pub const ViewerManager = struct {
                 .mtime = e.mtime,
                 .trashed_at = e.trashed_at,
                 .trash_name = trash_name_copy,
+                .favorite = e.favorite,
             }) catch {
                 init.gpa.free(path_copy);
                 if (trash_name_copy) |tn| init.gpa.free(tn);
@@ -210,5 +211,20 @@ pub const ViewerManager = struct {
 
     pub fn removeImages(self: *ViewerManager, ids: *const std.AutoHashMap(u64, void)) void {
         for (self.windows.items) |vw| vw.state.removeImages(ids);
+    }
+
+    /// Propagate a favorite-flag change to every open viewer.
+    pub fn setFavorite(self: *ViewerManager, id: u64, favorite: bool) void {
+        for (self.windows.items) |vw| vw.state.setFavorite(id, favorite);
+    }
+
+    /// Current favorite flag for `id` as known to any open viewer (false if none).
+    pub fn favoriteState(self: *ViewerManager, id: u64) bool {
+        for (self.windows.items) |vw| {
+            for (vw.state.images.items) |e| {
+                if (e.id == id) return e.favorite;
+            }
+        }
+        return false;
     }
 };

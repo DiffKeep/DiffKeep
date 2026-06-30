@@ -70,6 +70,9 @@ pub const ViewerState = struct {
     // Pending actions consumed by app.zig
     delete_requested: bool = false,
     delete_force: bool = false,
+    // Set when the toolbar favorite star is clicked; app.zig toggles the flag for
+    // the current image (and reflects it back here via setFavorite).
+    favorite_toggle_requested: bool = false,
     // Set when the toolbar drag handle gesture fires; app.zig starts the native
     // drag of the current image.  dnd_available gates showing the handle at all.
     drag_requested: bool = false,
@@ -325,6 +328,20 @@ pub const ViewerState = struct {
     pub fn currentImage(self: *const ViewerState) ?*const image_grid_mod.ImageEntry {
         if (self.images.items.len == 0) return null;
         return &self.images.items[self.current_idx];
+    }
+
+    /// Update the cached favorite flag for `id` (called when the flag changes
+    /// elsewhere, so the viewer's star stays in sync).
+    pub fn setFavorite(self: *ViewerState, id: u64, favorite: bool) void {
+        for (self.images.items) |*e| {
+            if (e.id == id) e.favorite = favorite;
+        }
+    }
+
+    /// Whether the current image is favorited (false if no image).
+    pub fn currentFavorite(self: *const ViewerState) bool {
+        const img = self.currentImage() orelse return false;
+        return img.favorite;
     }
 
     /// Actual on-disk location for an entry. Trashed entries live in
@@ -598,6 +615,10 @@ pub const ViewerState = struct {
             self.persistPrefs();
         }
 
+        if (self.images.items.len > 0 and favoriteButton(self.currentFavorite(), 12)) {
+            self.favorite_toggle_requested = true;
+        }
+
         if (self.images.items.len > 0 and
             iconButton(i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", 11))
         {
@@ -661,6 +682,30 @@ pub const ViewerState = struct {
         bw.processEvents();
         bw.drawBackground();
         dvui.icon(@src(), label, tvg, .{}, iconChildOpts(&bw, opts));
+        const click = bw.clicked();
+        bw.drawFocus();
+        btnTooltip(&bw, label);
+        bw.deinit();
+        return click;
+    }
+
+    /// Favorite toggle button: a gold filled star when favorited, a faint
+    /// low-contrast star otherwise (standard favorite affordance).
+    fn favoriteButton(favorited: bool, id_extra: usize) bool {
+        const label = i18n.t(.viewer_favorite);
+        const opts = iconBtnOpts(id_extra, label);
+        var bw: dvui.ButtonWidget = undefined;
+        bw.init(@src(), .{}, opts);
+        bw.processEvents();
+        bw.drawBackground();
+        // Tint via color_text (a colormod over the white-rasterized icon) — the
+        // reliable way to recolor; setting IconRenderOptions.fill_color alone
+        // leaves it white.
+        const star_color: dvui.Color = if (favorited)
+            .{ .r = 255, .g = 200, .b = 40, .a = 255 }
+        else
+            .{ .r = 255, .g = 255, .b = 255, .a = 90 };
+        dvui.icon(@src(), label, icons.tvg.heroicons.solid.star, .{}, iconChildOpts(&bw, opts).override(.{ .color_text = star_color }));
         const click = bw.clicked();
         bw.drawFocus();
         btnTooltip(&bw, label);

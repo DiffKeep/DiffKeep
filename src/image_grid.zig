@@ -4,6 +4,7 @@ const db_mod = @import("db.zig");
 const vips = @import("vips");
 const notifier_mod = @import("notifier.zig");
 const i18n = @import("i18n.zig");
+const icons = @import("icons");
 
 pub const ImageNotifier = notifier_mod.ImageNotifier;
 
@@ -11,7 +12,7 @@ const log = std.log.scoped(.image_grid);
 
 pub const SortMode = enum { date, name, random };
 pub const SortDir = enum { asc, desc };
-pub const ViewMode = enum { library, trash, duplicates };
+pub const ViewMode = enum { library, trash, duplicates, favorites };
 pub const SearchMode = enum { fts, semantic, visual, combined };
 
 pub const ImageEntry = struct {
@@ -21,6 +22,7 @@ pub const ImageEntry = struct {
     mtime: ?i64,
     trashed_at: ?i64 = null,
     trash_name: ?[]const u8 = null, // heap-allocated, only set in trash view
+    favorite: bool = false,
 };
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -69,6 +71,9 @@ const LoadRequest = struct {
 pub const thumb_size_min: f32 = 80;
 pub const thumb_size_max: f32 = 320;
 const max_workers = 8;
+// Favorite star overlay (top-right of each thumbnail), in logical px.
+const star_sz: f32 = 22;
+const star_margin: f32 = 4;
 const gap: f32 = 8;
 const cell_border: f32 = 2; // border on each side; must be factored into h_margin
 const label_h: f32 = 20;
@@ -163,6 +168,8 @@ pub const GridState = struct {
     copy_image_path: []const u8 = "",
     reparse_requested: bool = false,
     reparse_id: u64 = 0,
+    // Favorite toggle — set when a grid star is clicked, consumed by app.zig.
+    favorite_toggle_id: ?u64 = null,
     drag_requested: bool = false,
     drag_requested_ids: std.ArrayListUnmanaged(u64) = .empty,
     // Mirrored from config so renderItem can condition the context menu label
@@ -279,7 +286,7 @@ pub const GridState = struct {
     /// Replace the image list with pre-fetched entries from a background query task.
     /// Takes ownership of all path strings in `entries`; the caller must free the
     /// slice backing array itself (not the individual paths).
-    pub fn applySearchResults(self: *GridState, entries: []db_mod.VectorDb.GridEntry) void {
+    pub fn applySearchResults(self: *GridState, db: *db_mod.VectorDb, entries: []db_mod.VectorDb.GridEntry) void {
         {
             self.queue_mutex.lockUncancelable(self.io);
             for (self.high_queue.items) |r| self.allocator.free(r.path);
@@ -309,6 +316,7 @@ pub const GridState = struct {
                 .mtime = e.mtime,
             });
         }
+        self.markFavorites(db);
         self.applySortOrder();
     }
 
@@ -369,6 +377,7 @@ pub const GridState = struct {
             },
             .trash => try db.listTrashImages(self.allocator),
             .duplicates => try db.listDuplicateImages(self.allocator),
+            .favorites => try db.listFavorites(self.allocator),
         };
         defer self.allocator.free(entries);
         try self.images.ensureTotalCapacity(self.allocator, entries.len);
@@ -380,9 +389,28 @@ pub const GridState = struct {
                 .mtime = e.mtime,
                 .trashed_at = e.trashed_at,
                 .trash_name = e.trash_name,
+                .favorite = e.favorite,
             });
         }
+        self.markFavorites(db);
         self.applySortOrder();
+    }
+
+    /// Mark which of the currently-loaded entries are favorites, in one query.
+    /// Keeps the per-entry `favorite` flag accurate without threading a column
+    /// through every grid query.
+    pub fn markFavorites(self: *GridState, db: *db_mod.VectorDb) void {
+        const fav_ids = db.listFavoriteIds(self.allocator) catch return;
+        defer self.allocator.free(fav_ids);
+        if (fav_ids.len == 0) {
+            for (self.images.items) |*e| e.favorite = false;
+            return;
+        }
+        var set = std.AutoHashMap(u64, void).init(self.allocator);
+        defer set.deinit();
+        set.ensureTotalCapacity(@intCast(fav_ids.len)) catch {};
+        for (fav_ids) |id| set.put(id, {}) catch {};
+        for (self.images.items) |*e| e.favorite = set.contains(e.id);
     }
 
     /// True if `path` names a file directly or transitively inside `root`.
@@ -674,6 +702,7 @@ pub const GridState = struct {
             const empty_text = switch (self.view_mode) {
                 .trash => i18n.t(.trash_empty),
                 .duplicates => i18n.t(.duplicates_empty),
+                .favorites => i18n.t(.favorites_empty),
                 .library => if (is_searching) i18n.t(.search_no_results) else i18n.t(.library_empty),
             };
             dvui.label(@src(), "{s}", .{empty_text}, .{
@@ -1028,6 +1057,88 @@ pub const GridState = struct {
             }
         }
 
+        // ── Thumbnail + favorite star ─────────────────────────────────────
+        // The star sits at the top-right of the thumbnail; it is shown when the
+        // image is favorited (always) or while hovering the cell. It is a real
+        // button rendered BEFORE the cell's click handling, so it consumes its
+        // own clicks (toggling favorite) and gets hover/press feedback, while a
+        // click anywhere else still selects the cell.
+        const cell_hovered = cell.data().contentRectScale().r.contains(dvui.currentWindow().mouse_pt);
+        const show_star = entry.favorite or cell_hovered;
+
+        var img_rs: dvui.RectScale = undefined;
+        {
+            // Overlay so the favorite star can sit on top of the thumbnail.
+            var img_area = dvui.overlay(@src(), .{
+                .id_extra = idx,
+                .min_size_content = .{ .w = ts, .h = ts },
+                .background = true,
+                .color_fill = .{ .r = 30, .g = 30, .b = 30, .a = 255 },
+            });
+            img_rs = img_area.data().contentRectScale();
+            defer img_area.deinit();
+
+            if (self.committed.get(entry.id)) |ce| {
+                // Scale to fit ts×ts while preserving aspect ratio, then center with margin.
+                // Using explicit margin avoids DVUI layout bugs caused by gravity_y=0.5
+                // triggering child_positioned mode in the vertical BoxWidget.
+                const scale = @min(ts / ce.width, ts / ce.height);
+                const rw = ce.width * scale;
+                const rh = ce.height * scale;
+                const mx = (ts - rw) / 2.0;
+                const my = (ts - rh) / 2.0;
+                _ = dvui.image(@src(), .{
+                    // Key dvui's texture cache on the JPEG *content*, not the byte
+                    // pointer. After a thumbnail is freed (delete / reparse) the
+                    // allocator can hand the same address to a different image's
+                    // bytes; pointer-keyed caching (.ptr, the default) would then
+                    // show the stale texture for the new image.
+                    .source = .{ .imageFile = .{ .bytes = ce.bytes, .invalidation = .bytes } },
+                }, .{
+                    .id_extra = idx,
+                    .min_size_content = .{ .w = rw, .h = rh },
+                    .margin = .{ .x = mx, .y = my, .w = mx, .h = my },
+                });
+            }
+
+            if (show_star) {
+                var bw: dvui.ButtonWidget = undefined;
+                bw.init(@src(), .{}, .{
+                    .id_extra = idx,
+                    .min_size_content = .{ .w = star_sz, .h = star_sz },
+                    .gravity_x = 1.0,
+                    .gravity_y = 0.0,
+                    .margin = .{ .x = star_margin, .y = star_margin, .w = star_margin, .h = star_margin },
+                    .padding = dvui.Rect.all(3),
+                    .corner_radius = dvui.Rect.all(star_sz),
+                });
+                bw.processEvents();
+                // Dark circular backdrop for legibility on any thumbnail; it
+                // darkens on hover and again on press (the click feedback).
+                const bg_a: u8 = if (bw.pressed()) 150 else if (bw.hovered()) 100 else 50;
+                bw.data().borderAndBackground(.{ .fill_color = .{ .r = 0, .g = 0, .b = 0, .a = bg_a } });
+                // Favorited → yellow, translucent when idle and solid on
+                // hover/press. Not favorited → faint white that brightens on
+                // hover/press so it reads as clickable. The icon is tinted via
+                // color_text (applied as a colormod) — the reliable way to
+                // recolor a currentColor-based icon.
+                const star_color: dvui.Color = if (entry.favorite)
+                    .{ .r = 255, .g = 205, .b = 45, .a = if (bw.hovered() or bw.pressed()) 255 else 150 }
+                else
+                    .{ .r = 255, .g = 255, .b = 255, .a = if (bw.pressed()) 255 else if (bw.hovered()) 215 else 120 };
+                dvui.icon(@src(), "favorite", icons.tvg.heroicons.solid.star, .{}, .{
+                    .id_extra = idx,
+                    .gravity_x = 0.5,
+                    .gravity_y = 0.5,
+                    .expand = .ratio,
+                    .min_size_content = .{ .w = star_sz - 6, .h = star_sz - 6 },
+                    .color_text = star_color,
+                });
+                if (bw.clicked()) self.favorite_toggle_id = entry.id;
+                bw.deinit();
+            }
+        }
+
         if (dvui.clickedEx(cell.data(), .{})) |click_evt| {
             // Route subsequent key events to the grid container.
             dvui.focusWidget(grid_id, null, null);
@@ -1097,42 +1208,6 @@ pub const GridState = struct {
                 }
             } else {
                 self.drag_requested_ids.append(self.allocator, entry.id) catch {};
-            }
-        }
-
-        // Fixed ts×ts area; dark background is the letterbox fill and loading placeholder.
-        var img_rs: dvui.RectScale = undefined;
-        {
-            var img_area = dvui.box(@src(), .{}, .{
-                .id_extra = idx,
-                .min_size_content = .{ .w = ts, .h = ts },
-                .background = true,
-                .color_fill = .{ .r = 30, .g = 30, .b = 30, .a = 255 },
-            });
-            img_rs = img_area.data().contentRectScale();
-            defer img_area.deinit();
-
-            if (self.committed.get(entry.id)) |ce| {
-                // Scale to fit ts×ts while preserving aspect ratio, then center with margin.
-                // Using explicit margin avoids DVUI layout bugs caused by gravity_y=0.5
-                // triggering child_positioned mode in the vertical BoxWidget.
-                const scale = @min(ts / ce.width, ts / ce.height);
-                const rw = ce.width * scale;
-                const rh = ce.height * scale;
-                const mx = (ts - rw) / 2.0;
-                const my = (ts - rh) / 2.0;
-                _ = dvui.image(@src(), .{
-                    // Key dvui's texture cache on the JPEG *content*, not the byte
-                    // pointer. After a thumbnail is freed (delete / reparse) the
-                    // allocator can hand the same address to a different image's
-                    // bytes; pointer-keyed caching (.ptr, the default) would then
-                    // show the stale texture for the new image.
-                    .source = .{ .imageFile = .{ .bytes = ce.bytes, .invalidation = .bytes } },
-                }, .{
-                    .id_extra = idx,
-                    .min_size_content = .{ .w = rw, .h = rh },
-                    .margin = .{ .x = mx, .y = my, .w = mx, .h = my },
-                });
             }
         }
 

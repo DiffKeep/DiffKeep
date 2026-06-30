@@ -232,6 +232,7 @@ pub const SidebarState = struct {
         cfg_trash_enabled: bool,
         trash_stats: ?db_mod.TrashStats,
         duplicate_count: i64,
+        favorite_count: i64,
     ) !bool {
         var needs_count_refresh = false;
 
@@ -440,6 +441,34 @@ pub const SidebarState = struct {
             dvui.label(@src(), "{s}", .{i18n.t(.sidebar_duplicates)}, .{ .font = bold, .gravity_y = 0.5 });
             _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             dvui.label(@src(), "{d}", .{duplicate_count}, .{ .gravity_y = 0.5 });
+        }
+
+        // ── Favorites quick filter ────────────────────────────────────────
+        {
+            const in_favorites = if (grid) |g| g.view_mode == .favorites else false;
+            const fav_bg = focusBg(in_favorites);
+            var fav_row = dvui.box(@src(), .{ .dir = .horizontal }, fav_bg.override(.{
+                .expand = .horizontal,
+                .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .tag = "nav-favorites",
+            }));
+            defer fav_row.deinit();
+            if (dvui.clickedEx(fav_row.data(), .{})) |_| {
+                if (grid) |g| {
+                    if (g.view_mode != .favorites) {
+                        g.view_mode = .favorites;
+                        if (db) |d| g.reloadImages(d) catch {};
+                    }
+                }
+            }
+            dvui.icon(@src(), "favorites", icons.tvg.heroicons.solid.star, .{}, .{
+                .min_size_content = .{ .w = 14, .h = 14 },
+                .gravity_y = 0.5,
+                .margin = .{ .w = 4 },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_favorites)}, .{ .font = bold, .gravity_y = 0.5 });
+            _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+            dvui.label(@src(), "{d}", .{favorite_count}, .{ .gravity_y = 0.5 });
         }
 
         // ── Library removal confirmation modal ───────────────────────────

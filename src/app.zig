@@ -52,6 +52,7 @@ fn wakeupFrame() void {
 var g_db_stats: ?db_mod.DbStats = null;
 var g_trash_stats: ?db_mod.TrashStats = null;
 var g_duplicate_count: i64 = 0;
+var g_favorite_count: i64 = 0;
 var g_total_image_count: i64 = 0;
 
 var g_sidebar: sidebar_mod.SidebarState = .{};
@@ -89,9 +90,50 @@ fn refreshCounts() void {
             g_total_image_count = db.getTotalImageCount() catch 0;
             g_trash_stats = db.getTrashStats() catch null;
             g_duplicate_count = db.getDuplicateCount() catch 0;
+            g_favorite_count = db.getFavoriteCount() catch 0;
             g_sidebar.refreshLibraryCounts(db, init.gpa);
         }
     }
+}
+
+/// Toggle an image's favorite flag (raised from the grid star or the viewer
+/// toolbar). Writes the DB, reflects it live in the grid and any open viewers,
+/// and refreshes the sidebar count.
+fn toggleFavorite(id: u64) void {
+    const init = dvui.App.main_init orelse return;
+    const db = if (dk.g_db) |*d| d else return;
+
+    // New state = inverse of the current cached flag (grid first, else viewers).
+    var new_val = true;
+    var found = false;
+    if (dk.g_grid) |*grid| {
+        for (grid.images.items) |e| {
+            if (e.id == id) { new_val = !e.favorite; found = true; break; }
+        }
+    }
+    if (!found) new_val = !g_viewer_manager.favoriteState(id);
+
+    db.setFavorite(id, new_val) catch |err| {
+        log.warn("setFavorite {d}: {}", .{ id, err });
+        return;
+    };
+
+    if (dk.g_grid) |*grid| {
+        for (grid.images.items) |*e| {
+            if (e.id == id) e.favorite = new_val;
+        }
+        // In the Favorites view an un-favorited image leaves the grid at once.
+        if (grid.view_mode == .favorites and !new_val) {
+            var ids = std.AutoHashMap(u64, void).init(init.gpa);
+            defer ids.deinit();
+            ids.put(id, {}) catch {};
+            const saved_y = grid.scroll_info.viewport.y;
+            image_ops_mod.removeFromGrid(grid, &ids);
+            grid.scroll_info.viewport.y = saved_y;
+        }
+    }
+    g_viewer_manager.setFavorite(id, new_val);
+    refreshCounts();
 }
 
 
@@ -448,8 +490,10 @@ fn frame() !dvui.App.Result {
     // Apply completed background search tasks
     if (dvui.App.main_init) |init| {
         if (dk.g_grid) |*grid| {
-            g_search.applyQueryIfDone(init.gpa, grid);
-            if (dk.g_db) |*db| g_search.applyEmbedIfDone(init.gpa, init.io, grid, db);
+            if (dk.g_db) |*db| {
+                g_search.applyQueryIfDone(init.gpa, grid, db);
+                g_search.applyEmbedIfDone(init.gpa, init.io, grid, db);
+            }
         }
     }
 
@@ -485,6 +529,10 @@ fn frame() !dvui.App.Result {
         if (grid.restore_requested) {
             grid.restore_requested = false;
             if (dvui.App.main_init) |init| image_ops_mod.performRestore(init.io, init.gpa, grid);
+        }
+        if (grid.favorite_toggle_id) |id| {
+            grid.favorite_toggle_id = null;
+            toggleFavorite(id);
         }
         if (grid.dedupe_requested) {
             grid.dedupe_requested = false;
@@ -694,6 +742,7 @@ fn frame() !dvui.App.Result {
         .db_stats = &g_db_stats,
         .trash_stats = &g_trash_stats,
         .duplicate_count = &g_duplicate_count,
+        .favorite_count = &g_favorite_count,
         .sidebar = &g_sidebar,
         .detail = &g_detail,
         .library_manager = &dk.g_library_manager,
@@ -1185,6 +1234,11 @@ pub fn main(init: std.process.Init) !void {
             if (vw.state.delete_requested) {
                 vw.state.delete_requested = false;
                 openViewerDeleteDialog(&vw.state, vw.state.delete_force);
+            }
+
+            if (vw.state.favorite_toggle_requested) {
+                vw.state.favorite_toggle_requested = false;
+                if (vw.state.currentImage()) |img| toggleFavorite(img.id);
             }
 
             if (vw.state.delete_confirmed) {
