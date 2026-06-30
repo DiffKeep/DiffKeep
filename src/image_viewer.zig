@@ -581,6 +581,13 @@ pub const ViewerState = struct {
             self.persistPrefs();
         }
 
+        if (self.images.items.len > 0 and
+            iconButton(i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", 11))
+        {
+            if (self.currentImage()) |img|
+                detail_panel_mod.copyImageToClipboard(img.path, self.gpa, self.io);
+        }
+
         if (self.dnd_available and self.images.items.len > 0) {
             if (dragButton(i18n.t(.viewer_drag), icons.tvg.lucide.grab, 9)) self.drag_requested = true;
         }
