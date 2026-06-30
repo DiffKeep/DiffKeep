@@ -462,6 +462,229 @@ test "grid: render with images doesn't crash" {
     try std.testing.expect(dvui.tagGet("grid-empty") == null);
 }
 
+// ── UI panel tests (headless dvui, driving real widgets via tags) ───────────────
+//
+// These exercise the sidebar/toolbar/detail panels through the .testing backend.
+// They are possible because those modules reach the SDL backend only through the
+// `platform` seam (see src/platform.zig), which is left at its no-op defaults in
+// tests.
+
+var g_sidebar: *dk.sidebar.SidebarState = undefined;
+var g_sidebar_db: *dk.VectorDb = undefined;
+var g_sidebar_grid: *dk.GridState = undefined;
+
+fn sidebarFrame() anyerror!dvui.App.Result {
+    _ = g_sidebar.render(220, alloc, g_sidebar_db, g_sidebar_grid, null, true, null, 0) catch {};
+    return .ok;
+}
+
+test "sidebar: clicking Trash / Duplicates switches the grid view" {
+    const path = "/tmp/diffkeep_test_sidebar_nav.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var sb = dk.sidebar.SidebarState{};
+    defer sb.deinit(alloc);
+
+    g_sidebar = &sb;
+    g_sidebar_db = &db;
+    g_sidebar_grid = &grid;
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.fonts.register() catch {};
+
+    try dvui.testing.settle(sidebarFrame);
+    try std.testing.expect(grid.view_mode == .library);
+
+    try dvui.testing.moveTo("nav-trash");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(sidebarFrame);
+    try std.testing.expect(grid.view_mode == .trash);
+
+    try dvui.testing.moveTo("nav-duplicates");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(sidebarFrame);
+    try std.testing.expect(grid.view_mode == .duplicates);
+}
+
+var g_detail_details: dk.ImageDetails = undefined;
+
+fn detailFrame() anyerror!dvui.App.Result {
+    dk.detail_panel.renderContent(g_detail_details);
+    return .ok;
+}
+
+test "detail panel: Copy on the prompt writes it to the clipboard" {
+    g_detail_details = .{
+        .id = 1,
+        .library_id = 1,
+        .library_path = "/lib/a.png",
+        .creation_date = null,
+        .positive_prompt_text = "a fluffy cat",
+        .negative_prompt_text = null,
+        .model = null,
+        .cfg = null,
+        .steps = null,
+        .seed = null,
+        .sampler = null,
+        .scheduler = null,
+        .loras = null,
+        .trashed_at = null,
+    };
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.fonts.register() catch {};
+
+    try dvui.testing.settle(detailFrame);
+    try dvui.testing.moveTo("copy-prompt");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(detailFrame);
+
+    // dvui's testing backend implements clipboardTextSet/clipboardText, so we can
+    // assert the decoupled copy path actually wrote the prompt.
+    try std.testing.expectEqualStrings("a fluffy cat", dvui.clipboardText());
+}
+
+fn noopRefresh() void {}
+
+/// Owns every piece of app state the toolbar's RenderCtx points at, so a test
+/// can build a valid context with one struct.
+const ToolbarFix = struct {
+    search: dk.search.SearchState = .{},
+    filters: std.ArrayList(dk.ActiveFilter) = .empty,
+    filter_modal: dk.filter_modal.FilterModalState = .{},
+    grid: ?dk.GridState = null,
+    db: ?dk.VectorDb = null,
+    cfg: dk.Config = .{},
+    settings: dk.settings_modal.SettingsModalState = .{},
+    db_stats: ?dk.DbStats = null,
+    trash_stats: ?dk.TrashStats = null,
+    duplicate_count: i64 = 0,
+    sidebar: dk.sidebar.SidebarState = .{},
+    detail: dk.detail_panel.DetailState = .{},
+    library_manager: ?dk.LibraryManager = null,
+    left_w: f32 = 220,
+    left_w_open: f32 = 220,
+    right_w: f32 = 280,
+    right_w_open: f32 = 280,
+    total_image_count: i64 = 0,
+
+    fn deinit(self: *ToolbarFix) void {
+        self.filters.deinit(alloc);
+        self.search.deinit(alloc);
+        self.sidebar.deinit(alloc);
+        self.detail.deinit(alloc);
+    }
+
+    fn ctx(self: *ToolbarFix) dk.toolbar.RenderCtx {
+        return .{
+            .search = &self.search,
+            .active_filters = &self.filters,
+            .filter_modal = &self.filter_modal,
+            .grid = &self.grid,
+            .db = &self.db,
+            .cfg = &self.cfg,
+            .settings = &self.settings,
+            .db_stats = &self.db_stats,
+            .trash_stats = &self.trash_stats,
+            .duplicate_count = &self.duplicate_count,
+            .sidebar = &self.sidebar,
+            .detail = &self.detail,
+            .library_manager = &self.library_manager,
+            .left_w = &self.left_w,
+            .left_w_open = &self.left_w_open,
+            .right_w = &self.right_w,
+            .right_w_open = &self.right_w_open,
+            .total_image_count = &self.total_image_count,
+            .on_refresh_counts = noopRefresh,
+            .embedder_loading = false,
+        };
+    }
+};
+
+var g_toolbar_fix: *ToolbarFix = undefined;
+
+fn toolbarFrame() anyerror!dvui.App.Result {
+    dk.toolbar.renderToolbar(g_toolbar_fix.ctx());
+    return .ok;
+}
+
+test "toolbar: typing into the search box fills the query buffer" {
+    var fix = ToolbarFix{};
+    defer fix.deinit();
+    g_toolbar_fix = &fix;
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.fonts.register() catch {};
+
+    try dvui.testing.settle(toolbarFrame);
+    try dvui.testing.moveTo("search-box");
+    try dvui.testing.click(.left);
+    try dvui.testing.writeText("kitten");
+    try dvui.testing.settle(toolbarFrame);
+
+    const typed = std.mem.sliceTo(&fix.search.buf, 0);
+    try std.testing.expectEqualStrings("kitten", typed);
+}
+
+// ── Viewer logic tests (no rendering; pure ViewerState navigation) ──────────────
+//
+// ViewerState reaches the SDL backend only through the platform seam (window
+// fullscreen / geometry), so its image-list navigation is testable headlessly.
+
+test "viewer: navigateTo clamps and removeImages keeps the current index sane" {
+    var images: std.ArrayList(dk.ImageEntry) = .empty;
+    for ([_]u64{ 10, 11, 12, 13 }, 0..) |id, i| {
+        const p = try std.fmt.allocPrint(alloc, "/lib/img{d}.png", .{i});
+        try images.append(alloc, .{
+            .id = id,
+            .path = p,
+            .filename = std.fs.path.basename(p),
+            .mtime = null,
+        });
+    }
+    // db = null so navigateTo skips the detail-panel DB refresh; no cfg/wakeup.
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, images, 0, null, null, io, null, null);
+    defer vs.deinit();
+
+    // navigateTo clamps past the end.
+    vs.navigateTo(99);
+    try std.testing.expectEqual(@as(usize, 3), vs.current_idx);
+    try std.testing.expectEqual(@as(u64, 13), vs.currentImage().?.id);
+
+    vs.navigateTo(1);
+    try std.testing.expectEqual(@as(usize, 1), vs.current_idx);
+
+    var ids = std.AutoHashMap(u64, void).init(alloc);
+    defer ids.deinit();
+
+    // Removing an image before the current one shifts the index down with it.
+    try ids.put(10, {});
+    vs.removeImages(&ids);
+    try std.testing.expectEqual(@as(u64, 11), vs.currentImage().?.id);
+    try std.testing.expect(vs.open);
+
+    // Removing the current image re-targets a valid neighbour.
+    ids.clearRetainingCapacity();
+    try ids.put(11, {});
+    vs.removeImages(&ids);
+    try std.testing.expectEqual(@as(u64, 12), vs.currentImage().?.id);
+
+    // Removing every remaining image closes the viewer.
+    ids.clearRetainingCapacity();
+    try ids.put(12, {});
+    try ids.put(13, {});
+    vs.removeImages(&ids);
+    try std.testing.expect(!vs.open);
+}
+
 test "grid: incomingBelongs respects the active view filters" {
     const path = "/tmp/diffkeep_test_grid_belongs.db";
     var db = try openDb(path);
@@ -498,4 +721,133 @@ test "grid: incomingBelongs respects the active view filters" {
     grid.query_embedding = &dummy_embedding;
     try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
     grid.query_embedding = null;
+}
+
+// ── Grid ↔ DB integration ───────────────────────────────────────────────────────
+
+/// Assert the grid holds exactly `want_ids` (order-independent — the grid sorts
+/// by date, so never assert on position).
+fn expectGridIds(grid: *const dk.GridState, want_ids: []const u64) !void {
+    try std.testing.expectEqual(want_ids.len, grid.images.items.len);
+    for (want_ids) |want| {
+        var found = false;
+        for (grid.images.items) |e| {
+            if (e.id == want) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("grid is missing expected id {d}\n", .{want});
+            return error.GridMissingId;
+        }
+    }
+}
+
+/// Create an image with a hash; returns its id. (Shared shape with the dup tests.)
+fn makeHashedImage(db: *dk.VectorDb, lib: u64, p: []const u8, h: []const u8) !u64 {
+    var img = try db.findOrCreateImage(alloc, lib, p);
+    defer img.deinit(alloc);
+    if (img.hash) |old| alloc.free(old);
+    img.hash = try alloc.dupe(u8, h);
+    try db.saveImage(&img);
+    return img.id;
+}
+
+test "grid: reloadImages reflects the active view_mode" {
+    const path = "/tmp/diffkeep_test_grid_views.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const a = try makeHashedImage(&db, lib, "/lib/a.png", "dup"); // duplicate pair…
+    const b = try makeHashedImage(&db, lib, "/lib/b.png", "dup"); // …with a
+    const c = try makeHashedImage(&db, lib, "/lib/c.png", "uniq");
+    const d = try makeHashedImage(&db, lib, "/lib/d.png", "trash-me");
+    try db.trashImage(d, "d_trash.png", 0, 1000);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // Library view: every non-trashed image, trashed one excluded.
+    grid.view_mode = .library;
+    try grid.reloadImages(&db);
+    try expectGridIds(&grid, &.{ a, b, c });
+
+    // Trash view: only the trashed image.
+    grid.view_mode = .trash;
+    try grid.reloadImages(&db);
+    try expectGridIds(&grid, &.{d});
+
+    // Duplicates view: only the images that share a hash.
+    grid.view_mode = .duplicates;
+    try grid.reloadImages(&db);
+    try expectGridIds(&grid, &.{ a, b });
+}
+
+test "grid: reloadImages resets the scroll position to the top" {
+    const path = "/tmp/diffkeep_test_grid_scroll.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // Pretend the user had scrolled down, then switch view.
+    grid.scroll_info.viewport.y = 500;
+    try grid.reloadImages(&db);
+    try std.testing.expectEqual(@as(f32, 0), grid.scroll_info.viewport.y);
+}
+
+test "grid: a scanned image is only injected if it belongs to the current view" {
+    const path = "/tmp/diffkeep_test_grid_incoming.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Empty DB → grid starts empty in the (default) library view.
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    grid.filter_library_path = "/lib";
+    grid.filter_folder_path = "/lib/cats";
+
+    // Two images arrive from a background scan: one inside the folder, one not.
+    grid.notifier.push(io, 100, "/lib/cats/new.png", 0);
+    grid.notifier.push(io, 101, "/lib/dogs/other.png", 0);
+    grid.update();
+
+    // Only the in-folder image is shown; the other is dropped (it will appear
+    // when its own folder/view is loaded).
+    try expectGridIds(&grid, &.{100});
+}
+
+var g_clear_fix: *ToolbarFix = undefined;
+
+fn clearFrame() anyerror!dvui.App.Result {
+    dk.toolbar.renderToolbar(g_clear_fix.ctx());
+    return .ok;
+}
+
+test "toolbar: the clear button empties the search query" {
+    var fix = ToolbarFix{};
+    defer fix.deinit();
+    // Pre-fill the query so the clear button renders.
+    @memcpy(fix.search.buf[0..3], "cat");
+    g_clear_fix = &fix;
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.fonts.register() catch {};
+
+    try dvui.testing.settle(clearFrame);
+    try dvui.testing.moveTo("search-clear");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(clearFrame);
+
+    try std.testing.expectEqual(@as(u8, 0), fix.search.buf[0]);
 }

@@ -3,7 +3,7 @@ const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
-const SDLBackend = @import("backend");
+const platform = @import("platform.zig");
 const library_manager_mod = @import("library_manager.zig");
 const image_grid_mod = @import("image_grid.zig");
 
@@ -112,14 +112,14 @@ pub const SidebarState = struct {
         });
     }
 
-    fn libraryFolderCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    /// Platform-agnostic folder-picker result handler. Invoked by the platform
+    /// seam (real native dialog in production, never called in headless tests).
+    fn onFolderPicked(userdata: ?*anyopaque, path: ?[]const u8) void {
         const self: *SidebarState = @ptrCast(@alignCast(userdata orelse return));
         self.library_dialog_open = false;
-        const files = filelist orelse return;
-        if (files[0] == null) return;
-        const path = std.mem.span(files[0].?);
-        const len = @min(path.len, self.pending_library_buf.len);
-        @memcpy(self.pending_library_buf[0..len], path[0..len]);
+        const p = path orelse return;
+        const len = @min(p.len, self.pending_library_buf.len);
+        @memcpy(self.pending_library_buf[0..len], p[0..len]);
         self.pending_library_len = len;
     }
 
@@ -280,14 +280,7 @@ pub const SidebarState = struct {
             })) {
                 if (!self.library_dialog_open) {
                     self.library_dialog_open = true;
-                    const sdl: *SDLBackend = dvui.currentWindow().backend.impl;
-                    SDLBackend.c.SDL_ShowOpenFolderDialog(
-                        SidebarState.libraryFolderCallback,
-                        self,
-                        sdl.window,
-                        null,
-                        false,
-                    );
+                    platform.openFolderDialog(self, SidebarState.onFolderPicked);
                 }
             }
         }
@@ -406,6 +399,7 @@ pub const SidebarState = struct {
             var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, trash_bg.override(.{
                 .expand = .horizontal,
                 .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .tag = "nav-trash",
             }));
             defer trash_row.deinit();
             if (dvui.clickedEx(trash_row.data(), .{})) |_| {
@@ -432,6 +426,7 @@ pub const SidebarState = struct {
             var dupes_row = dvui.box(@src(), .{ .dir = .horizontal }, dupes_bg.override(.{
                 .expand = .horizontal,
                 .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .tag = "nav-duplicates",
             }));
             defer dupes_row.deinit();
             if (dvui.clickedEx(dupes_row.data(), .{})) |_| {

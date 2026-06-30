@@ -1,11 +1,10 @@
 const std = @import("std");
 const dvui = @import("dvui");
-const SDLBackend = @import("backend");
 const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const config_mod = @import("config.zig");
-const window_state = @import("window_state.zig");
+const platform = @import("platform.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
 const vips_mod = @import("vips");
@@ -63,7 +62,10 @@ pub const ViewerState = struct {
     // Window state
     open: bool = true,
     fullscreen: bool = false,
-    sdl_window_ptr: ?*SDLBackend.c.SDL_Window = null,
+    /// Opaque native window handle (SDL window pointer in production), set by the
+    /// viewer manager. Window ops go through the `platform` seam so this module
+    /// stays backend-free and headless-testable.
+    window_handle: ?*anyopaque = null,
 
     // Pending actions consumed by app.zig
     delete_requested: bool = false,
@@ -884,11 +886,10 @@ pub const ViewerState = struct {
     }
 
     fn toggleFullscreen(self: *ViewerState) void {
-        if (self.sdl_window_ptr) |win| {
-            self.fullscreen = !self.fullscreen;
-            _ = SDLBackend.c.SDL_SetWindowFullscreen(win, self.fullscreen);
-            self.persistPrefs();
-        }
+        if (self.window_handle == null) return;
+        self.fullscreen = !self.fullscreen;
+        platform.setWindowFullscreen(self.window_handle, self.fullscreen);
+        self.persistPrefs();
     }
 
     // Copy the current UI preferences into the shared config so they are
@@ -905,8 +906,8 @@ pub const ViewerState = struct {
     // maximized and fullscreen state in the shared config.
     fn captureWindowState(self: *ViewerState) void {
         const cfg = self.cfg orelse return;
-        const win = self.sdl_window_ptr orelse return;
-        window_state.capture(win, &cfg.viewer_window);
+        if (self.window_handle == null) return;
+        platform.captureWindowState(self.window_handle, &cfg.viewer_window);
     }
 };
 

@@ -323,6 +323,8 @@ pub fn build(b: *std.Build) !void {
     diffkeep_test_module.addImport("vips", vips_module);
     diffkeep_test_module.addIncludePath(b.path("lib/vips"));
     diffkeep_test_module.addOptions("build_options", options);
+    // icons is pure TVG data (no backend dependency); UI modules need it to compile.
+    diffkeep_test_module.addImport("icons", icons_dep.module("icons"));
 
     const integration_module = b.createModule(.{
         .target = target,

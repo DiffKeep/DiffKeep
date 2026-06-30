@@ -26,10 +26,10 @@ const window_state = @import("window_state.zig");
 const search_mod = @import("search.zig");
 const image_ops_mod = @import("image_ops.zig");
 const toolbar_mod = @import("toolbar.zig");
+const platform = @import("platform.zig");
+const platform_sdl = @import("platform_sdl.zig");
+const fonts = @import("fonts.zig");
 const dk = @import("diffkeep.zig");
-
-const noto_cjk_bytes = @embedFile("fonts/NotoSansCJK-Regular.ttc");
-const noto_cjk_bold_bytes = @embedFile("fonts/NotoSansCJK-Bold.ttc");
 
 // Path to the config file: set from --config/-c flag, otherwise resolved from known folders.
 var g_config: ?[]const u8 = null;
@@ -129,6 +129,9 @@ fn appStart() dvui.App.StartOptions {
 
 fn appInit(win: *dvui.Window) !void {
     _ = win;
+    // Install the real SDL-backed platform services (clipboard image data,
+    // native folder picker). UI modules call these through the platform seam.
+    platform.init(platform_sdl.vtable);
     image_ops_mod.init(.{
         .db = &dk.g_db,
         .data_dir = &g_data_dir,
@@ -751,8 +754,7 @@ fn frame() !dvui.App.Result {
 }
 
 fn initWindowFontsAndTheme() !void {
-    try dvui.addFont("NotoSansCJK", noto_cjk_bytes, null);
-    try dvui.addFont("NotoSansCJKBold", noto_cjk_bold_bytes, null);
+    try fonts.register();
     var theme = dvui.themeGet();
     theme.font_body = theme.font_body.withFamily("NotoSansCJK");
     theme.font_title = theme.font_title.withFamily("NotoSansCJKBold");

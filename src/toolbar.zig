@@ -77,6 +77,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .padding = dvui.Rect.all(3),
                 .margin = .{ .x = 4 },
+                .tag = "search-clear",
             })) {
                 @memset(&ctx.search.buf, 0);
                 ctx.search.force_search = true;

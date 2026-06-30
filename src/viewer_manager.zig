@@ -178,7 +178,7 @@ pub const ViewerManager = struct {
                 init.io, db, cfg,
             ),
         };
-        vw.state.sdl_window_ptr = vw.back.window;
+        vw.state.window_handle = @ptrCast(vw.back.window);
         // Restore the remembered window geometry now that the window exists.
         if (cfg) |c| {
             window_state.apply(vw.back.window, c.viewer_window);

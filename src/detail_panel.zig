@@ -1,46 +1,17 @@
 const std = @import("std");
 const dvui = @import("dvui");
-const SDLBackend = @import("backend");
 const db_mod = @import("db.zig");
 const png_mod = @import("image/png-data.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const platform = @import("platform.zig");
 
 const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
 
-const ClipboardImageData = struct {
-    gpa: std.mem.Allocator,
-    bytes: []u8,
-};
-
-fn clipboardImageCallback(userdata: ?*anyopaque, mime_type: [*c]const u8, size: [*c]usize) callconv(.c) ?*const anyopaque {
-    _ = mime_type;
-    const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
-    size.* = d.bytes.len;
-    return d.bytes.ptr;
-}
-
-fn clipboardImageCleanup(userdata: ?*anyopaque) callconv(.c) void {
-    const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
-    d.gpa.free(d.bytes);
-    d.gpa.destroy(d);
-}
-
+/// Copy the image at `path` to the system clipboard (as image data). Routed
+/// through the platform seam so this module stays backend-agnostic.
 pub fn copyImageToClipboard(path: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
-    copyImageToClipboardImpl(path, gpa, io) catch {};
-}
-
-fn copyImageToClipboardImpl(path: []const u8, gpa: std.mem.Allocator, io: std.Io) !void {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const len: usize = @intCast(try file.length(io));
-    const bytes = try gpa.alloc(u8, len);
-    errdefer gpa.free(bytes);
-    _ = try file.readPositionalAll(io, bytes, 0);
-    const d = try gpa.create(ClipboardImageData);
-    d.* = .{ .gpa = gpa, .bytes = bytes };
-    var mime: [*c]const u8 = "image/png";
-    _ = SDLBackend.c.SDL_SetClipboardData(clipboardImageCallback, clipboardImageCleanup, d, &mime, 1);
+    platform.copyImageFile(path, gpa, io);
 }
 
 pub const BytesFmt = struct { value: f64, unit: []const u8 };
@@ -257,11 +228,9 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
             defer hdr.deinit();
             dvui.label(@src(), "{s}", .{i18n.t(.detail_prompt)}, bp.override(.{ .expand = .horizontal }));
             if (dvui.buttonIcon(@src(), i18n.t(.action_copy), icons.tvg.lucide.@"copy", .{}, .{},
-                .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
+                .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4), .tag = "copy-prompt" }))
             {
-                if (dvui.currentWindow().arena().dupeZ(u8, v)) |c_str| {
-                    _ = SDLBackend.c.SDL_SetClipboardText(c_str.ptr);
-                } else |_| {}
+                dvui.clipboardTextSet(v);
             }
         }
         var tl = dvui.textLayout(@src(), .{}, lp);
@@ -276,9 +245,7 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
             if (dvui.buttonIcon(@src(), i18n.t(.action_copy), icons.tvg.lucide.@"copy", .{}, .{},
                 .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
             {
-                if (dvui.currentWindow().arena().dupeZ(u8, v)) |c_str| {
-                    _ = SDLBackend.c.SDL_SetClipboardText(c_str.ptr);
-                } else |_| {}
+                dvui.clipboardTextSet(v);
             }
         }
         var tl = dvui.textLayout(@src(), .{}, lp);
