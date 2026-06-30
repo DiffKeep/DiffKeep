@@ -1243,6 +1243,14 @@ pub fn main(init: std.process.Init) !void {
             }
             try vw.back.renderPresent();
 
+            // Reveal the window only after its first frame has been drawn and its
+            // saved geometry applied (in viewer_manager.open, while hidden). This
+            // avoids it appearing at the default position/screen and then jumping.
+            if (!vw.shown) {
+                vw.shown = true;
+                _ = SDLBackend.c.SDL_ShowWindow(vw.back.window);
+            }
+
             end_micros = pickMinWait(end_micros, vw_end);
 
             if (close) {

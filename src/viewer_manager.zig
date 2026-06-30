@@ -14,6 +14,10 @@ pub const ViewerWindow = struct {
     sdl_window_id: u32,
     state: image_viewer_mod.ViewerState,
     fonts_initialized: bool = false,
+    // The window is created hidden and its saved geometry applied while hidden,
+    // then shown after the first frame is presented — so it never flashes at the
+    // default position/screen before jumping to the remembered spot.
+    shown: bool = false,
     // Native drag source bound to this window, for dragging the current image
     // out to other apps.  null if the platform DnD backend is unavailable.
     dnd: ?dnd_mod.DragSource = null,
@@ -162,6 +166,9 @@ pub const ViewerManager = struct {
             .min_size = .{ .w = 400, .h = 300 },
             .vsync = true,
             .title = "DiffKeep Viewer",
+            // Created hidden; shown after geometry is applied and the first frame
+            // is presented (see ViewerWindow.shown).
+            .hidden = true,
         }) catch {
             for (images.items) |e| { init.gpa.free(e.path); if (e.trash_name) |tn| init.gpa.free(tn); }
             images.deinit(init.gpa);
