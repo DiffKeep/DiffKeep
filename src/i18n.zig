@@ -98,6 +98,8 @@ pub const Strings = struct {
 
     viewer_zoom_fit: [:0]const u8,
     viewer_zoom_100: [:0]const u8,
+    viewer_zoom_fit_hint: [:0]const u8,
+    viewer_zoom_100_hint: [:0]const u8,
     viewer_fullscreen: [:0]const u8,
     viewer_exit_fullscreen: [:0]const u8,
     viewer_toggle_info: [:0]const u8,
@@ -230,6 +232,8 @@ pub const en: Strings = .{
 
     .viewer_zoom_fit = "Fit",
     .viewer_zoom_100 = "1:1",
+    .viewer_zoom_fit_hint = "Fit image to window",
+    .viewer_zoom_100_hint = "Actual size (100%)",
     .viewer_fullscreen = "Fullscreen",
     .viewer_exit_fullscreen = "Exit Fullscreen",
     .viewer_toggle_info = "Info",

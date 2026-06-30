@@ -488,27 +488,19 @@ pub const ViewerState = struct {
         });
         defer tb.deinit();
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_first), icons.tvg.lucide.@"chevrons-left", .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_first), icons.tvg.lucide.@"chevrons-left", 1)) {
             if (self.images.items.len > 0) self.navigateTo(0);
         }
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_prev), icons.tvg.lucide.@"chevron-left", .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_prev), icons.tvg.lucide.@"chevron-left", 2)) {
             if (self.current_idx > 0) self.navigateTo(self.current_idx - 1);
         }
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_next), icons.tvg.lucide.@"chevron-right", .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_next), icons.tvg.lucide.@"chevron-right", 3)) {
             if (self.current_idx + 1 < self.images.items.len) self.navigateTo(self.current_idx + 1);
         }
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_last), icons.tvg.lucide.@"chevrons-right", .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_last), icons.tvg.lucide.@"chevrons-right", 4)) {
             if (self.images.items.len > 0) self.navigateTo(self.images.items.len - 1);
         }
 
@@ -538,13 +530,13 @@ pub const ViewerState = struct {
             });
         }
 
-        if (dvui.button(@src(), i18n.t(.viewer_zoom_fit), .{}, .{ .gravity_y = 0.5 })) {
+        if (textButton(i18n.t(.viewer_zoom_fit), i18n.t(.viewer_zoom_fit_hint), 5)) {
             self.zoom_mode = .fit;
             self.pan_x = 0;
             self.pan_y = 0;
         }
 
-        if (dvui.button(@src(), i18n.t(.viewer_zoom_100), .{}, .{ .gravity_y = 0.5 })) {
+        if (textButton(i18n.t(.viewer_zoom_100), i18n.t(.viewer_zoom_100_hint), 6)) {
             self.zoom = 1.0;
             self.zoom_mode = .pct100;
             self.pan_x = 0;
@@ -556,84 +548,131 @@ pub const ViewerState = struct {
         else
             icons.tvg.lucide.maximize;
         const fs_label = if (self.fullscreen) i18n.t(.viewer_exit_fullscreen) else i18n.t(.viewer_fullscreen);
-        if (dvui.buttonIcon(@src(), fs_label, fs_icon, .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(fs_label, fs_icon, 7)) {
             self.toggleFullscreen();
         }
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_toggle_info), icons.tvg.lucide.info, .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_toggle_info), icons.tvg.lucide.info, 8)) {
             self.info_open = !self.info_open;
             self.persistPrefs();
         }
 
-        if (self.dnd_available and self.images.items.len > 0) self.renderDragHandle();
+        if (self.dnd_available and self.images.items.len > 0) {
+            if (dragButton(i18n.t(.viewer_drag), icons.tvg.lucide.grab, 9)) self.drag_requested = true;
+        }
 
-        if (dvui.buttonIcon(@src(), i18n.t(.viewer_delete), icons.tvg.lucide.trash, .{}, .{},
-            .{ .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }))
-        {
+        if (iconButton(i18n.t(.viewer_delete), icons.tvg.lucide.trash, 10)) {
             self.delete_requested = true;
             self.delete_force = false;
         }
     }
 
-    // A grip the user presses and drags to export the current image to another
-    // app via native drag-and-drop.  Mirrors the grid's drag-to-external gesture:
-    // capture on press, fire once the drag threshold is exceeded.
-    fn renderDragHandle(self: *ViewerState) void {
-        var handle = dvui.box(@src(), .{}, .{
-            .min_size_content = .{ .w = 22, .h = 22 },
+    // Shared button styling for the toolbar.  `id_extra` makes each call site a
+    // distinct widget (all helpers share one @src()).
+    const tb_btn_size: dvui.Size = .{ .w = 22, .h = 22 };
+
+    // Options for an icon-sized toolbar button, matching `dvui.buttonIcon`.
+    fn iconBtnOpts(id_extra: usize, label: [:0]const u8) dvui.Options {
+        return .{
+            .id_extra = id_extra,
+            .padding = .all(4),
+            .min_size_content = tb_btn_size,
             .gravity_y = 0.5,
-            .background = true,
-            .corner_radius = dvui.Rect.all(3),
-            .margin = .all(2),
+            .label = .{ .text = label },
+        };
+    }
+
+    // The child icon's options, mirroring `dvui.buttonIcon` exactly: start from a
+    // STRIPPED copy of the button opts (so the icon inherits no padding/background
+    // of its own) then layer the button's hover/press style on top.
+    fn iconChildOpts(bw: *dvui.ButtonWidget, opts: dvui.Options) dvui.Options {
+        return opts.strip().override(bw.style()).override(.{
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+            .min_size_content = opts.min_size_content,
+            .expand = .ratio,
+            .color_text = opts.color_text,
+            .role = .none,
         });
-        defer handle.deinit();
+    }
 
-        const wd = handle.data();
-        const id = wd.id;
+    fn btnTooltip(bw: *dvui.ButtonWidget, tip: [:0]const u8) void {
+        dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 },
+            "{s}", .{tip}, .{});
+    }
 
-        for (dvui.events()) |*e| {
-            if (e.evt != .mouse) continue;
-            const me = e.evt.mouse;
-            switch (me.action) {
-                .position => {
-                    if (dvui.eventMatchSimple(e, wd)) dvui.cursorSet(.hand);
-                },
-                .press => {
-                    if (me.button.pointer() and dvui.eventMatchSimple(e, wd)) {
-                        e.handled = true;
-                        dvui.captureMouse(wd, e.num);
-                        dvui.dragPreStart(me.p, .{ .cursor = .hand });
-                    }
-                },
-                .motion => {
-                    if (dvui.captured(id) and dvui.dragging(me.p, null) != null) {
-                        e.handled = true;
-                        dvui.captureMouse(null, e.num);
-                        dvui.dragEnd();
-                        self.drag_requested = true;
-                    }
-                },
-                .release => {
-                    if (dvui.captured(id)) {
-                        e.handled = true;
-                        dvui.captureMouse(null, e.num);
-                        dvui.dragEnd();
-                    }
-                },
-                else => {},
+    /// Icon toolbar button matching `dvui.buttonIcon`, with a hover tooltip.
+    fn iconButton(label: [:0]const u8, tvg: []const u8, id_extra: usize) bool {
+        const opts = iconBtnOpts(id_extra, label);
+        var bw: dvui.ButtonWidget = undefined;
+        bw.init(@src(), .{}, opts);
+        bw.processEvents();
+        bw.drawBackground();
+        dvui.icon(@src(), label, tvg, .{}, iconChildOpts(&bw, opts));
+        const click = bw.clicked();
+        bw.drawFocus();
+        btnTooltip(&bw, label);
+        bw.deinit();
+        return click;
+    }
+
+    /// Text toolbar button (e.g. zoom controls), with a descriptive hover hint.
+    /// Sized to match the icon buttons (same padding + content height).
+    fn textButton(label: [:0]const u8, hint: [:0]const u8, id_extra: usize) bool {
+        const opts = dvui.Options{
+            .id_extra = id_extra,
+            .padding = .all(4),
+            .min_size_content = .{ .h = tb_btn_size.h },
+            .gravity_y = 0.5,
+            .label = .{ .text = label },
+        };
+        var bw: dvui.ButtonWidget = undefined;
+        bw.init(@src(), .{}, opts);
+        bw.processEvents();
+        bw.drawBackground();
+        dvui.labelNoFmt(@src(), label, .{ .align_x = 0.5, .align_y = 0.5 },
+            opts.strip().override(bw.style()).override(.{ .gravity_x = 0.5, .gravity_y = 0.5 }));
+        const click = bw.clicked();
+        bw.drawFocus();
+        btnTooltip(&bw, hint);
+        bw.deinit();
+        return click;
+    }
+
+    /// Like `iconButton`, but instead of a click it reports a drag gesture: the
+    /// pointer pressed on the button and moved past the drag threshold.  Used to
+    /// drag the current image out to another app via native drag-and-drop.
+    fn dragButton(label: [:0]const u8, tvg: []const u8, id_extra: usize) bool {
+        const opts = iconBtnOpts(id_extra, label);
+        var bw: dvui.ButtonWidget = undefined;
+        bw.init(@src(), .{ .touch_drag = true }, opts);
+        bw.processEvents();
+        bw.drawBackground();
+        if (bw.hovered()) dvui.cursorSet(.hand);
+
+        // dvui.clicked() (in processEvents) already captured the mouse and armed
+        // the drag on press; fire once it crosses the threshold and cancel the
+        // pending click so the gesture isn't also treated as one.
+        var started = false;
+        if (dvui.captured(bw.data().id)) {
+            for (dvui.events()) |*e| {
+                if (e.handled or e.evt != .mouse) continue;
+                const me = e.evt.mouse;
+                if (me.action != .motion) continue;
+                if (dvui.dragging(me.p, null) != null) {
+                    e.handle(@src(), bw.data());
+                    dvui.captureMouse(null, e.num);
+                    dvui.dragEnd();
+                    started = true;
+                }
             }
         }
 
-        dvui.icon(@src(), i18n.t(.viewer_drag), icons.tvg.lucide.grab, .{}, .{
-            .min_size_content = .{ .w = 16, .h = 16 },
-            .gravity_x = 0.5,
-            .gravity_y = 0.5,
-            .expand = .both,
-        });
+        dvui.icon(@src(), label, tvg, .{}, iconChildOpts(&bw, opts));
+        bw.drawFocus();
+        btnTooltip(&bw, label);
+        bw.deinit();
+        return started;
     }
 
     fn renderImageArea(self: *ViewerState) void {
