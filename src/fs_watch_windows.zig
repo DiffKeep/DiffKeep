@@ -5,6 +5,7 @@
 /// Only .png files trigger events.
 const std = @import("std");
 const windows = std.os.windows;
+const media = @import("media.zig");
 const log = std.log.scoped(.fs_watch);
 
 // ── NtWaitForMultipleObjects (not in stdlib) ──────────────────────────────────
@@ -316,7 +317,7 @@ fn processWinNotify(watch: *LibWatch) void {
         };
         defer allocator.free(filename_u8);
 
-        if (std.mem.endsWith(u8, filename_u8, ".png")) {
+        if (media.isSupportedMediaFile(filename_u8)) {
             const FILE_ACTION_REMOVED: windows.ULONG = 2;
             const FILE_ACTION_RENAMED_OLD_NAME: windows.ULONG = 4;
             const deleted = info.Action == FILE_ACTION_REMOVED or

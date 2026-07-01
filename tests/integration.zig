@@ -462,6 +462,41 @@ test "grid: render with images doesn't crash" {
     try std.testing.expect(dvui.tagGet("grid-empty") == null);
 }
 
+test "grid: autoplay renders playable cells without crashing (missing files fall back)" {
+    const path = "/tmp/diffkeep_test_grid_autoplay.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    _ = try makeImage(&db, lib, "/lib/still.png");
+    const gif = try makeImage(&db, lib, "/lib/anim.gif");
+    const clip = try makeImage(&db, lib, "/lib/clip.mp4");
+    try db.setMediaType(gif, .animated);
+    try db.setMediaType(clip, .video);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    grid.autoplay = true;
+    try grid.reloadImages(&db);
+
+    g_grid_test_ptr = &grid;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    // The files don't exist, so each player open fails and the cell falls back to
+    // its poster — the point is that the autoplay path (create/fail/evict) is
+    // exercised over several frames without crashing or leaking a live player.
+    try dvui.testing.settle(gridFrame);
+    try std.testing.expectEqual(@as(usize, 0), grid.grid_players.count());
+
+    // Toggling autoplay off is a no-op here (nothing live) and must not crash.
+    grid.autoplay = false;
+    try dvui.testing.settle(gridFrame);
+    try std.testing.expectEqual(@as(usize, 0), grid.grid_players.count());
+}
+
 // ── UI panel tests (headless dvui, driving real widgets via tags) ───────────────
 //
 // These exercise the sidebar/toolbar/detail panels through the .testing backend.
@@ -965,4 +1000,200 @@ test "viewer: setFavorite updates the current image's favorite flag" {
     // Toggling an id not present is a no-op (no crash).
     vs.setFavorite(999, true);
     try std.testing.expect(vs.currentFavorite());
+}
+
+// ── Format filter ───────────────────────────────────────────────────────────────
+
+fn sliceSetContains(haystack: [][]const u8, needle: []const u8) bool {
+    for (haystack) |h| if (std.mem.eql(u8, h, needle)) return true;
+    return false;
+}
+
+test "db: format filter matches by file extension (query-time, case-insensitive)" {
+    const path = "/tmp/diffkeep_test_format_filter.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    _ = try makeImage(&db, lib, "/lib/a.png");
+    _ = try makeImage(&db, lib, "/lib/e.PNG"); // uppercase ext still counts as png
+    _ = try makeImage(&db, lib, "/lib/b.webp");
+    _ = try makeImage(&db, lib, "/lib/c.webp");
+    _ = try makeImage(&db, lib, "/lib/d.jpg");
+
+    // Distinct formats present (sorted), derived from the extensions — no gif here.
+    {
+        const fmts = try db.getDistinctColumnValues(alloc, .format);
+        defer {
+            for (fmts) |s| alloc.free(s);
+            alloc.free(fmts);
+        }
+        try std.testing.expectEqual(@as(usize, 3), fmts.len);
+        try std.testing.expect(sliceSetContains(fmts, "png"));
+        try std.testing.expect(sliceSetContains(fmts, "webp"));
+        try std.testing.expect(sliceSetContains(fmts, "jpg"));
+    }
+
+    // Filtering by "webp" returns only the two webp.
+    {
+        const filters = [_]dk.ActiveFilter{.{ .column = .format, .value = "webp" }};
+        const res = try db.listImagesFiltered(alloc, null, null, null, &filters);
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 2), res.len);
+        for (res) |e| try std.testing.expect(std.ascii.endsWithIgnoreCase(e.path, ".webp"));
+    }
+
+    // "png" matches both lowercase and uppercase extensions on disk.
+    {
+        const filters = [_]dk.ActiveFilter{.{ .column = .format, .value = "png" }};
+        const res = try db.listImagesFiltered(alloc, null, null, null, &filters);
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 2), res.len);
+    }
+
+    // The filter value itself is matched case-insensitively too.
+    {
+        const filters = [_]dk.ActiveFilter{.{ .column = .format, .value = "WEBP" }};
+        const res = try db.listImagesFiltered(alloc, null, null, null, &filters);
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 2), res.len);
+    }
+}
+
+test "db: resource_type filter (image includes animated; video separate)" {
+    const path = "/tmp/diffkeep_test_resource_filter.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const img = try makeImage(&db, lib, "/lib/a.png"); // stays media_type=image (0)
+    const ani = try makeImage(&db, lib, "/lib/b.webp");
+    const vid = try makeImage(&db, lib, "/lib/c.mp4");
+    try db.setMediaType(ani, .animated);
+    try db.setMediaType(vid, .video);
+
+    const filterIds = struct {
+        fn f(d: *dk.VectorDb, value: []const u8) ![]dk.VectorDb.GridEntry {
+            const filters = [_]dk.ActiveFilter{.{ .column = .resource_type, .value = value }};
+            return d.listImagesFiltered(alloc, null, null, null, &filters);
+        }
+    }.f;
+
+    // "image" includes static + animated, excludes video.
+    {
+        const res = try filterIds(&db, "image");
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 2), res.len);
+        for (res) |e| try std.testing.expect(e.id == img or e.id == ani);
+    }
+    // "animated" → only the animated webp.
+    {
+        const res = try filterIds(&db, "animated");
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 1), res.len);
+        try std.testing.expectEqual(ani, res[0].id);
+    }
+    // "video" → only the mp4.
+    {
+        const res = try filterIds(&db, "video");
+        defer {
+            for (res) |e| alloc.free(e.path);
+            alloc.free(res);
+        }
+        try std.testing.expectEqual(@as(usize, 1), res.len);
+        try std.testing.expectEqual(vid, res[0].id);
+    }
+
+    // Distinct options reflect what's present (all three here).
+    {
+        const types = try db.getDistinctColumnValues(alloc, .resource_type);
+        defer {
+            for (types) |s| alloc.free(s);
+            alloc.free(types);
+        }
+        try std.testing.expectEqual(@as(usize, 3), types.len);
+        try std.testing.expect(sliceSetContains(types, "image"));
+        try std.testing.expect(sliceSetContains(types, "animated"));
+        try std.testing.expect(sliceSetContains(types, "video"));
+    }
+}
+
+// ── Animated / video playback classification ─────────────────────────────────
+
+test "grid: markMediaTypes flags animated and video entries from the DB" {
+    const path = "/tmp/diffkeep_test_media_types.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer db.pool.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const still = try makeImage(&db, lib, "/lib/a.png"); // stays .image
+    const gif = try makeImage(&db, lib, "/lib/b.gif");
+    const webp = try makeImage(&db, lib, "/lib/c.webp");
+    const clip = try makeImage(&db, lib, "/lib/d.mp4");
+    try db.setMediaType(gif, .animated);
+    try db.setMediaType(webp, .animated);
+    try db.setMediaType(clip, .video);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    grid.view_mode = .library;
+    try grid.reloadImages(&db);
+
+    for (grid.images.items) |e| {
+        const want: dk.VectorDb.MediaType = if (e.id == clip)
+            .video
+        else if (e.id == gif or e.id == webp)
+            .animated
+        else
+            .image;
+        try std.testing.expectEqual(want, e.media_type);
+    }
+    _ = still;
+}
+
+test "viewer: currentIsPlayable is true for video and animated, false for static" {
+    const cases = [_]struct { id: u64, mt: dk.VectorDb.MediaType, playable: bool }{
+        .{ .id = 1, .mt = .image, .playable = false },
+        .{ .id = 2, .mt = .animated, .playable = true },
+        .{ .id = 3, .mt = .video, .playable = true },
+    };
+    var images: std.ArrayList(dk.ImageEntry) = .empty;
+    for (cases) |cse| {
+        const p = try std.fmt.allocPrint(alloc, "/lib/m{d}.bin", .{cse.id});
+        try images.append(alloc, .{
+            .id = cse.id,
+            .path = p,
+            .filename = std.fs.path.basename(p),
+            .mtime = null,
+            .media_type = cse.mt,
+        });
+    }
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, images, 0, null, null, io, null, null);
+    defer vs.deinit();
+
+    for (cases, 0..) |cse, i| {
+        vs.navigateTo(i);
+        try std.testing.expectEqual(cse.playable, vs.currentIsPlayable());
+    }
 }

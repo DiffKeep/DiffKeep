@@ -27,6 +27,7 @@ pub const Config = struct {
 
     // Remembered main-grid layout, persisted across sessions.
     grid_thumb_fraction: f32 = 0.25, // 0..1 maps to min..max thumbnail size
+    grid_autoplay: bool = false,      // live-play animated/video cells in the grid (muted)
     grid_left_w: f32 = 240,           // current tree-pane width (< 2 = collapsed)
     grid_left_w_open: f32 = 240,      // last non-collapsed tree-pane width
     grid_right_w: f32 = 300,          // current info-pane width (< 2 = collapsed)
@@ -102,6 +103,7 @@ test "config: round-trip preserves all fields" {
         .viewer_info_open = true,
         .viewer_info_w = 333,
         .grid_thumb_fraction = 0.6,
+        .grid_autoplay = true,
         .grid_left_w = 200,
         .grid_left_w_open = 260,
         .grid_right_w = 0,
@@ -118,6 +120,7 @@ test "config: round-trip preserves all fields" {
     try std.testing.expectEqual(original.viewer_info_open, loaded.viewer_info_open);
     try std.testing.expectEqual(original.viewer_info_w, loaded.viewer_info_w);
     try std.testing.expectEqual(original.grid_thumb_fraction, loaded.grid_thumb_fraction);
+    try std.testing.expectEqual(original.grid_autoplay, loaded.grid_autoplay);
     try std.testing.expectEqual(original.grid_left_w, loaded.grid_left_w);
     try std.testing.expectEqual(original.grid_left_w_open, loaded.grid_left_w_open);
     try std.testing.expectEqual(original.grid_right_w, loaded.grid_right_w);

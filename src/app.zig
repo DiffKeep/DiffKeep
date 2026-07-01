@@ -266,6 +266,7 @@ fn appInit(win: *dvui.Window) !void {
             if (dk.g_grid) |*grid| {
                 grid.data_dir = g_data_dir;
                 grid.thumb_fraction = std.math.clamp(dk.g_cfg.grid_thumb_fraction, 0, 1);
+                grid.autoplay = dk.g_cfg.grid_autoplay;
                 try grid.startWorker();
             }
 
@@ -793,7 +794,10 @@ fn frame() !dvui.App.Result {
     );
 
     // Mirror remembered grid layout into the config (flushed to disk on exit).
-    if (dk.g_grid) |*grid| dk.g_cfg.grid_thumb_fraction = grid.thumb_fraction;
+    if (dk.g_grid) |*grid| {
+        dk.g_cfg.grid_thumb_fraction = grid.thumb_fraction;
+        dk.g_cfg.grid_autoplay = grid.autoplay;
+    }
     dk.g_cfg.grid_left_w = g_left_w;
     dk.g_cfg.grid_left_w_open = g_left_w_open;
     dk.g_cfg.grid_right_w = g_right_w;

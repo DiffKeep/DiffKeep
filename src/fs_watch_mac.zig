@@ -7,6 +7,7 @@
 /// Only .png files trigger events.
 const std = @import("std");
 const dispatch = std.c.dispatch;
+const media = @import("media.zig");
 const log = std.log.scoped(.fs_watch);
 
 // ── CoreFoundation / FSEvents types ──────────────────────────────────────────
@@ -377,7 +378,7 @@ fn fseventsCallback(
         if (!f.item_is_file) continue;
 
         const event_path = std.mem.span(raw_path);
-        if (!std.mem.endsWith(u8, event_path, ".png")) continue;
+        if (!media.isSupportedMediaFile(event_path)) continue;
 
         const deleted = f.item_removed or f.item_renamed;
 

@@ -5,6 +5,8 @@ const vips = @import("vips");
 const notifier_mod = @import("notifier.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const media = @import("media.zig");
+const video_player_mod = @import("video_player.zig");
 
 pub const ImageNotifier = notifier_mod.ImageNotifier;
 
@@ -23,6 +25,10 @@ pub const ImageEntry = struct {
     trashed_at: ?i64 = null,
     trash_name: ?[]const u8 = null, // heap-allocated, only set in trash view
     favorite: bool = false,
+    // Playback classification. Defaults to a plain (static) image; set from the
+    // DB via markMediaTypes. Distinguishes animated webp/gif from static ones,
+    // which extension alone cannot.
+    media_type: db_mod.VectorDb.MediaType = .image,
 };
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -80,6 +86,42 @@ const label_h: f32 = 20;
 const evict_interval_s: i64 = 5;
 const ttl_s: i64 = 45;
 const prefetch_screens: usize = 2;
+
+// ── Grid autoplay ──────────────────────────────────────────────────────────────
+// Live playback of animated/video cells in the grid (opt-in, muted). Currently
+// UNBOUNDED: every visible playable cell gets a player, created as soon as it
+// scrolls into view (no concurrency cap or per-frame open throttle). Off-screen
+// players are still evicted after a short grace so memory/threads don't grow
+// without bound as you scroll.
+// Frames decoded to fit this many px (long edge). Kept modest: animated cells are
+// decoded whole into an in-memory cache (see the vips anim decoder), so this
+// directly bounds per-clip memory, and it's only a grid preview so slight softness
+// is fine.
+const grid_player_dim = 256;
+// Keep a player alive briefly after its cell scrolls off, so scrubbing back and
+// forth doesn't thrash open/close (each close joins a decode thread).
+const player_evict_grace_frames: u64 = 30;
+// Opening a player does file I/O (avformat/vips header read) + spawns a decode
+// thread — too slow for the render thread. A small pool opens them off-thread and
+// hands the ready player back to be installed on the next frame.
+const max_player_openers = 4;
+
+/// A request to open a player for a cell, handed to an opener thread. `path_z` is
+/// heap-owned; the opener frees it after use.
+const PlayerOpenReq = struct { id: u64, path_z: [:0]u8 };
+/// An opened player handed back to the main thread (player == null on open error).
+const ReadyPlayer = struct { id: u64, player: ?*video_player_mod.VideoPlayer };
+
+/// A live player bound to one animated/video grid cell. Owns the current decoded
+/// frame (packed RGBA8) shown in place of the static thumbnail.
+const CellPlayer = struct {
+    player: *video_player_mod.VideoPlayer,
+    pixels: ?[]u8 = null,
+    width: u32 = 0,
+    height: u32 = 0,
+    tex_hash: u64 = 0,
+    last_touched: u64 = 0, // player_frame when this cell was last visible
+};
 
 // ── GridState ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +186,26 @@ pub const GridState = struct {
 
     // Called from worker after each thumbnail is ready, to wake the render loop.
     wakeup_fn: ?*const fn () void = null,
+
+    // ── Grid autoplay ─────────────────────────────────────────────────────────
+    // When enabled, visible animated/video cells play live (muted). Mirrored from
+    // config each frame by app.zig. Players are created/ticked during render and
+    // evicted when their cell scrolls off. Main-thread only.
+    autoplay: bool = false,
+    grid_players: std.AutoHashMap(u64, CellPlayer) = undefined, // main-thread only
+    player_frame: u64 = 0, // bumped once per render for touch/evict
+    // Background opener pipeline. player_queue/player_ready/player_in_flight are
+    // shared with opener threads (guarded by player_mutex); player_failed is
+    // main-thread only. The queue is rebuilt each frame from the visible cells,
+    // like the thumbnail loader's high/low queues.
+    player_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    player_cond: std.Io.Condition = std.Io.Condition.init,
+    player_queue: std.ArrayListUnmanaged(PlayerOpenReq) = .empty,
+    player_ready: std.ArrayListUnmanaged(ReadyPlayer) = .empty,
+    player_in_flight: std.AutoHashMap(u64, void) = undefined,
+    player_failed: std.AutoHashMap(u64, void) = undefined, // opens that errored; don't retry
+    player_openers: [max_player_openers]std.Thread = undefined,
+    player_opener_count: usize = 0,
 
     // UI state
     view_mode: ViewMode = .library,
@@ -212,6 +274,9 @@ pub const GridState = struct {
             .loader_db = try db.getConnection(),
             .thumbnails_in_db = thumbnails_in_db,
             .wakeup_fn = wakeup_fn,
+            .grid_players = std.AutoHashMap(u64, CellPlayer).init(allocator),
+            .player_in_flight = std.AutoHashMap(u64, void).init(allocator),
+            .player_failed = std.AutoHashMap(u64, void).init(allocator),
         };
 
         // Populate from DB synchronously so existing images appear immediately
@@ -242,6 +307,13 @@ pub const GridState = struct {
             self.workers[self.worker_count] = try std.Thread.spawn(.{}, workerFn, .{self});
             self.worker_count += 1;
         }
+        // Background player-opener pool (grid autoplay). Idle until autoplay
+        // requests opens, so it's cheap to always have running.
+        const np = @min(std.Thread.getCpuCount() catch 2, max_player_openers);
+        for (0..np) |_| {
+            self.player_openers[self.player_opener_count] = try std.Thread.spawn(.{}, playerOpenerFn, .{self});
+            self.player_opener_count += 1;
+        }
     }
 
     pub fn deinit(self: *GridState) void {
@@ -251,6 +323,25 @@ pub const GridState = struct {
         for (0..self.worker_count) |_| self.queue_cond.signal(self.io);
         self.queue_mutex.unlock(self.io);
         for (self.workers[0..self.worker_count]) |w| w.join();
+
+        // Stop the player-opener pool (they wait on player_cond).
+        self.player_mutex.lockUncancelable(self.io);
+        for (0..self.player_opener_count) |_| self.player_cond.signal(self.io);
+        self.player_mutex.unlock(self.io);
+        for (self.player_openers[0..self.player_opener_count]) |t| t.join();
+
+        // No opener threads left, so the pipeline is now ours alone to tear down.
+        // Tear down live players first (clearGridPlayersEx still reads player_failed),
+        // then the pipeline maps/lists. deinit runs at shutdown, outside any dvui
+        // frame: don't touch the texture cache (the window is already being torn down).
+        self.clearGridPlayersEx(false);
+        self.grid_players.deinit();
+        for (self.player_queue.items) |r| self.allocator.free(r.path_z);
+        self.player_queue.deinit(self.allocator);
+        for (self.player_ready.items) |rp| if (rp.player) |p| p.deinit();
+        self.player_ready.deinit(self.allocator);
+        self.player_in_flight.deinit();
+        self.player_failed.deinit();
 
         var ci = self.committed.iterator();
         while (ci.next()) |kv| self.allocator.free(kv.value_ptr.bytes);
@@ -300,6 +391,8 @@ pub const GridState = struct {
             self.allocator.free(e.path);
             if (e.trash_name) |tn| self.allocator.free(tn);
         }
+        // Live cell players reference image ids; the list is about to change.
+        self.clearGridPlayers();
         self.images.clearRetainingCapacity();
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
@@ -317,6 +410,7 @@ pub const GridState = struct {
             });
         }
         self.markFavorites(db);
+        self.markMediaTypes(db);
         self.applySortOrder();
     }
 
@@ -337,6 +431,8 @@ pub const GridState = struct {
             self.allocator.free(e.path);
             if (e.trash_name) |tn| self.allocator.free(tn);
         }
+        // Live cell players reference image ids; the list is about to change.
+        self.clearGridPlayers();
         self.images.clearRetainingCapacity();
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
@@ -393,6 +489,7 @@ pub const GridState = struct {
             });
         }
         self.markFavorites(db);
+        self.markMediaTypes(db);
         self.applySortOrder();
     }
 
@@ -411,6 +508,187 @@ pub const GridState = struct {
         set.ensureTotalCapacity(@intCast(fav_ids.len)) catch {};
         for (fav_ids) |id| set.put(id, {}) catch {};
         for (self.images.items) |*e| e.favorite = set.contains(e.id);
+    }
+
+    /// Mark the playback classification (animated / video) of loaded entries in
+    /// one query. Like markFavorites, this avoids threading a media_type column
+    /// through every grid query; the non-image set is small.
+    pub fn markMediaTypes(self: *GridState, db: *db_mod.VectorDb) void {
+        for (self.images.items) |*e| e.media_type = .image;
+        const rows = db.listNonImageMediaTypes(self.allocator) catch return;
+        defer self.allocator.free(rows);
+        if (rows.len == 0) return;
+        var map = std.AutoHashMap(u64, db_mod.VectorDb.MediaType).init(self.allocator);
+        defer map.deinit();
+        map.ensureTotalCapacity(@intCast(rows.len)) catch {};
+        for (rows) |r| map.put(r.id, r.media_type) catch {};
+        for (self.images.items) |*e| {
+            if (map.get(e.id)) |mt| e.media_type = mt;
+        }
+    }
+
+    // ── Grid autoplay players ──────────────────────────────────────────────────
+
+    /// Whether an entry is a live-playable type (animated image or video).
+    fn isPlayable(e: *const ImageEntry) bool {
+        return e.media_type == .animated or e.media_type == .video;
+    }
+
+    /// Advance the (already-open) player for a visible cell and return it so its
+    /// current frame can be drawn, or null if no player exists yet (opening, or
+    /// never requested). Never opens — that happens off-thread via requestPlayer.
+    fn drawCellPlayer(self: *GridState, id: u64, now_ns: i128) ?*CellPlayer {
+        const cp = self.grid_players.getPtr(id) orelse return null;
+        cp.last_touched = self.player_frame;
+        if (cp.player.tick(now_ns)) |frame| {
+            if (cp.pixels) |old| {
+                dvui.textureInvalidateCache(cp.tex_hash);
+                self.allocator.free(old);
+            }
+            cp.pixels = frame.pixels;
+            cp.width = frame.width;
+            cp.height = frame.height;
+            cp.tex_hash = (dvui.ImageSource{ .pixels = .{
+                .rgba = frame.pixels, .width = frame.width, .height = frame.height,
+            } }).hash();
+        }
+        return cp;
+    }
+
+    /// Queue an off-thread open for a visible playable cell that has no player yet.
+    /// No-op if the open is already in flight or previously failed. The queue is
+    /// rebuilt each frame (see syncPlayerPipeline), so only currently-visible cells
+    /// stay queued.
+    fn requestPlayer(self: *GridState, entry: *const ImageEntry) void {
+        const id = entry.id;
+        if (self.player_failed.contains(id)) return; // main-thread only; no lock
+        const path = self.diskPath(entry);
+        defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
+        const path_z = self.allocator.dupeZ(u8, path) catch return;
+
+        self.player_mutex.lockUncancelable(self.io);
+        defer self.player_mutex.unlock(self.io);
+        if (self.player_in_flight.contains(id)) { self.allocator.free(path_z); return; }
+        for (self.player_queue.items) |r| if (r.id == id) { self.allocator.free(path_z); return; };
+        self.player_queue.append(self.allocator, .{ .id = id, .path_z = path_z }) catch {
+            self.allocator.free(path_z);
+            return;
+        };
+        self.player_cond.signal(self.io);
+    }
+
+    /// Per-frame pipeline sync: drop stale open requests (visible cells re-queue
+    /// during row render) and take the players the openers finished. When
+    /// `install` is true, ready players are installed into grid_players; otherwise
+    /// (autoplay off) they're discarded. Runs on the main thread.
+    fn syncPlayerPipeline(self: *GridState, install: bool) void {
+        self.player_mutex.lockUncancelable(self.io);
+        for (self.player_queue.items) |r| self.allocator.free(r.path_z);
+        self.player_queue.clearRetainingCapacity();
+        var ready = self.player_ready; // move the finished list out from under the lock
+        self.player_ready = .empty;
+        self.player_mutex.unlock(self.io);
+        defer ready.deinit(self.allocator);
+
+        for (ready.items) |rp| {
+            const player = rp.player orelse {
+                if (install) self.player_failed.put(rp.id, {}) catch {};
+                continue;
+            };
+            if (!install) { player.deinit(); continue; }
+            const gop = self.grid_players.getOrPut(rp.id) catch { player.deinit(); continue; };
+            if (gop.found_existing) { player.deinit(); continue; } // already have one
+            gop.value_ptr.* = .{ .player = player, .last_touched = self.player_frame };
+        }
+    }
+
+    /// Free a single cell player (joins its decode thread and releases frames).
+    /// `invalidate` drops the frame's cached GPU texture — only valid mid-frame
+    /// (dvui requires an active window); the deinit path passes false since the
+    /// whole window is being torn down.
+    fn destroyCellPlayer(self: *GridState, cp: *CellPlayer, invalidate: bool) void {
+        cp.player.deinit();
+        if (cp.pixels) |p| {
+            if (invalidate) dvui.textureInvalidateCache(cp.tex_hash);
+            self.allocator.free(p);
+        }
+    }
+
+    /// Evict players whose cell hasn't been visible for `player_evict_grace_frames`.
+    /// Also returns true if any surviving player is still playing (so the render
+    /// loop keeps spinning to advance playback).
+    fn evictStaleCellPlayers(self: *GridState) bool {
+        var any_playing = false;
+        // Collect stale keys first — removing during iteration can invalidate the
+        // iterator, and (with no cap) any number may go stale in one frame. Only
+        // destroy after collecting, so a player is never freed while its map entry
+        // survives (that would be a use-after-free next frame).
+        var stale: std.ArrayListUnmanaged(u64) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.grid_players.iterator();
+        while (it.next()) |kv| {
+            const cp = kv.value_ptr;
+            if (self.player_frame - cp.last_touched > player_evict_grace_frames) {
+                // If the append fails (OOM), leave the entry: it stays alive and is
+                // retried next frame — never destroyed-but-orphaned.
+                stale.append(self.allocator, kv.key_ptr.*) catch {};
+            } else if (cp.player.isPlaying()) {
+                any_playing = true;
+            }
+        }
+        for (stale.items) |id| {
+            if (self.grid_players.getPtr(id)) |cp| self.destroyCellPlayer(cp, true);
+            _ = self.grid_players.remove(id);
+        }
+        return any_playing;
+    }
+
+    /// Tear down all grid players (autoplay turned off, view reloaded, or deinit).
+    /// `invalidate` must be false when called outside a dvui frame (deinit).
+    /// Also drops any queued (not-yet-opened) requests and the failed-open set;
+    /// in-flight opens still complete but their players are discarded on the next
+    /// syncPlayerPipeline. (deinit clears the queue itself after joining openers.)
+    fn clearGridPlayersEx(self: *GridState, invalidate: bool) void {
+        var it = self.grid_players.iterator();
+        while (it.next()) |kv| self.destroyCellPlayer(kv.value_ptr, invalidate);
+        self.grid_players.clearRetainingCapacity();
+        self.player_failed.clearRetainingCapacity();
+    }
+
+    /// Tear down all grid players from within a frame (autoplay off / view reload).
+    pub fn clearGridPlayers(self: *GridState) void {
+        self.clearGridPlayersEx(true);
+    }
+
+    /// Background opener: pops a request, opens the player (file I/O + decode
+    /// thread spawn — the work we keep off the render thread), and hands it back.
+    fn playerOpenerFn(self: *GridState) void {
+        while (true) {
+            self.player_mutex.lockUncancelable(self.io);
+            while (self.player_queue.items.len == 0 and !self.stop.load(.acquire))
+                self.player_cond.waitUncancelable(self.io, &self.player_mutex);
+            if (self.stop.load(.acquire)) { self.player_mutex.unlock(self.io); break; }
+            const req = self.player_queue.orderedRemove(0);
+            self.player_in_flight.put(req.id, {}) catch {};
+            self.player_mutex.unlock(self.io);
+
+            const player = video_player_mod.VideoPlayer.init(self.allocator, self.io, req.path_z, .{
+                .wakeup_fn = self.wakeup_fn,
+                .audio = false,
+                .max_dim = grid_player_dim,
+            }) catch null;
+            self.allocator.free(req.path_z);
+
+            self.player_mutex.lockUncancelable(self.io);
+            _ = self.player_in_flight.remove(req.id);
+            self.player_ready.append(self.allocator, .{ .id = req.id, .player = player }) catch {
+                self.player_mutex.unlock(self.io);
+                if (player) |p| p.deinit(); // couldn't hand it back; don't leak
+                continue;
+            };
+            self.player_mutex.unlock(self.io);
+            if (self.wakeup_fn) |w| w();
+        }
     }
 
     /// True if `path` names a file directly or transitively inside `root`.
@@ -945,6 +1223,17 @@ pub const GridState = struct {
             sp.deinit();
         }
 
+        // Grid autoplay bookkeeping: bump the frame counter (used to evict players
+        // whose cell has scrolled off), install players the openers finished, and
+        // drop stale open requests. renderItem ticks/requests the visible cells.
+        if (self.autoplay) {
+            self.player_frame +%= 1;
+            self.syncPlayerPipeline(true);
+        } else {
+            if (self.grid_players.count() > 0) self.clearGridPlayers(); // just turned off
+            self.syncPlayerPipeline(false); // discard any in-flight opens that land
+        }
+
         // Visible rows
         for (first_row..last_row) |row| {
             var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -958,6 +1247,12 @@ pub const GridState = struct {
                 const focused = if (self.focused_idx) |fi| fi == idx else false;
                 self.renderItem(idx, ts, h_margin, focused, grid_id);
             }
+        }
+
+        // Evict players whose cell scrolled off; keep the loop spinning while any
+        // survivor is still playing so playback advances without further input.
+        if (self.autoplay) {
+            if (self.evictStaleCellPlayers()) dvui.refresh(null, @src(), null);
         }
 
         // Bottom spacer (same max_size_content override as the top spacer).
@@ -1078,7 +1373,41 @@ pub const GridState = struct {
             img_rs = img_area.data().contentRectScale();
             defer img_area.deinit();
 
-            if (self.committed.get(entry.id)) |ce| {
+            // Autoplay: if this cell is a playable type with a live frame, draw it
+            // in place of the static poster. If no player is open yet, request one
+            // (opened off-thread) and fall back to the poster until it's ready.
+            var drew_live = false;
+            if (self.autoplay and isPlayable(&entry)) {
+                const now_ns = std.Io.Clock.real.now(self.io).nanoseconds;
+                if (self.drawCellPlayer(entry.id, now_ns)) |cp| {
+                    if (cp.pixels) |px| {
+                        const fw: f32 = @floatFromInt(cp.width);
+                        const fh: f32 = @floatFromInt(cp.height);
+                        const scale = @min(ts / fw, ts / fh);
+                        const rw = fw * scale;
+                        const rh = fh * scale;
+                        const mx = (ts - rw) / 2.0;
+                        const my = (ts - rh) / 2.0;
+                        _ = dvui.image(@src(), .{
+                            // Pointer-keyed: each frame is a fresh buffer, and the
+                            // previous frame's texture is invalidated on swap (see
+                            // drawCellPlayer), so exactly one texture lives per cell.
+                            .source = .{ .pixels = .{
+                                .rgba = px, .width = cp.width, .height = cp.height, .invalidation = .ptr,
+                            } },
+                        }, .{
+                            .id_extra = idx,
+                            .min_size_content = .{ .w = rw, .h = rh },
+                            .margin = .{ .x = mx, .y = my, .w = mx, .h = my },
+                        });
+                        drew_live = true;
+                    }
+                } else {
+                    self.requestPlayer(&entry);
+                }
+            }
+
+            if (!drew_live) if (self.committed.get(entry.id)) |ce| {
                 // Scale to fit ts×ts while preserving aspect ratio, then center with margin.
                 // Using explicit margin avoids DVUI layout bugs caused by gravity_y=0.5
                 // triggering child_positioned mode in the vertical BoxWidget.
@@ -1099,7 +1428,7 @@ pub const GridState = struct {
                     .min_size_content = .{ .w = rw, .h = rh },
                     .margin = .{ .x = mx, .y = my, .w = mx, .h = my },
                 });
-            }
+            };
 
             if (show_star) {
                 var bw: dvui.ButtonWidget = undefined;
@@ -1245,6 +1574,11 @@ pub const GridState = struct {
     }
 };
 
+/// Whether a path is a video DiffKeep indexes (poster thumbnail stored in DB).
+pub fn isVideoPath(path: []const u8) bool {
+    return media.isVideoFile(path);
+}
+
 // ── Sort comparators ──────────────────────────────────────────────────────────
 
 fn imageDateLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
@@ -1294,16 +1628,18 @@ fn workerFn(state: *GridState) void {
         }
         defer state.allocator.free(req.path);
 
-        // Try DB first when thumbnails are stored there (serialized: single shared connection)
+        // Video posters live in the DB (libvips can't open mp4/webm); for those,
+        // always read the stored blob. Otherwise use the DB only when configured.
+        const is_video = isVideoPath(req.path);
         var bytes: ?[]u8 = null;
-        if (state.thumbnails_in_db) {
+        if (state.thumbnails_in_db or is_video) {
             state.loader_db_mutex.lockUncancelable(state.io);
             bytes = state.loader_db.getThumbnailBytes(state.allocator, req.id) catch null;
             state.loader_db_mutex.unlock(state.io);
         }
 
-        // Fall back to on-the-fly VIPS generation
-        if (bytes == null) {
+        // Fall back to on-the-fly VIPS generation (images only).
+        if (bytes == null and !is_video) {
             const path_z = state.allocator.dupeZ(u8, req.path) catch continue;
             defer state.allocator.free(path_z);
             bytes = vips.thumbnailToJpeg(state.allocator, path_z, @as(c_int, @intFromFloat(thumb_size_max))) catch |err| blk: {

@@ -5,7 +5,35 @@ const comfy_mod = @import("parse/comfy.zig");
 const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
 const onnx_mod = @import("onnx_embedder.zig");
+const video = @import("video");
+const vips = @import("vips");
+const media = @import("media.zig");
 const log = std.log.scoped(.scan);
+
+/// Gather ComfyUI metadata sections from a non-PNG image's raw bytes. ComfyUI's
+/// WebP saver embeds the workflow JSON (prefixed "workflow:") and prompt JSON
+/// (prefixed "prompt:") as ASCII in EXIF. We scan the file buffer for those
+/// markers and brace-match the JSON object out — reading via libexif instead
+/// would truncate these long values. `aa` is an arena; the JSON slices point
+/// into `buffer` and are duped into it. ComfyUI writes each marker exactly once.
+fn gatherEmbeddedSections(
+    aa: std.mem.Allocator,
+    buffer: []const u8,
+    sections: *std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection),
+) void {
+    const markers = [_]struct { marker: []const u8, keyword: []const u8 }{
+        .{ .marker = "workflow:{", .keyword = "workflow" },
+        .{ .marker = "prompt:{", .keyword = "prompt" },
+    };
+    for (markers) |m| {
+        const at = std.mem.indexOf(u8, buffer, m.marker) orelse continue;
+        // The marker ends with '{', so the JSON object begins at that brace.
+        const json = comfy_mod.extractJsonObject(buffer[at + m.marker.len - 1 ..]) orelse continue;
+        const kw = aa.dupe(u8, m.keyword) catch continue;
+        const tx = aa.dupe(u8, json) catch continue;
+        sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+    }
+}
 
 /// Join a slice of lora names into a single newline-separated string.
 fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]const u8 {
@@ -308,7 +336,7 @@ pub const LibraryScanner = struct {
                 continue;
             }
 
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".png")) {
+            if (entry.kind != .file or !media.isSupportedMediaFile(entry.name)) {
                 self.allocator.free(full_path);
                 continue;
             }
@@ -465,6 +493,93 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
     return did_work;
 }
 
+/// gif/webp can be animated; persist media_type accordingly. Gated on those two
+/// extensions so it never loads the (many) PNG/JPEG files — only the handful of
+/// gif/webp pay the cheap header read. Idempotent, so it also repairs the
+/// media_type of already-indexed animated images on a later rescan.
+fn classifyAnimatedImage(ctx: ScanCtx, image_id: u64) void {
+    if (!media.isAnimatableImage(ctx.path)) return;
+    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch return;
+    defer ctx.allocator.free(path_z);
+    const pages = vips.nPages(path_z) catch return;
+    ctx.db.setMediaType(image_id, if (pages > 1) .animated else .image) catch {};
+}
+
+/// Process a video file: poster-frame thumbnail (always stored in the DB so the
+/// grid loader can read it — libvips can't open video) + ComfyUI metadata from
+/// the container's format tags. `aa` is the per-file arena.
+fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.mem.Allocator, is_new: bool) void {
+    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch return;
+    defer ctx.allocator.free(path_z);
+
+    // Poster frame → JPEG, stored on the image row.
+    if (video.firstFrameRgba(aa, path_z)) |frame| {
+        if (vips.rgbaToJpeg(ctx.allocator, frame.pixels, frame.width, frame.height, 320)) |jpeg| {
+            if (image.thumbnail) |t| ctx.allocator.free(t);
+            image.thumbnail = jpeg;
+        } else |err| log.warn("video thumb encode {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+    } else |err| log.warn("video decode {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+
+    // Metadata: ComfyUI stores the same workflow/prompt JSON as mp4 format tags.
+    var sections: std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection) = .empty;
+    if (video.readTag(aa, path_z, "workflow") catch null) |w|
+        sections.append(aa, .{ .keyword = "workflow", .text = w }) catch {};
+    if (video.readTag(aa, path_z, "prompt") catch null) |p|
+        sections.append(aa, .{ .keyword = "prompt", .text = p }) catch {};
+
+    var parser = comfy_mod.ComfyParser.init(aa);
+    if (parser.parseImageMetadata(sections.items) catch null) |res| {
+        var result = res;
+        defer result.deinit(aa);
+        if (image.positivePromptText) |p| ctx.allocator.free(p);
+        image.positivePromptText = if (result.positive_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
+        if (image.negativePromptText) |p| ctx.allocator.free(p);
+        image.negativePromptText = if (result.negative_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
+        if (image.model) |m| ctx.allocator.free(m);
+        image.model = if (result.model) |m| ctx.allocator.dupe(u8, m) catch null else null;
+        if (image.sampler) |s| ctx.allocator.free(s);
+        image.sampler = if (result.sampler) |s| ctx.allocator.dupe(u8, s) catch null else null;
+        if (image.scheduler) |s| ctx.allocator.free(s);
+        image.scheduler = if (result.scheduler) |s| ctx.allocator.dupe(u8, s) catch null else null;
+        image.cfg = result.cfg;
+        image.steps = result.steps;
+        image.seed = result.seed;
+        if (image.loras) |l| ctx.allocator.free(l);
+        image.loras = lorasToString(ctx.allocator, result.loras);
+    }
+
+    // Hash the file bytes for duplicate detection.
+    if (std.Io.Dir.cwd().openFile(ctx.io, ctx.path, .{})) |file| {
+        defer file.close(ctx.io);
+        if (file.length(ctx.io)) |size| {
+            if (aa.alloc(u8, size)) |buffer| {
+                if (file.readPositionalAll(ctx.io, buffer, 0)) |_| {
+                    var hasher = std.crypto.hash.Blake3.init(.{});
+                    hasher.update(buffer);
+                    var digest: [32]u8 = undefined;
+                    hasher.final(&digest);
+                    const hash_hex = std.fmt.bytesToHex(digest, .lower);
+                    if (image.hash) |h| ctx.allocator.free(h);
+                    image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    image.mtime = current_mtime;
+    ctx.db.saveImage(image) catch |err| {
+        log.warn("save video {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        return;
+    };
+    ctx.db.setMediaType(image.id, .video) catch |err|
+        log.warn("setMediaType {d}: {}", .{ image.id, err });
+
+    if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
+    else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
+    if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
+    log.debug("processed video {s}", .{std.fs.path.basename(ctx.path)});
+}
+
 pub fn processFile(ctx: ScanCtx) void {
     defer ctx.allocator.free(ctx.path);
     defer _ = ctx.files_scanned.fetchAdd(1, .acq_rel);
@@ -487,6 +602,9 @@ pub fn processFile(ctx: ScanCtx) void {
     if (image.mtime) |stored| {
         if (stored == current_mtime) {
             // File content unchanged. Fill in any data now wanted but missing.
+            // (Re)classify gif/webp so animated images indexed before media_type
+            // existed get repaired on a normal rescan.
+            classifyAnimatedImage(ctx, image.id);
             var did_work = false;
             if (ctx.thumbnails_in_db and image.thumbnail == null) {
                 image.generate_thumbnail(ctx.io, ctx.allocator, ctx.path) catch |err| {
@@ -536,6 +654,15 @@ pub fn processFile(ctx: ScanCtx) void {
         if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
     }
 
+    // Video files take a separate path: libav* for the poster frame + metadata.
+    if (media.isVideoFile(ctx.path)) {
+        processVideo(ctx, &image, current_mtime, aa, is_new);
+        return;
+    }
+
+    // Classify gif/webp as static vs animated (before any metadata early-returns).
+    classifyAnimatedImage(ctx, image.id);
+
     // Read file into arena buffer.
     var file = std.Io.Dir.cwd().openFile(ctx.io, ctx.path, .{}) catch return;
     defer file.close(ctx.io);
@@ -544,43 +671,48 @@ pub fn processFile(ctx: ScanCtx) void {
     const buffer = aa.alloc(u8, file_size) catch return;
     _ = file.readPositionalAll(ctx.io, buffer, 0) catch return;
 
-    // Parse PNG metadata.
-    var png_parser = png_mod.PngParser.init(aa, ctx.io) catch return;
-    defer png_parser.deinit();
-    png_parser.parseBuffer(buffer) catch |err| {
-        log.warn("parse failed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-        image.mtime = current_mtime;
-        ctx.db.saveImage(&image) catch {};
-        _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
-        return;
-    };
-
-    // Gather all readable text sections (keyword + text), preserving file order
-    // so the shared selector can pick the first of each kind.  iTXt is collected
-    // before tEXt to match prior behaviour (an iTXt "parameters" wins over tEXt).
+    // Gather metadata "sections" (keyword + text) for the shared ComfyUI/A1111
+    // parser. ComfyUI PNGs carry the workflow/prompt JSON in tEXt/iTXt chunks;
+    // other formats (notably ComfyUI WebP) carry the same JSON in EXIF.
     var sections: std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection) = .empty;
-    {
-        const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
-        defer aa.free(itxt);
-        for (itxt) |chunk| {
-            var content = png_parser.parseITxtChunk(chunk) catch continue;
-            defer content.deinit(aa);
-            if (content.compressed) continue;
-            const kw = aa.dupe(u8, content.keyword) catch continue;
-            const tx = aa.dupe(u8, content.text) catch continue;
-            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+    if (std.ascii.endsWithIgnoreCase(ctx.path, ".png")) {
+        var png_parser = png_mod.PngParser.init(aa, ctx.io) catch return;
+        defer png_parser.deinit();
+        png_parser.parseBuffer(buffer) catch |err| {
+            log.warn("parse failed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+            image.mtime = current_mtime;
+            ctx.db.saveImage(&image) catch {};
+            _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
+            return;
+        };
+
+        // Preserve file order so the shared selector can pick the first of each
+        // kind. iTXt is collected before tEXt (an iTXt "parameters" wins over tEXt).
+        {
+            const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
+            defer aa.free(itxt);
+            for (itxt) |chunk| {
+                var content = png_parser.parseITxtChunk(chunk) catch continue;
+                defer content.deinit(aa);
+                if (content.compressed) continue;
+                const kw = aa.dupe(u8, content.keyword) catch continue;
+                const tx = aa.dupe(u8, content.text) catch continue;
+                sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+            }
         }
-    }
-    {
-        const text_chunks = png_parser.getTExtChunks() catch return;
-        defer aa.free(text_chunks);
-        for (text_chunks) |chunk| {
-            var content = png_parser.parseTExtChunk(chunk) catch continue;
-            defer content.deinit(aa);
-            const kw = aa.dupe(u8, content.keyword) catch continue;
-            const tx = aa.dupe(u8, content.text) catch continue;
-            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+        {
+            const text_chunks = png_parser.getTExtChunks() catch return;
+            defer aa.free(text_chunks);
+            for (text_chunks) |chunk| {
+                var content = png_parser.parseTExtChunk(chunk) catch continue;
+                defer content.deinit(aa);
+                const kw = aa.dupe(u8, content.keyword) catch continue;
+                const tx = aa.dupe(u8, content.text) catch continue;
+                sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+            }
         }
+    } else {
+        gatherEmbeddedSections(aa, buffer, &sections);
     }
 
     var parser = comfy_mod.ComfyParser.init(aa);

@@ -9,6 +9,7 @@
 /// directly without a full library rescan.
 const std = @import("std");
 const linux = std.os.linux;
+const media = @import("media.zig");
 const log = std.log.scoped(.fs_watch);
 
 /// Events that indicate a file is ready to read (fully written).
@@ -253,9 +254,9 @@ fn watcherFn(self: *FsWatcher) void {
                     continue; // directory events don't need further processing
                 }
 
-                // Only process named, non-directory events for .png files.
+                // Only process named, non-directory events for supported media.
                 const filename = name orelse continue;
-                if (!std.mem.endsWith(u8, filename, ".png")) continue;
+                if (!media.isSupportedMediaFile(filename)) continue;
 
                 const deleted = mask & MASK_DELETE != 0;
 

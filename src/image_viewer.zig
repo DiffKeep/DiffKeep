@@ -1,6 +1,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const image_grid_mod = @import("image_grid.zig");
+const video_player_mod = @import("video_player.zig");
 const db_mod = @import("db.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const config_mod = @import("config.zig");
@@ -34,6 +35,9 @@ pub const ViewerState = struct {
     image_width: u32 = 0,
     image_height: u32 = 0,
     image_texture_hash: u64 = 0,
+    // Video playback (active only while the current entry is a video).
+    video_player: ?*video_player_mod.VideoPlayer = null,
+    video_player_idx: usize = 0,
 
     // Prefetch cache.  cache_mutex protects both cache_slots and cache_threads.
     // Thread handles are managed only by the main thread.
@@ -153,6 +157,8 @@ pub const ViewerState = struct {
     }
 
     pub fn deinit(self: *ViewerState) void {
+        // Stop the video decode thread first (joins it).
+        self.teardownVideo();
         // Mark all slots inactive so in-flight threads will discard their results.
         // Collect thread handles while holding the lock, then join without it.
         var threads: [cache_size]?std.Thread = undefined;
@@ -307,6 +313,8 @@ pub const ViewerState = struct {
 
     pub fn navigateTo(self: *ViewerState, idx: usize) void {
         if (self.images.items.len == 0) return;
+        // Stop any current video; updateVideo() will start the new one if needed.
+        self.teardownVideo();
         self.current_idx = @min(idx, self.images.items.len - 1);
         if (self.image_pixels) |p| {
             dvui.textureInvalidateCache(self.image_texture_hash);
@@ -401,8 +409,15 @@ pub const ViewerState = struct {
 
     pub fn render(self: *ViewerState) void {
         self.captureWindowState();
-        self.drainCache();
-        self.updateCache();
+        // Videos and animated images play through the media player; static
+        // images use the prefetch cache.
+        if (self.currentIsPlayable()) {
+            self.updateVideo();
+        } else {
+            self.teardownVideo();
+            self.drainCache();
+            self.updateCache();
+        }
         self.handleKeyEvents();
         if (self.delete_confirm_open) self.renderDeleteConfirmDialog();
 
@@ -420,6 +435,57 @@ pub const ViewerState = struct {
             self.renderInfoHandle();
             self.renderInfoPane();
         }
+    }
+
+    /// Whether the current entry plays through the media player: a real video
+    /// (mp4/webm) or an animated image (gif/animated webp). Static images —
+    /// including single-frame webp/gif — use the static prefetch cache. The DB
+    /// media_type is authoritative; extension alone can't tell an animated webp
+    /// from a static one.
+    pub fn currentIsPlayable(self: *const ViewerState) bool {
+        const cur = self.currentImage() orelse return false;
+        return cur.media_type == .video or cur.media_type == .animated;
+    }
+
+    fn teardownVideo(self: *ViewerState) void {
+        if (self.video_player) |p| {
+            p.deinit();
+            self.video_player = null;
+        }
+    }
+
+    /// Drive video playback for the current entry: (re)create the player when the
+    /// view moves to a new video, then promote the next due frame into the texture.
+    fn updateVideo(self: *ViewerState) void {
+        const cur = self.currentImage() orelse return;
+
+        if (self.video_player == null or self.video_player_idx != self.current_idx) {
+            self.teardownVideo();
+            const path_z = self.diskPathZ(cur) catch return;
+            defer self.gpa.free(path_z);
+            self.video_player = video_player_mod.VideoPlayer.init(self.gpa, self.io, path_z, .{ .wakeup_fn = self.wakeup_fn }) catch null;
+            self.video_player_idx = self.current_idx;
+        }
+
+        const player = self.video_player orelse return;
+        const now: i128 = std.Io.Clock.real.now(self.io).nanoseconds;
+        if (player.tick(now)) |frame| {
+            if (self.image_pixels) |old| {
+                dvui.textureInvalidateCache(self.image_texture_hash);
+                self.gpa.free(old);
+            }
+            self.image_pixels = frame.pixels;
+            self.image_width = frame.width;
+            self.image_height = frame.height;
+            const src = dvui.ImageSource{ .pixels = .{
+                .rgba = frame.pixels,
+                .width = frame.width,
+                .height = frame.height,
+            } };
+            self.image_texture_hash = src.hash();
+        }
+        // Keep the render loop spinning so playback advances without input.
+        if (player.isPlaying()) dvui.refresh(null, @src(), null);
     }
 
     fn handleKeyEvents(self: *ViewerState) void {
@@ -574,10 +640,71 @@ pub const ViewerState = struct {
         else filename;
 
         dvui.label(@src(), "{s}", .{label_str}, .{
-            .expand = .horizontal,
             .gravity_y = 0.5,
             .padding = .{ .x = 8, .y = 0 },
         });
+
+        // Centered playback controls (flanked by expanding spacers).
+        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+        if (self.video_player) |p| {
+            var pb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+            defer pb.deinit();
+
+            if (iconButton(i18n.t(.viewer_step_back), icons.tvg.lucide.@"step-back", 14)) p.stepBackward();
+
+            const playing = p.isPlaying();
+            const ic = if (playing) icons.tvg.lucide.pause else icons.tvg.lucide.play;
+            const lbl = if (playing) i18n.t(.viewer_pause) else i18n.t(.viewer_play);
+            if (iconButton(lbl, ic, 13)) p.togglePlay();
+
+            if (iconButton(i18n.t(.viewer_step_forward), icons.tvg.lucide.@"step-forward", 15)) p.stepForward();
+
+            // Scrubber.
+            const dur = p.duration();
+            const pos = p.position();
+            var frac: f32 = if (dur > 0)
+                std.math.clamp(@as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(dur)), 0, 1)
+            else
+                0;
+            if (dvui.slider(@src(), .{ .fraction = &frac }, .{
+                .min_size_content = .{ .w = 220, .h = 14 },
+                .gravity_y = 0.5,
+                .margin = .{ .x = 8, .w = 8 },
+            })) {
+                if (dur > 0) p.requestSeek(@intFromFloat(@as(f64, @floatCast(frac)) * @as(f64, @floatFromInt(dur))));
+            }
+
+            var tbuf: [32]u8 = undefined;
+            const tstr = std.fmt.bufPrint(&tbuf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
+                @divTrunc(pos, 60000), @mod(@divTrunc(pos, 1000), 60),
+                @divTrunc(dur, 60000), @mod(@divTrunc(dur, 1000), 60),
+            }) catch "";
+            dvui.label(@src(), "{s}", .{tstr}, .{ .gravity_y = 0.5, .padding = .{ .x = 8 } });
+
+            // Volume / mute — disabled (greyed, inert) when there's no audio.
+            if (p.hasAudio()) {
+                const muted = p.isMuted();
+                const vic = if (muted) icons.tvg.lucide.@"volume-x" else icons.tvg.lucide.@"volume-2";
+                const vlbl = if (muted) i18n.t(.viewer_unmute) else i18n.t(.viewer_mute);
+                if (iconButton(vlbl, vic, 16)) p.toggleMute();
+                var vol: f32 = std.math.clamp(p.volumeLevel(), 0, 1);
+                if (dvui.slider(@src(), .{ .fraction = &vol }, .{
+                    .min_size_content = .{ .w = 70, .h = 14 },
+                    .gravity_y = 0.5,
+                    .margin = .{ .x = 4 },
+                })) {
+                    p.setVolume(vol);
+                }
+            } else {
+                dvui.icon(@src(), "no-audio", icons.tvg.lucide.@"volume-x", .{}, .{
+                    .min_size_content = .{ .w = 22, .h = 22 },
+                    .gravity_y = 0.5,
+                    .padding = .all(4),
+                    .color_text = dvui.themeGet().border,
+                });
+            }
+        }
+        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
 
         if (self.image_width > 0) {
             var zoom_buf: [16]u8 = undefined;

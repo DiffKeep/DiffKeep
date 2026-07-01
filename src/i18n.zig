@@ -17,6 +17,12 @@ pub const Strings = struct {
     favorites_empty: [:0]const u8,
     sidebar_favorites: [:0]const u8,
     viewer_favorite: [:0]const u8,
+    viewer_play: [:0]const u8,
+    viewer_pause: [:0]const u8,
+    viewer_step_back: [:0]const u8,
+    viewer_step_forward: [:0]const u8,
+    viewer_mute: [:0]const u8,
+    viewer_unmute: [:0]const u8,
 
     search_placeholder: [:0]const u8,
     search_no_results: [:0]const u8,
@@ -55,6 +61,8 @@ pub const Strings = struct {
     settings_database_section: [:0]const u8,
     settings_data_path: [:0]const u8,
     settings_data_path_default: [:0]const u8,
+    detail_format: [:0]const u8,
+    detail_resource_type: [:0]const u8,
     settings_data_path_placeholder: [:0]const u8,
     settings_data_path_warning: [:0]const u8,
     settings_db_no_database: [:0]const u8,
@@ -111,6 +119,8 @@ pub const Strings = struct {
     toolbar_sort_ascending: [:0]const u8,
     toolbar_sort_descending: [:0]const u8,
     toolbar_reshuffle: [:0]const u8,
+    toolbar_autoplay_on: [:0]const u8,
+    toolbar_autoplay_off: [:0]const u8,
 
     context_view_image: [:0]const u8,
 
@@ -169,6 +179,12 @@ pub const en: Strings = .{
     .favorites_empty = "No favorites yet.",
     .sidebar_favorites = "Favorites",
     .viewer_favorite = "Favorite",
+    .viewer_play = "Play",
+    .viewer_pause = "Pause",
+    .viewer_step_back = "Previous frame",
+    .viewer_step_forward = "Next frame",
+    .viewer_mute = "Mute",
+    .viewer_unmute = "Unmute",
 
     .search_placeholder = "Search prompts\u{2026}",
     .search_no_results = "No results.",
@@ -207,6 +223,8 @@ pub const en: Strings = .{
     .settings_database_section = "Database",
     .settings_data_path = "Data path",
     .settings_data_path_default = "(default XDG data directory)",
+    .detail_format = "Format",
+    .detail_resource_type = "Type",
     .settings_data_path_placeholder = "Leave empty for the default XDG data directory",
     .settings_data_path_warning = "Changing the data path takes effect after restart. DiffKeep will use the new location; your existing data is left untouched at the old path.",
     .settings_db_no_database = "(no database)",
@@ -263,6 +281,8 @@ pub const en: Strings = .{
     .toolbar_sort_ascending = "Ascending",
     .toolbar_sort_descending = "Descending",
     .toolbar_reshuffle = "Re-randomize order",
+    .toolbar_autoplay_on = "Autoplay on — click to stop grid animation",
+    .toolbar_autoplay_off = "Autoplay off — click to animate grid",
 
     .context_view_image = "View Image",
 

@@ -61,6 +61,58 @@ void diffkeep_vips_free(void *buf) {
     g_free(buf);
 }
 
+int diffkeep_image_n_pages(const char *filename) {
+    VipsImage *im = vips_image_new_from_file(filename, NULL);
+    if (!im) return -1;
+    int n = 1;
+    if (vips_image_get_typeof(im, "n-pages") != 0)
+        vips_image_get_int(im, "n-pages", &n);
+    g_object_unref(im);
+    return n;
+}
+
+int diffkeep_rgba_to_jpeg(
+    const void *rgba,
+    int width,
+    int height,
+    int max_size,
+    void **buf,
+    size_t *len
+) {
+    /* Copy the pixels into a vips image (so the caller's buffer needn't outlive
+       this call), downscale to fit max_size, flatten alpha, encode JPEG. */
+    VipsImage *img = vips_image_new_from_memory_copy(
+        rgba, (size_t)width * (size_t)height * 4, width, height, 4, VIPS_FORMAT_UCHAR);
+    if (!img) return -1;
+
+    VipsImage *thumb = NULL;
+    if (vips_thumbnail_image(img, &thumb, max_size,
+            "height", max_size,
+            "size", VIPS_SIZE_DOWN,
+            NULL) != 0) {
+        g_object_unref(img);
+        return -1;
+    }
+    g_object_unref(img);
+
+    if (vips_image_hasalpha(thumb)) {
+        VipsImage *flat = NULL;
+        if (vips_flatten(thumb, &flat, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = flat;
+    }
+
+    if (vips_image_write_to_buffer(thumb, ".jpg[Q=85,strip]", buf, len, NULL) != 0) {
+        g_object_unref(thumb);
+        return -1;
+    }
+    g_object_unref(thumb);
+    return 0;
+}
+
 int diffkeep_image_to_rgb_square(
     const char *filename,
     int size,
@@ -104,6 +156,227 @@ int diffkeep_image_to_rgb_square(
 
     *buf = pixels;
     *len = out_len;
+    return 0;
+}
+
+/* ── Animated-image decoder ───────────────────────────────────────────────── */
+
+/* Two modes. CACHED: the whole (downscaled) animation is decoded once into a
+   single RGBA buffer at open time; each frame is then a cheap memcpy and looping
+   is free — this is what makes many grid cells affordable, since per-frame libwebp
+   decode is ~9ms. STREAM: no cache, pages decoded on demand from a live vips
+   "toilet-roll" image (reopened on backward seek) — used when the decoded
+   animation would exceed the cache budget (e.g. the viewer at native resolution,
+   or a very long clip). Cached mode is chosen when width*height*n_pages*4 fits. */
+#define DIFFKEEP_ANIM_CACHE_MAX_BYTES (96u * 1024u * 1024u)
+
+struct DiffkeepAnimDecoder {
+    /* Cached mode (pixels != NULL): the whole roll, width*page_height*n_pages*4. */
+    unsigned char *pixels;
+    /* Stream mode (pixels == NULL): live toilet-roll + reopen info. */
+    VipsImage *roll;
+    char *filename;
+    int max_dim;       /* downscale long edge to this if > 0; 0 = native */
+
+    int width;
+    int page_height;
+    int n_pages;
+    long *pts_ms;      /* pts_ms[k] = start time of page k (cumulative delay) */
+    long duration_ms;  /* total = sum of all per-frame delays */
+    int cur;           /* index of the next page diffkeep_anim_next emits */
+};
+
+/* Scale (sw,sh) to fit max_dim on the long edge (never upscales). */
+static void anim_fit_dims(int sw, int sh, int max_dim, int *dw, int *dh) {
+    if (max_dim <= 0 || (sw <= max_dim && sh <= max_dim)) { *dw = sw; *dh = sh; return; }
+    double scale = (sw >= sh) ? (double)max_dim / sw : (double)max_dim / sh;
+    int w = (int)(sw * scale + 0.5), h = (int)(sh * scale + 0.5);
+    *dw = w < 1 ? 1 : w;
+    *dh = h < 1 ? 1 : h;
+}
+
+/* Open a fresh sequential toilet-roll (all pages). */
+static VipsImage *anim_open_roll_file(const char *filename) {
+    return vips_image_new_from_file(filename, "access", VIPS_ACCESS_SEQUENTIAL, "n", -1, NULL);
+}
+
+DiffkeepAnimDecoder *diffkeep_anim_open(const char *filename, int max_dim) {
+    DiffkeepAnimDecoder *d = g_new0(DiffkeepAnimDecoder, 1);
+    d->filename = g_strdup(filename);
+    d->max_dim = max_dim;
+
+    VipsImage *src = anim_open_roll_file(filename);
+    if (!src) { diffkeep_anim_close(d); return NULL; }
+
+    d->n_pages = vips_image_get_n_pages(src);
+    if (d->n_pages <= 1) { g_object_unref(src); diffkeep_anim_close(d); return NULL; }
+    int src_ph = vips_image_get_page_height(src);
+    int src_w = vips_image_get_width(src);
+    if (src_ph <= 0 || src_w <= 0) { g_object_unref(src); diffkeep_anim_close(d); return NULL; }
+
+    /* Per-frame delays (ms). Fall back to 100ms/frame if the metadata is absent
+       or malformed — the common case for GIFs that omit an explicit delay. */
+    int *delays = NULL, n_delays = 0;
+    int have_delays = (vips_image_get_typeof(src, "delay") != 0 &&
+                       vips_image_get_array_int(src, "delay", &delays, &n_delays) == 0);
+    d->pts_ms = g_new0(long, d->n_pages);
+    long acc = 0;
+    for (int k = 0; k < d->n_pages; k++) {
+        d->pts_ms[k] = acc;
+        int delay = (have_delays && k < n_delays && delays[k] > 0) ? delays[k] : 100;
+        acc += delay;
+    }
+    d->duration_ms = acc;
+
+    /* Decide cached vs stream from the projected decoded size at the target size. */
+    int tw, th;
+    anim_fit_dims(src_w, src_ph, max_dim, &tw, &th);
+    size_t frame_bytes = (size_t)tw * (size_t)th * 4;
+    int use_cache = frame_bytes > 0 &&
+        frame_bytes * (size_t)d->n_pages <= DIFFKEEP_ANIM_CACHE_MAX_BYTES;
+
+    if (!use_cache) {
+        /* Stream mode: keep the live roll; per-page decode happens in _next. */
+        d->roll = src;
+        d->width = src_w;
+        d->page_height = src_ph;
+        return d;
+    }
+
+    /* Cached mode. Produce the (optionally downscaled) roll, then decode it whole.
+       For downscaling use vips_thumbnail with "[n=-1]" so page geometry stays
+       correct across the resize (the same path vips uses for animated thumbnails). */
+    VipsImage *roll = NULL;
+    if (max_dim > 0 && (src_w > max_dim || src_ph > max_dim)) {
+        char *fn = g_strdup_printf("%s[n=-1]", filename);
+        int rc = vips_thumbnail(fn, &roll, max_dim, "height", max_dim, "size", VIPS_SIZE_DOWN, NULL);
+        g_free(fn);
+        g_object_unref(src);
+        src = NULL;
+        if (rc != 0) { diffkeep_anim_close(d); return NULL; }
+    } else {
+        roll = src;
+        src = NULL;
+    }
+
+    if (!vips_image_hasalpha(roll)) {
+        VipsImage *rgba = NULL;
+        if (vips_addalpha(roll, &rgba, NULL) != 0) { g_object_unref(roll); diffkeep_anim_close(d); return NULL; }
+        g_object_unref(roll);
+        roll = rgba;
+    }
+
+    d->width = vips_image_get_width(roll);
+    d->page_height = vips_image_get_page_height(roll);
+    int rn = vips_image_get_n_pages(roll);
+    if (rn > 0 && rn < d->n_pages) d->n_pages = rn;
+    if (d->width <= 0 || d->page_height <= 0) { g_object_unref(roll); diffkeep_anim_close(d); return NULL; }
+
+    size_t len = 0;
+    void *px = vips_image_write_to_memory(roll, &len);
+    g_object_unref(roll);
+    if (!px) { diffkeep_anim_close(d); return NULL; }
+    d->pixels = (unsigned char *)px;
+
+    /* Trust the buffer size over metadata: clamp n_pages to what actually landed. */
+    size_t fb = (size_t)d->width * (size_t)d->page_height * 4;
+    if (fb > 0) {
+        int actual = (int)(len / fb);
+        if (actual > 0 && actual < d->n_pages) d->n_pages = actual;
+    }
+    return d;
+}
+
+void diffkeep_anim_close(DiffkeepAnimDecoder *d) {
+    if (!d) return;
+    if (d->pixels) g_free(d->pixels);
+    if (d->roll) g_object_unref(d->roll);
+    g_free(d->pts_ms);
+    g_free(d->filename);
+    g_free(d);
+}
+
+int diffkeep_anim_frame_count(const DiffkeepAnimDecoder *d) { return d ? d->n_pages : 0; }
+long diffkeep_anim_duration_ms(const DiffkeepAnimDecoder *d) { return d ? d->duration_ms : 0; }
+double diffkeep_anim_fps(const DiffkeepAnimDecoder *d) {
+    if (!d || d->duration_ms <= 0) return 0.0;
+    return (double)d->n_pages * 1000.0 / (double)d->duration_ms;
+}
+
+/* Stream mode: decode the current page from the live roll (with optional resize). */
+static int anim_next_stream(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms) {
+    VipsImage *page = NULL;
+    if (vips_extract_area(d->roll, &page, 0, d->cur * d->page_height,
+                          d->width, d->page_height, NULL) != 0)
+        return -1;
+
+    if (d->max_dim > 0 && (d->width > d->max_dim || d->page_height > d->max_dim)) {
+        VipsImage *thumb = NULL;
+        if (vips_thumbnail_image(page, &thumb, d->max_dim,
+                "height", d->max_dim, "size", VIPS_SIZE_DOWN, NULL) != 0) {
+            g_object_unref(page);
+            return -1;
+        }
+        g_object_unref(page);
+        page = thumb;
+    }
+
+    if (!vips_image_hasalpha(page)) {
+        VipsImage *rgba = NULL;
+        if (vips_addalpha(page, &rgba, NULL) != 0) { g_object_unref(page); return -1; }
+        g_object_unref(page);
+        page = rgba;
+    }
+
+    size_t len = 0;
+    void *pixels = vips_image_write_to_memory(page, &len);
+    if (!pixels) { g_object_unref(page); return -1; }
+    *buf = pixels;
+    *w = vips_image_get_width(page);
+    *h = vips_image_get_height(page);
+    *pts_ms = d->pts_ms[d->cur];
+    g_object_unref(page);
+    d->cur++;
+    return 1;
+}
+
+int diffkeep_anim_next(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms) {
+    if (!d || d->cur >= d->n_pages) return 0; /* EOF */
+
+    if (d->pixels) {
+        /* Cached: hand back a copy of the pre-decoded frame (cheap). */
+        size_t fb = (size_t)d->width * (size_t)d->page_height * 4;
+        void *out = g_malloc(fb);
+        memcpy(out, d->pixels + (size_t)d->cur * fb, fb);
+        *buf = out;
+        *w = d->width;
+        *h = d->page_height;
+        *pts_ms = d->pts_ms[d->cur];
+        d->cur++;
+        return 1;
+    }
+    return anim_next_stream(d, buf, w, h, pts_ms);
+}
+
+int diffkeep_anim_seek(DiffkeepAnimDecoder *d, long ts_ms) {
+    if (!d) return -1;
+    /* Find the last page whose start time is <= ts_ms. */
+    int target = 0;
+    for (int k = 0; k < d->n_pages; k++) {
+        if (d->pts_ms[k] <= ts_ms) target = k; else break;
+    }
+    if (d->pixels) {
+        d->cur = target; /* random access is free in cached mode */
+        return 0;
+    }
+    /* Stream mode is forward-only: rewind by reopening, then let the caller decode
+       forward to the target. Forward seeks need no reopen. */
+    if (target < d->cur) {
+        if (d->roll) { g_object_unref(d->roll); d->roll = NULL; }
+        d->roll = anim_open_roll_file(d->filename);
+        d->cur = 0;
+        if (!d->roll) return -1;
+    }
     return 0;
 }
 

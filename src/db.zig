@@ -168,6 +168,9 @@ const migrations = [_][]const u8{
     // v10: per-image favorite flag (0/1) for curation.
     \\ALTER TABLE images ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
     ,
+    // v11: media type — 0 = image, 1 = animated image, 2 = video.
+    \\ALTER TABLE images ADD COLUMN media_type INTEGER NOT NULL DEFAULT 0;
+    ,
 };
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables
@@ -223,6 +226,12 @@ fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
 
 pub const FilterColumn = enum {
     model, sampler, scheduler,
+    /// Virtual column: not stored, derived from the file extension of
+    /// `library_path` at query time. See listImagesFiltered / getDistinctColumnValues.
+    format,
+    /// Backed by the `media_type` column, but with custom value→SQL mapping
+    /// ("image" includes animated). See listImagesFiltered.
+    resource_type,
     pub fn name(self: FilterColumn) []const u8 { return @tagName(self); }
 };
 
@@ -880,20 +889,56 @@ pub const VectorDb = struct {
     pub fn getDistinctColumnValues(self: *VectorDb, allocator: std.mem.Allocator, column: FilterColumn) ![][]const u8 {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        const col = column.name();
-        const sql = try std.fmt.allocPrint(allocator,
-            "SELECT DISTINCT {s} FROM images WHERE {s} IS NOT NULL AND {s} != '' ORDER BY {s} LIMIT 500",
-            .{ col, col, col, col });
-        defer allocator.free(sql);
-        var stmt = try self.db.prepare(sql);
-        defer stmt.deinit();
+
         var list: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (list.items) |s| allocator.free(s);
             list.deinit(allocator);
         }
-        while (try stmt.step()) {
-            try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+
+        if (column == .format) {
+            // "format" is virtual — derive the distinct file extensions present.
+            var stmt = try self.db.prepare(
+                \\SELECT DISTINCT ext FROM (
+                \\  SELECT CASE
+                \\    WHEN LOWER(library_path) LIKE '%.png'  THEN 'png'
+                \\    WHEN LOWER(library_path) LIKE '%.jpeg' THEN 'jpeg'
+                \\    WHEN LOWER(library_path) LIKE '%.jpg'  THEN 'jpg'
+                \\    WHEN LOWER(library_path) LIKE '%.webp' THEN 'webp'
+                \\    WHEN LOWER(library_path) LIKE '%.gif'  THEN 'gif'
+                \\    WHEN LOWER(library_path) LIKE '%.mp4'  THEN 'mp4'
+                \\    WHEN LOWER(library_path) LIKE '%.webm' THEN 'webm'
+                \\    ELSE NULL END AS ext
+                \\  FROM images WHERE trashed_at IS NULL
+                \\) WHERE ext IS NOT NULL ORDER BY ext
+            );
+            defer stmt.deinit();
+            while (try stmt.step()) {
+                try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+            }
+        } else if (column == .resource_type) {
+            // Offer image / animated / video, but only those actually present.
+            var stmt = try self.db.prepare(
+                "SELECT SUM(media_type != 2) > 0, SUM(media_type = 1) > 0, SUM(media_type = 2) > 0" ++
+                    " FROM images WHERE trashed_at IS NULL",
+            );
+            defer stmt.deinit();
+            if (try stmt.step()) {
+                if (stmt.columnInt64(0) != 0) try list.append(allocator, try allocator.dupe(u8, "image"));
+                if (stmt.columnInt64(1) != 0) try list.append(allocator, try allocator.dupe(u8, "animated"));
+                if (stmt.columnInt64(2) != 0) try list.append(allocator, try allocator.dupe(u8, "video"));
+            }
+        } else {
+            const col = column.name();
+            const sql = try std.fmt.allocPrint(allocator,
+                "SELECT DISTINCT {s} FROM images WHERE {s} IS NOT NULL AND {s} != '' ORDER BY {s} LIMIT 500",
+                .{ col, col, col, col });
+            defer allocator.free(sql);
+            var stmt = try self.db.prepare(sql);
+            defer stmt.deinit();
+            while (try stmt.step()) {
+                try list.append(allocator, try allocator.dupe(u8, stmt.columnText(0)));
+            }
         }
         return list.toOwnedSlice(allocator);
     }
@@ -925,9 +970,20 @@ pub const VectorDb = struct {
         if (library_id != null) try sql.appendSlice(allocator, " AND images.library_id = ?");
         if (folder_path != null) try sql.appendSlice(allocator, " AND images.library_path LIKE ?");
         for (filters) |f| {
-            try sql.appendSlice(allocator, " AND images.");
-            try sql.appendSlice(allocator, f.column.name());
-            try sql.appendSlice(allocator, " = ?");
+            if (f.column == .format) {
+                // Virtual column: match the file extension of library_path.
+                try sql.appendSlice(allocator, " AND LOWER(images.library_path) LIKE ?");
+            } else if (f.column == .resource_type) {
+                // "image" means non-video (includes animated); others are exact.
+                if (std.mem.eql(u8, f.value, "image"))
+                    try sql.appendSlice(allocator, " AND images.media_type != ?")
+                else
+                    try sql.appendSlice(allocator, " AND images.media_type = ?");
+            } else {
+                try sql.appendSlice(allocator, " AND images.");
+                try sql.appendSlice(allocator, f.column.name());
+                try sql.appendSlice(allocator, " = ?");
+            }
         }
         if (search_query != null) {
             try sql.appendSlice(allocator, " ORDER BY fts.rank LIMIT 10000");
@@ -955,7 +1011,22 @@ pub const VectorDb = struct {
             param += 1;
         }
         for (filters) |f| {
-            try stmt.bind(param, f.value);
+            if (f.column == .format) {
+                // Build a lowercase "%.<ext>" LIKE pattern (matches LOWER(library_path)).
+                const pattern = try std.fmt.allocPrint(allocator, "%.{s}", .{f.value});
+                defer allocator.free(pattern);
+                for (pattern) |*ch| ch.* = std.ascii.toLower(ch.*);
+                try stmt.bind(param, @as([]const u8, pattern));
+            } else if (f.column == .resource_type) {
+                // image → != 2 (non-video); animated → 1; video → 2; unknown → no match.
+                const mt: i64 = if (std.mem.eql(u8, f.value, "image")) 2
+                    else if (std.mem.eql(u8, f.value, "animated")) 1
+                    else if (std.mem.eql(u8, f.value, "video")) 2
+                    else -1;
+                try stmt.bind(param, mt);
+            } else {
+                try stmt.bind(param, f.value);
+            }
             param += 1;
         }
 
@@ -1093,6 +1164,20 @@ pub const VectorDb = struct {
         _ = try stmt.step();
     }
 
+    /// Media classification stored per image (column `media_type`).
+    pub const MediaType = enum(i64) { image = 0, animated = 1, video = 2 };
+
+    /// Set an image's media type (image / animated image / video).
+    pub fn setMediaType(self: *VectorDb, id: u64, media_type: MediaType) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("UPDATE images SET media_type = ? WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bind(1, @intFromEnum(media_type));
+        try stmt.bind(2, id);
+        _ = try stmt.step();
+    }
+
     /// Set (or clear) an image's favorite flag.
     pub fn setFavorite(self: *VectorDb, id: u64, favorite: bool) !void {
         self.db_mutex.lockUncancelable(self.io);
@@ -1148,6 +1233,28 @@ pub const VectorDb = struct {
         var list: std.ArrayList(u64) = .empty;
         errdefer list.deinit(allocator);
         while (try stmt.step()) try list.append(allocator, @intCast(stmt.columnInt64(0)));
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub const MediaTypeRow = struct { id: u64, media_type: MediaType };
+
+    /// All images whose media_type is not the default (0 = plain image): i.e.
+    /// animated images and videos. Used to mark grid entries after (re)loading a
+    /// view, the same way listFavoriteIds avoids a column on every grid query.
+    /// This set is small (animated + video) relative to the full library.
+    pub fn listNonImageMediaTypes(self: *VectorDb, allocator: std.mem.Allocator) ![]MediaTypeRow {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT id, media_type FROM images WHERE media_type != 0");
+        defer stmt.deinit();
+        var list: std.ArrayList(MediaTypeRow) = .empty;
+        errdefer list.deinit(allocator);
+        while (try stmt.step()) {
+            try list.append(allocator, .{
+                .id = @intCast(stmt.columnInt64(0)),
+                .media_type = @enumFromInt(stmt.columnInt64(1)),
+            });
+        }
         return list.toOwnedSlice(allocator);
     }
 

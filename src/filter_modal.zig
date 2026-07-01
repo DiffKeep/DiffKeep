@@ -11,6 +11,8 @@ pub fn filterColumnLabel(kind: db_mod.FilterColumn) [:0]const u8 {
         .model     => i18n.t(.detail_model),
         .sampler   => i18n.t(.detail_sampler),
         .scheduler => i18n.t(.detail_scheduler),
+        .format    => i18n.t(.detail_format),
+        .resource_type => i18n.t(.detail_resource_type),
     };
 }
 
@@ -95,7 +97,7 @@ pub const FilterModalState = struct {
                 .gravity_y = 0.5,
             };
 
-            const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler };
+            const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler, .format, .resource_type };
             for (kinds) |kind| {
                 const selected = self.kind == kind;
                 const chip_opts = if (selected)

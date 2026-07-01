@@ -209,6 +209,29 @@ pub fn renderToolbar(ctx: RenderCtx) void {
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
+        // Autoplay toggle: live-play animated/video cells in the grid (muted).
+        // Accent-tinted when on so its state reads at a glance.
+        {
+            const on = grid.autoplay;
+            var bw: dvui.ButtonWidget = undefined;
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 7, .min_size_content = .{ .w = 16, .h = 16 } }));
+            defer bw.deinit();
+            bw.processEvents();
+            bw.drawBackground();
+            dvui.icon(@src(), "autoplay_icon", icons.tvg.lucide.film, .{}, .{
+                .gravity_x = 0.5, .gravity_y = 0.5,
+                .min_size_content = .{ .w = 16, .h = 16 },
+                .expand = .ratio,
+                .color_text = if (on) dvui.themeGet().focus else null,
+            });
+            if (bw.clicked()) grid.autoplay = !grid.autoplay;
+            bw.drawFocus();
+            const tip = if (on) i18n.t(.toolbar_autoplay_on) else i18n.t(.toolbar_autoplay_off);
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{tip}, .{});
+        }
+
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
         {
             const sort_mode_tvg = switch (grid.sort_mode) {
                 .date   => icons.tvg.lucide.calendar,

@@ -148,6 +148,60 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addIncludePath(b.path("lib/vips"));
     exe.root_module.addImport("vips", vips_module);
 
+    // *** video (libav*) ***
+    // System-linked like vips; pkg-config (default for linkSystemLibrary) supplies
+    // the per-platform include/lib paths. The C wrapper itself is fully portable.
+    const av_libs = [_][]const u8{ "avformat", "avcodec", "avutil", "swscale", "swresample" };
+    const video_helper_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    video_helper_mod.addCSourceFile(.{
+        .file = b.path("lib/video/video_helper.c"),
+        .flags = &.{},
+    });
+    video_helper_mod.addIncludePath(b.path("lib/video"));
+    for (av_libs) |lib| video_helper_mod.linkSystemLibrary(lib, .{});
+
+    const video_helper_lib = b.addLibrary(.{
+        .name = "video_helper",
+        .root_module = video_helper_mod,
+    });
+
+    const video_module = b.addModule("video", .{
+        .root_source_file = b.path("src/video.zig"),
+    });
+    video_module.addIncludePath(b.path("lib/video"));
+
+    exe.root_module.linkLibrary(video_helper_lib);
+    exe.root_module.addIncludePath(b.path("lib/video"));
+    exe.root_module.addImport("video", video_module);
+
+    // Dev tool: probe a media file's streams/metadata/first-frame.
+    const video_probe_exe = b.addExecutable(.{
+        .name = "video_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_video.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    video_probe_exe.root_module.linkLibrary(video_helper_lib);
+    video_probe_exe.root_module.addIncludePath(b.path("lib/video"));
+    video_probe_exe.root_module.addImport("video", video_module);
+    video_probe_exe.root_module.linkLibrary(vips_helper_lib);
+    video_probe_exe.root_module.addIncludePath(b.path("lib/vips"));
+    video_probe_exe.root_module.linkSystemLibrary("vips", .{});
+    video_probe_exe.root_module.addImport("vips", vips_module);
+    b.installArtifact(video_probe_exe);
+    const run_video_probe = b.addRunArtifact(video_probe_exe);
+    run_video_probe.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_video_probe.addArgs(args);
+    const video_probe_step = b.step("video_probe", "Probe a media file via libav* (dimensions, metadata tags, first frame)");
+    video_probe_step.dependOn(&run_video_probe.step);
+
     // *** ONNX Runtime (embeddings) ***
     try addOnnxRuntime(b, exe, use_gpu);
 
@@ -322,6 +376,8 @@ pub fn build(b: *std.Build) !void {
     diffkeep_test_module.addImport("sqlite", sqlite_module_zig);
     diffkeep_test_module.addImport("vips", vips_module);
     diffkeep_test_module.addIncludePath(b.path("lib/vips"));
+    diffkeep_test_module.addImport("video", video_module);
+    diffkeep_test_module.addIncludePath(b.path("lib/video"));
     diffkeep_test_module.addOptions("build_options", options);
     // icons is pure TVG data (no backend dependency); UI modules need it to compile.
     diffkeep_test_module.addImport("icons", icons_dep.module("icons"));
@@ -345,6 +401,9 @@ pub fn build(b: *std.Build) !void {
     integration_tests.root_module.linkLibrary(vips_helper_lib);
     integration_tests.root_module.addIncludePath(b.path("lib/vips"));
     integration_tests.root_module.linkSystemLibrary("vips", .{});
+    integration_tests.root_module.linkLibrary(video_helper_lib);
+    integration_tests.root_module.addIncludePath(b.path("lib/video"));
+    for (av_libs) |lib| integration_tests.root_module.linkSystemLibrary(lib, .{});
     // onnxruntime import goes to diffkeep_test_module (where onnx_embedder.zig lives);
     // library linkage goes to integration_tests.root_module.
     try addOnnxRuntimeEx(b, integration_tests, diffkeep_test_module, use_gpu);

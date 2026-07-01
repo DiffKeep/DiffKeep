@@ -14,6 +14,13 @@ pub const vtable: platform.Vtable = .{
     .open_folder_dialog = openFolderDialog,
     .set_window_fullscreen = setWindowFullscreen,
     .capture_window_state = captureWindowState,
+    .audio_open = audioOpen,
+    .audio_feed = audioFeed,
+    .audio_queued = audioQueued,
+    .audio_set_gain = audioSetGain,
+    .audio_set_paused = audioSetPaused,
+    .audio_clear = audioClear,
+    .audio_close = audioClose,
 };
 
 // ── Image clipboard ─────────────────────────────────────────────────────────
@@ -90,4 +97,52 @@ fn setWindowFullscreen(handle: ?*anyopaque, fullscreen: bool) void {
 fn captureWindowState(handle: ?*anyopaque, out: *config_mod.WindowState) void {
     const win: *SDLBackend.c.SDL_Window = @ptrCast(handle orelse return);
     window_state.capture(win, out);
+}
+
+// ── Audio output (SDL3) ─────────────────────────────────────────────────────
+
+fn audioOpen(sample_rate: i32, channels: i32) ?*anyopaque {
+    _ = SDLBackend.c.SDL_InitSubSystem(SDLBackend.c.SDL_INIT_AUDIO);
+    var spec: SDLBackend.c.SDL_AudioSpec = .{
+        .format = SDLBackend.c.SDL_AUDIO_F32,
+        .channels = channels,
+        .freq = sample_rate,
+    };
+    const stream = SDLBackend.c.SDL_OpenAudioDeviceStream(
+        SDLBackend.c.SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+        &spec,
+        null,
+        null,
+    ) orelse return null;
+    _ = SDLBackend.c.SDL_ResumeAudioStreamDevice(stream);
+    return @ptrCast(stream);
+}
+
+fn audioFeed(handle: *anyopaque, pcm: []const u8) void {
+    _ = SDLBackend.c.SDL_PutAudioStreamData(@ptrCast(handle), pcm.ptr, @intCast(pcm.len));
+}
+
+fn audioQueued(handle: *anyopaque) usize {
+    const q = SDLBackend.c.SDL_GetAudioStreamQueued(@ptrCast(handle));
+    return if (q < 0) 0 else @intCast(q);
+}
+
+fn audioSetGain(handle: *anyopaque, gain: f32) void {
+    _ = SDLBackend.c.SDL_SetAudioStreamGain(@ptrCast(handle), gain);
+}
+
+fn audioSetPaused(handle: *anyopaque, paused: bool) void {
+    if (paused) {
+        _ = SDLBackend.c.SDL_PauseAudioStreamDevice(@ptrCast(handle));
+    } else {
+        _ = SDLBackend.c.SDL_ResumeAudioStreamDevice(@ptrCast(handle));
+    }
+}
+
+fn audioClear(handle: *anyopaque) void {
+    _ = SDLBackend.c.SDL_ClearAudioStream(@ptrCast(handle));
+}
+
+fn audioClose(handle: *anyopaque) void {
+    SDLBackend.c.SDL_DestroyAudioStream(@ptrCast(handle));
 }

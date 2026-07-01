@@ -129,6 +129,7 @@ pub const ViewerManager = struct {
                 .trashed_at = e.trashed_at,
                 .trash_name = trash_name_copy,
                 .favorite = e.favorite,
+                .media_type = e.media_type,
             }) catch {
                 init.gpa.free(path_copy);
                 if (trash_name_copy) |tn| init.gpa.free(tn);

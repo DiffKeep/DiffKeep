@@ -32,6 +32,18 @@ pub const Vtable = struct {
     set_window_fullscreen: *const fn (handle: ?*anyopaque, fullscreen: bool) void = noopSetWindowFullscreen,
     /// Sample a window's current geometry into `out` (see config.WindowState).
     capture_window_state: *const fn (handle: ?*anyopaque, out: *config_mod.WindowState) void = noopCaptureWindowState,
+
+    // ── Audio output (interleaved f32) ───────────────────────────────────────
+    /// Open a playback stream; returns an opaque handle, or null if unavailable
+    /// (no device, or the seam isn't installed — e.g. in tests).
+    audio_open: *const fn (sample_rate: i32, channels: i32) ?*anyopaque = noopAudioOpen,
+    audio_feed: *const fn (handle: *anyopaque, pcm: []const u8) void = noopAudioFeed,
+    /// Bytes currently buffered (for real-time pacing).
+    audio_queued: *const fn (handle: *anyopaque) usize = noopAudioQueued,
+    audio_set_gain: *const fn (handle: *anyopaque, gain: f32) void = noopAudioSetGain,
+    audio_set_paused: *const fn (handle: *anyopaque, paused: bool) void = noopAudioSetPaused,
+    audio_clear: *const fn (handle: *anyopaque) void = noopAudioClear,
+    audio_close: *const fn (handle: *anyopaque) void = noopAudioClose,
 };
 
 var vtable: Vtable = .{};
@@ -57,7 +69,40 @@ pub fn captureWindowState(handle: ?*anyopaque, out: *config_mod.WindowState) voi
     vtable.capture_window_state(handle, out);
 }
 
+pub fn audioOpen(sample_rate: i32, channels: i32) ?*anyopaque {
+    return vtable.audio_open(sample_rate, channels);
+}
+pub fn audioFeed(handle: *anyopaque, pcm: []const u8) void {
+    vtable.audio_feed(handle, pcm);
+}
+pub fn audioQueued(handle: *anyopaque) usize {
+    return vtable.audio_queued(handle);
+}
+pub fn audioSetGain(handle: *anyopaque, gain: f32) void {
+    vtable.audio_set_gain(handle, gain);
+}
+pub fn audioSetPaused(handle: *anyopaque, paused: bool) void {
+    vtable.audio_set_paused(handle, paused);
+}
+pub fn audioClear(handle: *anyopaque) void {
+    vtable.audio_clear(handle);
+}
+pub fn audioClose(handle: *anyopaque) void {
+    vtable.audio_close(handle);
+}
+
 fn noopCopyImageFile(_: []const u8, _: std.mem.Allocator, _: std.Io) void {}
 fn noopOpenFolderDialog(_: ?*anyopaque, _: FolderPickedFn) void {}
 fn noopSetWindowFullscreen(_: ?*anyopaque, _: bool) void {}
 fn noopCaptureWindowState(_: ?*anyopaque, _: *config_mod.WindowState) void {}
+fn noopAudioOpen(_: i32, _: i32) ?*anyopaque {
+    return null;
+}
+fn noopAudioFeed(_: *anyopaque, _: []const u8) void {}
+fn noopAudioQueued(_: *anyopaque) usize {
+    return 0;
+}
+fn noopAudioSetGain(_: *anyopaque, _: f32) void {}
+fn noopAudioSetPaused(_: *anyopaque, _: bool) void {}
+fn noopAudioClear(_: *anyopaque) void {}
+fn noopAudioClose(_: *anyopaque) void {}

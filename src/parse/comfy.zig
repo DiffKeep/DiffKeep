@@ -1,5 +1,54 @@
 const std = @import("std");
 
+/// Slice out a single balanced JSON object starting at the first `{` in `s`,
+/// honoring string literals and escapes (so braces inside strings don't count).
+/// Returns the `{`…`}` slice, or null if there is no object or it is unterminated.
+///
+/// Used to pull the workflow/prompt JSON out of raw file bytes for formats that
+/// embed it as ASCII (e.g. ComfyUI WebP EXIF), where reading via libexif would
+/// truncate long values.
+pub fn extractJsonObject(s: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, s, '{') orelse return null;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (ch == '\\') {
+                esc = true;
+            } else if (ch == '"') {
+                in_str = false;
+            }
+        } else switch (ch) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return s[start .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "extractJsonObject: balanced, nested, string-aware, unterminated" {
+    const t = std.testing;
+    // Prefix + trailing junk (mimics "workflow:{...}" embedded in a file).
+    try t.expectEqualStrings("{\"a\":{\"b\":1}}", extractJsonObject("workflow:{\"a\":{\"b\":1}}\x00xx").?);
+    // Braces inside a string must not end the object early.
+    try t.expectEqualStrings("{\"t\":\"a } b { c\"}", extractJsonObject("{\"t\":\"a } b { c\"}").?);
+    // Escaped quote inside a string.
+    try t.expectEqualStrings("{\"t\":\"x\\\"}y\"}", extractJsonObject("{\"t\":\"x\\\"}y\"}").?);
+    // No object / unterminated → null.
+    try t.expect(extractJsonObject("no braces here") == null);
+    try t.expect(extractJsonObject("{\"a\":1") == null);
+}
+
 pub const ParseResult = struct {
     positive_prompt: ?[]const u8 = null,
     negative_prompt: ?[]const u8 = null,
