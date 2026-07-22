@@ -16,6 +16,7 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .TensorPencil = .{ .path = "../TensorPencil" },
         .icons = .{
             .url = "git+https://github.com/nat3Github/zig-lib-icons#b7299b19fa11caa5be93ef49743d8fc31a4bf9a0",
             .hash = "icons-0.1.0-iJxA-VrGMwAVIStBxqDPFeC3wdnANtYyDrNfYXNz95OW",

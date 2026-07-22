@@ -1,18 +1,28 @@
 /// ONNX text retrieval quality: nomic-embed-text-v1.5 vs snowflake-arctic-embed-m-v2.0.
 ///
 /// Usage:
-///   test_onnx_text_search <images_dir> <nomic_dir> <snowflake_dir>
+///   test_onnx_text_search <images_dir> <nomic_dir> <snowflake_dir> [gemma_dir]
+///
+/// If [gemma_dir] is given, EmbeddingGemma (TensorPencil) is also evaluated
+/// across several prompt/prefix styles (gemma-*).
 ///
 /// Each model dir must contain:
 ///   onnx/model_int8.onnx   — quantised sentence encoder
 ///   tokenizer.json         — HuggingFace tokenizer
 ///
-/// Tests three configurations and reports MRR/@1/@3/@5 split by query tier:
-///   nomic-bare     : nomic, no prefix
-///   nomic-native   : nomic, "search_query: " / "search_document: "
-///   snowflake      : snowflake, no prefix
+/// Tests several configurations and reports MRR/@1/@3/@5 split by query tier:
+///   nomic-bare     : nomic (ONNX), no prefix
+///   nomic-native   : nomic (ONNX), "search_query: " / "search_document: "
+///   snowflake      : snowflake (ONNX int8), no prefix
+///   snowflake-tp   : snowflake (TensorPencil, native Zig fp32), no prefix
+///   snowflake-tp-q : snowflake (TensorPencil), "query: " on queries only
+///
+/// snowflake vs snowflake-tp is the apples-to-apples check that the TP text
+/// encoder reproduces ONNX retrieval quality. The snowflake dir must also carry
+/// `model.safetensors` (TP loads safetensors, not ONNX).
 const std = @import("std");
 const ort_c = @import("onnxruntime_c");
+const tp = @import("TensorPencil");
 const png = @import("image/png-data.zig");
 const ComfyParser = @import("parse/comfy.zig").ComfyParser;
 const ParseResult = @import("parse/comfy.zig").ParseResult;
@@ -545,17 +555,101 @@ const QUERIES = [_]Query{
 
 // ── Model/prefix configurations to test ──────────────────────────────────────
 
+const Backend = enum { nomic_onnx, snowflake_onnx, snowflake_tp, gemma_tp };
+
 const ModelCfg = struct {
     name:         []const u8,
-    encoder_idx:  u1,
+    backend:      Backend,
     query_prefix: []const u8,
     doc_prefix:   []const u8,
 };
 
+// EmbeddingGemma prompt templates come straight from the model's own
+// config_sentence_transformers.json / README: query prompts are
+// "task: {desc} | query: " and document prompts are "title: {t|none} | text: ".
+// We try the canonical retrieval pair plus a few alternative framings to see
+// which suits DiffKeep's short-keyword → image-prompt retrieval.
 const MODEL_CFGS = [_]ModelCfg{
-    .{ .name = "nomic-bare",   .encoder_idx = 0, .query_prefix = "",               .doc_prefix = "" },
-    .{ .name = "nomic-native", .encoder_idx = 0, .query_prefix = "search_query: ", .doc_prefix = "search_document: " },
-    .{ .name = "snowflake",    .encoder_idx = 1, .query_prefix = "",               .doc_prefix = "" },
+    .{ .name = "nomic-bare",       .backend = .nomic_onnx,     .query_prefix = "",               .doc_prefix = "" },
+    .{ .name = "nomic-native",     .backend = .nomic_onnx,     .query_prefix = "search_query: ", .doc_prefix = "search_document: " },
+    .{ .name = "snowflake",        .backend = .snowflake_onnx, .query_prefix = "",               .doc_prefix = "" },
+    .{ .name = "snowflake-tp",     .backend = .snowflake_tp,   .query_prefix = "",               .doc_prefix = "" },
+    .{ .name = "snowflake-tp-q",   .backend = .snowflake_tp,   .query_prefix = "query: ",        .doc_prefix = "" },
+    .{ .name = "gemma-retrieval",  .backend = .gemma_tp,       .query_prefix = "task: search result | query: ",       .doc_prefix = "title: none | text: " },
+    .{ .name = "gemma-qa",         .backend = .gemma_tp,       .query_prefix = "task: question answering | query: ",  .doc_prefix = "title: none | text: " },
+    .{ .name = "gemma-sts",        .backend = .gemma_tp,       .query_prefix = "task: sentence similarity | query: ", .doc_prefix = "task: sentence similarity | query: " },
+    .{ .name = "gemma-bare",       .backend = .gemma_tp,       .query_prefix = "",                                    .doc_prefix = "" },
+    .{ .name = "gemma-query-both", .backend = .gemma_tp,       .query_prefix = "task: search result | query: ",       .doc_prefix = "task: search result | query: " },
+};
+
+/// Dispatches tokenize + embed across the three backends so the eval loop is
+/// backend-agnostic. All backends return an L2-normalized vector (caller owns).
+const Encoders = struct {
+    nomic_tok: *const WordPieceTokenizer,
+    snow_tok:  *const UnigramTokenizer,
+    tp_tok:    *const tp.tokenizer.Tokenizer,
+    nomic_enc: *SentenceEncoder,
+    snow_enc:  *SentenceEncoder,
+    tp_model:  *const tp.models.embed_snowflake.Model,
+    // Optional: only loaded when a gemma dir is passed on the command line.
+    gemma_tok:   ?*const tp.tokenizer.Tokenizer = null,
+    gemma_model: ?*const tp.models.embed_gemma.Model = null,
+    io:        std.Io,
+
+    fn embed(self: Encoders, allocator: std.mem.Allocator, backend: Backend, text: []const u8) ![]f32 {
+        switch (backend) {
+            .nomic_onnx => {
+                const ids = try self.nomic_tok.tokenize(allocator, text, MAX_TOKENS);
+                defer allocator.free(ids);
+                return self.nomic_enc.embed(ids);
+            },
+            .snowflake_onnx => {
+                const ids = try self.snow_tok.tokenize(allocator, text, MAX_TOKENS);
+                defer allocator.free(ids);
+                return self.snow_enc.embed(ids);
+            },
+            .snowflake_tp => {
+                // TP tokenizer emits content ids only; frame <s>=0 … </s>=2.
+                var content: std.ArrayList(u32) = .empty;
+                defer content.deinit(allocator);
+                try self.tp_tok.encode(allocator, text, &content);
+
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(allocator);
+                try ids.append(allocator, 0);
+                const cap = @min(content.items.len, MAX_TOKENS - 2);
+                try ids.appendSlice(allocator, content.items[0..cap]);
+                try ids.append(allocator, 2);
+
+                const out = try allocator.alloc(f32, tp.models.embed_snowflake.embed_dim);
+                errdefer allocator.free(out);
+                try self.tp_model.embed(self.io, allocator, ids.items, out);
+                return out; // already L2-normalized by TP
+            },
+            .gemma_tp => {
+                const tok   = self.gemma_tok   orelse return error.GemmaNotLoaded;
+                const model = self.gemma_model orelse return error.GemmaNotLoaded;
+
+                // Gemma tokenizer emits content ids only; frame <bos>=2 … <eos>=1.
+                var content: std.ArrayList(u32) = .empty;
+                defer content.deinit(allocator);
+                try tok.encode(allocator, text, &content);
+
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(allocator);
+                try ids.append(allocator, 2);
+                // EmbeddingGemma asserts framed seq <= 512; cap content at 510.
+                const cap = @min(content.items.len, MAX_TOKENS - 2);
+                try ids.appendSlice(allocator, content.items[0..cap]);
+                try ids.append(allocator, 1);
+
+                const out = try allocator.alloc(f32, tp.models.embed_gemma.embed_dim);
+                errdefer allocator.free(out);
+                try model.embed(self.io, allocator, ids.items, out);
+                return out; // already L2-normalized by TP
+            },
+        }
+    }
 };
 
 const MAX_TOKENS = 512;
@@ -680,7 +774,7 @@ fn extractPrompt(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?[
 }
 
 fn usage() void {
-    std.log.err("Usage: test_onnx_text_search <images_dir> <nomic_dir> <snowflake_dir>", .{});
+    std.log.err("Usage: test_onnx_text_search <images_dir> <nomic_dir> <snowflake_dir> [gemma_dir]", .{});
 }
 
 fn insertionSortDesc(ranking: []usize, scores: []f32) void {
@@ -706,6 +800,7 @@ pub fn main(init: std.process.Init) !void {
     const images_dir = args.next() orelse { usage(); return; };
     const nomic_dir  = args.next() orelse { usage(); return; };
     const snow_dir   = args.next() orelse { usage(); return; };
+    const gemma_dir  = args.next(); // optional: enables the gemma-* configs
 
     // ── Load tokenizers ───────────────────────────────────────────────────
 
@@ -779,7 +874,49 @@ pub fn main(init: std.process.Init) !void {
     var snow_enc = try SentenceEncoder.init(allocator, api, env.?, opts.?, snow_path, .snowflake);
     defer snow_enc.deinit();
 
-    const encoders = [2]*SentenceEncoder{ &nomic_enc, &snow_enc };
+    // ── Load TensorPencil snowflake (native Zig, safetensors) ─────────────
+    try println(io, "Loading TensorPencil snowflake tokenizer + model...", .{});
+    var tp_tok = try tp.tokenizer.Tokenizer.initUnigramFromTokenizerJson(allocator, snow_tok_json);
+    defer tp_tok.deinit();
+    var tp_model = try tp.models.embed_snowflake.Model.open(allocator, io, snow_dir);
+    defer tp_model.deinit();
+
+    // ── Load EmbeddingGemma (optional, TensorPencil, safetensors) ─────────
+    var gemma_tok: ?tp.tokenizer.Tokenizer = null;
+    defer if (gemma_tok) |*t| t.deinit();
+    var gemma_model: ?tp.models.embed_gemma.Model = null;
+    defer if (gemma_model) |*m| m.deinit();
+
+    if (gemma_dir) |gdir| {
+        try println(io, "Loading EmbeddingGemma tokenizer + model from {s}...", .{gdir});
+        const gtok_json = blk: {
+            const p = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{gdir});
+            defer allocator.free(p);
+            var f = try std.Io.Dir.cwd().openFile(io, p, .{});
+            defer f.close(io);
+            const sz = try f.length(io);
+            const buf = try allocator.alloc(u8, sz);
+            _ = try f.readPositionalAll(io, buf, 0);
+            break :blk buf;
+        };
+        defer allocator.free(gtok_json);
+        gemma_tok   = try tp.tokenizer.Tokenizer.initGemma4FromTokenizerJson(allocator, gtok_json);
+        gemma_model = try tp.models.embed_gemma.Model.open(allocator, io, gdir);
+    } else {
+        try println(io, "(no gemma dir given — gemma-* configs will be skipped)", .{});
+    }
+
+    const enc_set = Encoders{
+        .nomic_tok   = &nomic_tok,
+        .snow_tok    = &snow_tok,
+        .tp_tok      = &tp_tok,
+        .nomic_enc   = &nomic_enc,
+        .snow_enc    = &snow_enc,
+        .tp_model    = &tp_model,
+        .gemma_tok   = if (gemma_tok)   |*t| t else null,
+        .gemma_model = if (gemma_model) |*m| m else null,
+        .io          = io,
+    };
 
     // ── Scan images ───────────────────────────────────────────────────────
 
@@ -824,8 +961,8 @@ pub fn main(init: std.process.Init) !void {
     try println(io, "{s}", .{"-" ** 62});
 
     for (MODEL_CFGS) |cfg| {
+        if (cfg.backend == .gemma_tp and enc_set.gemma_model == null) continue;
         const t_cfg_start = nanoNow();
-        const enc = encoders[cfg.encoder_idx];
 
         // Embed all documents
         const doc_embs = try allocator.alloc([]f32, entries.items.len);
@@ -840,13 +977,7 @@ pub fn main(init: std.process.Init) !void {
             );
             defer allocator.free(full_doc);
 
-            const ids: []i64 = if (cfg.encoder_idx == 0)
-                try nomic_tok.tokenize(allocator, full_doc, MAX_TOKENS)
-            else
-                try snow_tok.tokenize(allocator, full_doc, MAX_TOKENS);
-            defer allocator.free(ids);
-
-            doc_embs[idx] = try enc.embed(ids);
+            doc_embs[idx] = try enc_set.embed(allocator, cfg.backend, full_doc);
         }
 
         // Evaluate queries
@@ -860,13 +991,7 @@ pub fn main(init: std.process.Init) !void {
             );
             defer allocator.free(full_q);
 
-            const q_ids: []i64 = if (cfg.encoder_idx == 0)
-                try nomic_tok.tokenize(allocator, full_q, MAX_TOKENS)
-            else
-                try snow_tok.tokenize(allocator, full_q, MAX_TOKENS);
-            defer allocator.free(q_ids);
-
-            const q_emb = try enc.embed(q_ids);
+            const q_emb = try enc_set.embed(allocator, cfg.backend, full_q);
             defer allocator.free(q_emb);
 
             var scores = try allocator.alloc(f32, entries.items.len);

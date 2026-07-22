@@ -33,7 +33,9 @@ const QueryTaskCtx = struct {
     db: *db_mod.VectorDb,
     mode: image_grid_mod.SearchMode,
     fts_query: ?[]u8,           // owned; freed by task
-    embedding: ?[]const f32,    // owned; freed by task
+    embeddings: image_grid_mod.QueryEmbeddings, // owned; freed by task
+    semantic_min_similarity: f32,
+    visual_min_similarity: f32,
     filter_library_id: ?u64,
     filter_folder_path: ?[]u8,  // owned; freed by task
     filters: []db_mod.ActiveFilter, // owned (each .value duped); freed by task
@@ -46,13 +48,23 @@ const QueryTaskCtx = struct {
 };
 
 fn runQuery(ctx: QueryTaskCtx) ![]db_mod.VectorDb.GridEntry {
-    if (ctx.embedding) |embd| {
-        return switch (ctx.mode) {
-            .semantic => try ctx.db.searchByPromptEmbedding(ctx.allocator, embd, 200),
-            .visual   => try ctx.db.searchByImageEmbedding(ctx.allocator, embd, 200),
-            .combined => try ctx.db.searchCombined(ctx.allocator, embd, 200),
-            .fts      => error.InvalidMode,
-        };
+    // Vector modes; combined degrades to a single-space search when only one
+    // encoder produced an embedding.
+    switch (ctx.mode) {
+        .semantic => if (ctx.embeddings.prompt) |e|
+            return try ctx.db.searchByPromptEmbedding(ctx.allocator, e, 200, ctx.semantic_min_similarity),
+        .visual => if (ctx.embeddings.visual) |e|
+            return try ctx.db.searchByImageEmbedding(ctx.allocator, e, 200, ctx.visual_min_similarity),
+        .combined => {
+            if (ctx.embeddings.prompt) |pe| {
+                if (ctx.embeddings.visual) |ve|
+                    return try ctx.db.searchCombined(ctx.allocator, pe, ve, 200, ctx.semantic_min_similarity, ctx.visual_min_similarity);
+                return try ctx.db.searchByPromptEmbedding(ctx.allocator, pe, 200, ctx.semantic_min_similarity);
+            }
+            if (ctx.embeddings.visual) |ve|
+                return try ctx.db.searchByImageEmbedding(ctx.allocator, ve, 200, ctx.visual_min_similarity);
+        },
+        .fts => {},
     }
     const has_text = if (ctx.fts_query) |q| q.len > 0 else false;
     if (has_text or ctx.filters.len > 0) {
@@ -73,9 +85,10 @@ fn runQuery(ctx: QueryTaskCtx) ![]db_mod.VectorDb.GridEntry {
 }
 
 fn queryTask(ctx: QueryTaskCtx) void {
+    var embeddings = ctx.embeddings;
     defer {
         if (ctx.fts_query) |q| ctx.allocator.free(q);
-        if (ctx.embedding) |e| ctx.allocator.free(e);
+        embeddings.free(ctx.allocator);
         if (ctx.filter_folder_path) |p| ctx.allocator.free(p);
         for (ctx.filters) |f| ctx.allocator.free(f.value);
         ctx.allocator.free(ctx.filters);
@@ -107,7 +120,7 @@ const EmbedTaskCtx = struct {
     embedder: *onnx_mod.OnnxEmbedder,
     generation: u64,
     current_gen: *std.atomic.Value(u64),
-    result: *?[]const f32,
+    result: *image_grid_mod.QueryEmbeddings,
     result_gen: *u64,
     done: *std.atomic.Value(bool),
     wakeup_fn: ?*const fn () void,
@@ -121,30 +134,33 @@ fn embedTask(ctx: EmbedTaskCtx) void {
         return;
     }
 
-    var embedding: ?[]const f32 = null;
-    switch (ctx.mode) {
-        .fts => {},
-        .semantic, .combined => {
-            embedding = ctx.embedder.embedPrompt(ctx.allocator, ctx.query) catch |err| blk: {
-                log.warn("embedPrompt failed: {}", .{err});
-                break :blk null;
-            };
-        },
-        .visual => {
-            embedding = ctx.embedder.embedQueryForVisual(ctx.allocator, ctx.query) catch |err| blk: {
-                log.warn("embedQueryForVisual failed: {}", .{err});
-                break :blk null;
-            };
-        },
+    // Each vector space needs a query embedding from its own encoder;
+    // combined mode needs both.
+    var embeddings: image_grid_mod.QueryEmbeddings = .{};
+    if (ctx.mode == .semantic or ctx.mode == .combined) {
+        embeddings.prompt = ctx.embedder.embedPromptQuery(ctx.allocator, ctx.query) catch |err| blk: {
+            log.warn("embedPromptQuery failed: {}", .{err});
+            break :blk null;
+        };
+    }
+    if (ctx.mode == .visual or ctx.mode == .combined) {
+        embeddings.visual = ctx.embedder.embedQueryForVisual(ctx.allocator, ctx.query) catch |err| blk: {
+            log.warn("embedQueryForVisual failed: {}", .{err});
+            break :blk null;
+        };
     }
 
     if (ctx.current_gen.load(.acquire) != ctx.generation) {
         log.info("embed task gen={d} stale after embedding, discarding", .{ctx.generation});
-        if (embedding) |e| ctx.allocator.free(e);
+        embeddings.free(ctx.allocator);
         return;
     }
-    log.info("embed task gen={d} complete, embedding={s}", .{ ctx.generation, if (embedding != null) "present" else "null" });
-    ctx.result.* = embedding;
+    log.info("embed task gen={d} complete: prompt={s} visual={s}", .{
+        ctx.generation,
+        if (embeddings.prompt != null) "present" else "null",
+        if (embeddings.visual != null) "present" else "null",
+    });
+    ctx.result.* = embeddings;
     ctx.result_gen.* = ctx.generation;
     ctx.done.store(true, .release);
     if (ctx.wakeup_fn) |w| w();
@@ -160,7 +176,7 @@ pub const SearchState = struct {
     last_buf: [256]u8 = std.mem.zeroes([256]u8),
     mode: image_grid_mod.SearchMode = .fts,
     embedder: ?*onnx_mod.OnnxEmbedder = null,
-    query_embedding: ?[]const f32 = null,
+    query_embeddings: image_grid_mod.QueryEmbeddings = .{},
 
     // Debounce: fire search 300 ms after the last keystroke.
     // Set to 1 to fire on the very next frame (used by mode-button clicks).
@@ -174,8 +190,8 @@ pub const SearchState = struct {
     embed_generation: std.atomic.Value(u64) = .init(0),
     embed_in_flight: usize = 0,  // tasks spawned since last full drain
     embed_pending: bool = false,  // true while an embed task is in flight
-    pending_embedding: ?[]const f32 = null,
-    pending_embedding_gen: u64 = 0,
+    pending_embeddings: image_grid_mod.QueryEmbeddings = .{},
+    pending_embeddings_gen: u64 = 0,
     wakeup_fn: ?*const fn () void = null,
 
     // Async DB query (runs after embed for vector modes, immediately for FTS)
@@ -188,8 +204,8 @@ pub const SearchState = struct {
     query_pending: bool = false,  // true while a query task is in flight
 
     pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
-        if (self.query_embedding) |emb| gpa.free(emb);
-        if (self.pending_embedding) |emb| gpa.free(emb);
+        self.query_embeddings.free(gpa);
+        self.pending_embeddings.free(gpa);
         if (self.query_result) |r| {
             for (r) |e| gpa.free(e.path);
             gpa.free(r);
@@ -228,22 +244,20 @@ pub const SearchState = struct {
         if (!self.embed_done.load(.acquire)) return;
         self.embed_done.store(false, .release);
         self.embed_pending = false;
-        log.info("applyEmbedIfDone: pending_gen={d} current_gen={d}", .{ self.pending_embedding_gen, self.embed_generation.load(.acquire) });
+        log.info("applyEmbedIfDone: pending_gen={d} current_gen={d}", .{ self.pending_embeddings_gen, self.embed_generation.load(.acquire) });
 
-        if (self.query_embedding) |old| allocator.free(old);
-        self.query_embedding = null;
+        self.query_embeddings.free(allocator);
 
-        if (self.pending_embedding_gen == self.embed_generation.load(.acquire)) {
-            self.query_embedding = self.pending_embedding;
-            self.pending_embedding = null;
+        if (self.pending_embeddings_gen == self.embed_generation.load(.acquire)) {
+            self.query_embeddings = self.pending_embeddings;
+            self.pending_embeddings = .{};
         } else {
-            log.info("applyEmbedIfDone: discarding stale embedding", .{});
-            if (self.pending_embedding) |e| allocator.free(e);
-            self.pending_embedding = null;
+            log.info("applyEmbedIfDone: discarding stale embeddings", .{});
+            self.pending_embeddings.free(allocator);
         }
 
-        log.info("applyEmbedIfDone: spawning query task, embedding={s}", .{if (self.query_embedding != null) "present" else "null"});
-        grid.query_embedding = self.query_embedding;
+        log.info("applyEmbedIfDone: spawning query task, embeddings={s}", .{if (self.query_embeddings.any()) "present" else "null"});
+        grid.query_embeddings = self.query_embeddings;
         self.spawnQueryTask(io, allocator, db, grid) catch |err| {
             log.warn("applyEmbedIfDone: spawnQueryTask failed: {}", .{err});
         };
@@ -278,12 +292,10 @@ pub const SearchState = struct {
             n += 1;
         }
 
-        const embedding: ?[]const f32 = if (grid.query_embedding) |e| blk: {
-            const copy = try allocator.alloc(f32, e.len);
-            @memcpy(copy, e);
-            break :blk copy;
-        } else null;
-        errdefer if (embedding) |e| allocator.free(e);
+        var embeddings: image_grid_mod.QueryEmbeddings = .{};
+        errdefer embeddings.free(allocator);
+        if (grid.query_embeddings.prompt) |e| embeddings.prompt = try allocator.dupe(f32, e);
+        if (grid.query_embeddings.visual) |e| embeddings.visual = try allocator.dupe(f32, e);
 
         const gen = self.query_generation.fetchAdd(1, .acq_rel) + 1;
         self.query_done.store(false, .release);
@@ -300,7 +312,9 @@ pub const SearchState = struct {
             .db = db,
             .mode = grid.search_mode,
             .fts_query = fts_query,
-            .embedding = embedding,
+            .embeddings = embeddings,
+            .semantic_min_similarity = grid.semantic_min_similarity,
+            .visual_min_similarity = grid.visual_min_similarity,
             .filter_library_id = grid.filter_library_id,
             .filter_folder_path = folder_path,
             .filters = filters_copy,
@@ -316,7 +330,7 @@ pub const SearchState = struct {
         log.info("query task spawned: gen={d} mode={s} fts={s} embed={s}", .{
             gen, @tagName(grid.search_mode),
             if (fts_query != null) "yes" else "no",
-            if (embedding != null) "yes" else "no",
+            if (grid.query_embeddings.any()) "yes" else "no",
         });
     }
 
@@ -367,10 +381,7 @@ pub const SearchState = struct {
         const gen = self.embed_generation.fetchAdd(1, .acq_rel) + 1;
         self.embed_done.store(false, .release);
         self.embed_pending = true;
-        if (self.pending_embedding) |e| {
-            allocator.free(e);
-            self.pending_embedding = null;
-        }
+        self.pending_embeddings.free(allocator);
 
         const query_copy = try allocator.dupe(u8, query);
         errdefer allocator.free(query_copy);
@@ -382,8 +393,8 @@ pub const SearchState = struct {
             .embedder = embedder,
             .generation = gen,
             .current_gen = &self.embed_generation,
-            .result = &self.pending_embedding,
-            .result_gen = &self.pending_embedding_gen,
+            .result = &self.pending_embeddings,
+            .result_gen = &self.pending_embeddings_gen,
             .done = &self.embed_done,
             .wakeup_fn = self.wakeup_fn,
         };

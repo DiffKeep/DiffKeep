@@ -329,6 +329,27 @@ pub fn build(b: *std.Build) !void {
     const text_search_step = b.step("test_text_search", "Test text retrieval quality across embedding models");
     text_search_step.dependOn(&run_text_search.step);
 
+    // Dev tool: parity check — TensorPencil (native Zig) vs ONNX Runtime for the
+    // Snowflake text encoder. Proves the TP text-embedding path reproduces the
+    // ONNX vectors before we rip ONNX out of the text space.
+    const tp_parity_exe = b.addExecutable(.{
+        .name = "test_tp_parity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_tp_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    try addOnnxRuntime(b, tp_parity_exe, use_gpu);
+    try addTensorPencil(b, tp_parity_exe, tp_parity_exe.root_module);
+    b.installArtifact(tp_parity_exe);
+    const run_tp_parity = b.addRunArtifact(tp_parity_exe);
+    run_tp_parity.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_tp_parity.addArgs(args);
+    const tp_parity_step = b.step("test_tp_parity", "Compare TensorPencil vs ONNX Snowflake embeddings (cosine parity)");
+    tp_parity_step.dependOn(&run_tp_parity.step);
+
     const onnx_text_search_exe = b.addExecutable(.{
         .name = "test_onnx_text_search",
         .root_module = b.createModule(.{
@@ -339,6 +360,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     try addOnnxRuntime(b, onnx_text_search_exe, use_gpu);
+    try addTensorPencil(b, onnx_text_search_exe, onnx_text_search_exe.root_module);
     b.installArtifact(onnx_text_search_exe);
     const run_onnx_text_search = b.addRunArtifact(onnx_text_search_exe);
     run_onnx_text_search.step.dependOn(b.getInstallStep());
@@ -510,6 +532,22 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
         .root_source_file = b.path("src/mtmd.zig"),
     });
     exe.root_module.addImport("mtmd", mtmd_zig);
+}
+
+/// Add the TensorPencil native-Zig inference library. `import_mod` receives the
+/// `TensorPencil` import (may differ from exe.root_module for the test build).
+/// ggml is disabled: the embedding encoders compute in f32 (native Zig GEMM),
+/// so ggml's block-quant kernels aren't needed and skipping them keeps the link
+/// free of ggml's C library + libc++.
+fn addTensorPencil(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void {
+    const target = exe.root_module.resolved_target.?;
+    const optimize = exe.root_module.optimize.?;
+    const tp_dep = b.dependency("TensorPencil", .{
+        .target = target,
+        .optimize = optimize,
+        .ggml = false,
+    });
+    import_mod.addImport("TensorPencil", tp_dep.module("TensorPencil"));
 }
 
 fn addOnnxRuntime(b: *std.Build, exe: anytype, use_gpu: bool) !void {

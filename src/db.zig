@@ -327,37 +327,60 @@ pub const VectorDb = struct {
     }
 
     /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 768-dim.
-    pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
-        return self.searchByEmbedding(allocator, "positive_prompt_embeddings", query, limit);
+    /// Results with cosine similarity below `min_similarity` are dropped (pass -1 to disable).
+    pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
+        return self.searchByEmbedding(allocator, "positive_prompt_embeddings", query, limit, min_similarity);
     }
 
     /// KNN search on image_embeddings. query must be L2-normalized, 768-dim.
-    pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
-        return self.searchByEmbedding(allocator, "image_embeddings", query, limit);
+    /// Results with cosine similarity below `min_similarity` are dropped (pass -1 to disable).
+    pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
+        return self.searchByEmbedding(allocator, "image_embeddings", query, limit, min_similarity);
     }
 
-    /// Cosine-distance KNN over a vec0 embedding table joined to non-trashed images.
+    /// KNN over a vec0 embedding table using the optimized MATCH path, then a
+    /// rowid join to non-trashed images preserving KNN order.
+    /// The tables use the default L2 metric; since all stored vectors and the
+    /// query are L2-normalized, L2 order equals cosine order and
+    /// sim = 1 - d²/2 recovers cosine similarity for thresholding.
     /// `table` is a compile-time-trusted internal identifier (not user input).
-    fn searchByEmbedding(self: *VectorDb, allocator: std.mem.Allocator, comptime table: []const u8, query: []const f32, limit: usize) ![]GridEntry {
+    fn searchByEmbedding(self: *VectorDb, allocator: std.mem.Allocator, comptime table: []const u8, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare(
-            "SELECT i.id, i.library_path, i.mtime\n" ++
-            "FROM images i\n" ++
-            "JOIN " ++ table ++ " e ON e.rowid = i.id\n" ++
-            "WHERE i.trashed_at IS NULL\n" ++
-            "ORDER BY vec_distance_cosine(e.vector, ?) ASC\n" ++
-            "LIMIT ?",
-        );
-        defer stmt.deinit();
-        try stmt.bindBlob(1, std.mem.sliceAsBytes(query));
-        try stmt.bind(2, @as(i64, @intCast(limit)));
+
+        // Over-fetch to absorb rows the trash filter removes afterwards.
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        {
+            var knn = try self.db.prepare(
+                "SELECT rowid, distance FROM " ++ table ++ " WHERE vector MATCH ? AND k = ?",
+            );
+            defer knn.deinit();
+            try knn.bindBlob(1, std.mem.sliceAsBytes(query));
+            try knn.bind(2, @as(i64, @intCast(limit * 2)));
+            while (try knn.step()) {
+                const d: f32 = @floatCast(knn.columnDouble(1));
+                const sim = 1.0 - (d * d) / 2.0;
+                // KNN returns nearest-first; the first miss ends the useful prefix.
+                if (sim < min_similarity) break;
+                try ids.append(allocator, knn.columnInt64(0));
+            }
+        }
+
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
             for (list.items) |e| allocator.free(e.path);
             list.deinit(allocator);
         }
-        while (try stmt.step()) {
+        var stmt = try self.db.prepare(
+            "SELECT id, library_path, mtime FROM images WHERE id = ? AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        for (ids.items) |rowid| {
+            if (list.items.len >= limit) break;
+            try stmt.reset();
+            try stmt.bind(1, rowid);
+            if (!try stmt.step()) continue; // trashed or deleted
             const id: u64 = @intCast(stmt.columnInt64(0));
             const path = try allocator.dupe(u8, stmt.columnText(1));
             errdefer allocator.free(path);
@@ -368,16 +391,28 @@ pub const VectorDb = struct {
     }
 
     /// RRF-merged KNN search over both prompt and image embeddings.
-    /// Runs both queries independently (top `limit` each), merges via Reciprocal
-    /// Rank Fusion (k=60), and returns the top `limit` results sorted by combined
-    /// score descending.  query must be L2-normalized, 768-dim.
-    pub fn searchCombined(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize) ![]GridEntry {
-        const prompt_results = try self.searchByPromptEmbedding(allocator, query, limit);
+    /// The two tables live in different embedding spaces, so each leg takes its
+    /// own query vector: `prompt_query` from the text-retrieval encoder
+    /// (Snowflake) and `visual_query` from the cross-modal text encoder
+    /// (SigLIP2).  Runs both KNNs independently (top `limit` each), merges via
+    /// Reciprocal Rank Fusion (k=60), and returns the top `limit` results
+    /// sorted by combined score descending.  Both vectors must be
+    /// L2-normalized, 768-dim.
+    pub fn searchCombined(
+        self: *VectorDb,
+        allocator: std.mem.Allocator,
+        prompt_query: []const f32,
+        visual_query: []const f32,
+        limit: usize,
+        prompt_min_similarity: f32,
+        visual_min_similarity: f32,
+    ) ![]GridEntry {
+        const prompt_results = try self.searchByPromptEmbedding(allocator, prompt_query, limit, prompt_min_similarity);
         defer {
             for (prompt_results) |e| allocator.free(e.path);
             allocator.free(prompt_results);
         }
-        const image_results = try self.searchByImageEmbedding(allocator, query, limit);
+        const image_results = try self.searchByImageEmbedding(allocator, visual_query, limit, visual_min_similarity);
         defer {
             for (image_results) |e| allocator.free(e.path);
             allocator.free(image_results);

@@ -39,6 +39,15 @@ pub const Config = struct {
     trash_enabled: bool = true,
     text_model_dir: ?[]const u8 = null,    // path to snowflake-arctic-embed-m-v2.0 dir
     visual_model_dir: ?[]const u8 = null,  // path to ViT-B-16-SigLIP2__webli dir
+    // Minimum cosine similarity for vector search hits; anything below is
+    // dropped instead of padding the grid with the irrelevant KNN tail.
+    // Ranges differ per embedding space; defaults calibrated on the labeled
+    // eval corpora (see search_quality_corpus.zig / test_onnx_search.zig):
+    // Snowflake relevant hits sit ≳0.17, irrelevant mass ≈0.11; SigLIP2
+    // relevant ≳0.035, irrelevant ≈0.04. Both chosen to cut the far tail
+    // without dropping real matches.
+    semantic_min_similarity: f32 = 0.15,
+    visual_min_similarity: f32 = 0.03,
     use_gpu: bool = false,
     gpu_device_id: u32 = 0,
 

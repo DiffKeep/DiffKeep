@@ -2,6 +2,7 @@ const std = @import("std");
 const db_mod = @import("db.zig");
 const png_mod = @import("image/png-data.zig");
 const comfy_mod = @import("parse/comfy.zig");
+const prompt_clean = @import("parse/prompt_clean.zig");
 const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
 const onnx_mod = @import("onnx_embedder.zig");
@@ -54,6 +55,14 @@ fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]co
 /// Number of files processed concurrently per batch. After each batch of CPU
 /// work (parse + thumbnail) completes, embeddings are run in a single GPU call.
 pub const EMBED_BATCH_SIZE: usize = 8;
+
+/// Number of embed-consumer goroutines draining the queue concurrently when the
+/// embedder is on the GPU. Each Run() is tiny; the per-item bottleneck is the
+/// CPU-side prep (vips image decode, tokenization) and the blocking GPU sync, so
+/// several consumers keep decode overlapping with in-flight GPU compute and
+/// stop the GPU from sitting idle between calls. On CPU we use a single consumer
+/// (see below) — the session already saturates every core per inference.
+pub const EMBED_GPU_CONSUMERS: usize = 16;
 
 pub const ScanStats = struct {
     added: u32 = 0,
@@ -249,14 +258,26 @@ pub const LibraryScanner = struct {
         };
         var embed_group: std.Io.Group = .init;
         if (self.embedder) |emb| {
-            embed_group.concurrent(io, embedConsumer, .{EmbedConsumerCtx{
-                .queue     = &embed_queue,
-                .db        = self.db,
-                .emb       = emb,
-                .allocator = self.allocator,
-                .stop      = stop,
-                .io        = io,
-            }}) catch |err| log.warn("spawn embed consumer: {}", .{err});
+            // Multiple consumers only pay off on the GPU (concurrent Run() calls
+            // overlap CPU prep with GPU compute); on CPU one consumer already
+            // uses every core per inference, so more would just oversubscribe.
+            const n_consumers: usize = if (emb.isGpu()) EMBED_GPU_CONSUMERS else 1;
+            var spawned: usize = 0;
+            for (0..n_consumers) |_| {
+                embed_group.concurrent(io, embedConsumer, .{EmbedConsumerCtx{
+                    .queue     = &embed_queue,
+                    .db        = self.db,
+                    .emb       = emb,
+                    .allocator = self.allocator,
+                    .stop      = stop,
+                    .io        = io,
+                }}) catch |err| {
+                    log.warn("spawn embed consumer: {}", .{err});
+                    continue;
+                };
+                spawned += 1;
+            }
+            log.debug("embed consumers spawned: {d} (gpu={})", .{ spawned, emb.isGpu() });
         }
 
         var group: std.Io.Group = .init;
@@ -439,8 +460,12 @@ fn embedSingle(
     emb:       *onnx_mod.OnnxEmbedder,
     item:      *const EmbedInput,
 ) void {
-    if (item.prompt_text) |text| {
-        if (emb.embedPrompt(allocator, text)) |vec| {
+    if (item.prompt_text) |text| clean_blk: {
+        // Strip ComfyUI/A1111 markup so the embedder sees natural language.
+        const cleaned = prompt_clean.cleanPrompt(allocator, text) catch break :clean_blk;
+        defer allocator.free(cleaned);
+        if (cleaned.len == 0) break :clean_blk;
+        if (emb.embedPrompt(allocator, cleaned)) |vec| {
             defer allocator.free(vec);
             db.storePromptEmbedding(item.image_id, vec) catch |err|
                 log.warn("store prompt embed: {}", .{err});
@@ -470,7 +495,11 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
         const emb = ctx.embedder orelse break :prompt;
         const prompt = image.positivePromptText orelse break :prompt;
         if (ctx.stop.load(.acquire)) break :prompt;
-        const vec = emb.embedPrompt(ctx.allocator, prompt) catch break :prompt;
+        // Strip ComfyUI/A1111 markup so the embedder sees natural language.
+        const cleaned = prompt_clean.cleanPrompt(ctx.allocator, prompt) catch break :prompt;
+        defer ctx.allocator.free(cleaned);
+        if (cleaned.len == 0) break :prompt;
+        const vec = emb.embedPrompt(ctx.allocator, cleaned) catch break :prompt;
         defer ctx.allocator.free(vec);
         ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
             log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });

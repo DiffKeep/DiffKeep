@@ -17,6 +17,25 @@ pub const SortDir = enum { asc, desc };
 pub const ViewMode = enum { library, trash, duplicates, favorites };
 pub const SearchMode = enum { fts, semantic, visual, combined };
 
+/// One query embedding per vector space: `prompt` targets
+/// positive_prompt_embeddings (Snowflake), `visual` targets image_embeddings
+/// (SigLIP2 text encoder). Combined mode uses both; the spaces are not
+/// interchangeable.
+pub const QueryEmbeddings = struct {
+    prompt: ?[]const f32 = null,
+    visual: ?[]const f32 = null,
+
+    pub fn any(self: QueryEmbeddings) bool {
+        return self.prompt != null or self.visual != null;
+    }
+
+    pub fn free(self: *QueryEmbeddings, allocator: std.mem.Allocator) void {
+        if (self.prompt) |e| allocator.free(e);
+        if (self.visual) |e| allocator.free(e);
+        self.* = .{};
+    }
+};
+
 pub const ImageEntry = struct {
     id: u64,
     path: []const u8,     // heap-allocated, owned by GridState.images
@@ -253,9 +272,12 @@ pub const GridState = struct {
     search_query: ?[]const u8 = null,
     // Active metadata filters — slice into app.zig's g_active_filters; not owned
     filters: []const db_mod.ActiveFilter = &.{},
-    // Search mode and query embedding for semantic/visual search
+    // Search mode and query embeddings for semantic/visual search
     search_mode: SearchMode = .fts,
-    query_embedding: ?[]const f32 = null,  // borrowed, not owned
+    query_embeddings: QueryEmbeddings = .{},  // borrowed, not owned
+    // Minimum cosine similarity per vector space (from config; set at startup).
+    semantic_min_similarity: f32 = 0.15,
+    visual_min_similarity: f32 = 0.03,
 
     // Data directory (e.g. ~/.local/share/DiffKeep) — borrowed from app, not owned.
     // Used to resolve trash file paths: <data_dir>/trash/<trash_name>.
@@ -443,14 +465,24 @@ pub const GridState = struct {
         const entries = switch (self.view_mode) {
             .library => blk: {
                 const has_text = if (self.search_query) |q| q.len > 0 else false;
-                // Vector search modes — only when an embedding is available
-                if (self.query_embedding) |embd| {
-                    switch (self.search_mode) {
-                        .semantic  => break :blk try db.searchByPromptEmbedding(self.allocator, embd, 200),
-                        .visual    => break :blk try db.searchByImageEmbedding(self.allocator, embd, 200),
-                        .combined  => break :blk try db.searchCombined(self.allocator, embd, 200),
-                        .fts       => {},
-                    }
+                // Vector search modes — only when the needed embedding is available.
+                // Combined degrades to a single-space search when only one
+                // encoder produced an embedding.
+                switch (self.search_mode) {
+                    .semantic => if (self.query_embeddings.prompt) |e|
+                        break :blk try db.searchByPromptEmbedding(self.allocator, e, 200, self.semantic_min_similarity),
+                    .visual => if (self.query_embeddings.visual) |e|
+                        break :blk try db.searchByImageEmbedding(self.allocator, e, 200, self.visual_min_similarity),
+                    .combined => {
+                        if (self.query_embeddings.prompt) |pe| {
+                            if (self.query_embeddings.visual) |ve|
+                                break :blk try db.searchCombined(self.allocator, pe, ve, 200, self.semantic_min_similarity, self.visual_min_similarity);
+                            break :blk try db.searchByPromptEmbedding(self.allocator, pe, 200, self.semantic_min_similarity);
+                        }
+                        if (self.query_embeddings.visual) |ve|
+                            break :blk try db.searchByImageEmbedding(self.allocator, ve, 200, self.visual_min_similarity);
+                    },
+                    .fts => {},
                 }
                 // FTS / filtered query
                 if (has_text or self.filters.len > 0) {
@@ -704,7 +736,7 @@ pub const GridState = struct {
     /// tell whether the new image matches, so we leave it out — it appears the
     /// next time the query is run.
     pub fn incomingBelongs(self: *const GridState, path: []const u8) bool {
-        if (self.query_embedding != null) return false;
+        if (self.query_embeddings.any()) return false;
         if (self.search_query) |q| if (q.len > 0) return false;
         if (self.filters.len > 0) return false;
         if (self.filter_folder_path) |fp| return pathInside(path, fp);
@@ -975,7 +1007,7 @@ pub const GridState = struct {
 
         if (n == 0) {
             const is_searching = self.search_query != null or
-                self.query_embedding != null or
+                self.query_embeddings.any() or
                 self.filters.len > 0;
             const empty_text = switch (self.view_mode) {
                 .trash => i18n.t(.trash_empty),

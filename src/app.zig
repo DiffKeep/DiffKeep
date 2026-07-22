@@ -267,6 +267,8 @@ fn appInit(win: *dvui.Window) !void {
                 grid.data_dir = g_data_dir;
                 grid.thumb_fraction = std.math.clamp(dk.g_cfg.grid_thumb_fraction, 0, 1);
                 grid.autoplay = dk.g_cfg.grid_autoplay;
+                grid.semantic_min_similarity = dk.g_cfg.semantic_min_similarity;
+                grid.visual_min_similarity = dk.g_cfg.visual_min_similarity;
                 try grid.startWorker();
             }
 
@@ -635,11 +637,8 @@ fn frame() !dvui.App.Result {
                 switch (g_search.mode) {
                     .fts => {
                         grid.search_query = if (q.len > 0) q else null;
-                        grid.query_embedding = null;
-                        if (g_search.query_embedding) |emb| {
-                            init.gpa.free(emb);
-                            g_search.query_embedding = null;
-                        }
+                        grid.query_embeddings = .{};
+                        g_search.query_embeddings.free(init.gpa);
                         log.info("fts search: query={?s}", .{grid.search_query});
                         if (dk.g_db) |*db| g_search.spawnQueryTask(init.io, init.gpa, db, grid) catch |err| {
                             log.warn("spawnQueryTask (fts): {}", .{err});
@@ -647,11 +646,8 @@ fn frame() !dvui.App.Result {
                     },
                     .semantic, .visual, .combined => {
                         grid.search_query = null;
-                        if (g_search.query_embedding) |emb| {
-                            init.gpa.free(emb);
-                            g_search.query_embedding = null;
-                        }
-                        grid.query_embedding = null;
+                        grid.query_embeddings = .{};
+                        g_search.query_embeddings.free(init.gpa);
                         if (q.len > 0) {
                             log.info("spawning embed query: mode={s}", .{@tagName(g_search.mode)});
                             g_search.spawnEmbedQuery(init.io, init.gpa, q, g_search.mode) catch |err| {

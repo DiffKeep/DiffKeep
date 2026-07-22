@@ -341,8 +341,10 @@ pub const Database = struct {
     }
 
     // Search for nearest vectors
+    /// KNN via the vec0 MATCH fast path. `distance` is the table's metric
+    /// (L2 by default); with L2-normalized vectors the ranking equals cosine.
     pub fn searchNearestVectors(self: *Database, table_name: []const u8, query_vector: []const f32, limit: usize) !std.ArrayList(VecResult) {
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT rowid, vec_distance_cosine(vector, ?) as distance FROM {s} ORDER BY distance ASC LIMIT ?", .{table_name});
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT rowid, distance FROM {s} WHERE vector MATCH ? AND k = ?", .{table_name});
         defer self.allocator.free(sql);
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -355,14 +357,14 @@ pub const Database = struct {
         _ = c.sqlite3_bind_blob(stmt, 1, @ptrCast(query_vector.ptr), @intCast(query_vector.len * @sizeOf(f32)), c.SQLITE_STATIC);
         _ = c.sqlite3_bind_int(stmt, 2, @intCast(limit));
 
-        var results = std.ArrayList(VecResult).init(self.allocator);
-        errdefer results.deinit();
+        var results: std.ArrayList(VecResult) = .empty;
+        errdefer results.deinit(self.allocator);
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id = c.sqlite3_column_int64(stmt, 0);
             const distance = @as(f32, @floatCast(c.sqlite3_column_double(stmt, 1)));
 
-            try results.append(.{ .id = id, .distance = distance });
+            try results.append(self.allocator, .{ .id = id, .distance = distance });
         }
 
         return results;

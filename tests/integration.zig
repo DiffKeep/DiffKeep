@@ -372,7 +372,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q = [_]f32{0} ** dim;
         q[1] = 1.0;
-        const hits = try db.searchByPromptEmbedding(alloc, &q, 3);
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -385,7 +385,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q = [_]f32{0} ** dim;
         q[12] = 1.0;
-        const hits = try db.searchByImageEmbedding(alloc, &q, 3);
+        const hits = try db.searchByImageEmbedding(alloc, &q, 3, -1.0);
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -394,12 +394,41 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
         try std.testing.expectEqual(ids[2], hits[0].id);
     }
 
+    // A similarity threshold drops the orthogonal (sim = 0) tail.
+    {
+        var q = [_]f32{0} ** dim;
+        q[1] = 1.0;
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, 0.5);
+        defer {
+            for (hits) |e| alloc.free(e.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqual(ids[1], hits[0].id);
+    }
+
+    // Combined search: prompt leg matches b, visual leg matches c; RRF puts
+    // both ahead of a, which neither leg ranked first.
+    {
+        var pq = [_]f32{0} ** dim;
+        pq[1] = 1.0;
+        var vq = [_]f32{0} ** dim;
+        vq[12] = 1.0;
+        const hits = try db.searchCombined(alloc, &pq, &vq, 2, -1.0, -1.0);
+        defer {
+            for (hits) |e| alloc.free(e.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        for (hits) |e| try std.testing.expect(e.id == ids[1] or e.id == ids[2]);
+    }
+
     // Trashed images must be excluded from results.
     try db.trashImage(ids[1], "b_trash.png", 1024, 1000);
     {
         var q = [_]f32{0} ** dim;
         q[1] = 1.0;
-        const hits = try db.searchByPromptEmbedding(alloc, &q, 3);
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -760,9 +789,11 @@ test "grid: incomingBelongs respects the active view filters" {
 
     // Same for an active embedding (semantic/visual) query.
     const dummy_embedding = [_]f32{0.0} ** 4;
-    grid.query_embedding = &dummy_embedding;
+    grid.query_embeddings = .{ .prompt = &dummy_embedding };
     try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
-    grid.query_embedding = null;
+    grid.query_embeddings = .{ .visual = &dummy_embedding };
+    try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
+    grid.query_embeddings = .{};
 }
 
 // ── Grid ↔ DB integration ───────────────────────────────────────────────────────
