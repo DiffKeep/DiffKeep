@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("vips_helper.h");
-});
+pub const c = @import("vips_c");
 
 pub fn init() !void {
     if (c.diffkeep_vips_init("diffkeep") != 0) return error.VipsInitFailed;

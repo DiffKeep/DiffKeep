@@ -3,13 +3,14 @@ const db_mod = @import("db.zig");
 const image_grid_mod = @import("image_grid.zig");
 const library_manager_mod = @import("library_manager.zig");
 const models_mod = @import("models.zig");
-const onnx_mod = @import("onnx_embedder.zig");
+const embedder_mod = @import("embedder.zig");
 
 // UI modules — re-exported so the headless test build compiles and can drive
 // them. They reach the backend only through the `platform` seam, so they build
 // against dvui's `.testing` backend.
 pub const platform = @import("platform.zig");
 pub const fonts = @import("fonts.zig");
+pub const style = @import("style.zig");
 pub const sidebar = @import("sidebar.zig");
 pub const toolbar = @import("toolbar.zig");
 pub const detail_panel = @import("detail_panel.zig");
@@ -18,6 +19,7 @@ pub const filter_modal = @import("filter_modal.zig");
 pub const delete_dialog = @import("delete_dialog.zig");
 pub const search = @import("search.zig");
 pub const image_viewer = @import("image_viewer.zig");
+pub const image_grid = image_grid_mod;
 
 pub const Config = config_mod.Config;
 pub const VectorDb = db_mod.VectorDb;
@@ -36,4 +38,4 @@ pub var g_cfg: Config = .{};
 pub var g_db: ?VectorDb = null;
 pub var g_grid: ?GridState = null;
 pub var g_library_manager: ?LibraryManager = null;
-pub var g_embedder: ?onnx_mod.OnnxEmbedder = null;
+pub var g_embedder: ?embedder_mod.Embedder = null;

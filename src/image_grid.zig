@@ -7,6 +7,8 @@ const i18n = @import("i18n.zig");
 const icons = @import("icons");
 const media = @import("media.zig");
 const video_player_mod = @import("video_player.zig");
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 pub const ImageNotifier = notifier_mod.ImageNotifier;
 
@@ -177,6 +179,12 @@ pub const GridState = struct {
     // `queued` so the per-frame queue rebuild (which drops stale queued requests)
     // doesn't re-request something already in flight and load it twice.
     in_flight: std.AutoHashMap(u64, void),
+    // Ids whose thumbnail couldn't be produced: not re-requested until
+    // invalidateThumbnail (refresh / recycled id). Guarded by queue_mutex.
+    load_failed: std.AutoHashMap(u64, void),
+    // Ids the loader deleted from the DB because their file is gone. Drained by
+    // app.zig each frame to drop them from the grid and viewers. Guarded by queue_mutex.
+    missing_ids: std.ArrayList(u64) = .empty,
     queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
     queue_cond: std.Io.Condition = std.Io.Condition.init,
 
@@ -219,8 +227,8 @@ pub const GridState = struct {
     // like the thumbnail loader's high/low queues.
     player_mutex: std.Io.Mutex = std.Io.Mutex.init,
     player_cond: std.Io.Condition = std.Io.Condition.init,
-    player_queue: std.ArrayListUnmanaged(PlayerOpenReq) = .empty,
-    player_ready: std.ArrayListUnmanaged(ReadyPlayer) = .empty,
+    player_queue: std.ArrayList(PlayerOpenReq) = .empty,
+    player_ready: std.ArrayList(ReadyPlayer) = .empty,
     player_in_flight: std.AutoHashMap(u64, void) = undefined,
     player_failed: std.AutoHashMap(u64, void) = undefined, // opens that errored; don't retry
     player_openers: [max_player_openers]std.Thread = undefined,
@@ -252,7 +260,7 @@ pub const GridState = struct {
     // Favorite toggle — set when a grid star is clicked, consumed by app.zig.
     favorite_toggle_id: ?u64 = null,
     drag_requested: bool = false,
-    drag_requested_ids: std.ArrayListUnmanaged(u64) = .empty,
+    drag_requested_ids: std.ArrayList(u64) = .empty,
     // Mirrored from config so renderItem can condition the context menu label
     trash_enabled: bool = true,
     // Viewer opening — set by double-click/Enter/context menu, consumed by app.zig each frame
@@ -291,6 +299,7 @@ pub const GridState = struct {
             .pending = std.AutoHashMap(u64, []u8).init(allocator),
             .queued = std.AutoHashMap(u64, void).init(allocator),
             .in_flight = std.AutoHashMap(u64, void).init(allocator),
+            .load_failed = std.AutoHashMap(u64, void).init(allocator),
             .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = try db.getConnection(),
@@ -309,7 +318,7 @@ pub const GridState = struct {
             state.images.appendAssumeCapacity(.{
                 .id = e.id,
                 .path = e.path,
-                .filename = std.fs.path.basename(e.path),
+                .filename = std.Io.Dir.path.basename(e.path),
                 .mtime = e.mtime,
             });
         }
@@ -379,6 +388,8 @@ pub const GridState = struct {
         self.low_queue.deinit(self.allocator);
         self.queued.deinit();
         self.in_flight.deinit();
+        self.load_failed.deinit();
+        self.missing_ids.deinit(self.allocator);
         self.refreshed.deinit();
 
         self.loader_db.deinit();
@@ -427,7 +438,7 @@ pub const GridState = struct {
             self.images.appendAssumeCapacity(.{
                 .id = e.id,
                 .path = e.path,
-                .filename = std.fs.path.basename(e.path),
+                .filename = std.Io.Dir.path.basename(e.path),
                 .mtime = e.mtime,
             });
         }
@@ -513,7 +524,7 @@ pub const GridState = struct {
             self.images.appendAssumeCapacity(.{
                 .id = e.id,
                 .path = e.path,
-                .filename = std.fs.path.basename(e.path),
+                .filename = std.Io.Dir.path.basename(e.path),
                 .mtime = e.mtime,
                 .trashed_at = e.trashed_at,
                 .trash_name = e.trash_name,
@@ -596,7 +607,7 @@ pub const GridState = struct {
         if (self.player_failed.contains(id)) return; // main-thread only; no lock
         const path = self.diskPath(entry);
         defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
-        const path_z = self.allocator.dupeZ(u8, path) catch return;
+        const path_z = self.allocator.dupeSentinel(u8, path, 0) catch return;
 
         self.player_mutex.lockUncancelable(self.io);
         defer self.player_mutex.unlock(self.io);
@@ -655,7 +666,7 @@ pub const GridState = struct {
         // iterator, and (with no cap) any number may go stale in one frame. Only
         // destroy after collecting, so a player is never freed while its map entry
         // survives (that would be a use-after-free next frame).
-        var stale: std.ArrayListUnmanaged(u64) = .empty;
+        var stale: std.ArrayList(u64) = .empty;
         defer stale.deinit(self.allocator);
         var it = self.grid_players.iterator();
         while (it.next()) |kv| {
@@ -787,7 +798,7 @@ pub const GridState = struct {
                 self.images.append(self.allocator, .{
                     .id = e.id,
                     .path = e.path,
-                    .filename = std.fs.path.basename(e.path),
+                    .filename = std.Io.Dir.path.basename(e.path),
                     .mtime = e.mtime,
                 }) catch {
                     self.allocator.free(e.path);
@@ -861,7 +872,48 @@ pub const GridState = struct {
             self.queue_mutex.lockUncancelable(self.io);
             defer self.queue_mutex.unlock(self.io);
             _ = self.queued.remove(id);
+            _ = self.load_failed.remove(id);
         }
+    }
+
+    /// Worker side: no thumbnail could be produced for `id`. A file deleted
+    /// outside the app (gone from a directory that still exists) has its row
+    /// removed now and its id queued for `drainMissingIds`; anything else (an
+    /// undecodable file, or a whole directory missing, e.g. an unmounted drive,
+    /// which the library scan reconciles) is just not retried.
+    pub fn noteLoadFailure(self: *GridState, id: u64, path: []const u8) void {
+        {
+            // Covers both outcomes: a deleted id must not be re-requested before
+            // the main thread drains it (removal then invalidates it).
+            self.queue_mutex.lockUncancelable(self.io);
+            defer self.queue_mutex.unlock(self.io);
+            self.load_failed.put(id, {}) catch {};
+        }
+        if (fileDeleted(self.io, path)) {
+            self.loader_db_mutex.lockUncancelable(self.io);
+            const deleted = self.loader_db.deleteMissingImage(id, path) catch |err| blk: {
+                log.warn("remove missing {s}: {}", .{ std.Io.Dir.path.basename(path), err });
+                break :blk false;
+            };
+            self.loader_db_mutex.unlock(self.io);
+            if (deleted) {
+                log.info("removed missing file {s} from the library", .{std.Io.Dir.path.basename(path)});
+                self.queue_mutex.lockUncancelable(self.io);
+                self.missing_ids.append(self.allocator, id) catch {};
+                self.queue_mutex.unlock(self.io);
+                if (self.wakeup_fn) |wakeup| wakeup();
+            }
+        }
+    }
+
+    /// Move the ids `noteLoadFailure` deleted from the DB into `out` (which
+    /// grows with `gpa`). Main-thread only; called once per frame.
+    pub fn drainMissingIds(self: *GridState, gpa: std.mem.Allocator, out: *std.ArrayList(u64)) void {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        if (self.missing_ids.items.len == 0) return;
+        out.appendSlice(gpa, self.missing_ids.items) catch return;
+        self.missing_ids.clearRetainingCapacity();
     }
 
     /// True if `id` was re-notified (reparsed / changed) during this frame's
@@ -949,7 +1001,7 @@ pub const GridState = struct {
     fn diskPath(self: *GridState, entry: *const ImageEntry) []const u8 {
         const tn = entry.trash_name orelse return entry.path;
         const dd = self.data_dir orelse return entry.path;
-        return std.fs.path.join(self.allocator, &.{ dd, "trash", tn }) catch entry.path;
+        return std.Io.Dir.path.join(self.allocator, &.{ dd, "trash", tn }) catch entry.path;
     }
 
     fn requestLoad(self: *GridState, id: u64, path: []const u8, high: bool) void {
@@ -958,7 +1010,7 @@ pub const GridState = struct {
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
 
-        if (self.queued.contains(id) or self.in_flight.contains(id)) return;
+        if (self.queued.contains(id) or self.in_flight.contains(id) or self.load_failed.contains(id)) return;
 
         const path_copy = self.allocator.dupe(u8, path) catch return;
         const req = LoadRequest{ .id = id, .path = path_copy };
@@ -1020,6 +1072,7 @@ pub const GridState = struct {
                 .gravity_x = 0.5,
                 .gravity_y = 0.5,
                 .expand = .both,
+                .color_text = .{ .color = style.C.text_ghost },
             });
             return;
         }
@@ -1303,17 +1356,17 @@ pub const GridState = struct {
         const entry = self.images.items[idx];
         const selected = self.selection.contains(entry.id);
 
-        // Border: blue when focused (keyboard cursor), invisible otherwise.
-        // Selection is shown via a corner square instead (see below).
-        const bg_color = dvui.themeGet().fill;
-        const border_color: dvui.Color = if (focused) dvui.themeGet().focus else bg_color;
+        // Border: blue when focused (keyboard cursor), the ground colour
+        // otherwise so the cell's footprint stays the same either way.
+        // Selection is shown via corner marks instead (see below).
+        const border_color: dvui.Color = if (focused) style.C.blue else style.C.canvas;
 
         var cell = dvui.box(@src(), .{ .dir = .vertical }, .{
             .id_extra = idx,
             .min_size_content = .{ .w = ts, .h = ts + label_h },
             .margin = .{ .x = h_margin, .y = gap / 2, .w = h_margin, .h = gap / 2 },
             .border = dvui.Rect.all(cell_border),
-            .color_border = border_color,
+            .color_border = .{ .color = border_color },
         });
         defer cell.deinit();
 
@@ -1400,7 +1453,7 @@ pub const GridState = struct {
                 .id_extra = idx,
                 .min_size_content = .{ .w = ts, .h = ts },
                 .background = true,
-                .color_fill = .{ .r = 30, .g = 30, .b = 30, .a = 255 },
+                .color_fill = .{ .color = style.C.thumb_well },
             });
             img_rs = img_area.data().contentRectScale();
             defer img_area.deinit();
@@ -1471,29 +1524,29 @@ pub const GridState = struct {
                     .gravity_y = 0.0,
                     .margin = .{ .x = star_margin, .y = star_margin, .w = star_margin, .h = star_margin },
                     .padding = dvui.Rect.all(3),
-                    .corner_radius = dvui.Rect.all(star_sz),
+                    .corners = .all(star_sz),
                 });
                 bw.processEvents();
                 // Dark circular backdrop for legibility on any thumbnail; it
                 // darkens on hover and again on press (the click feedback).
                 const bg_a: u8 = if (bw.pressed()) 150 else if (bw.hovered()) 100 else 50;
-                bw.data().borderAndBackground(.{ .fill_color = .{ .r = 0, .g = 0, .b = 0, .a = bg_a } });
+                bw.data().borderAndBackground(.{ .fill_color = .{ .color = .{ .r = 0, .g = 0, .b = 0, .a = bg_a } } });
                 // Favorited → yellow, translucent when idle and solid on
                 // hover/press. Not favorited → faint white that brightens on
                 // hover/press so it reads as clickable. The icon is tinted via
                 // color_text (applied as a colormod) — the reliable way to
                 // recolor a currentColor-based icon.
                 const star_color: dvui.Color = if (entry.favorite)
-                    .{ .r = 255, .g = 205, .b = 45, .a = if (bw.hovered() or bw.pressed()) 255 else 150 }
+                    style.tint(style.C.star, if (bw.hovered() or bw.pressed()) 255 else 150)
                 else
-                    .{ .r = 255, .g = 255, .b = 255, .a = if (bw.pressed()) 255 else if (bw.hovered()) 215 else 120 };
+                    style.tint(style.C.text_hi, if (bw.pressed()) 255 else if (bw.hovered()) 215 else 120);
                 dvui.icon(@src(), "favorite", icons.tvg.heroicons.solid.star, .{}, .{
                     .id_extra = idx,
                     .gravity_x = 0.5,
                     .gravity_y = 0.5,
                     .expand = .ratio,
                     .min_size_content = .{ .w = star_sz - 6, .h = star_sz - 6 },
-                    .color_text = star_color,
+                    .color_text = .{ .color = star_color },
                 });
                 if (bw.clicked()) self.favorite_toggle_id = entry.id;
                 bw.deinit();
@@ -1554,10 +1607,10 @@ pub const GridState = struct {
             if (e.evt != .mouse) continue;
             if (e.evt.mouse.action != .motion) continue;
             if (!dvui.captured(cell.data().id)) continue;
-            if (dvui.dragging(e.evt.mouse.p, null) == null) continue;
+            if (dvui.dragging(e.evt.mouse, null) == null) continue;
             e.handled = true;
             dvui.captureMouse(null, e.num);
-            dvui.dragEnd();
+            dvui.dragEnd(e.evt.mouse.button);
             log.debug("drag gesture fired on id={d}", .{entry.id});
             self.drag_requested = true;
             self.drag_requested_ids.clearRetainingCapacity();
@@ -1572,11 +1625,14 @@ pub const GridState = struct {
             }
         }
 
-        // Selection indicator: white right-triangle in the top-left and bottom-right corners.
+        // Selection indicator: right-triangles in the top-left and bottom-right
+        // corners. Blue, because selection is the user's own choice — and blue
+        // survives on a thumbnail where white did not, since a photograph is far
+        // more likely to be white in a corner than accent-blue.
         if (selected) {
             const sz = 12 * img_rs.s;
             const r = img_rs.r;
-            const white = dvui.Color{ .r = 255, .g = 255, .b = 255, .a = 220 };
+            const c = style.C.blue;
             const alloc = dvui.currentWindow().arena();
 
             var tl = dvui.Path.Builder.init(alloc);
@@ -1584,27 +1640,49 @@ pub const GridState = struct {
             tl.addPoint(.{ .x = r.x,        .y = r.y        });
             tl.addPoint(.{ .x = r.x + sz,   .y = r.y        });
             tl.addPoint(.{ .x = r.x,        .y = r.y + sz   });
-            tl.build().fillConvex(.{ .color = white, .fade = 0 });
+            tl.build().fillConvex(.{ .color = .{ .color = c }, .fade = 0 });
 
             var br = dvui.Path.Builder.init(alloc);
             defer br.deinit();
             br.addPoint(.{ .x = r.x + r.w,        .y = r.y + r.h        });
             br.addPoint(.{ .x = r.x + r.w - sz,   .y = r.y + r.h        });
             br.addPoint(.{ .x = r.x + r.w,        .y = r.y + r.h - sz   });
-            br.build().fillConvex(.{ .color = white, .fade = 0 });
+            br.build().fillConvex(.{ .color = .{ .color = c }, .fade = 0 });
         }
 
-        dvui.labelNoFmt(@src(), entry.filename, .{}, .{
+        // A filename is user data and can hold any script, so it goes through
+        // the run splitter, and is cut to the cell width with a measured
+        // ellipsis rather than wrapped — a wrapped caption would make the cell
+        // taller than `cell_h` and desync the virtual scroll height.
+        var name_buf: [512]u8 = undefined;
+        fonts.richLine(@src(), style.ellipsize(&name_buf, entry.filename, style.F.caption, ts - 4), .{
             .id_extra = idx,
             .min_size_content = .{ .w = ts, .h = label_h },
             .max_size_content = .{ .w = ts, .h = dvui.max_float_safe },
             .expand = .horizontal,
+            .font = style.F.caption,
+            .color_text = .{ .color = if (focused or selected) style.C.text_hi else style.C.text_dim },
             // Horizontal padding only: vertical padding would make the rendered
             // cell taller than cell_h and desync the virtual scroll height.
             .padding = .{ .x = 2 },
         });
     }
 };
+
+/// True when `path` no longer exists but its directory does, i.e. the file
+/// was deleted. A missing directory is not treated as a deletion.
+pub fn fileDeleted(io: std.Io, path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            const dir = std.Io.Dir.path.dirname(path) orelse return false;
+            cwd.access(io, dir, .{}) catch return false;
+            return true;
+        },
+        else => return false,
+    };
+    return false;
+}
 
 /// Whether a path is a video DiffKeep indexes (poster thumbnail stored in DB).
 pub fn isVideoPath(path: []const u8) bool {
@@ -1672,15 +1750,18 @@ fn workerFn(state: *GridState) void {
 
         // Fall back to on-the-fly VIPS generation (images only).
         if (bytes == null and !is_video) {
-            const path_z = state.allocator.dupeZ(u8, req.path) catch continue;
+            const path_z = state.allocator.dupeSentinel(u8, req.path, 0) catch continue;
             defer state.allocator.free(path_z);
             bytes = vips.thumbnailToJpeg(state.allocator, path_z, @as(c_int, @intFromFloat(thumb_size_max))) catch |err| blk: {
-                log.warn("vips thumbnail {s}: {}", .{ std.fs.path.basename(req.path), err });
+                log.warn("vips thumbnail {s}: {}", .{ std.Io.Dir.path.basename(req.path), err });
                 break :blk null;
             };
         }
 
-        const b = bytes orelse continue;
+        const b = bytes orelse {
+            state.noteLoadFailure(req.id, req.path);
+            continue;
+        };
 
         state.pending_mutex.lockUncancelable(state.io);
         if (state.pending.fetchRemove(req.id)) |old| state.allocator.free(old.value);

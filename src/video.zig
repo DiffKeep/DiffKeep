@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("video_helper.h");
-});
+const c = @import("video_c");
 
 pub const Info = struct {
     width: u32,

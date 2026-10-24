@@ -1,0 +1,233 @@
+{
+ "name": "images32",
+ "images": [
+  {
+   "path": "Models/Images/05.11.57-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/12.04.07-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/17.57.54-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.00.34-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.02.50-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.03.17-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.04.11-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.04.39-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.05.07-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.06.54-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.08.14-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.09.06-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.10.26-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.11.21-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.12.42-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.13.34-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.14.28-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.16.17-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.17.12-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.19.28-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.30.13-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.30.39-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.32.27-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/18.36.29-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/20.53.37-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/20.55.01-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/20.56.20-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/20.57.12-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/20.58.57-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/21.01.42-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/21.17.24-80085_00001_.png"
+  },
+  {
+   "path": "Models/Images/21.20.13-80085_00001_.png"
+  }
+ ],
+ "queries": [
+  {
+   "text": "sword",
+   "relevant": [
+    "05.11.57-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "cloak",
+   "relevant": [
+    "05.11.57-80085_00001_.png",
+    "18.30.39-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "unicorn",
+   "relevant": [
+    "12.04.07-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "apple",
+   "relevant": [
+    "17.57.54-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "bird",
+   "relevant": [
+    "18.04.11-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "cat",
+   "relevant": [
+    "18.17.12-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "beware",
+   "relevant": [
+    "18.17.12-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "wing",
+   "relevant": [
+    "21.20.13-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "butterfly",
+   "relevant": [
+    "21.20.13-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "monarch",
+   "relevant": [
+    "21.20.13-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "nectar",
+   "relevant": [
+    "21.20.13-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "cold",
+   "relevant": [
+    "21.01.42-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "ramen",
+   "relevant": [
+    "18.12.42-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "fantasy",
+   "relevant": [
+    "05.11.57-80085_00001_.png",
+    "12.04.07-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "flower",
+   "relevant": [
+    "21.20.13-80085_00001_.png",
+    "12.04.07-80085_00001_.png",
+    "18.04.39-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "dock",
+   "relevant": [
+    "18.11.21-80085_00001_.png",
+    "18.36.29-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "pier",
+   "relevant": [
+    "18.11.21-80085_00001_.png",
+    "18.36.29-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "system error 404",
+   "relevant": [
+    "18.05.07-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "japan",
+   "relevant": [
+    "18.30.13-80085_00001_.png",
+    "18.12.42-80085_00001_.png"
+   ]
+  },
+  {
+   "text": "water",
+   "relevant": [
+    "18.11.21-80085_00001_.png",
+    "18.32.27-80085_00001_.png",
+    "18.36.29-80085_00001_.png",
+    "20.56.20-80085_00001_.png"
+   ]
+  }
+ ]
+}

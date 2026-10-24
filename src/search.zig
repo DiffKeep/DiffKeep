@@ -1,5 +1,5 @@
 const std = @import("std");
-const onnx_mod = @import("onnx_embedder.zig");
+const embedder_mod = @import("embedder.zig");
 const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
 
@@ -117,7 +117,7 @@ const EmbedTaskCtx = struct {
     allocator: std.mem.Allocator,
     query: []const u8,        // owned; freed by task
     mode: image_grid_mod.SearchMode,
-    embedder: *onnx_mod.OnnxEmbedder,
+    embedder: *embedder_mod.Embedder,
     generation: u64,
     current_gen: *std.atomic.Value(u64),
     result: *image_grid_mod.QueryEmbeddings,
@@ -175,7 +175,7 @@ pub const SearchState = struct {
     // Only changes to buf (vs last_buf) reset the debounce deadline.
     last_buf: [256]u8 = std.mem.zeroes([256]u8),
     mode: image_grid_mod.SearchMode = .fts,
-    embedder: ?*onnx_mod.OnnxEmbedder = null,
+    embedder: ?*embedder_mod.Embedder = null,
     query_embeddings: image_grid_mod.QueryEmbeddings = .{},
 
     // Debounce: fire search 300 ms after the last keystroke.

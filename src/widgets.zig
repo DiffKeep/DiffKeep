@@ -2,6 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const style = @import("style.zig");
 
 /// Drag handle between two panels.  Click to collapse/expand; drag to resize.
 /// `side` controls which direction the handle adjusts (left panel grows .left,
@@ -18,6 +19,7 @@ pub fn panelHandle(
         .min_size_content = .{ .w = 10, .h = 0 },
         .expand = .vertical,
         .background = true,
+        .color_fill = .{ .color = style.C.canvas },
     });
     defer h.deinit();
 
@@ -45,13 +47,13 @@ pub fn panelHandle(
                 if (me.button.pointer() and dvui.eventMatchSimple(e, h.data())) {
                     e.handle(@src(), h.data());
                     dvui.captureMouse(h.data(), e.num);
-                    dvui.dragPreStart(me.p, .{ .cursor = .arrow_w_e });
+                    dvui.dragPreStart(me.button, me.p, .{ .cursor = .arrow_w_e });
                     dragged = false;
                 }
             },
             .motion => |delta| {
                 if (dvui.captured(id)) {
-                    if (dvui.dragging(me.p, null) != null) {
+                    if (dvui.dragging(me, null) != null) {
                         const dx: f32 = switch (side) {
                             .left => delta.x,
                             .right => -delta.x,
@@ -98,10 +100,13 @@ pub fn panelHandle(
             .left  => if (collapsed) icons.tvg.lucide.@"chevron-right" else icons.tvg.lucide.@"chevron-left",
             .right => if (collapsed) icons.tvg.lucide.@"chevron-left"  else icons.tvg.lucide.@"chevron-right",
         };
+        // Ghosted until the pointer is on the handle: a full-height chevron on
+        // both sides of the grid is two arrows the eye keeps returning to.
         dvui.icon(@src(), "pane_toggle", tvg, .{}, .{
             .gravity_y = 0.5,
             .gravity_x = 0.5,
             .min_size_content = .{ .w = 10, .h = 10 },
+            .color_text = .{ .color = if (is_hovered or dragged) style.C.text_dim else style.C.text_ghost },
         });
     }
 

@@ -124,7 +124,7 @@ pub const ViewerManager = struct {
             images.append(init.gpa, .{
                 .id = e.id,
                 .path = path_copy,
-                .filename = std.fs.path.basename(path_copy),
+                .filename = std.Io.Dir.path.basename(path_copy),
                 .mtime = e.mtime,
                 .trashed_at = e.trashed_at,
                 .trash_name = trash_name_copy,
@@ -163,7 +163,6 @@ pub const ViewerManager = struct {
         const init_h: f32 = if (cfg) |c| @floatFromInt(c.viewer_window.height) else 800;
         const back = SDLBackend.initWindow(.{
             .io = init.io,
-            .allocator = init.gpa,
             .size = .{ .w = init_w, .h = init_h },
             .min_size = .{ .w = 400, .h = 300 },
             .vsync = true,
@@ -171,6 +170,8 @@ pub const ViewerManager = struct {
             // Created hidden; shown after geometry is applied and the first frame
             // is presented (see ViewerWindow.shown).
             .hidden = true,
+            // Geometry is persisted in our own config (viewer_window).
+            .persist_window_geometry = false,
         }) catch {
             for (images.items) |e| { init.gpa.free(e.path); if (e.trash_name) |tn| init.gpa.free(tn); }
             images.deinit(init.gpa);

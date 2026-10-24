@@ -13,6 +13,7 @@ const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const widgets_mod = @import("widgets.zig");
 const image_ops_mod = @import("image_ops.zig");
+const style = @import("style.zig");
 
 pub const left_w_min: f32 = 160;
 pub const left_w_max: f32 = 400;
@@ -46,8 +47,11 @@ pub const RenderCtx = struct {
 pub fn renderToolbar(ctx: RenderCtx) void {
     var toolbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
-        .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
+        .padding = .{ .x = 10, .y = 7, .w = 10, .h = 7 },
         .background = true,
+        .color_fill = .{ .color = style.C.chrome },
+        .border = style.Edge.bottom,
+        .color_border = .{ .color = style.hairline },
     });
     defer toolbar.deinit();
 
@@ -66,8 +70,13 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .tag = "search-box",
                 .expand = .horizontal,
                 .gravity_y = 0.5,
-                .corner_radius = dvui.Rect.all(5),
-                .min_size_content = .{ .h = 22 },
+                .background = true,
+                .color_fill = .{ .color = style.C.sunken },
+                .border = style.Edge.all,
+                .color_border = .{ .color = style.hairline_hi },
+                .corners = style.R.button,
+                .padding = .{ .x = 9, .y = 5, .w = 9, .h = 5 },
+                .font = style.F.input,
             });
             defer te.deinit();
         }
@@ -75,9 +84,11 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         if (ctx.search.buf[0] != 0) {
             if (dvui.buttonIcon(@src(), "search_clear", dvui.entypo.cross, .{}, .{}, .{
                 .gravity_y = 0.5,
-                .min_size_content = .{ .w = 16, .h = 16 },
+                .min_size_content = .{ .w = 14, .h = 14 },
                 .padding = dvui.Rect.all(3),
                 .margin = .{ .x = 4 },
+                .corners = style.R.chip,
+                .color_text = .{ .color = style.C.text_dim },
                 .tag = "search-clear",
             })) {
                 @memset(&ctx.search.buf, 0);
@@ -86,90 +97,94 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         }
     }
 
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+    // Search mode: one segmented well rather than four loose buttons. The modes
+    // are mutually exclusive and the set never changes, which is exactly what a
+    // segmented control says and a row of toggles does not.
     {
-        const modes = [_]struct { mode: image_grid_mod.SearchMode, label: [:0]const u8 }{
-            .{ .mode = .fts,      .label = i18n.t(.search_mode_fts) },
-            .{ .mode = .semantic, .label = i18n.t(.search_mode_semantic) },
-            .{ .mode = .visual,   .label = i18n.t(.search_mode_visual) },
-            .{ .mode = .combined, .label = i18n.t(.search_mode_combined) },
+        const modes = [_]image_grid_mod.SearchMode{ .fts, .semantic, .visual, .combined };
+        const labels = [_][]const u8{
+            i18n.t(.search_mode_fts),
+            i18n.t(.search_mode_semantic),
+            i18n.t(.search_mode_visual),
+            i18n.t(.search_mode_combined),
         };
-        for (modes, 0..) |m, mi| {
-            const active = ctx.search.mode == m.mode;
-            const enabled: bool = switch (m.mode) {
-                .fts      => true,
-                .semantic => if (ctx.search.embedder) |e| e.hasPromptEncoder() else false,
-                .visual   => if (ctx.search.embedder) |e| e.hasVisualEncoder() else false,
-                .combined => if (ctx.search.embedder) |e| e.hasPromptEncoder() and e.hasVisualEncoder() else false,
-            };
-            var bw: dvui.ButtonWidget = undefined;
-            bw.init(@src(), .{}, .{
-                .id_extra = mi,
-                .gravity_y = 0.5,
-                .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
-                .corner_radius = dvui.Rect.all(4),
-                .margin = .{ .x = 2, .w = 2 },
-                .color_fill = if (active) dvui.themeGet().focus else null,
-            });
-            defer bw.deinit();
-            bw.processEvents();
-            bw.drawBackground();
-            dvui.label(@src(), "{s}", .{m.label}, .{
-                .id_extra = mi,
-                .gravity_y = 0.5,
-                .color_text = if (enabled) null else dvui.Color{ .r = 110, .g = 110, .b = 110, .a = 255 },
-            });
-            if (bw.clicked() and enabled) {
-                if (ctx.search.mode != m.mode) {
-                    ctx.search.mode = m.mode;
-                    ctx.search.force_search = true;
-                }
-            }
-            bw.drawFocus();
-            if (!enabled) {
-                dvui.tooltip(@src(), .{
-                    .active_rect = bw.data().rectScale().r,
-                    .delay = 200_000,
-                }, "{s}", .{i18n.t(.search_no_model_hint)}, .{});
+        const has_prompt = if (ctx.search.embedder) |e| e.hasPromptEncoder() else false;
+        const has_visual = if (ctx.search.embedder) |e| e.hasVisualEncoder() else false;
+        const enabled = [_]bool{ true, has_prompt, has_visual, has_prompt and has_visual };
+
+        var active: usize = 0;
+        for (modes, 0..) |m, i| if (ctx.search.mode == m) { active = i; };
+
+        var well = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+        defer well.deinit();
+
+        if (style.segmented(@src(), &labels, active, .{ .enabled = &enabled })) |picked| {
+            if (ctx.search.mode != modes[picked]) {
+                ctx.search.mode = modes[picked];
+                ctx.search.force_search = true;
             }
         }
+        // One tooltip for the whole well: the per-segment reason is always the
+        // same ("no model loaded"), so four identical tooltips were four copies
+        // of one sentence.
+        if (!has_prompt or !has_visual) {
+            dvui.tooltip(@src(), .{
+                .active_rect = well.data().rectScale().r,
+                .delay = 400_000,
+            }, "{s}", .{i18n.t(.search_no_model_hint)}, .{});
+        }
     }
-    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 4, .h = 0 } });
 
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
+
+    // A search in flight is the machine working, so it is amber.
     if (ctx.search.isSearchLoading()) {
         _ = dvui.spinner(@src(), .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 12, .h = 12 },
             .margin = .{ .x = 4 },
+            .color_text = .{ .color = style.C.amber },
         });
         dvui.label(@src(), "{s}", .{i18n.t(.search_loading)}, .{
             .gravity_y = 0.5,
             .margin = .{ .w = 4 },
+            .font = style.F.mono,
+            .color_text = .{ .color = style.C.amber },
         });
     }
 
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
     const chip: dvui.Options = .{
-        .corner_radius = dvui.Rect.all(12),
-        .padding = .{ .x = 10, .y = 3, .w = 10, .h = 3 },
+        .corners = style.R.button,
+        .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
         .margin = .{ .x = 2, .w = 2 },
         .gravity_y = 0.5,
     };
     var filter_remove_idx: ?usize = null;
     for (ctx.active_filters.items, 0..) |f, fi| {
+        // An active filter is a choice the user made, so it is blue — a tinted
+        // fill and border rather than a solid slab, which would out-shout the
+        // grid it is filtering.
         var pill = dvui.box(@src(), .{ .dir = .horizontal }, .{
             .id_extra = fi,
-            .corner_radius = dvui.Rect.all(12),
-            .padding = .{ .x = 8, .y = 3, .w = 4, .h = 3 },
+            .corners = style.R.button,
+            .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
             .margin = .{ .x = 2, .w = 2 },
             .gravity_y = 0.5,
             .background = true,
-            .color_fill = dvui.themeGet().focus,
+            .color_fill = .{ .color = style.over(style.C.chrome, style.C.blue, 0.14) },
+            .border = style.Edge.all,
+            .color_border = .{ .color = style.tint(style.C.blue, 90) },
         });
         defer pill.deinit();
         dvui.label(@src(), "{s}: {s}", .{ filter_modal_mod.filterColumnLabel(f.column), f.value }, .{
             .id_extra = fi,
             .gravity_y = 0.5,
+            .font = style.F.mono,
+            .color_text = .{ .color = style.C.text_hi },
         });
         if (dvui.buttonIcon(@src(), "remove_filter", dvui.entypo.cross, .{}, .{}, .{
             .id_extra = fi,
@@ -177,6 +192,8 @@ pub fn renderToolbar(ctx: RenderCtx) void {
             .gravity_y = 0.5,
             .padding = dvui.Rect.all(2),
             .margin = .{ .x = 4 },
+            .corners = style.R.chip,
+            .color_text = .{ .color = style.C.text_dim },
         })) {
             filter_remove_idx = fi;
         }
@@ -192,7 +209,14 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         }
     }
 
-    if (dvui.button(@src(), i18n.t(.toolbar_add_filter), .{}, chip.override(.{ .id_extra = 4 }))) {
+    if (dvui.button(@src(), i18n.t(.toolbar_add_filter), .{}, chip.override(.{
+        .id_extra = 4,
+        .font = style.F.ui,
+        .color_fill = .{ .color = style.C.raised_dim },
+        .color_text = .{ .color = style.C.text_dim },
+        .border = style.Edge.all,
+        .color_border = .{ .color = style.hairline },
+    }))) {
         ctx.filter_modal.open = true;
         ctx.filter_modal.value_buf = std.mem.zeroes([256]u8);
         ctx.filter_modal.kind = .model;
@@ -202,9 +226,13 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
     if (ctx.grid.*) |*grid| {
-        _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction }, .{
+        // Thumbnail size is a value the user sets, so the filled bar is blue.
+        // `color_fill` here paints the empty track and the knob; `color_bar` is
+        // the filled portion.
+        _ = dvui.slider(@src(), .{ .fraction = &grid.thumb_fraction, .color_bar = style.C.blue }, .{
             .gravity_y = 0.5,
-            .min_size_content = .{ .w = 80, .h = 16 },
+            .min_size_content = .{ .w = 80, .h = 14 },
+            .color_fill = .{ .color = style.C.track },
         });
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
@@ -222,7 +250,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
-                .color_text = if (on) dvui.themeGet().focus else null,
+                .color_text = .{ .color = if (on) style.C.blue else style.C.text_dim },
             });
             if (bw.clicked()) grid.autoplay = !grid.autoplay;
             bw.drawFocus();
@@ -252,6 +280,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
+                .color_text = .{ .color = style.C.text_dim },
             });
             if (bw.clicked()) {
                 grid.sort_mode = switch (grid.sort_mode) {
@@ -275,6 +304,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
+                .color_text = .{ .color = style.C.text_dim },
             });
             if (bw.clicked()) {
                 grid.sort_seed +%= 1;
@@ -294,6 +324,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
+                .color_text = .{ .color = style.C.text_dim },
             });
             if (bw.clicked()) {
                 grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
@@ -313,14 +344,14 @@ pub fn renderToolbar(ctx: RenderCtx) void {
 fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, trash_stats: ?db_mod.TrashStats) void {
     const Action = enum { dedupe, empty_trash };
     var action: Action = undefined;
-    var style: dvui.Theme.Style.Name = undefined;
+    var accent: style.Color = undefined;
     var description: [:0]const u8 = undefined;
     var button_text: [:0]const u8 = undefined;
     switch (grid.view_mode) {
         .duplicates => {
             if (duplicate_count <= 0) return;
             action = .dedupe;
-            style = .highlight;
+            accent = style.C.blue;
             description = i18n.t(.dupes_banner_text);
             button_text = i18n.t(.dupes_remove_button);
         },
@@ -328,37 +359,57 @@ fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, tra
             const has_items = if (trash_stats) |ts| ts.count > 0 else false;
             if (!has_items) return;
             action = .empty_trash;
-            style = .err;
+            accent = style.C.danger;
             description = i18n.t(.trash_banner_text);
             button_text = i18n.t(.settings_empty_trash);
         },
         .library, .favorites => return,
     }
 
+    // A tinted wash with an accent left edge, not a saturated slab: the banner
+    // sits directly above the grid and a solid accent there would out-shout
+    // every thumbnail under it. `over` resolves the wash to an opaque colour
+    // because dvui paints the border rect first and insets the background.
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
-        .padding = .{ .x = 12, .y = 8, .w = 12, .h = 8 },
+        .padding = .{ .x = 12, .y = 9, .w = 12, .h = 9 },
         .background = true,
-        .style = style,
+        .color_fill = .{ .color = style.over(style.C.canvas, accent, 0.12) },
+        .border = .{ .x = 2, .h = 1 },
+        .color_border = .{ .color = style.tint(accent, 150) },
     });
     defer bar.deinit();
 
     // Description fills the bar and pushes the action to the right edge.
     dvui.label(@src(), "{s}", .{description}, .{
-        .style = style,
         .gravity_y = 0.5,
         .expand = .horizontal,
+        .color_text = .{ .color = style.C.text_hi },
     });
 
+    // A bulk op in flight is the machine working: amber, with the spinner that
+    // says so, never a disabled-looking grey.
     if (image_ops_mod.bulkActive()) {
-        dvui.label(@src(), "{s}", .{i18n.t(.action_working)}, .{ .style = style, .gravity_y = 0.5 });
+        _ = dvui.spinner(@src(), .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 12, .h = 12 },
+            .margin = .{ .w = 6 },
+            .color_text = .{ .color = style.C.amber },
+        });
+        dvui.label(@src(), "{s}", .{i18n.t(.action_working)}, .{
+            .gravity_y = 0.5,
+            .font = style.F.mono,
+            .color_text = .{ .color = style.C.amber },
+        });
         return;
     }
 
     if (dvui.button(@src(), button_text, .{}, .{
         .gravity_y = 0.5,
-        .padding = .{ .x = 12, .y = 4, .w = 12, .h = 4 },
-        .corner_radius = dvui.Rect.all(4),
+        .padding = .{ .x = 12, .y = 5, .w = 12, .h = 5 },
+        .corners = style.R.button,
+        .font = style.F.ui,
+        .style = if (action == .empty_trash) .err else .control,
     })) {
         switch (action) {
             .dedupe => grid.dedupe_requested = true,
@@ -368,7 +419,11 @@ fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, tra
 }
 
 pub fn renderContent(ctx: RenderCtx) !void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both, .background = true });
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = .{ .color = style.C.canvas },
+    });
     defer row.deinit();
 
     if (ctx.left_w.* >= 2) {
@@ -398,7 +453,12 @@ pub fn renderContent(ctx: RenderCtx) !void {
             renderActionBanner(grid, ctx.duplicate_count.*, ctx.trash_stats.*);
             grid.render();
         } else {
-            dvui.label(@src(), "(no library)", .{}, .{ .padding = .all(8) });
+            dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
+                .padding = .all(12),
+                .color_text = .{ .color = style.C.text_ghost },
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+            });
         }
     }
 
@@ -436,39 +496,66 @@ pub fn renderContent(ctx: RenderCtx) !void {
     }
 }
 
+/// One "the machine is busy" line: amber spinner, amber mono caption. Every
+/// background job in the status bar reads identically, so the user learns one
+/// shape rather than four.
+fn activityLine(src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype) void {
+    var line = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+    defer line.deinit();
+    _ = dvui.spinner(@src(), .{
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 12, .h = 12 },
+        .color_text = .{ .color = style.C.amber },
+    });
+    dvui.label(@src(), fmt, args, .{
+        .gravity_y = 0.5,
+        .margin = .{ .x = 6 },
+        .font = style.F.mono,
+        .color_text = .{ .color = style.C.amber },
+    });
+}
+
 pub fn renderStatusBar(ctx: RenderCtx) void {
     var statusbar = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
-        .padding = .{ .x = 8, .y = 2, .w = 4, .h = 2 },
+        .padding = .{ .x = 12, .y = 5, .w = 6, .h = 5 },
         .background = true,
+        .color_fill = .{ .color = style.C.chrome },
+        .border = style.Edge.top,
+        .color_border = .{ .color = style.hairline },
     });
     defer statusbar.deinit();
 
     // ── Section 1: image count ──────────────────────────────────────────────
+    // Figures the user compares against each other, so they are monospaced and
+    // their units are dimmed away from them.
     {
-        var count_box = dvui.box(@src(), .{}, .{
-            .min_size_content = .{ .w = 160 },
+        var count_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .min_size_content = .{ .w = 170 },
             .gravity_y = 0.5,
         });
         defer count_box.deinit();
 
+        const figure: dvui.Options = .{ .font = style.F.mono_val, .color_text = .{ .color = style.C.text_hi }, .gravity_y = 0.5 };
+        const unit: dvui.Options = .{ .font = style.F.mono, .color_text = .{ .color = style.C.text_faint }, .gravity_y = 0.5 };
+
         if (ctx.library_manager.* != null) {
             const displayed: usize = if (ctx.grid.*) |*grid| grid.images.items.len else 0;
             const total: i64 = ctx.total_image_count.*;
+            dvui.label(@src(), "{d}", .{displayed}, figure);
             if (@as(i64, @intCast(displayed)) < total) {
-                dvui.label(@src(), "{d} {s} {s} {d}", .{
-                    displayed,
-                    i18n.t(.status_out_of),
-                    i18n.t(.status_images),
-                    total,
-                }, .{ .gravity_y = 0.5 });
+                dvui.label(@src(), " {s} ", .{i18n.t(.status_out_of)}, unit);
+                dvui.label(@src(), "{d}", .{total}, figure);
+                dvui.label(@src(), " {s}", .{i18n.t(.status_images)}, unit);
             } else {
-                dvui.label(@src(), "{d} {s}", .{ displayed, i18n.t(.status_images) }, .{ .gravity_y = 0.5 });
+                dvui.label(@src(), " {s}", .{i18n.t(.status_images)}, unit);
             }
         } else {
-            dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, .{ .gravity_y = 0.5 });
+            dvui.label(@src(), "{s}", .{i18n.t(.status_no_database)}, unit);
         }
     }
+
+    style.vsep(@src());
 
     // ── Section 2: current activity ─────────────────────────────────────────
     {
@@ -480,55 +567,24 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
 
         const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
         const is_searching = ctx.search.isSearchLoading();
-        const is_downloading = ctx.settings.snowflake_dl_running.load(.acquire) or
+        const is_downloading = ctx.settings.gemma_dl_running.load(.acquire) or
             ctx.settings.siglip2_dl_running.load(.acquire);
 
         if (is_scanning) {
-            _ = dvui.spinner(@src(), .{
-                .gravity_y = 0.5,
-                .min_size_content = .{ .w = 12, .h = 12 },
-            });
             const embed_total = if (ctx.library_manager.*) |*mgr| mgr.embedsTotal() else 0;
             if (embed_total > 0) {
                 const embed_done = if (ctx.library_manager.*) |*mgr| mgr.embedsDone() else 0;
-                dvui.label(@src(), "{s}: {d} / {d}", .{ i18n.t(.status_embedding), embed_done, embed_total }, .{
-                    .gravity_y = 0.5,
-                    .margin = .{ .x = 4 },
-                });
+                activityLine(@src(), "{s}: {d} / {d}", .{ i18n.t(.status_embedding), embed_done, embed_total });
             } else {
                 const scanned = if (ctx.library_manager.*) |*mgr| mgr.filesScanned() else 0;
-                dvui.label(@src(), "{s}: {d}", .{ i18n.t(.status_indexing), scanned }, .{
-                    .gravity_y = 0.5,
-                    .margin = .{ .x = 4 },
-                });
+                activityLine(@src(), "{s}: {d}", .{ i18n.t(.status_indexing), scanned });
             }
         } else if (is_searching) {
-            _ = dvui.spinner(@src(), .{
-                .gravity_y = 0.5,
-                .min_size_content = .{ .w = 12, .h = 12 },
-            });
-            dvui.label(@src(), "{s}", .{i18n.t(.search_loading)}, .{
-                .gravity_y = 0.5,
-                .margin = .{ .x = 4 },
-            });
+            activityLine(@src(), "{s}", .{i18n.t(.search_loading)});
         } else if (ctx.embedder_loading) {
-            _ = dvui.spinner(@src(), .{
-                .gravity_y = 0.5,
-                .min_size_content = .{ .w = 12, .h = 12 },
-            });
-            dvui.label(@src(), "{s}", .{i18n.t(.status_loading_model)}, .{
-                .gravity_y = 0.5,
-                .margin = .{ .x = 4 },
-            });
+            activityLine(@src(), "{s}", .{i18n.t(.status_loading_model)});
         } else if (is_downloading) {
-            _ = dvui.spinner(@src(), .{
-                .gravity_y = 0.5,
-                .min_size_content = .{ .w = 12, .h = 12 },
-            });
-            dvui.label(@src(), "{s}", .{i18n.t(.settings_download_running)}, .{
-                .gravity_y = 0.5,
-                .margin = .{ .x = 4 },
-            });
+            activityLine(@src(), "{s}", .{i18n.t(.settings_download_running)});
         }
     }
 
@@ -536,8 +592,11 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
         .min_size_content = .{ .w = 14, .h = 14 },
         .gravity_y = 0.5,
-        .padding = dvui.Rect.all(3),
+        .padding = dvui.Rect.all(4),
         .margin = .{ .w = 2 },
+        .corners = style.R.chip,
+        .background = false,
+        .color_text = .{ .color = style.C.text_dim },
     })) {
         ctx.settings.open = !ctx.settings.open;
         if (ctx.settings.open) {
@@ -554,8 +613,8 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
             @memcpy(&ctx.settings.model_snapshot.visual_dir, &ctx.settings.visual_model_dir_buf);
             @memcpy(&ctx.settings.data_path_snapshot, &ctx.settings.data_path_buf);
             ctx.settings.gpu_snapshot = .{
-                .use_gpu = ctx.cfg.use_gpu,
-                .gpu_device_id = ctx.cfg.gpu_device_id,
+                .backend = ctx.cfg.embed_gpu_backend,
+                .threshold = ctx.cfg.embed_gpu_threshold,
             };
         }
     }

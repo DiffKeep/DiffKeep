@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) !void {
     const git_version = get_git_version(b.allocator, b.graph.io) catch "dev";
@@ -6,11 +7,8 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const use_gpu = b.option(bool, "gpu", "Enable ONNX Runtime GPU (CUDA) acceleration") orelse false;
-
     const options = b.addOptions();
     options.addOption([]const u8, "version", git_version);
-    options.addOption(bool, "gpu", use_gpu);
 
     const known_folders = b.dependency("known_folders", .{
         .target = target,
@@ -33,7 +31,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("src/app.zig"),
         }),
     });
-    exe.root_module.strip = optimize != .Debug;
+    exe.root_module.strip = optimize != .debug;
     exe.root_module.addOptions("build_options", options);
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
@@ -68,9 +66,58 @@ pub fn build(b: *std.Build) !void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run DiffKeep");
     run_step.dependOn(&run_cmd.step);
+
+    // *** C header translations (replaces @cImport) ***
+    const translate_c = b.dependency("translate_c", .{});
+    const sqlite_c: Translator = .init(translate_c, .{
+        .name = "sqlite_c",
+        .c_source_file = b.addWriteFiles().add("sqlite_c.h",
+            \\#include <sqlite3.h>
+            \\#include <sqlite-vec.h>
+            \\
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+    sqlite_c.addIncludePath(b.path("lib/sqlite"));
+    sqlite_c.addIncludePath(b.path("lib/sqlite-vec"));
+    const vips_c: Translator = .init(translate_c, .{
+        .name = "vips_c",
+        .c_source_file = b.path("lib/vips/vips_helper.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const video_c: Translator = .init(translate_c, .{
+        .name = "video_c",
+        .c_source_file = b.path("lib/video/video_helper.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (os == .linux) {
+        const x11_c: Translator = .init(translate_c, .{
+            .name = "x11_c",
+            .c_source_file = b.addWriteFiles().add("x11_c.h",
+                \\#include <X11/Xlib.h>
+                \\#include <X11/Xatom.h>
+                \\#include <X11/Xcursor/Xcursor.h>
+                \\#include <X11/extensions/XInput2.h>
+                \\
+            ),
+            .target = target,
+            .optimize = optimize,
+        });
+        const wayland_c: Translator = .init(translate_c, .{
+            .name = "wayland_c",
+            .c_source_file = b.addWriteFiles().add("wayland_c.h", "#include <wayland-client.h>\n"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.root_module.addImport("x11_c", x11_c.mod);
+        exe.root_module.addImport("wayland_c", wayland_c.mod);
+    }
 
     // *** sqlite ***
     const sqlite_c_module = b.createModule(.{
@@ -115,9 +162,8 @@ pub fn build(b: *std.Build) !void {
 
     const sqlite_module_zig = b.addModule("sqlite", .{
         .root_source_file = b.path("src/sqlite.zig"),
+        .imports = &.{.{ .name = "sqlite_c", .module = sqlite_c.mod }},
     });
-    sqlite_module_zig.addIncludePath(b.path("lib/sqlite"));
-    sqlite_module_zig.addIncludePath(b.path("lib/sqlite-vec"));
 
     exe.root_module.addImport("sqlite", sqlite_module_zig);
 
@@ -141,8 +187,8 @@ pub fn build(b: *std.Build) !void {
 
     const vips_module = b.addModule("vips", .{
         .root_source_file = b.path("src/vips.zig"),
+        .imports = &.{.{ .name = "vips_c", .module = vips_c.mod }},
     });
-    vips_module.addIncludePath(b.path("lib/vips"));
 
     exe.root_module.linkLibrary(vips_helper_lib);
     exe.root_module.addIncludePath(b.path("lib/vips"));
@@ -171,8 +217,8 @@ pub fn build(b: *std.Build) !void {
 
     const video_module = b.addModule("video", .{
         .root_source_file = b.path("src/video.zig"),
+        .imports = &.{.{ .name = "video_c", .module = video_c.mod }},
     });
-    video_module.addIncludePath(b.path("lib/video"));
 
     exe.root_module.linkLibrary(video_helper_lib);
     exe.root_module.addIncludePath(b.path("lib/video"));
@@ -198,14 +244,14 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(video_probe_exe);
     const run_video_probe = b.addRunArtifact(video_probe_exe);
     run_video_probe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_video_probe.addArgs(args);
+    run_video_probe.addPassthruArgs();
     const video_probe_step = b.step("video_probe", "Probe a media file via libav* (dimensions, metadata tags, first frame)");
     video_probe_step.dependOn(&run_video_probe.step);
 
-    // *** ONNX Runtime (embeddings) ***
-    try addOnnxRuntime(b, exe, use_gpu);
+    // TensorPencil — all embeddings (EmbeddingGemma text + SigLIP2 image/text)
+    try addTensorPencil(b, exe, exe.root_module);
 
-    // *** Dev/research tools (not part of the GUI, useful for data pipeline work) ***
+    // Dev/research tools (not part of the GUI, useful for data pipeline work)
 
     const parse_threads_exe = b.addExecutable(.{
         .name = "test_parse_threads",
@@ -221,7 +267,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(parse_threads_exe);
     const run_parse_threads = b.addRunArtifact(parse_threads_exe);
     run_parse_threads.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_parse_threads.addArgs(args);
+    run_parse_threads.addPassthruArgs();
     const parse_threads_step = b.step("parse_threads", "Concurrently parse PNG metadata across a directory tree");
     parse_threads_step.dependOn(&run_parse_threads.step);
 
@@ -237,7 +283,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(test_embed_exe);
     const run_test_embed = b.addRunArtifact(test_embed_exe);
     run_test_embed.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_test_embed.addArgs(args);
+    run_test_embed.addPassthruArgs();
     const test_embed_step = b.step("test_embed", "Test embedding generation with a GGUF model");
     test_embed_step.dependOn(&run_test_embed.step);
 
@@ -253,7 +299,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(search_quality_exe);
     const run_search_quality = b.addRunArtifact(search_quality_exe);
     run_search_quality.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_search_quality.addArgs(args);
+    run_search_quality.addPassthruArgs();
     const search_quality_step = b.step("test_search_quality", "Evaluate embedding search quality with short queries");
     search_quality_step.dependOn(&run_search_quality.step);
 
@@ -270,7 +316,7 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(vl_embed_exe);
     const run_vl_embed = b.addRunArtifact(vl_embed_exe);
     run_vl_embed.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_vl_embed.addArgs(args);
+    run_vl_embed.addPassthruArgs();
     const vl_embed_step = b.step("test_vl_embed", "Test VL image embedding with Qwen3-VL");
     vl_embed_step.dependOn(&run_vl_embed.step);
 
@@ -288,29 +334,9 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(cross_modal_exe);
     const run_cross_modal = b.addRunArtifact(cross_modal_exe);
     run_cross_modal.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cross_modal.addArgs(args);
+    run_cross_modal.addPassthruArgs();
     const cross_modal_step = b.step("test_cross_modal", "Test text→image cross-modal search quality");
     cross_modal_step.dependOn(&run_cross_modal.step);
-
-    const onnx_search_exe = b.addExecutable(.{
-        .name = "test_onnx_search",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_onnx_search.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    try addOnnxRuntime(b, onnx_search_exe, use_gpu);
-    onnx_search_exe.root_module.linkLibrary(vips_helper_lib);
-    onnx_search_exe.root_module.addIncludePath(b.path("lib/vips"));
-    onnx_search_exe.root_module.linkSystemLibrary("vips", .{});
-    b.installArtifact(onnx_search_exe);
-    const run_onnx_search = b.addRunArtifact(onnx_search_exe);
-    run_onnx_search.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_onnx_search.addArgs(args);
-    const onnx_search_step = b.step("test_onnx_search", "Test ONNX Runtime + SigLIP2 search quality");
-    onnx_search_step.dependOn(&run_onnx_search.step);
 
     const text_search_exe = b.addExecutable(.{
         .name = "test_text_search",
@@ -325,48 +351,43 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(text_search_exe);
     const run_text_search = b.addRunArtifact(text_search_exe);
     run_text_search.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_text_search.addArgs(args);
+    run_text_search.addPassthruArgs();
     const text_search_step = b.step("test_text_search", "Test text retrieval quality across embedding models");
     text_search_step.dependOn(&run_text_search.step);
 
-    // Dev tool: parity check — TensorPencil (native Zig) vs ONNX Runtime for the
-    // Snowflake text encoder. Proves the TP text-embedding path reproduces the
-    // ONNX vectors before we rip ONNX out of the text space.
-    const tp_parity_exe = b.addExecutable(.{
-        .name = "test_tp_parity",
+    // Dev tool: batch throughput bench for the TensorPencil encoders
+    const tp_batch_exe = b.addExecutable(.{
+        .name = "test_tp_batch",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_tp_parity.zig"),
+            .root_source_file = b.path("src/test_tp_batch.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    try addOnnxRuntime(b, tp_parity_exe, use_gpu);
-    try addTensorPencil(b, tp_parity_exe, tp_parity_exe.root_module);
-    b.installArtifact(tp_parity_exe);
-    const run_tp_parity = b.addRunArtifact(tp_parity_exe);
-    run_tp_parity.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_tp_parity.addArgs(args);
-    const tp_parity_step = b.step("test_tp_parity", "Compare TensorPencil vs ONNX Snowflake embeddings (cosine parity)");
-    tp_parity_step.dependOn(&run_tp_parity.step);
+    try addTensorPencil(b, tp_batch_exe, tp_batch_exe.root_module);
+    const run_tp_batch = b.addRunArtifact(tp_batch_exe);
+    run_tp_batch.addPassthruArgs();
+    const tp_batch_step = b.step("test_tp_batch", "Bench TensorPencil single vs batch embed throughput (cpu/vulkan/cuda)");
+    tp_batch_step.dependOn(&run_tp_batch.step);
 
-    const onnx_text_search_exe = b.addExecutable(.{
-        .name = "test_onnx_text_search",
+    // Dev tool: retrieval-quality + speed A/B, current encoders vs EmbeddingGemma 2
+    const bench_embed_exe = b.addExecutable(.{
+        .name = "bench_embed",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_onnx_text_search.zig"),
+            .root_source_file = b.path("src/bench_embed.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    try addOnnxRuntime(b, onnx_text_search_exe, use_gpu);
-    try addTensorPencil(b, onnx_text_search_exe, onnx_text_search_exe.root_module);
-    b.installArtifact(onnx_text_search_exe);
-    const run_onnx_text_search = b.addRunArtifact(onnx_text_search_exe);
-    run_onnx_text_search.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_onnx_text_search.addArgs(args);
-    const onnx_text_search_step = b.step("test_onnx_text_search", "Test ONNX text retrieval: nomic vs snowflake");
-    onnx_text_search_step.dependOn(&run_onnx_text_search.step);
+    bench_embed_exe.root_module.addImport("vips", vips_module);
+    bench_embed_exe.root_module.linkLibrary(vips_helper_lib);
+    try addTensorPencil(b, bench_embed_exe, bench_embed_exe.root_module);
+    const run_bench_embed = b.addRunArtifact(bench_embed_exe);
+    run_bench_embed.addPassthruArgs();
+    const bench_embed_step = b.step("bench_embed", "A/B retrieval quality + speed: current encoders vs EmbeddingGemma 2");
+    bench_embed_step.dependOn(&run_bench_embed.step);
 
     const exe_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -426,9 +447,7 @@ pub fn build(b: *std.Build) !void {
     integration_tests.root_module.linkLibrary(video_helper_lib);
     integration_tests.root_module.addIncludePath(b.path("lib/video"));
     for (av_libs) |lib| integration_tests.root_module.linkSystemLibrary(lib, .{});
-    // onnxruntime import goes to diffkeep_test_module (where onnx_embedder.zig lives);
-    // library linkage goes to integration_tests.root_module.
-    try addOnnxRuntimeEx(b, integration_tests, diffkeep_test_module, use_gpu);
+    try addTensorPencil(b, integration_tests, diffkeep_test_module);
 
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }
@@ -444,11 +463,11 @@ fn addLlamaEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void 
     const target = exe.root_module.resolved_target.?;
     const dep = b.dependency("llama_cpp", .{});
 
-    const llama_cpp = b.addTranslateC(.{
-        .root_source_file = dep.path("include/llama.h"),
+    const llama_cpp: Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "llama_cpp",
+        .c_source_file = dep.path("include/llama.h"),
         .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
+        .optimize = .fast,
     });
 
     llama_cpp.addIncludePath(dep.path("include"));
@@ -491,7 +510,7 @@ fn addLlamaEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void 
         }
     }
 
-    import_mod.addImport("llama_cpp", llama_cpp.createModule());
+    import_mod.addImport("llama_cpp", llama_cpp.mod);
 }
 
 fn addMtmd(b: *std.Build, exe: anytype) !void {
@@ -501,7 +520,7 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
 
     const mtmd_wrapper_mod = b.createModule(.{
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .link_libc = true,
         .link_libcpp = true,
     });
@@ -528,7 +547,7 @@ fn addMtmd(b: *std.Build, exe: anytype) !void {
     const step = b.addInstallBinFile(bin_path.path(b, "libmtmd.so"), "libmtmd.so");
     b.getInstallStep().dependOn(&step.step);
 
-    const mtmd_zig = b.addModule("mtmd", .{
+    const mtmd_zig = b.createModule(.{
         .root_source_file = b.path("src/mtmd.zig"),
     });
     exe.root_module.addImport("mtmd", mtmd_zig);
@@ -550,56 +569,6 @@ fn addTensorPencil(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !
     import_mod.addImport("TensorPencil", tp_dep.module("TensorPencil"));
 }
 
-fn addOnnxRuntime(b: *std.Build, exe: anytype, use_gpu: bool) !void {
-    try addOnnxRuntimeEx(b, exe, exe.root_module, use_gpu);
-}
-
-fn addOnnxRuntimeEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module, use_gpu: bool) !void {
-    const target = exe.root_module.resolved_target.?;
-
-    const dep_name = switch (target.result.os.tag) {
-        .linux => if (use_gpu) "onnxruntime_linux_gpu" else "onnxruntime_linux",
-        else => return error.OnnxRuntimeUnsupportedPlatform,
-    };
-    const dep = b.lazyDependency(dep_name, .{}) orelse return;
-    const bin_path = dep.path(".");
-
-    const ort_c = b.addTranslateC(.{
-        .root_source_file = bin_path.path(b, "include/onnxruntime_c_api.h"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    ort_c.addIncludePath(bin_path.path(b, "include"));
-
-    // Library linkage on the exe; import goes to import_mod (may differ for integration tests).
-    exe.root_module.addLibraryPath(bin_path.path(b, "lib"));
-    exe.root_module.linkSystemLibrary("onnxruntime", .{});
-    import_mod.addImport("onnxruntime_c", ort_c.createModule());
-
-    // Install core shared libraries alongside the binary
-    for ([_][]const u8{
-        "libonnxruntime.so",
-        "libonnxruntime.so.1",
-        "libonnxruntime.so.1.26.0",
-        "libonnxruntime_providers_shared.so",
-    }) |lib| {
-        const step = b.addInstallBinFile(bin_path.path(b, b.fmt("lib/{s}", .{lib})), lib);
-        b.getInstallStep().dependOn(&step.step);
-    }
-
-    // GPU build: install CUDA/TensorRT execution provider libraries
-    if (use_gpu) {
-        for ([_][]const u8{
-            "libonnxruntime_providers_cuda.so",
-            "libonnxruntime_providers_tensorrt.so",
-        }) |lib| {
-            const step = b.addInstallBinFile(bin_path.path(b, b.fmt("lib/{s}", .{lib})), lib);
-            b.getInstallStep().dependOn(&step.step);
-        }
-    }
-}
-
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const version_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "describe", "--tags", "--always" } });
     defer allocator.free(version_result.stdout);
@@ -614,7 +583,7 @@ fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const trimmed_version = std.mem.trimEnd(u8, version_result.stdout, "\n");
 
     if (status_result.stdout.len > 0) {
-        return try std.fmt.allocPrint(allocator, "{s}(DIRTY)", .{trimmed_version});
+        return try allocator.print("{s}(DIRTY)", .{trimmed_version});
     }
     return try allocator.dupe(u8, trimmed_version);
 }

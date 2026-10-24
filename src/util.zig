@@ -3,7 +3,7 @@ const std = @import("std");
 /// Write a formatted string to stdout.  Buffer is 4096 bytes; larger output will error.
 pub fn print(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
+    const s = try std.mem.print(&buf, fmt, args);
     try std.Io.File.stdout().writeStreamingAll(io, s);
 }
 
@@ -14,5 +14,5 @@ pub fn getDataPath(allocator: std.mem.Allocator, io: std.Io, data_path: []const 
     };
 
     // Build the path to the database file
-    return try std.fs.path.join(allocator, &[_][]const u8{ data_path, filename });
+    return try std.Io.Dir.path.join(allocator, &[_][]const u8{ data_path, filename });
 }

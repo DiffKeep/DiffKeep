@@ -9,6 +9,8 @@ const platform = @import("platform.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
 const vips_mod = @import("vips");
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 const cache_radius: usize = 2;
 const cache_size: usize = cache_radius * 2 + 1; // 5 slots
@@ -45,7 +47,7 @@ pub const ViewerState = struct {
     cache_threads: [cache_size]?std.Thread,
     cache_mutex: std.Io.Mutex = std.Io.Mutex.init,
     // Handles for evicted threads (can't join immediately); joined at deinit.
-    orphan_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    orphan_threads: std.ArrayList(std.Thread) = .empty,
     // Number of load threads that have not yet exited.  Lets the close path defer
     // joining until the (uncancellable) decodes have finished, so it never blocks.
     inflight: std.atomic.Value(u32) = .init(0),
@@ -358,9 +360,9 @@ pub const ViewerState = struct {
     fn diskPathZ(self: *const ViewerState, e: *const image_grid_mod.ImageEntry) std.mem.Allocator.Error![:0]u8 {
         if (e.trash_name) |tn| {
             if (self.data_dir) |dd|
-                return std.fs.path.joinZ(self.gpa, &.{ dd, "trash", tn });
+                return std.Io.Dir.path.joinZ(self.gpa, &.{ dd, "trash", tn });
         }
-        return self.gpa.dupeZ(u8, e.path);
+        return self.gpa.dupeSentinel(u8, e.path, 0);
     }
 
     pub fn removeImages(self: *ViewerState, ids: *const std.AutoHashMap(u64, void)) void {
@@ -421,7 +423,11 @@ pub const ViewerState = struct {
         self.handleKeyEvents();
         if (self.delete_confirm_open) self.renderDeleteConfirmDialog();
 
-        var outer = dvui.box(@src(), .{}, .{ .expand = .both, .background = true });
+        var outer = dvui.box(@src(), .{}, .{
+            .expand = .both,
+            .background = true,
+            .color_fill = .{ .color = style.C.canvas },
+        });
         defer outer.deinit();
 
         self.renderToolbar();
@@ -564,17 +570,23 @@ pub const ViewerState = struct {
         defer float.deinit();
         float.autoSize();
 
-        var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+        var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(18) });
         defer content.deinit();
 
         const title = if (self.delete_pending_permanent)
             i18n.t(.confirm_delete_title)
         else
             i18n.t(.confirm_trash_title);
-        dvui.label(@src(), "{s}", .{title}, .{ .font = dvui.themeGet().font_heading, .margin = .{ .h = 8 } });
+        style.modalTitle(@src(), title);
 
+        // Same shape as the grid's delete dialog (see delete_dialog.zig): the
+        // filename is the brightest thing, because it is what the user checks.
         const name = self.delete_pending_name_buf[0..self.delete_pending_name_len];
-        dvui.label(@src(), "{s}", .{name}, .{ .margin = .{ .h = 12 } });
+        fonts.richLabel(@src(), name, .{
+            .font = style.F.row_hi,
+            .color_text = .{ .color = style.C.text_hi },
+            .margin = .{ .h = 16 },
+        });
 
         var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
         defer btn_row.deinit();
@@ -597,7 +609,11 @@ pub const ViewerState = struct {
             i18n.t(.confirm_delete)
         else
             i18n.t(.confirm_move_to_trash);
-        if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+        const confirmed = if (self.delete_pending_permanent)
+            dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4), .style = .err })
+        else
+            style.primaryButton(@src(), confirm_label, .{ .margin = .all(4) });
+        if (confirmed) {
             self.delete_confirm_open = false;
             self.delete_confirmed = true;
         }
@@ -606,9 +622,12 @@ pub const ViewerState = struct {
     fn renderToolbar(self: *ViewerState) void {
         var tb = dvui.box(@src(), .{ .dir = .horizontal }, .{
             .expand = .horizontal,
-            .padding = .{ .x = 6, .y = 4 },
+            .padding = .{ .x = 8, .y = 5 },
             .background = true,
-            .min_size_content = .{ .h = 28 },
+            .color_fill = .{ .color = style.C.chrome },
+            .border = style.Edge.bottom,
+            .color_border = .{ .color = style.hairline },
+            .min_size_content = .{ .h = 30 },
         });
         defer tb.deinit();
 
@@ -634,14 +653,19 @@ pub const ViewerState = struct {
 
         var label_buf: [256]u8 = undefined;
         const label_str = if (self.images.items.len > 0)
-            std.fmt.bufPrint(&label_buf, "{s}  \u{00b7}  {d} {s} {d}",
+            std.mem.print(&label_buf, "{s}  \u{00b7}  {d} {s} {d}",
                 .{ filename, self.current_idx + 1, i18n.t(.viewer_of), self.images.items.len })
             catch filename
         else filename;
 
-        dvui.label(@src(), "{s}", .{label_str}, .{
+        // The filename is user data, so it goes through the run splitter; the
+        // "3 of 47" that follows it rides along in the same run rather than
+        // becoming a second widget to align.
+        fonts.richLine(@src(), label_str, .{
             .gravity_y = 0.5,
             .padding = .{ .x = 8, .y = 0 },
+            .font = style.F.row_hi,
+            .color_text = .{ .color = style.C.text_hi },
         });
 
         // Centered playback controls (flanked by expanding spacers).
@@ -666,20 +690,26 @@ pub const ViewerState = struct {
                 std.math.clamp(@as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(dur)), 0, 1)
             else
                 0;
-            if (dvui.slider(@src(), .{ .fraction = &frac }, .{
+            if (dvui.slider(@src(), .{ .fraction = &frac, .color_bar = style.C.blue }, .{
                 .min_size_content = .{ .w = 220, .h = 14 },
                 .gravity_y = 0.5,
                 .margin = .{ .x = 8, .w = 8 },
+                .color_fill = .{ .color = style.C.track },
             })) {
                 if (dur > 0) p.requestSeek(@intFromFloat(@as(f64, @floatCast(frac)) * @as(f64, @floatFromInt(dur))));
             }
 
             var tbuf: [32]u8 = undefined;
-            const tstr = std.fmt.bufPrint(&tbuf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
+            const tstr = std.mem.print(&tbuf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
                 @divTrunc(pos, 60000), @mod(@divTrunc(pos, 1000), 60),
                 @divTrunc(dur, 60000), @mod(@divTrunc(dur, 1000), 60),
             }) catch "";
-            dvui.label(@src(), "{s}", .{tstr}, .{ .gravity_y = 0.5, .padding = .{ .x = 8 } });
+            dvui.label(@src(), "{s}", .{tstr}, .{
+                .gravity_y = 0.5,
+                .padding = .{ .x = 8 },
+                .font = style.F.mono_val,
+                .color_text = .{ .color = style.C.text_dim },
+            });
 
             // Volume / mute — disabled (greyed, inert) when there's no audio.
             if (p.hasAudio()) {
@@ -688,10 +718,11 @@ pub const ViewerState = struct {
                 const vlbl = if (muted) i18n.t(.viewer_unmute) else i18n.t(.viewer_mute);
                 if (iconButton(vlbl, vic, 16)) p.toggleMute();
                 var vol: f32 = std.math.clamp(p.volumeLevel(), 0, 1);
-                if (dvui.slider(@src(), .{ .fraction = &vol }, .{
+                if (dvui.slider(@src(), .{ .fraction = &vol, .color_bar = style.C.blue }, .{
                     .min_size_content = .{ .w = 70, .h = 14 },
                     .gravity_y = 0.5,
                     .margin = .{ .x = 4 },
+                    .color_fill = .{ .color = style.C.track },
                 })) {
                     p.setVolume(vol);
                 }
@@ -700,7 +731,7 @@ pub const ViewerState = struct {
                     .min_size_content = .{ .w = 22, .h = 22 },
                     .gravity_y = 0.5,
                     .padding = .all(4),
-                    .color_text = dvui.themeGet().border,
+                    .color_text = .{ .color = style.C.text_ghost },
                 });
             }
         }
@@ -708,10 +739,12 @@ pub const ViewerState = struct {
 
         if (self.image_width > 0) {
             var zoom_buf: [16]u8 = undefined;
-            const zoom_str = std.fmt.bufPrint(&zoom_buf, "{d:.0}%", .{self.zoom * 100}) catch "";
+            const zoom_str = std.mem.print(&zoom_buf, "{d:.0}%", .{self.zoom * 100}) catch "";
             dvui.label(@src(), "{s}", .{zoom_str}, .{
                 .gravity_y = 0.5,
-                .padding = .{ .x = 4, .y = 0 },
+                .padding = .{ .x = 6, .y = 0 },
+                .font = style.F.mono_val,
+                .color_text = .{ .color = style.C.text_dim },
             });
         }
 
@@ -779,6 +812,14 @@ pub const ViewerState = struct {
             .min_size_content = tb_btn_size,
             .gravity_y = 0.5,
             .label = .{ .text = label },
+            // Flat over the chrome band: a dozen raised slabs in one row reads
+            // as a wall, so the button only grows a fill when the pointer is on
+            // it. `hover_wash` is white-over-surface, so it works on `chrome`.
+            .background = false,
+            .color_fill_hover = .{ .color = style.hover_wash },
+            .color_fill_press = .{ .color = style.C.raised },
+            .corners = style.R.chip,
+            .color_text = .{ .color = style.C.text_dim },
         };
     }
 
@@ -829,10 +870,10 @@ pub const ViewerState = struct {
         // reliable way to recolor; setting IconRenderOptions.fill_color alone
         // leaves it white.
         const star_color: dvui.Color = if (favorited)
-            .{ .r = 255, .g = 200, .b = 40, .a = 255 }
+            style.C.star
         else
-            .{ .r = 255, .g = 255, .b = 255, .a = 90 };
-        dvui.icon(@src(), label, icons.tvg.heroicons.solid.star, .{}, iconChildOpts(&bw, opts).override(.{ .color_text = star_color }));
+            style.tint(style.C.text_hi, 90);
+        dvui.icon(@src(), label, icons.tvg.heroicons.solid.star, .{}, iconChildOpts(&bw, opts).override(.{ .color_text = .{ .color = star_color } }));
         const click = bw.clicked();
         bw.drawFocus();
         btnTooltip(&bw, label);
@@ -845,10 +886,16 @@ pub const ViewerState = struct {
     fn textButton(label: [:0]const u8, hint: [:0]const u8, id_extra: usize) bool {
         const opts = dvui.Options{
             .id_extra = id_extra,
-            .padding = .all(4),
+            .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
             .min_size_content = .{ .h = tb_btn_size.h },
             .gravity_y = 0.5,
             .label = .{ .text = label },
+            .background = false,
+            .color_fill_hover = .{ .color = style.hover_wash },
+            .color_fill_press = .{ .color = style.C.raised },
+            .corners = style.R.chip,
+            .color_text = .{ .color = style.C.text_dim },
+            .font = style.F.ui,
         };
         var bw: dvui.ButtonWidget = undefined;
         bw.init(@src(), .{}, opts);
@@ -883,10 +930,10 @@ pub const ViewerState = struct {
                 if (e.handled or e.evt != .mouse) continue;
                 const me = e.evt.mouse;
                 if (me.action != .motion) continue;
-                if (dvui.dragging(me.p, null) != null) {
+                if (dvui.dragging(me, null) != null) {
                     e.handle(@src(), bw.data());
                     dvui.captureMouse(null, e.num);
-                    dvui.dragEnd();
+                    dvui.dragEnd(me.button);
                     started = true;
                 }
             }
@@ -903,7 +950,7 @@ pub const ViewerState = struct {
         var area = dvui.box(@src(), .{}, .{
             .expand = .both,
             .background = true,
-            .color_fill = .{ .r = 15, .g = 15, .b = 15, .a = 255 },
+            .color_fill = .{ .color = style.C.thumb_well },
         });
         defer area.deinit();
 
@@ -979,12 +1026,12 @@ pub const ViewerState = struct {
                     if (me.button.pointer() and dvui.eventMatchSimple(e, wd)) {
                         e.handled = true;
                         dvui.captureMouse(wd, e.num);
-                        dvui.dragPreStart(me.p, .{});
+                        dvui.dragPreStart(me.button, me.p, .{});
                     }
                 },
                 .motion => |delta| {
                     if (dvui.captured(id)) {
-                        if (dvui.dragging(me.p, null) != null) {
+                        if (dvui.dragging(me, null) != null) {
                             e.handled = true;
                             const s = crs.s;
                             self.pan_x += delta.x / (self.zoom * s);
@@ -1009,6 +1056,7 @@ pub const ViewerState = struct {
             .min_size_content = .{ .w = 8, .h = 0 },
             .expand = .vertical,
             .background = true,
+            .color_fill = .{ .color = style.C.canvas },
         });
         defer h.deinit();
 
@@ -1026,12 +1074,12 @@ pub const ViewerState = struct {
                     if (me.button.pointer() and dvui.eventMatchSimple(e, h.data())) {
                         e.handled = true;
                         dvui.captureMouse(h.data(), e.num);
-                        dvui.dragPreStart(me.p, .{ .cursor = .arrow_w_e });
+                        dvui.dragPreStart(me.button, me.p, .{ .cursor = .arrow_w_e });
                     }
                 },
                 .motion => |delta| {
                     if (dvui.captured(id)) {
-                        if (dvui.dragging(me.p, null) != null) {
+                        if (dvui.dragging(me, null) != null) {
                             e.handled = true;
                             self.info_w = std.math.clamp(self.info_w - delta.x / scale, 120, 600);
                             self.info_w_open = self.info_w;

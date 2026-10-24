@@ -7,18 +7,76 @@ const image_grid_mod = @import("image_grid.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const search_mod = @import("search.zig");
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
 const log = std.log.scoped(.settings);
 
-// HuggingFace download sources for the bundled ONNX models
-const snowflake_hf_base = "https://huggingface.co/onnx-community/snowflake-arctic-embed-m-v2.0/resolve/main";
-const snowflake_dir_name = "snowflake-arctic-embed-m-v2.0";
-const snowflake_dl_files = [_][]const u8{ "tokenizer.json", "onnx/model_int8.onnx" };
+// Shared presets, so every field in the two columns is built the same way.
 
-const siglip2_hf_base = "https://huggingface.co/immich-app/ViT-B-16-SigLIP2__webli/resolve/main";
-const siglip2_dir_name = "ViT-B-16-SigLIP2__webli";
-const siglip2_dl_files = [_][]const u8{ "textual/tokenizer.json", "textual/model.onnx", "visual/model.onnx" };
+/// A sunken, hairlined text field — the same skin as the toolbar's search box.
+const input_opts: dvui.Options = .{
+    .expand = .horizontal,
+    .background = true,
+    .color_fill = .{ .color = style.C.sunken },
+    .border = style.Edge.all,
+    .color_border = .{ .color = style.hairline_hi },
+    .corners = style.R.button,
+    .padding = .{ .x = 9, .y = 6, .w = 9, .h = 6 },
+    .font = style.F.input,
+    .margin = .{ .h = 4 },
+};
+
+/// A compact secondary action sitting beside a field or a stat row.
+const small_button: dvui.Options = .{
+    .padding = .{ .x = 10, .y = 4, .w = 10, .h = 4 },
+    .corners = style.R.button,
+    .font = style.F.ui,
+};
+
+/// A field caption. Uppercase mono, because the settings screen is a list of
+/// things to find rather than text to read, and a head that scans beats a head
+/// that reads.
+fn fieldHead(src: std.builtin.SourceLocation, text: []const u8, top: f32) void {
+    style.sectionHead(src, text, .{ .padding = .{}, .margin = .{ .y = top, .h = 6 } });
+}
+
+/// "A background job is running" — the same amber spinner-and-caption the
+/// status bar uses, so the two read as one language.
+fn runningLine(src: std.builtin.SourceLocation, text: []const u8) void {
+    var line = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+    defer line.deinit();
+    _ = dvui.spinner(@src(), .{
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 12, .h = 12 },
+        .color_text = .{ .color = style.C.amber },
+    });
+    dvui.label(@src(), "{s}", .{text}, .{
+        .gravity_y = 0.5,
+        .margin = .{ .x = 6 },
+        .font = style.F.mono,
+        .color_text = .{ .color = style.C.amber },
+    });
+}
+
+// HuggingFace download sources for the bundled models.
+// Text encoder: EmbeddingGemma 300m (native-Zig via TensorPencil, loads
+// safetensors). unsloth is the ungated mirror of google/embeddinggemma-300m.
+const gemma_hf_base = "https://huggingface.co/unsloth/embeddinggemma-300m/resolve/main";
+const gemma_dir_name = "embeddinggemma-300m";
+const gemma_dl_files = [_][]const u8{
+    "tokenizer.json",
+    "model.safetensors",
+    "2_Dense/model.safetensors",
+    "3_Dense/model.safetensors",
+};
+
+// Visual + cross-modal-text encoder: SigLIP2 ViT-B-16 (native-Zig via
+// TensorPencil, loads the open_clip safetensors — both towers in one file).
+// timm is the source for the open_clip checkpoint + tokenizer.
+const siglip2_hf_base = "https://huggingface.co/timm/ViT-B-16-SigLIP2/resolve/main";
+const siglip2_dir_name = "ViT-B-16-SigLIP2-timm";
+const siglip2_dl_files = [_][]const u8{ "open_clip_model.safetensors", "tokenizer.json" };
 
 const DownloadCtx = struct {
     io: std.Io,
@@ -37,9 +95,9 @@ fn downloadTask(ctx: DownloadCtx) void {
     defer ctx.running.store(false, .release);
 
     for (ctx.files) |rel_path| {
-        const out_path = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.target_dir, rel_path }) catch return;
+        const out_path = ctx.allocator.print("{s}/{s}", .{ ctx.target_dir, rel_path }) catch return;
         defer ctx.allocator.free(out_path);
-        const url = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.hf_base, rel_path }) catch return;
+        const url = ctx.allocator.print("{s}/{s}", .{ ctx.hf_base, rel_path }) catch return;
         defer ctx.allocator.free(url);
 
         const result = std.process.run(ctx.allocator, ctx.io, .{
@@ -79,7 +137,7 @@ fn spawnDownload(
     if (running.load(.acquire)) return;
     success.store(false, .release);
 
-    const target_dir = std.fmt.allocPrint(allocator, "{s}/models/{s}", .{ data_dir, model_dir_name }) catch return;
+    const target_dir = allocator.print("{s}/models/{s}", .{ data_dir, model_dir_name }) catch return;
     running.store(true, .release);
 
     const ctx = DownloadCtx{
@@ -116,8 +174,8 @@ pub const SettingsModalState = struct {
         visual_dir: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
     } = .{},
     gpu_snapshot: struct {
-        use_gpu: bool = false,
-        gpu_device_id: u32 = 0,
+        backend: config_mod.GpuBackend = .cuda,
+        threshold: usize = 4,
     } = .{},
     text_model_dir_buf:   [4096:0]u8 = std.mem.zeroes([4096:0]u8),
     visual_model_dir_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
@@ -126,8 +184,8 @@ pub const SettingsModalState = struct {
     /// Set to true by onClosed() or applyCompletedDownloads() when model paths changed; cleared by app.zig.
     model_paths_changed: bool = false,
 
-    snowflake_dl_running: std.atomic.Value(bool) = .init(false),
-    snowflake_dl_success: std.atomic.Value(bool) = .init(false),
+    gemma_dl_running: std.atomic.Value(bool) = .init(false),
+    gemma_dl_success: std.atomic.Value(bool) = .init(false),
     siglip2_dl_running: std.atomic.Value(bool) = .init(false),
     siglip2_dl_success: std.atomic.Value(bool) = .init(false),
 
@@ -188,16 +246,19 @@ pub const SettingsModalState = struct {
 
         var outer = dvui.box(@src(), .{}, .{
             .expand = .both,
-            .padding = .all(16),
+            .padding = .all(20),
+            .background = true,
+            .color_fill = .{ .color = style.C.chrome },
         });
         defer outer.deinit();
 
-        dvui.label(@src(), "{s}", .{i18n.t(.settings_heading)}, .{ .font = bold, .margin = .{ .h = 12 } });
+        style.modalTitle(@src(), i18n.t(.settings_heading));
 
         {
             var scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{
                 .expand = .both,
                 .max_size_content = dvui.Options.MaxSize.height(0),
+                .background = false,
             });
             defer scroll.deinit();
 
@@ -213,45 +274,33 @@ pub const SettingsModalState = struct {
                 });
                 defer left_col.deinit();
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_scan_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
+                fieldHead(@src(), i18n.t(.settings_scan_section), 0);
                 _ = dvui.checkbox(@src(), &cfg.thumbnails_in_db, i18n.t(.settings_thumbnails_in_db), .{ .margin = .{ .h = 6 } });
                 _ = dvui.checkbox(@src(), &cfg.prompt_embeddings, i18n.t(.settings_prompt_embeddings), .{ .margin = .{ .h = 6 } });
                 _ = dvui.checkbox(@src(), &cfg.image_embeddings, i18n.t(.settings_image_embeddings), .{ .margin = .{ .h = 6 } });
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_model_path)}, .{ .font = bold, .margin = .{ .y = 12, .h = 4 } });
+                fieldHead(@src(), i18n.t(.settings_model_path), 14);
                 {
                     var te = dvui.textEntry(@src(), .{
                         .text = .{ .buffer = self.text_model_dir_buf[0..] },
                         .placeholder = i18n.t(.settings_model_placeholder),
-                    }, .{
-                        .expand = .horizontal,
-                        .min_size_content = .{ .h = 22 },
-                        .corner_radius = dvui.Rect.all(4),
-                        .margin = .{ .h = 4 },
-                    });
+                    }, input_opts);
                     defer te.deinit();
                 }
                 {
                     var dl_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 4 } });
                     defer dl_row.deinit();
-                    if (self.snowflake_dl_running.load(.acquire)) {
-                        _ = dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } });
-                        dvui.label(@src(), "{s}", .{i18n.t(.settings_download_running)}, .{
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
+                    if (self.gemma_dl_running.load(.acquire)) {
+                        runningLine(@src(), i18n.t(.settings_download_running));
                     } else {
-                        if (dvui.button(@src(), i18n.t(.settings_download_snowflake), .{}, .{
-                            .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
-                            .corner_radius = dvui.Rect.all(4),
-                        })) {
+                        if (dvui.button(@src(), i18n.t(.settings_download_text_model), .{}, small_button)) {
                             if (dvui.App.main_init) |init| {
                                 if (data_dir) |dd| {
                                     spawnDownload(
                                         init.io, init.gpa, dd,
-                                        snowflake_dir_name, snowflake_hf_base,
-                                        &snowflake_dl_files,
-                                        &self.snowflake_dl_running, &self.snowflake_dl_success,
+                                        gemma_dir_name, gemma_hf_base,
+                                        &gemma_dl_files,
+                                        &self.gemma_dl_running, &self.gemma_dl_success,
                                         &self.text_model_dir_buf, wakeup_fn,
                                     );
                                 }
@@ -260,33 +309,21 @@ pub const SettingsModalState = struct {
                     }
                 }
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_mmproj_path)}, .{ .font = bold, .margin = .{ .y = 8, .h = 4 } });
+                fieldHead(@src(), i18n.t(.settings_mmproj_path), 10);
                 {
                     var te = dvui.textEntry(@src(), .{
                         .text = .{ .buffer = self.visual_model_dir_buf[0..] },
                         .placeholder = i18n.t(.settings_mmproj_placeholder),
-                    }, .{
-                        .expand = .horizontal,
-                        .min_size_content = .{ .h = 22 },
-                        .corner_radius = dvui.Rect.all(4),
-                        .margin = .{ .h = 4 },
-                    });
+                    }, input_opts);
                     defer te.deinit();
                 }
                 {
                     var dl_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 4 } });
                     defer dl_row.deinit();
                     if (self.siglip2_dl_running.load(.acquire)) {
-                        _ = dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } });
-                        dvui.label(@src(), "{s}", .{i18n.t(.settings_download_running)}, .{
-                            .gravity_y = 0.5,
-                            .margin = .{ .x = 4 },
-                        });
+                        runningLine(@src(), i18n.t(.settings_download_running));
                     } else {
-                        if (dvui.button(@src(), i18n.t(.settings_download_siglip2), .{}, .{
-                            .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
-                            .corner_radius = dvui.Rect.all(4),
-                        })) {
+                        if (dvui.button(@src(), i18n.t(.settings_download_siglip2), .{}, small_button)) {
                             if (dvui.App.main_init) |init| {
                                 if (data_dir) |dd| {
                                     spawnDownload(
@@ -302,26 +339,44 @@ pub const SettingsModalState = struct {
                     }
                 }
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_gpu_section)}, .{ .font = bold, .margin = .{ .y = 12, .h = 8 } });
-                _ = dvui.checkbox(@src(), &cfg.use_gpu, i18n.t(.settings_use_gpu), .{ .margin = .{ .h = 6 } });
-                if (cfg.use_gpu) {
-                    var gpu_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+                fieldHead(@src(), i18n.t(.settings_backend_section), 16);
+                {
+                    // Enum tags map 1:1 to indices: none=0(CPU), vulkan=1, cuda=2.
+                    var backend_idx: usize = @backingInt(cfg.embed_gpu_backend);
+                    const backend_names = [_][]const u8{ i18n.t(.settings_backend_cpu), "Vulkan", "CUDA" };
+                    if (dvui.dropdown(@src(), &backend_names, .{ .choice = &backend_idx }, .{}, .{
+                        .margin = .{ .h = 6 },
+                        .min_size_content = .{ .w = 120, .h = 22 },
+                        .corners = style.R.button,
+                        .font = style.F.ui,
+                    })) {
+                        cfg.embed_gpu_backend = @fromBackingInt(@intCast(backend_idx));
+                    }
+                }
+                if (cfg.embed_gpu_backend != .none) {
+                    var thr_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
                         .expand = .horizontal,
                         .margin = .{ .h = 4 },
                     });
-                    defer gpu_row.deinit();
-                    dvui.label(@src(), "{s}", .{i18n.t(.settings_gpu_device_id)}, .{
+                    defer thr_row.deinit();
+                    dvui.label(@src(), "{s}", .{i18n.t(.settings_gpu_threshold)}, .{
                         .gravity_y = 0.5,
                         .margin = .{ .w = 8 },
+                        .color_text = .{ .color = style.C.text_dim },
                     });
-                    _ = dvui.textEntryNumber(@src(), u32, .{ .value = &cfg.gpu_device_id, .min = 0 }, .{
-                        .gravity_y = 0.5,
-                        .min_size_content = .{ .w = 40, .h = 22 },
-                        .corner_radius = dvui.Rect.all(4),
-                    });
+                    // Narrowing an entry has to go through `entrySize`; see the
+                    // comment on it for why a bare width collapses the field.
+                    _ = dvui.textEntryNumber(@src(), usize, .{ .value = &cfg.embed_gpu_threshold, .min = 1 },
+                        input_opts.override(.{
+                            .expand = .none,
+                            .gravity_y = 0.5,
+                            .min_size_content = style.entrySize(style.F.mono_val, 5),
+                            .margin = .{},
+                            .font = style.F.mono_val,
+                        }));
                 }
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_trash_section)}, .{ .font = bold, .margin = .{ .y = 20, .h = 8 } });
+                fieldHead(@src(), i18n.t(.settings_trash_section), 22);
                 _ = dvui.checkbox(@src(), &cfg.trash_enabled, i18n.t(.settings_trash_enable), .{ .margin = .{ .h = 6 } });
                 if (cfg.trash_enabled) {
                     if (trash_stats.*) |ts| {
@@ -331,15 +386,15 @@ pub const SettingsModalState = struct {
                             .margin = .{ .h = 6 },
                         });
                         defer trash_row.deinit();
-                        dvui.label(@src(), "{d} items ({d:.1} {s})", .{ ts.count, tb.value, tb.unit }, .{
+                        dvui.label(@src(), "{d} {s} ({d:.1} {s})", .{ ts.count, i18n.t(.settings_items), tb.value, tb.unit }, .{
                             .expand = .horizontal,
                             .gravity_y = 0.5,
+                            .font = style.F.mono,
+                            .color_text = .{ .color = style.C.text_dim },
                         });
-                        if (dvui.button(@src(), i18n.t(.settings_empty_trash), .{}, .{
-                            .gravity_y = 0.5,
-                            .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
-                            .corner_radius = dvui.Rect.all(4),
-                        })) {
+                        // Emptying the trash deletes the files for good.
+                        if (dvui.button(@src(), i18n.t(.settings_empty_trash), .{},
+                            small_button.override(.{ .gravity_y = 0.5, .style = .err }))) {
                             if (data_dir) |dd| {
                                 if (db) |d| {
                                     if (dvui.App.main_init) |init| {
@@ -349,7 +404,7 @@ pub const SettingsModalState = struct {
                                             init.gpa.free(names);
                                         }
                                         for (names) |trash_name| {
-                                            const p = std.fs.path.join(init.gpa, &.{ dd, "trash", trash_name }) catch continue;
+                                            const p = std.Io.Dir.path.join(init.gpa, &.{ dd, "trash", trash_name }) catch continue;
                                             defer init.gpa.free(p);
                                             std.Io.Dir.cwd().deleteFile(init.io, p) catch {};
                                         }
@@ -364,29 +419,40 @@ pub const SettingsModalState = struct {
                     }
                 }
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path)}, .{ .font = bold, .margin = .{ .y = 16, .h = 6 } });
+                fieldHead(@src(), i18n.t(.settings_data_path), 18);
                 {
                     var te = dvui.textEntry(@src(), .{
                         .text = .{ .buffer = self.data_path_buf[0..] },
                         .placeholder = i18n.t(.settings_data_path_placeholder),
-                    }, .{
-                        .expand = .horizontal,
-                        .min_size_content = .{ .h = 22 },
-                        .corner_radius = dvui.Rect.all(4),
-                        .margin = .{ .h = 4 },
-                    });
+                    }, input_opts);
                     defer te.deinit();
                 }
                 // Show where data currently lives so an empty (default) field is unambiguous.
                 if (data_dir) |dd| {
-                    dvui.label(@src(), "{s} {s}", .{ i18n.t(.settings_data_path_default), dd }, .{
-                        .margin = .{ .h = 4 },
+                    var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .h = 6 } });
+                    defer line.deinit();
+                    dvui.label(@src(), "{s} ", .{i18n.t(.settings_data_path_default)}, .{
+                        .gravity_y = 0.5,
+                        .font = style.F.mono,
+                        .color_text = .{ .color = style.C.text_faint },
+                    });
+                    // A path is arbitrary filesystem data, so it goes through
+                    // the run splitter rather than a plain label.
+                    fonts.richLine(@src(), dd, .{
+                        .gravity_y = 0.5,
+                        .expand = .horizontal,
+                        .font = style.F.mono,
+                        .color_text = .{ .color = style.C.text_dim },
                     });
                 }
                 dvui.label(@src(), "{s}", .{i18n.t(.settings_data_path_warning)}, .{
-                    .color_text = dvui.themeGet().err.fill orelse dvui.themeGet().border,
+                    .color_text = .{ .color = style.C.danger },
                 });
             }
+
+            // A hairline between the columns, so the two groups read as two
+            // rather than as one list that happens to wrap.
+            style.vsep(@src());
 
             // ── Right column ──────────────────────────────────────────────────
             {
@@ -397,10 +463,14 @@ pub const SettingsModalState = struct {
                 });
                 defer right_col.deinit();
 
-                dvui.label(@src(), "{s}", .{i18n.t(.settings_database_section)}, .{ .font = bold, .margin = .{ .h = 8 } });
+                fieldHead(@src(), i18n.t(.settings_database_section), 0);
                 if (db_stats.*) |stats| {
                     const total = detail_panel_mod.fmtBytes(stats.total_bytes);
-                    dvui.label(@src(), "{s}{d:.1} {s}", .{ i18n.t(.settings_db_total_size_label), total.value, total.unit }, .{ .margin = .{ .h = 10 } });
+                    dvui.label(@src(), "{s}{d:.1} {s}", .{ i18n.t(.settings_db_total_size_label), total.value, total.unit }, .{
+                        .margin = .{ .h = 12 },
+                        .font = style.F.mono_val,
+                        .color_text = .{ .color = style.C.text_hi },
+                    });
 
                     const db_label_keys = [_]std.meta.FieldEnum(i18n.Strings){
                         .settings_db_thumbnails_label,
@@ -428,13 +498,16 @@ pub const SettingsModalState = struct {
                             .id_extra = ri,
                             .expand = .horizontal,
                             .gravity_y = 0.5,
+                            .font = style.F.mono,
+                            .color_text = .{ .color = style.C.text_dim },
                         });
-                        if (dvui.button(@src(), i18n.t(.action_clear), .{}, .{
+                        // Clearing a cache throws away derived data that has to
+                        // be recomputed, so it reads as destructive.
+                        if (dvui.button(@src(), i18n.t(.action_clear), .{}, small_button.override(.{
                             .id_extra = ri,
                             .gravity_y = 0.5,
-                            .padding = .{ .x = 8, .y = 2, .w = 8, .h = 2 },
-                            .corner_radius = dvui.Rect.all(4),
-                        })) {
+                            .style = .err,
+                        }))) {
                             if (db) |d| {
                                 r.clear_fn(d) catch {};
                                 db_stats.* = d.getStats() catch null;
@@ -442,15 +515,20 @@ pub const SettingsModalState = struct {
                         }
                     }
                 } else {
-                    dvui.label(@src(), "{s}", .{i18n.t(.settings_db_no_database)}, .{});
+                    dvui.label(@src(), "{s}", .{i18n.t(.settings_db_no_database)}, .{
+                        .color_text = .{ .color = style.C.text_ghost },
+                    });
                 }
             }
         }
 
         {
-            var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .margin = .{ .y = 12 } });
+            style.hsep(@src());
+            var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .margin = .{ .y = 4 } });
             defer btn_row.deinit();
-            if (dvui.button(@src(), i18n.t(.action_close), .{}, .{ .margin = .all(4) })) {
+            // Settings apply as they are changed, so Close is the only exit and
+            // therefore the primary — there is nothing here to cancel.
+            if (style.primaryButton(@src(), i18n.t(.action_close), .{ .margin = .all(4) })) {
                 self.open = false;
             }
         }
@@ -458,8 +536,8 @@ pub const SettingsModalState = struct {
 
     pub fn applyCompletedDownloads(self: *SettingsModalState, cfg: *config_mod.Config, data_dir: ?[]const u8) void {
         _ = data_dir;
-        if (self.snowflake_dl_success.load(.acquire)) {
-            self.snowflake_dl_success.store(false, .release);
+        if (self.gemma_dl_success.load(.acquire)) {
+            self.gemma_dl_success.store(false, .release);
             if (!self.open) {
                 if (dvui.App.main_init) |init| {
                     if (cfg.text_model_dir) |p| init.gpa.free(p);
@@ -519,8 +597,8 @@ pub const SettingsModalState = struct {
             if (cfg.prompt_embeddings or cfg.image_embeddings) need_rescan = true;
         }
 
-        const gpu_changed = cfg.use_gpu != self.gpu_snapshot.use_gpu or
-            cfg.gpu_device_id != self.gpu_snapshot.gpu_device_id;
+        const gpu_changed = cfg.embed_gpu_backend != self.gpu_snapshot.backend or
+            cfg.embed_gpu_threshold != self.gpu_snapshot.threshold;
         if (gpu_changed) {
             self.model_paths_changed = true;
         }

@@ -71,15 +71,15 @@ fn embed(allocator: std.mem.Allocator, ctx: *llama.Context, text: []const u8) ![
 fn docText(allocator: std.mem.Allocator, prompt: []const u8, mode: PrefixMode) ![]const u8 {
     return switch (mode) {
         .none, .qwen3 => allocator.dupe(u8, prompt),
-        .mxbai, .qwen3d => std.fmt.allocPrint(allocator, DOC_PREFIX ++ "{s}", .{prompt}),
+        .mxbai, .qwen3d => allocator.print(DOC_PREFIX ++ "{s}", .{prompt}),
     };
 }
 
 fn queryText(allocator: std.mem.Allocator, q: []const u8, mode: PrefixMode) ![]const u8 {
     return switch (mode) {
         .none   => allocator.dupe(u8, q),
-        .mxbai  => std.fmt.allocPrint(allocator, QUERY_PREFIX ++ "{s}", .{q}),
-        .qwen3, .qwen3d => std.fmt.allocPrint(allocator, QWEN3_QUERY_PREFIX ++ "{s}", .{q}),
+        .mxbai  => allocator.print(QUERY_PREFIX ++ "{s}", .{q}),
+        .qwen3, .qwen3d => allocator.print(QWEN3_QUERY_PREFIX ++ "{s}", .{q}),
     };
 }
 
@@ -200,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (model_paths.items, 0..) |model_path, mi| {
         // Extract basename for display.
-        model_names[mi] = std.fs.path.stem(std.fs.path.basename(model_path));
+        model_names[mi] = std.Io.Dir.path.stem(std.Io.Dir.path.basename(model_path));
 
         try print(io, "\n=== Model: {s} ===\n", .{model_names[mi]});
 

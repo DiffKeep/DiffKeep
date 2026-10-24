@@ -8,7 +8,7 @@ const std = @import("std");
 /// embed it as ASCII (e.g. ComfyUI WebP EXIF), where reading via libexif would
 /// truncate long values.
 pub fn extractJsonObject(s: []const u8) ?[]const u8 {
-    const start = std.mem.indexOfScalar(u8, s, '{') orelse return null;
+    const start = std.mem.findScalar(u8, s, '{') orelse return null;
     var depth: usize = 0;
     var in_str = false;
     var esc = false;
@@ -144,8 +144,8 @@ pub const ComfyParser = struct {
         const t = t_val.string;
 
         // Direct text encoders: wv[0] is the text
-        if (std.mem.indexOf(u8, t, "CLIPTextEncode") != null or
-            std.mem.indexOf(u8, t, "T5TextEncode") != null)
+        if (std.mem.find(u8, t, "CLIPTextEncode") != null or
+            std.mem.find(u8, t, "T5TextEncode") != null)
         {
             const wv = node.object.get("widgets_values") orelse return null;
             if (wv != .array or wv.array.items.len == 0) return null;
@@ -156,7 +156,7 @@ pub const ComfyParser = struct {
 
         // Prompt Generator: try wv[4] (generated output, may be string or integer seed),
         // fall back to wv[3] (user-provided base text)
-        if (std.mem.indexOf(u8, t, "Prompt Generator") != null) {
+        if (std.mem.find(u8, t, "Prompt Generator") != null) {
             const wv = node.object.get("widgets_values") orelse return null;
             if (wv != .array) return null;
             const items = wv.array.items;
@@ -226,8 +226,8 @@ pub const ComfyParser = struct {
         const t = t_val.string;
 
         // Checkpoint / model loaders: wv[0] is model filename
-        if (std.mem.indexOf(u8, t, "CheckpointLoader") != null or
-            std.mem.indexOf(u8, t, "UnetLoader") != null or
+        if (std.mem.find(u8, t, "CheckpointLoader") != null or
+            std.mem.find(u8, t, "UnetLoader") != null or
             std.mem.eql(u8, t, "PixArtCheckpointLoader"))
         {
             const wv = node.object.get("widgets_values") orelse return null;
@@ -237,7 +237,7 @@ pub const ComfyParser = struct {
         }
 
         // Efficient Loader (SDXL): wv[0] is checkpoint name
-        if (std.mem.indexOf(u8, t, "Eff. Loader") != null) {
+        if (std.mem.find(u8, t, "Eff. Loader") != null) {
             const wv = node.object.get("widgets_values") orelse return null;
             if (wv != .array or wv.array.items.len == 0) return null;
             if (wv.array.items[0] != .string) return null;
@@ -245,7 +245,7 @@ pub const ComfyParser = struct {
         }
 
         // LoRA loader: collect lora name (wv[0]) and follow model input up the chain
-        if (std.mem.indexOf(u8, t, "LoraLoader") != null or std.mem.eql(u8, t, "LoRA Loader")) {
+        if (std.mem.find(u8, t, "LoraLoader") != null or std.mem.eql(u8, t, "LoRA Loader")) {
             if (node.object.get("widgets_values")) |wv| {
                 if (wv == .array and wv.array.items.len > 0 and wv.array.items[0] == .string) {
                     const duped = try self.allocator.dupe(u8, wv.array.items[0].string);
@@ -340,7 +340,7 @@ pub const ComfyParser = struct {
         const node = self.getNodeById(src_id) orelse return null;
         if (node != .object) return null;
         const t_val = node.object.get("type") orelse return null;
-        if (t_val != .string or std.mem.indexOf(u8, t_val.string, "Eff. Loader") == null) return null;
+        if (t_val != .string or std.mem.find(u8, t_val.string, "Eff. Loader") == null) return null;
         const wv = node.object.get("widgets_values") orelse return null;
         if (wv != .array or wv.array.items.len <= index) return null;
         const p = wv.array.items[index];
@@ -631,8 +631,8 @@ pub const ComfyParser = struct {
         const inp = inputs.object;
 
         // Direct text encoders
-        if (std.mem.indexOf(u8, ct, "CLIPTextEncode") != null or
-            std.mem.indexOf(u8, ct, "T5TextEncode") != null)
+        if (std.mem.find(u8, ct, "CLIPTextEncode") != null or
+            std.mem.find(u8, ct, "T5TextEncode") != null)
         {
             if (inp.get("text")) |text_val| {
                 return self.followPromptToText(nodes, text_val, depth + 1);
@@ -698,8 +698,8 @@ pub const ComfyParser = struct {
         const inp = inputs_val.object;
 
         // Checkpoint loaders: ckpt_name or unet_name is the widget
-        if (std.mem.indexOf(u8, ct, "CheckpointLoader") != null or
-            std.mem.indexOf(u8, ct, "UnetLoader") != null)
+        if (std.mem.find(u8, ct, "CheckpointLoader") != null or
+            std.mem.find(u8, ct, "UnetLoader") != null)
         {
             for ([_][]const u8{ "ckpt_name", "unet_name" }) |key| {
                 if (inp.get(key)) |name_val| {
@@ -710,7 +710,7 @@ pub const ComfyParser = struct {
         }
 
         // LoRA loaders: collect lora_name and follow model input
-        if (std.mem.indexOf(u8, ct, "LoraLoader") != null) {
+        if (std.mem.find(u8, ct, "LoraLoader") != null) {
             if (inp.get("lora_name")) |lora_val| {
                 if (lora_val == .string and lora_val.string.len > 0) {
                     const duped = try self.allocator.dupe(u8, lora_val.string);
@@ -808,7 +808,7 @@ pub const ComfyParser = struct {
 
         // Settings line: "Steps: N, Sampler: X, CFG scale: F, Seed: N, ..."
         if (settings_line_start) |sls| {
-            const line_end = std.mem.indexOfScalarPos(u8, text, sls, '\n') orelse text.len;
+            const line_end = std.mem.findScalarPos(u8, text, sls, '\n') orelse text.len;
             try parseA1111Settings(self.allocator, text[sls..line_end], &result);
         }
 
@@ -895,7 +895,7 @@ pub const ComfyParser = struct {
 fn parseA1111Settings(allocator: std.mem.Allocator, line: []const u8, result: *ParseResult) !void {
     var i: usize = 0;
     while (i < line.len) {
-        const colon = std.mem.indexOfPos(u8, line, i, ": ") orelse break;
+        const colon = std.mem.findPos(u8, line, i, ": ") orelse break;
         const key = std.mem.trim(u8, line[i..colon], " ");
         var j: usize = colon + 2;
         var depth: usize = 0;
@@ -1015,8 +1015,8 @@ test "comfy: A1111 multiline positive prompt" {
     ;
     var result = (try parser.parseA1111Parameters(text)).?;
     defer result.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, result.positive_prompt.?, "line one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.positive_prompt.?, "line three") != null);
+    try std.testing.expect(std.mem.find(u8, result.positive_prompt.?, "line one") != null);
+    try std.testing.expect(std.mem.find(u8, result.positive_prompt.?, "line three") != null);
     try std.testing.expectEqualStrings("ugly", result.negative_prompt.?);
     try std.testing.expectEqual(@as(?i64, 10), result.steps);
 }
@@ -1078,7 +1078,7 @@ test "parse ComfyUI workflow" {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-        const workflow_path = try std.fmt.allocPrint(testing.allocator, "test-artifacts/workflows/{s}", .{entry.name});
+        const workflow_path = try testing.allocator.print("test-artifacts/workflows/{s}", .{entry.name});
         defer testing.allocator.free(workflow_path);
 
         const file = try std.Io.Dir.cwd().openFile(io, workflow_path, .{});

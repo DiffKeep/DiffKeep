@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".png")) continue;
-        const full = try std.fs.path.join(allocator, &.{ dir_arg, entry.name });
+        const full = try std.Io.Dir.path.join(allocator, &.{ dir_arg, entry.name });
         const prompt = extractPrompt(allocator, io, full) catch |err| {
             std.log.warn("skip {s}: {}", .{ entry.name, err });
             allocator.free(full);
@@ -178,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (QUERIES) |q| {
         // Embed query text with search_query prefix.
-        const qt = try std.fmt.allocPrint(allocator, QUERY_PREFIX ++ "{s}", .{q.text});
+        const qt = try allocator.print(QUERY_PREFIX ++ "{s}", .{q.text});
         defer allocator.free(qt);
         var chunks = try llama.createEmbeddingFromPrompt(allocator, text_ctx, qt, 2048);
         const q_emb: []const f32 = blk: {
@@ -209,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
             if (best_rank <= 5) "✓" else "✗", q.text, best_rank,
         });
         for (ranking[0..@min(5, corpus.len)], 0..) |idx, r| {
-            const name = std.fs.path.basename(corpus[idx].path);
+            const name = std.Io.Dir.path.basename(corpus[idx].path);
             const is_rel = isRelevant(name, q.relevant);
             const snip = corpus[idx].prompt[0..@min(60, corpus[idx].prompt.len)];
             try print(io, "  {s} #{d} {d:.4}  {s}  {s}...\n", .{
@@ -251,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
                 if (rr_best <= 5) "✓" else "✗", rr_best,
             });
             for (rr_corpus_ranking[0..@min(5, k)], 0..) |idx, r| {
-                const name = std.fs.path.basename(corpus[idx].path);
+                const name = std.Io.Dir.path.basename(corpus[idx].path);
                 const is_rel = isRelevant(name, q.relevant);
                 try print(io, "      {s} #{d} {d:.4}  {s}\n", .{
                     if (is_rel) "→" else " ", r + 1, rr_scores[rr_ranking[r]], name,
@@ -303,7 +303,7 @@ fn bestRank(corpus: []const ImageEntry, ranking: []const usize, relevant: []cons
     var best: usize = corpus.len + 1;
     for (relevant) |rel| {
         for (ranking, 0..) |idx, r| {
-            if (std.mem.eql(u8, std.fs.path.basename(corpus[idx].path), rel)) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(corpus[idx].path), rel)) {
                 if (r + 1 < best) best = r + 1;
                 break;
             }
@@ -379,7 +379,7 @@ fn extractPrompt(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?[
 
 fn print(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
+    const s = try std.mem.print(&buf, fmt, args);
     try std.Io.File.stdout().writeStreamingAll(io, s);
 }
 

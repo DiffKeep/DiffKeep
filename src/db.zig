@@ -171,6 +171,17 @@ const migrations = [_][]const u8{
     // v11: media type — 0 = image, 1 = animated image, 2 = video.
     \\ALTER TABLE images ADD COLUMN media_type INTEGER NOT NULL DEFAULT 0;
     ,
+    // v12: drop an image's embeddings with its row. vec0 tables can't take a
+    // foreign key, and image ids are recycled, so an orphaned vector would be
+    // inherited by the next image given that id (and, looking embedded, never
+    // be recomputed). Also purge the orphans earlier deletes left behind.
+    \\CREATE TRIGGER images_embeddings_ad AFTER DELETE ON images BEGIN
+    \\  DELETE FROM image_embeddings WHERE rowid = old.id;
+    \\  DELETE FROM positive_prompt_embeddings WHERE rowid = old.id;
+    \\END;
+    \\DELETE FROM image_embeddings WHERE rowid NOT IN (SELECT id FROM images);
+    \\DELETE FROM positive_prompt_embeddings WHERE rowid NOT IN (SELECT id FROM images);
+    ,
 };
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables
@@ -179,7 +190,7 @@ const migrations = [_][]const u8{
 fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
     const c = sqlite.c;
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     var raw: ?*c.sqlite3 = null;
@@ -216,7 +227,7 @@ fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
             return error.MigrationFailed;
         }
         var buf: [64]u8 = undefined;
-        const pragma = try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d}", .{idx + 1});
+        const pragma = try std.mem.printSentinel(&buf, "PRAGMA user_version = {d}", .{idx + 1}, 0);
         _ = c.sqlite3_exec(db, pragma.ptr, null, null, null);
         _ = c.sqlite3_exec(db, "COMMIT", null, null, null);
         log.info("applied migration {d}", .{idx + 1});
@@ -240,24 +251,27 @@ pub const ActiveFilter = struct {
     value: []const u8,
 };
 
+/// One SQLite connection plus a shared pool. The handle returned by `init` owns
+/// the pool; `getConnection` hands out further handles (one per thread) that
+/// share it by pointer. Deinit every `getConnection` handle before the owner.
 pub const VectorDb = struct {
     db: sqlite.Database,
     allocator: std.mem.Allocator,
-    pool: sqlite.ConnectionPool,
+    pool: *sqlite.ConnectionPool,
+    owns_pool: bool,
     io: std.Io,
     db_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !VectorDb {
         try setupSchema(allocator, path);
 
-        var pool = try sqlite.ConnectionPool.init(allocator, io, path, 4);
-        errdefer pool.deinit();
-
-        const db = try pool.acquire();
+        const pool = try sqlite.ConnectionPool.create(allocator, io, path, 4);
+        errdefer pool.destroy();
 
         return VectorDb{
-            .db = db,
+            .db = try pool.acquire(),
             .pool = pool,
+            .owns_pool = true,
             .allocator = allocator,
             .io = io,
         };
@@ -268,14 +282,18 @@ pub const VectorDb = struct {
         return VectorDb{
             .db = try self.pool.acquire(),
             .pool = self.pool,
+            .owns_pool = false,
             .allocator = self.allocator,
             .io = self.io,
         };
     }
 
+    /// Return the connection to the pool; the owning handle also destroys the pool.
     pub fn deinit(self: *VectorDb) void {
         log.debug("Releasing connection", .{});
-        self.pool.release(&self.db) catch {};
+        self.pool.release(&self.db);
+        if (self.owns_pool) self.pool.destroy();
+        self.* = undefined;
     }
 
     pub fn storeImageEmbedding(self: *VectorDb, id: u64, embedding: []const f32) !void {
@@ -616,7 +634,7 @@ pub const VectorDb = struct {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
 
-        const pattern = try std.fmt.allocPrint(allocator, "{s}/%", .{parent_path});
+        const pattern = try allocator.print("{s}/%", .{parent_path});
         defer allocator.free(pattern);
 
         var stmt = try self.db.prepare(
@@ -641,13 +659,13 @@ pub const VectorDb = struct {
             const rest = path[prefix_len..];
             // Find first "/" after prefix to get immediate child directory name.
             // Images sitting directly in parent_path have no further slash — skip them.
-            const slash_pos = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+            const slash_pos = std.mem.findScalar(u8, rest, '/') orelse continue;
             if (slash_pos == 0) continue;
             const child_end = prefix_len + slash_pos;
             const child_path = path[0..child_end];
             // A further "/" past "child/" means this image lives in a deeper
             // subdirectory, so the child folder itself has children.
-            const deeper = std.mem.indexOfScalar(u8, path[child_end + 1 ..], '/') != null;
+            const deeper = std.mem.findScalar(u8, path[child_end + 1 ..], '/') != null;
             const gop = try map.getOrPut(child_path);
             if (gop.found_existing) {
                 gop.value_ptr.count += 1;
@@ -706,7 +724,7 @@ pub const VectorDb = struct {
             try stmt.bind(1, library_id);
             while (try stmt.step()) {
                 const path = stmt.columnText(0);
-                const dir = std.fs.path.dirname(path) orelse continue;
+                const dir = std.Io.Dir.path.dirname(path) orelse continue;
                 const gop = try map.getOrPut(dir);
                 if (gop.found_existing) {
                     gop.value_ptr.* += 1;
@@ -769,7 +787,7 @@ pub const VectorDb = struct {
     pub fn listImagesInFolder(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, folder_path: []const u8) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        const pattern: []u8 = try std.fmt.allocPrint(allocator, "{s}/%", .{folder_path});
+        const pattern: []u8 = try allocator.print("{s}/%", .{folder_path});
         defer allocator.free(pattern);
         var stmt = try self.db.prepare(
             "SELECT id, library_path, mtime FROM images WHERE library_id = ? AND library_path LIKE ? AND trashed_at IS NULL ORDER BY id",
@@ -965,8 +983,7 @@ pub const VectorDb = struct {
             }
         } else {
             const col = column.name();
-            const sql = try std.fmt.allocPrint(allocator,
-                "SELECT DISTINCT {s} FROM images WHERE {s} IS NOT NULL AND {s} != '' ORDER BY {s} LIMIT 500",
+            const sql = try allocator.print("SELECT DISTINCT {s} FROM images WHERE {s} IS NOT NULL AND {s} != '' ORDER BY {s} LIMIT 500",
                 .{ col, col, col, col });
             defer allocator.free(sql);
             var stmt = try self.db.prepare(sql);
@@ -1040,7 +1057,7 @@ pub const VectorDb = struct {
             param += 1;
         }
         if (folder_path) |fp| {
-            const pattern = try std.fmt.allocPrint(allocator, "{s}/%", .{fp});
+            const pattern = try allocator.print("{s}/%", .{fp});
             defer allocator.free(pattern);
             try stmt.bind(param, @as([]const u8, pattern));
             param += 1;
@@ -1048,7 +1065,7 @@ pub const VectorDb = struct {
         for (filters) |f| {
             if (f.column == .format) {
                 // Build a lowercase "%.<ext>" LIKE pattern (matches LOWER(library_path)).
-                const pattern = try std.fmt.allocPrint(allocator, "%.{s}", .{f.value});
+                const pattern = try allocator.print("%.{s}", .{f.value});
                 defer allocator.free(pattern);
                 for (pattern) |*ch| ch.* = std.ascii.toLower(ch.*);
                 try stmt.bind(param, @as([]const u8, pattern));
@@ -1208,7 +1225,7 @@ pub const VectorDb = struct {
         defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare("UPDATE images SET media_type = ? WHERE id = ?");
         defer stmt.deinit();
-        try stmt.bind(1, @intFromEnum(media_type));
+        try stmt.bind(1, @backingInt(media_type));
         try stmt.bind(2, id);
         _ = try stmt.step();
     }
@@ -1287,10 +1304,27 @@ pub const VectorDb = struct {
         while (try stmt.step()) {
             try list.append(allocator, .{
                 .id = @intCast(stmt.columnInt64(0)),
-                .media_type = @enumFromInt(stmt.columnInt64(1)),
+                .media_type = @fromBackingInt(stmt.columnInt64(1)),
             });
         }
         return list.toOwnedSlice(allocator);
+    }
+
+    /// Delete the live (non-trashed) row `id` whose file at `path` is gone, and
+    /// report whether a row was deleted. Matching the path guards against an id
+    /// SQLite has since recycled; skipping trashed rows keeps images whose file
+    /// was moved to the trash.
+    pub fn deleteMissingImage(self: *VectorDb, id: u64, path: []const u8) !bool {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "DELETE FROM images WHERE id = ? AND library_path = ? AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        try stmt.bind(2, path);
+        _ = try stmt.step();
+        return sqlite.c.sqlite3_changes(self.db.db) > 0;
     }
 
     /// Permanently delete an image row from the DB.

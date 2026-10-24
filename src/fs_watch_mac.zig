@@ -130,8 +130,15 @@ const Spinlock = @import("spinlock.zig").Spinlock;
 pub const DirtyEvent = struct {
     library_id: u64,
     /// Heap-allocated absolute path.  Caller must free after processing.
+    /// The changed file for `.file`, the library root for `.rescan_library`.
     path: []u8,
     deleted: bool,
+    /// TODO: this backend never reports `.rescan_library` yet, so a directory
+    /// renamed or moved within a library still leaves stale paths in the DB
+    /// until the next startup scan.  See fs_watch_linux.zig:handleDirEvent.
+    kind: Kind = .file,
+
+    pub const Kind = enum { file, rescan_library };
 };
 
 // ── Internal context types ────────────────────────────────────────────────────
@@ -182,8 +189,9 @@ pub const FsWatcher = struct {
         errdefer core_services.close();
 
         var rs: ResolvedSymbols = undefined;
-        inline for (@typeInfo(ResolvedSymbols).@"struct".fields) |f| {
-            @field(rs, f.name) = core_services.lookup(f.type, f.name) orelse
+        const info = @typeInfo(ResolvedSymbols).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            @field(rs, name) = core_services.lookup(T, name) orelse
                 return error.MissingCoreServicesSymbol;
         }
 
@@ -217,7 +225,7 @@ pub const FsWatcher = struct {
     }
 
     pub fn addLibrary(self: *FsWatcher, library_id: u64, path: []const u8) !void {
-        const path_z = try self.allocator.dupeZ(u8, path);
+        const path_z = try self.allocator.dupeSentinel(u8, path, 0);
         errdefer self.allocator.free(path_z);
         const ctx = try self.allocator.create(AddCtx);
         ctx.* = .{ .watcher = self, .library_id = library_id, .path = path_z };

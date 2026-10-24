@@ -100,7 +100,7 @@ fn dot(a: []const f32, b: []const f32) f32 {
 }
 
 fn shortName(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1..];
+    if (std.mem.findScalarLast(u8, path, '/')) |i| return path[i + 1..];
     return path;
 }
 
@@ -111,7 +111,7 @@ fn printUsageErr(io: std.Io) !void {
 
 fn print(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [1024]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
+    const s = try std.mem.print(&buf, fmt, args);
     try std.Io.File.stdout().writeStreamingAll(io, s);
 }
 

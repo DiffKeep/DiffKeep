@@ -137,7 +137,7 @@ pub const Pool = struct {
         // if set, otherwise default to 999 (offload everything) on Apple Silicon
         // where Metal is always available, and 0 elsewhere.
         // see https://github.com/ggerganov/llama.cpp/issues/3423#issuecomment-1745511586
-        const default_gpu_layers: u32 = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) 999 else 0;
+        const default_gpu_layers: u32 = if (builtin.target.os.tag == .macos and builtin.target.cpu.arch == .aarch64) 999 else 0;
         params.n_gpu_layers = @intCast(self.options.n_gpu_layers orelse default_gpu_layers);
         params.use_mlock = self.options.mlock;
 
@@ -194,7 +194,7 @@ pub const Model = struct {
     pub fn loadFromHuggingFace(allocator: std.mem.Allocator, repo: []const u8, options: cmdFlags.Flags, filename: []const u8, revision: ?[]const u8, params: c.struct_llama_model_params) !Model {
         const rev = revision orelse "main";
         // Get data path for model
-        const model_file = try std.fmt.allocPrint(allocator, "/Models/{s}.{s}", .{ filename, rev });
+        const model_file = try allocator.print("/Models/{s}.{s}", .{ filename, rev });
         defer allocator.free(model_file);
         const model_path = try util.getDataPath(allocator, options, model_file);
         defer allocator.free(model_path);
@@ -202,7 +202,7 @@ pub const Model = struct {
         // Check if model already exists
         if (!std.fs.cwd().access(model_path)) {
             // Construct HuggingFace API URL
-            const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/{s}/{s}", .{ repo, rev, filename });
+            const url = try allocator.print("https://huggingface.co/{s}/resolve/{s}/{s}", .{ repo, rev, filename });
             defer allocator.free(url);
             std.debug.print("Downloading model {s}...\n", .{url});
 
@@ -290,7 +290,7 @@ pub const Model = struct {
         // llama.cpp is using fopen() and it does not support UTF-8 paths on Windows
         // so what we need to do is to call GetShortPathName() to get the short path
         // and it should work
-        if (comptime builtin.os.tag == .windows) {
+        if (comptime builtin.target.os.tag == .windows) {
             const w = struct {
                 extern "kernel32" fn GetShortPathNameW(lpszLongPath: ?[*:0]const u16, lpszShortPath: ?[*:0]u16, cchBuffer: u32) callconv(std.os.windows.WINAPI) u32;
             };
@@ -304,7 +304,7 @@ pub const Model = struct {
             return std.unicode.utf16LeToUtf8AllocZ(allocator, &buf);
         }
 
-        return allocator.dupeZ(u8, path);
+        return allocator.dupeSentinel(u8, path, 0);
     }
 };
 
@@ -474,7 +474,7 @@ pub const Context = struct {
 };
 
 fn getPerfCpuCount() usize {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         var count: c_int = 0;
         var len: usize = @sizeOf(c_int);
 

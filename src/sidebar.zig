@@ -6,12 +6,48 @@ const icons = @import("icons");
 const platform = @import("platform.zig");
 const library_manager_mod = @import("library_manager.zig");
 const image_grid_mod = @import("image_grid.zig");
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
+/// Background options for a sidebar row.
+///
+/// A selected row is a raised slab with a blue left edge, not a saturated blue
+/// fill: the sidebar is read top to bottom and a solid accent bar in the middle
+/// of that column reads as an error before it reads as "you are here". The
+/// accent is on the edge, where the eye tracks the column.
+/// Width and height of the hover-only remove button's reserved slot. Must be at
+/// least the button's own footprint (10px icon + 2px padding each side).
+const remove_slot: f32 = 16;
 
-/// Highlight background options for a selected sidebar row; empty when not selected.
-fn focusBg(selected: bool) dvui.Options {
-    return if (selected) .{ .background = true, .color_fill = dvui.themeGet().focus } else .{};
+/// The border and the fill are ALWAYS present, and only their colours change.
+/// A border occupies space, so giving one only to the selected row would shift
+/// every label 2px sideways as the selection moves down the list.
+fn rowBg(selected: bool) dvui.Options {
+    return .{
+        .background = true,
+        .color_fill = .{ .color = if (selected) style.C.sel_row else style.C.rail },
+        .border = .{ .x = 2 },
+        .color_border = .{ .color = if (selected) style.C.blue else style.C.rail },
+        .corners = style.R.chip,
+    };
+}
+
+/// Colour for a row's title: bright when it is the selected one, dim otherwise.
+/// Shape carries the selection; colour only confirms it.
+fn rowText(selected: bool) dvui.Color {
+    return if (selected) style.C.text_hi else style.C.text_dim;
+}
+
+/// A row's right-aligned image count. Monospaced because these are figures a
+/// user compares down the column, and faint because none of them is the point.
+fn countLabel(src: std.builtin.SourceLocation, count: i64, id_extra: usize) void {
+    dvui.label(src, "{d}", .{count}, .{
+        .id_extra = id_extra,
+        .gravity_y = 0.5,
+        .padding = .{ .x = 6, .w = 2 },
+        .font = style.F.mono,
+        .color_text = .{ .color = style.C.text_faint },
+    });
 }
 
 pub const LibraryState = struct {
@@ -141,7 +177,7 @@ pub const SidebarState = struct {
             self.filter_folder != null and
             std.mem.eql(u8, self.filter_folder.?, node.path);
 
-        const row_bg = focusBg(is_selected);
+        const row_bg = rowBg(is_selected);
 
         // Before a folder is expanded we rely on the has_children flag computed
         // at list time; once loaded, trust the actual children we found.
@@ -151,7 +187,7 @@ pub const SidebarState = struct {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, row_bg.override(.{
                 .id_extra = node_id_extra,
                 .expand = .horizontal,
-                .padding = .{ .x = indent_x, .y = 1, .w = 4, .h = 1 },
+                .padding = .{ .x = indent_x, .y = 3, .w = 4, .h = 3 },
             }));
             defer row.deinit();
 
@@ -194,6 +230,7 @@ pub const SidebarState = struct {
                     .id_extra = node_id_extra,
                     .min_size_content = .{ .w = 12, .h = 12 },
                     .gravity_y = 0.5,
+                    .color_text = .{ .color = style.C.text_ghost },
                 });
             } else {
                 _ = dvui.spacer(@src(), .{
@@ -202,16 +239,17 @@ pub const SidebarState = struct {
                 });
             }
 
-            dvui.label(@src(), "{s}", .{std.fs.path.basename(node.path)}, .{
+            // A folder name comes from the filesystem, so it can hold anything;
+            // drawn through the run splitter so a CJK or emoji path is glyphs
+            // rather than boxes, and on one line so the list never reflows.
+            fonts.richLine(@src(), std.Io.Dir.path.basename(node.path), .{
                 .id_extra = node_id_extra,
                 .expand = .horizontal,
                 .gravity_y = 0.5,
+                .font = style.F.row,
+                .color_text = .{ .color = rowText(is_selected) },
             });
-            dvui.label(@src(), "{d}", .{node.count}, .{
-                .id_extra = node_id_extra +% 1,
-                .gravity_y = 0.5,
-                .padding = .{ .x = 4, .w = 0 },
-            });
+            countLabel(@src(), node.count, node_id_extra +% 1);
         }
 
         if (node.expanded) {
@@ -238,19 +276,28 @@ pub const SidebarState = struct {
 
         var sidebar = dvui.box(@src(), .{}, .{
             .min_size_content = .{ .w = panel_w, .h = 0 },
+            .max_size_content = .{ .w = panel_w, .h = 0 },
             .expand = .vertical,
             .background = true,
+            .color_fill = .{ .color = style.C.rail },
+            .border = style.Edge.right,
+            .color_border = .{ .color = style.hairline_soft },
         });
         defer sidebar.deinit();
 
-        var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+        var scroll = dvui.scrollArea(@src(), .{}, .{
+            .expand = .both,
+            .background = false,
+            .padding = .{ .x = 6, .y = 8, .w = 6, .h = 8 },
+        });
         defer scroll.deinit();
 
         // ── "Library" master header (clears filter, shows all) ───────────
         {
             const in_library = if (grid) |g| g.view_mode == .library else true;
             const unfiltered = self.filter_library_id == null and self.filter_folder == null;
-            const bg = focusBg(in_library and unfiltered);
+            const selected = in_library and unfiltered;
+            const bg = rowBg(selected);
             var lib_hdr = dvui.box(@src(), .{ .dir = .horizontal }, bg.override(.{
                 .expand = .horizontal,
                 .padding = .{ .x = 8, .y = 4, .w = 4, .h = 4 },
@@ -271,13 +318,20 @@ pub const SidebarState = struct {
                         if (db) |d| g.reloadImages(d) catch {};
                     }
                 }
-                dvui.label(@src(), "{s}", .{i18n.t(.nav_library)}, .{ .font = bold, .gravity_y = 0.5 });
+                style.sectionHead(@src(), i18n.t(.nav_library), .{
+                    .gravity_y = 0.5,
+                    .padding = .{},
+                    .color_text = .{ .color = if (selected) style.C.text_hi else style.C.text_ghost },
+                });
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             }
             if (dvui.buttonIcon(@src(), "add library", dvui.entypo.plus, .{}, .{}, .{
                 .min_size_content = .{ .w = 12, .h = 12 },
                 .gravity_y = 0.5,
                 .padding = dvui.Rect.all(3),
+                .background = false,
+                .corners = style.R.chip,
+                .color_text = .{ .color = style.C.text_dim },
             })) {
                 if (!self.library_dialog_open) {
                     self.library_dialog_open = true;
@@ -287,19 +341,23 @@ pub const SidebarState = struct {
         }
 
         if (self.libraries.items.len == 0) {
-            dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{ .padding = .all(8) });
+            dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
+                .padding = .all(8),
+                .color_text = .{ .color = style.C.text_ghost },
+            });
         } else {
             for (self.libraries.items, 0..) |*lib, idx| {
                 const in_lib_view = if (grid) |g| g.view_mode == .library else false;
                 const lib_selected = self.filter_library_id == lib.id and self.filter_folder == null;
 
                 var row_hov = false;
+                const lib_is_selected = lib_selected and in_lib_view;
                 {
-                    const lib_bg = focusBg(lib_selected and in_lib_view);
+                    const lib_bg = rowBg(lib_is_selected);
                     var lib_row = dvui.box(@src(), .{ .dir = .horizontal }, lib_bg.override(.{
                         .id_extra = idx,
                         .expand = .horizontal,
-                        .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
+                        .padding = .{ .x = 4, .y = 3, .w = 4, .h = 3 },
                     }));
                     defer lib_row.deinit();
 
@@ -318,6 +376,8 @@ pub const SidebarState = struct {
                         .gravity_y = 0.5,
                         .padding = dvui.Rect.all(2),
                         .margin = .{},
+                        .background = false,
+                        .color_text = .{ .color = style.C.text_ghost },
                     })) {
                         lib.expanded = !lib.expanded;
                         if (lib.expanded and !lib.top_loaded) {
@@ -358,27 +418,45 @@ pub const SidebarState = struct {
                                 if (db) |d| g.reloadImages(d) catch {};
                             }
                         }
-                        dvui.label(@src(), "{s}", .{std.fs.path.basename(lib.path)}, .{
+                        // A library is a root, so its name gets the 500-weight
+                        // row role — enough to rank above the folders nested
+                        // under it without a second colour.
+                        fonts.richLine(@src(), std.Io.Dir.path.basename(lib.path), .{
                             .id_extra = idx,
                             .expand = .horizontal,
                             .gravity_y = 0.5,
+                            .font = style.F.row_hi,
+                            .color_text = .{ .color = rowText(lib_is_selected) },
                         });
                     }
 
-                    dvui.label(@src(), "{d}", .{lib.image_count}, .{
-                        .id_extra = idx,
-                        .gravity_y = 0.5,
-                        .padding = .{ .x = 4, .w = 0 },
-                    });
+                    countLabel(@src(), lib.image_count, idx);
 
-                    if (row_hov) {
-                        if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
+                    // The remove button appears on hover, but its SLOT is always
+                    // there. Adding a widget to the row on hover changed the
+                    // row's width and height, so pointing at a library made the
+                    // list twitch and re-flow under the cursor.
+                    {
+                        var slot = dvui.box(@src(), .{ .dir = .horizontal }, .{
                             .id_extra = idx,
-                            .min_size_content = .{ .w = 10, .h = 10 },
+                            .min_size_content = .{ .w = remove_slot, .h = remove_slot },
                             .gravity_y = 0.5,
-                            .padding = dvui.Rect.all(2),
-                        })) {
-                            self.confirm_remove_idx = idx;
+                        });
+                        defer slot.deinit();
+                        if (row_hov) {
+                            if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
+                                .id_extra = idx,
+                                .min_size_content = .{ .w = 10, .h = 10 },
+                                .gravity_x = 0.5,
+                                .gravity_y = 0.5,
+                                .padding = dvui.Rect.all(2),
+                                .margin = .{},
+                                .background = false,
+                                .corners = style.R.chip,
+                                .color_text = .{ .color = style.C.text_ghost },
+                            })) {
+                                self.confirm_remove_idx = idx;
+                            }
                         }
                     }
                 }
@@ -391,15 +469,18 @@ pub const SidebarState = struct {
             }
         }
 
+        // ── The three fixed views ─────────────────────────────────────────
+        // Trash, Duplicates and Favorites are not part of the library tree, so
+        // a hairline separates them from it rather than a blank gap, which on a
+        // scrolled list just looks like the tree ended.
+        style.hsep(@src());
+
         // ── Trash section ─────────────────────────────────────────────────
         if (cfg_trash_enabled) {
-            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
-
             const in_trash = if (grid) |g| g.view_mode == .trash else false;
-            const trash_bg = focusBg(in_trash);
-            var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, trash_bg.override(.{
+            var trash_row = dvui.box(@src(), .{ .dir = .horizontal }, rowBg(in_trash).override(.{
                 .expand = .horizontal,
-                .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
                 .tag = "nav-trash",
             }));
             defer trash_row.deinit();
@@ -411,22 +492,29 @@ pub const SidebarState = struct {
                     }
                 }
             }
-            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_trash)}, .{ .font = bold, .gravity_y = 0.5 });
+            dvui.icon(@src(), "trash", icons.tvg.lucide.@"trash-2", .{}, .{
+                .min_size_content = .{ .w = 13, .h = 13 },
+                .gravity_y = 0.5,
+                .margin = .{ .w = 6 },
+                .color_text = .{ .color = if (in_trash) style.C.text_hi else style.C.text_ghost },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_trash)}, .{
+                .font = style.F.row_hi,
+                .gravity_y = 0.5,
+                .color_text = .{ .color = rowText(in_trash) },
+            });
             if (trash_stats) |ts| {
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                dvui.label(@src(), "{d}", .{ts.count}, .{ .gravity_y = 0.5 });
+                countLabel(@src(), ts.count, 0);
             }
         }
 
         // ── Duplicates section (always shown, like Trash) ─────────────────
         {
-            _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 0, .h = 8 } });
-
             const in_dupes = if (grid) |g| g.view_mode == .duplicates else false;
-            const dupes_bg = focusBg(in_dupes);
-            var dupes_row = dvui.box(@src(), .{ .dir = .horizontal }, dupes_bg.override(.{
+            var dupes_row = dvui.box(@src(), .{ .dir = .horizontal }, rowBg(in_dupes).override(.{
                 .expand = .horizontal,
-                .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
                 .tag = "nav-duplicates",
             }));
             defer dupes_row.deinit();
@@ -438,18 +526,27 @@ pub const SidebarState = struct {
                     }
                 }
             }
-            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_duplicates)}, .{ .font = bold, .gravity_y = 0.5 });
+            dvui.icon(@src(), "duplicates", icons.tvg.lucide.copy, .{}, .{
+                .min_size_content = .{ .w = 13, .h = 13 },
+                .gravity_y = 0.5,
+                .margin = .{ .w = 6 },
+                .color_text = .{ .color = if (in_dupes) style.C.text_hi else style.C.text_ghost },
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_duplicates)}, .{
+                .font = style.F.row_hi,
+                .gravity_y = 0.5,
+                .color_text = .{ .color = rowText(in_dupes) },
+            });
             _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-            dvui.label(@src(), "{d}", .{duplicate_count}, .{ .gravity_y = 0.5 });
+            countLabel(@src(), duplicate_count, 0);
         }
 
         // ── Favorites quick filter ────────────────────────────────────────
         {
             const in_favorites = if (grid) |g| g.view_mode == .favorites else false;
-            const fav_bg = focusBg(in_favorites);
-            var fav_row = dvui.box(@src(), .{ .dir = .horizontal }, fav_bg.override(.{
+            var fav_row = dvui.box(@src(), .{ .dir = .horizontal }, rowBg(in_favorites).override(.{
                 .expand = .horizontal,
-                .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
+                .padding = .{ .x = 8, .y = 5, .w = 8, .h = 5 },
                 .tag = "nav-favorites",
             }));
             defer fav_row.deinit();
@@ -461,21 +558,28 @@ pub const SidebarState = struct {
                     }
                 }
             }
+            // The only gold thing in the sidebar, and it matches the star on
+            // the cells this view collects.
             dvui.icon(@src(), "favorites", icons.tvg.heroicons.solid.star, .{}, .{
-                .min_size_content = .{ .w = 14, .h = 14 },
+                .min_size_content = .{ .w = 13, .h = 13 },
                 .gravity_y = 0.5,
-                .margin = .{ .w = 4 },
+                .margin = .{ .w = 6 },
+                .color_text = .{ .color = if (in_favorites) style.C.star else style.tint(style.C.star, 150) },
             });
-            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_favorites)}, .{ .font = bold, .gravity_y = 0.5 });
+            dvui.label(@src(), "{s}", .{i18n.t(.sidebar_favorites)}, .{
+                .font = style.F.row_hi,
+                .gravity_y = 0.5,
+                .color_text = .{ .color = rowText(in_favorites) },
+            });
             _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-            dvui.label(@src(), "{d}", .{favorite_count}, .{ .gravity_y = 0.5 });
+            countLabel(@src(), favorite_count, 0);
         }
 
         // ── Library removal confirmation modal ───────────────────────────
         if (self.confirm_remove_idx) |idx| {
             if (idx < self.libraries.items.len) {
                 const lib = &self.libraries.items[idx];
-                const name = std.fs.path.basename(lib.path);
+                const name = std.Io.Dir.path.basename(lib.path);
 
                 var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{
                     .min_size_content = .{ .w = 360, .h = 0 },
@@ -485,13 +589,22 @@ pub const SidebarState = struct {
 
                 var content = dvui.box(@src(), .{}, .{
                     .expand = .both,
-                    .padding = .all(16),
+                    .padding = .all(18),
                 });
                 defer content.deinit();
 
-                dvui.label(@src(), "{s}", .{i18n.t(.library_remove_title)}, .{ .font = bold, .margin = .{ .h = 6 } });
-                dvui.label(@src(), "{s}", .{name}, .{});
-                dvui.label(@src(), "{s}", .{lib.path}, .{ .margin = .{ .h = 14 } });
+                style.modalTitle(@src(), i18n.t(.library_remove_title));
+                fonts.richLabel(@src(), name, .{
+                    .font = style.F.row_hi,
+                    .color_text = .{ .color = style.C.text_hi },
+                });
+                // The full path is the detail that confirms WHICH library, so it
+                // is monospaced and dimmed — scanned, not read.
+                fonts.richLabel(@src(), lib.path, .{
+                    .font = style.F.mono,
+                    .color_text = .{ .color = style.C.text_faint },
+                    .margin = .{ .y = 4, .h = 16 },
+                });
 
                 {
                     var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
@@ -500,7 +613,7 @@ pub const SidebarState = struct {
                     if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
                         self.confirm_remove_idx = null;
                     }
-                    if (dvui.button(@src(), i18n.t(.action_remove), .{}, .{ .margin = .all(4) })) {
+                    if (dvui.button(@src(), i18n.t(.action_remove), .{}, .{ .margin = .all(4), .style = .err })) {
                         self.confirm_remove_idx = null;
                         var removed = self.libraries.orderedRemove(idx);
                         const removed_id = removed.id;

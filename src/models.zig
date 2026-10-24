@@ -49,7 +49,7 @@ pub const Image = struct {
             self.thumbnail = null;
         }
 
-        const terminated_path = try allocator.dupeZ(u8, path);
+        const terminated_path = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(terminated_path);
 
         self.thumbnail = try vips.thumbnailToJpeg(allocator, terminated_path, 320);

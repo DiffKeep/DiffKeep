@@ -25,8 +25,15 @@ const Spinlock = @import("spinlock.zig").Spinlock;
 pub const DirtyEvent = struct {
     library_id: u64,
     /// Heap-allocated absolute path.  Caller must free after processing.
+    /// The changed file for `.file`, the library root for `.rescan_library`.
     path: []u8,
     deleted: bool,
+    /// TODO: this backend never reports `.rescan_library` yet, so a directory
+    /// renamed or moved within a library still leaves stale paths in the DB
+    /// until the next startup scan.  See fs_watch_linux.zig:handleDirEvent.
+    kind: Kind = .file,
+
+    pub const Kind = enum { file, rescan_library };
 };
 
 // ── Per-library watch state ───────────────────────────────────────────────────

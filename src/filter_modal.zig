@@ -3,8 +3,8 @@ const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const image_grid_mod = @import("image_grid.zig");
 const i18n = @import("i18n.zig");
-
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 pub fn filterColumnLabel(kind: db_mod.FilterColumn) [:0]const u8 {
     return switch (kind) {
@@ -76,44 +76,32 @@ pub const FilterModalState = struct {
 
         var content = dvui.box(@src(), .{}, .{
             .expand = .both,
-            .padding = .all(16),
+            .padding = .all(18),
         });
         defer content.deinit();
 
-        dvui.label(@src(), "{s}", .{i18n.t(.filter_heading)}, .{ .font = bold, .margin = .{ .h = 10 } });
+        style.modalTitle(@src(), i18n.t(.filter_heading));
 
-        // Kind selector chips
+        // Kind selector: the same segmented well the toolbar uses for search
+        // modes, because it is the same kind of choice — one of a fixed set.
         {
+            const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler, .format, .resource_type };
+            var labels: [kinds.len][]const u8 = undefined;
+            var active: usize = 0;
+            for (kinds, 0..) |kind, i| {
+                labels[i] = filterColumnLabel(kind);
+                if (self.kind == kind) active = i;
+            }
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .expand = .horizontal,
-                .margin = .{ .h = 8 },
+                .margin = .{ .h = 10 },
             });
             defer row.deinit();
-
-            const chip_base: dvui.Options = .{
-                .corner_radius = dvui.Rect.all(12),
-                .padding = .{ .x = 10, .y = 3, .w = 10, .h = 3 },
-                .margin = .{ .w = 4 },
-                .gravity_y = 0.5,
-            };
-
-            const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler, .format, .resource_type };
-            for (kinds) |kind| {
-                const selected = self.kind == kind;
-                const chip_opts = if (selected)
-                    chip_base.override(.{
-                        .id_extra = @intFromEnum(kind),
-                        .background = true,
-                        .color_fill = dvui.themeGet().focus,
-                    })
-                else
-                    chip_base.override(.{ .id_extra = @intFromEnum(kind) });
-                if (dvui.button(@src(), filterColumnLabel(kind), .{}, chip_opts)) {
-                    if (self.kind != kind) {
-                        self.kind = kind;
-                        self.value_buf = std.mem.zeroes([256]u8);
-                        self.options_kind = null; // trigger re-fetch
-                    }
+            if (style.segmented(@src(), &labels, active, .{ .font = style.F.ui_sm })) |picked| {
+                if (self.kind != kinds[picked]) {
+                    self.kind = kinds[picked];
+                    self.value_buf = std.mem.zeroes([256]u8);
+                    self.options_kind = null; // trigger re-fetch
                 }
             }
         }
@@ -125,13 +113,21 @@ pub const FilterModalState = struct {
                 .placeholder = i18n.t(.filter_search_placeholder),
             }, .{
                 .expand = .horizontal,
-                .corner_radius = dvui.Rect.all(4),
-                .margin = .{ .h = 4 },
+                .background = true,
+                .color_fill = .{ .color = style.C.sunken },
+                .border = style.Edge.all,
+                .color_border = .{ .color = style.hairline_hi },
+                .corners = style.R.button,
+                .padding = .{ .x = 9, .y = 6, .w = 9, .h = 6 },
+                .font = style.F.input,
+                .margin = .{ .h = 6 },
             });
             te.deinit();
         }
 
-        // Autocomplete options
+        // Autocomplete options. Flat rows, not buttons: eight raised slabs in a
+        // column read as eight competing actions, where this is one list the
+        // user picks from.
         {
             const typed = std.mem.sliceTo(&self.value_buf, 0);
             const opts = self.options orelse &.{};
@@ -140,16 +136,36 @@ pub const FilterModalState = struct {
                 if (shown >= 8) break;
                 if (!filterMatchesTyped(opt, typed)) continue;
                 shown += 1;
-                if (dvui.button(@src(), opt, .{}, .{
+                var bw: dvui.ButtonWidget = undefined;
+                bw.init(@src(), .{}, .{
                     .id_extra = oi,
                     .expand = .horizontal,
-                    .padding = .{ .x = 6, .y = 3, .w = 6, .h = 3 },
+                    .background = true,
+                    .color_fill = .{ .color = style.C.chrome },
+                    .color_fill_hover = .{ .color = style.C.sel_row },
+                    .color_fill_press = .{ .color = style.C.raised },
+                    .corners = style.R.chip,
+                    .padding = .{ .x = 8, .y = 4, .w = 8, .h = 4 },
                     .margin = .{ .h = 1 },
-                })) {
+                });
+                defer bw.deinit();
+                bw.processEvents();
+                bw.drawBackground();
+                // Option values come from the database (model names, samplers),
+                // so they can carry any script.
+                fonts.richLine(@src(), opt, .{
+                    .id_extra = oi,
+                    .expand = .horizontal,
+                    .gravity_y = 0.5,
+                    .font = style.F.mono,
+                    .color_text = .{ .color = if (bw.hovered()) style.C.text_hi else style.C.text_dim },
+                });
+                if (bw.clicked()) {
                     @memset(&self.value_buf, 0);
                     const len = @min(opt.len, self.value_buf.len - 1);
                     @memcpy(self.value_buf[0..len], opt[0..len]);
                 }
+                bw.drawFocus();
             }
         }
 
@@ -157,7 +173,7 @@ pub const FilterModalState = struct {
         {
             var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .gravity_x = 1.0,
-                .margin = .{ .y = 12 },
+                .margin = .{ .y = 14 },
             });
             defer btn_row.deinit();
 
@@ -167,16 +183,24 @@ pub const FilterModalState = struct {
 
             const val = std.mem.sliceTo(&self.value_buf, 0);
             const can_add = val.len > 0;
-            const theme = dvui.themeGet();
-            if (dvui.button(@src(), i18n.t(.filter_add), .{}, .{
-                .margin = .all(4),
-                .color_fill       = if (!can_add) theme.fill else null,
-                .color_fill_hover = if (!can_add) theme.fill else null,
-                .color_fill_press = if (!can_add) theme.fill else null,
-                .color_text       = if (!can_add) theme.border else null,
-                .color_text_hover = if (!can_add) theme.border else null,
-                .color_text_press = if (!can_add) theme.border else null,
-            }) and can_add) {
+            // With nothing typed there is nothing to add, so Add is ghosted
+            // rather than removed — the button's slot is what tells the user
+            // the field above it is the thing to fill in.
+            const added = if (can_add)
+                style.primaryButton(@src(), i18n.t(.filter_add), .{ .margin = .all(4) })
+            else blk: {
+                _ = dvui.button(@src(), i18n.t(.filter_add), .{}, .{
+                    .margin = .all(4),
+                    .color_fill = .{ .color = style.C.raised_dim },
+                    .color_fill_hover = .{ .color = style.C.raised_dim },
+                    .color_fill_press = .{ .color = style.C.raised_dim },
+                    .color_text = .{ .color = style.C.text_ghost },
+                    .color_text_hover = .{ .color = style.C.text_ghost },
+                    .color_text_press = .{ .color = style.C.text_ghost },
+                });
+                break :blk false;
+            };
+            if (added) {
                 if (dvui.App.main_init) |init| {
                     const owned_val = try init.gpa.dupe(u8, val);
                     try active_filters.append(init.gpa, .{

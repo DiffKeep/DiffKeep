@@ -12,9 +12,8 @@ fn openDb(path: []const u8) !dk.VectorDb {
     return dk.VectorDb.init(alloc, io, path);
 }
 
-// Defers must be declared by the caller — use this to close in consistent order:
+// Callers close and clean up with:
 //   defer db.deinit();
-//   defer db.pool.deinit();
 //   defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
 // ── DB tests ──────────────────────────────────────────────────────────────────
@@ -23,7 +22,6 @@ test "db: all migrations apply without error" {
     const path = "/tmp/diffkeep_test_migrations.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
@@ -31,7 +29,6 @@ test "db: library CRUD" {
     const path = "/tmp/diffkeep_test_lib_crud.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/my/photos");
@@ -66,7 +63,6 @@ test "db: image create, save metadata, and retrieve details" {
     const path = "/tmp/diffkeep_test_img_details.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -104,7 +100,6 @@ test "db: FTS5 prompt search" {
     const path = "/tmp/diffkeep_test_fts.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -138,7 +133,6 @@ test "db: trash and restore lifecycle" {
     const path = "/tmp/diffkeep_test_trash.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -200,7 +194,6 @@ test "db: duplicate detection by hash" {
     const path = "/tmp/diffkeep_test_dupes.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -247,7 +240,6 @@ test "db: redundant duplicates keep exactly one per hash and never the unique" {
     const path = "/tmp/diffkeep_test_redundant.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -293,7 +285,6 @@ test "db: listImmediateSubdirs path logic" {
     const path = "/tmp/diffkeep_test_subdirs.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -343,7 +334,6 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     const path = "/tmp/diffkeep_test_vec_knn.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -360,8 +350,8 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
         defer img.deinit(alloc);
         ids[k] = img.id;
 
-        var prompt_vec = [_]f32{0} ** dim;
-        var image_vec = [_]f32{0} ** dim;
+        var prompt_vec: [dim]f32 = @splat(0);
+        var image_vec: [dim]f32 = @splat(0);
         prompt_vec[k] = 1.0; // prompt axis k
         image_vec[k + 10] = 1.0; // image axis k+10 (distinct from prompt axes)
         try db.storePromptEmbedding(img.id, &prompt_vec);
@@ -370,7 +360,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
 
     // Prompt query nearest to image b (axis 1).
     {
-        var q = [_]f32{0} ** dim;
+        var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
         const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
         defer {
@@ -383,7 +373,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
 
     // Image query nearest to image c (axis 12).
     {
-        var q = [_]f32{0} ** dim;
+        var q: [dim]f32 = @splat(0);
         q[12] = 1.0;
         const hits = try db.searchByImageEmbedding(alloc, &q, 3, -1.0);
         defer {
@@ -396,7 +386,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
 
     // A similarity threshold drops the orthogonal (sim = 0) tail.
     {
-        var q = [_]f32{0} ** dim;
+        var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
         const hits = try db.searchByPromptEmbedding(alloc, &q, 3, 0.5);
         defer {
@@ -410,9 +400,9 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     // Combined search: prompt leg matches b, visual leg matches c; RRF puts
     // both ahead of a, which neither leg ranked first.
     {
-        var pq = [_]f32{0} ** dim;
+        var pq: [dim]f32 = @splat(0);
         pq[1] = 1.0;
-        var vq = [_]f32{0} ** dim;
+        var vq: [dim]f32 = @splat(0);
         vq[12] = 1.0;
         const hits = try db.searchCombined(alloc, &pq, &vq, 2, -1.0, -1.0);
         defer {
@@ -426,7 +416,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     // Trashed images must be excluded from results.
     try db.trashImage(ids[1], "b_trash.png", 1024, 1000);
     {
-        var q = [_]f32{0} ** dim;
+        var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
         const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
         defer {
@@ -451,7 +441,6 @@ test "grid: empty library shows placeholder" {
     const path = "/tmp/diffkeep_test_grid_empty.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
@@ -470,7 +459,6 @@ test "grid: render with images doesn't crash" {
     const path = "/tmp/diffkeep_test_grid_images.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
@@ -485,6 +473,7 @@ test "grid: render with images doesn't crash" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    dk.style.install();
 
     try dvui.testing.settle(gridFrame);
     // "grid-empty" should not be registered when images are present
@@ -495,7 +484,6 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
     const path = "/tmp/diffkeep_test_grid_autoplay.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -513,6 +501,7 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
     g_grid_test_ptr = &grid;
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    dk.style.install();
 
     // The files don't exist, so each player open fails and the cell falls back to
     // its poster — the point is that the autoplay path (create/fail/evict) is
@@ -546,7 +535,6 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
     const path = "/tmp/diffkeep_test_sidebar_nav.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
@@ -560,7 +548,7 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    dk.fonts.register() catch {};
+    dk.style.install();
 
     try dvui.testing.settle(sidebarFrame);
     try std.testing.expect(grid.view_mode == .library);
@@ -608,7 +596,7 @@ test "detail panel: Copy on the prompt writes it to the clipboard" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    dk.fonts.register() catch {};
+    dk.style.install();
 
     try dvui.testing.settle(detailFrame);
     try dvui.testing.moveTo("copy-prompt");
@@ -693,7 +681,7 @@ test "toolbar: typing into the search box fills the query buffer" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    dk.fonts.register() catch {};
+    dk.style.install();
 
     try dvui.testing.settle(toolbarFrame);
     try dvui.testing.moveTo("search-box");
@@ -713,11 +701,11 @@ test "toolbar: typing into the search box fills the query buffer" {
 test "viewer: navigateTo clamps and removeImages keeps the current index sane" {
     var images: std.ArrayList(dk.ImageEntry) = .empty;
     for ([_]u64{ 10, 11, 12, 13 }, 0..) |id, i| {
-        const p = try std.fmt.allocPrint(alloc, "/lib/img{d}.png", .{i});
+        const p = try alloc.print("/lib/img{d}.png", .{i});
         try images.append(alloc, .{
             .id = id,
             .path = p,
-            .filename = std.fs.path.basename(p),
+            .filename = std.Io.Dir.path.basename(p),
             .mtime = null,
         });
     }
@@ -760,7 +748,6 @@ test "grid: incomingBelongs respects the active view filters" {
     const path = "/tmp/diffkeep_test_grid_belongs.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
@@ -788,7 +775,7 @@ test "grid: incomingBelongs respects the active view filters" {
     grid.search_query = null;
 
     // Same for an active embedding (semantic/visual) query.
-    const dummy_embedding = [_]f32{0.0} ** 4;
+    const dummy_embedding: [4]f32 = @splat(0.0);
     grid.query_embeddings = .{ .prompt = &dummy_embedding };
     try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
     grid.query_embeddings = .{ .visual = &dummy_embedding };
@@ -831,7 +818,6 @@ test "grid: reloadImages reflects the active view_mode" {
     const path = "/tmp/diffkeep_test_grid_views.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -864,7 +850,6 @@ test "grid: reloadImages resets the scroll position to the top" {
     const path = "/tmp/diffkeep_test_grid_scroll.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
@@ -880,7 +865,6 @@ test "grid: a scanned image is only injected if it belongs to the current view" 
     const path = "/tmp/diffkeep_test_grid_incoming.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     // Empty DB → grid starts empty in the (default) library view.
@@ -915,7 +899,7 @@ test "toolbar: the clear button empties the search query" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    dk.fonts.register() catch {};
+    dk.style.install();
 
     try dvui.testing.settle(clearFrame);
     try dvui.testing.moveTo("search-clear");
@@ -938,7 +922,6 @@ test "db: favorite flag set/count/list lifecycle" {
     const path = "/tmp/diffkeep_test_favorites.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -977,7 +960,6 @@ test "grid: favorites view lists only favorites; markFavorites flags entries" {
     const path = "/tmp/diffkeep_test_grid_favorites.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -1008,11 +990,11 @@ test "grid: favorites view lists only favorites; markFavorites flags entries" {
 test "viewer: setFavorite updates the current image's favorite flag" {
     var images: std.ArrayList(dk.ImageEntry) = .empty;
     for ([_]u64{ 10, 11 }, 0..) |id, i| {
-        const p = try std.fmt.allocPrint(alloc, "/lib/img{d}.png", .{i});
+        const p = try alloc.print("/lib/img{d}.png", .{i});
         try images.append(alloc, .{
             .id = id,
             .path = p,
-            .filename = std.fs.path.basename(p),
+            .filename = std.Io.Dir.path.basename(p),
             .mtime = null,
         });
     }
@@ -1044,7 +1026,6 @@ test "db: format filter matches by file extension (query-time, case-insensitive)
     const path = "/tmp/diffkeep_test_format_filter.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -1106,7 +1087,6 @@ test "db: resource_type filter (image includes animated; video separate)" {
     const path = "/tmp/diffkeep_test_resource_filter.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -1174,7 +1154,6 @@ test "grid: markMediaTypes flags animated and video entries from the DB" {
     const path = "/tmp/diffkeep_test_media_types.db";
     var db = try openDb(path);
     defer db.deinit();
-    defer db.pool.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib = try db.storeLibrary("/lib");
@@ -1211,11 +1190,11 @@ test "viewer: currentIsPlayable is true for video and animated, false for static
     };
     var images: std.ArrayList(dk.ImageEntry) = .empty;
     for (cases) |cse| {
-        const p = try std.fmt.allocPrint(alloc, "/lib/m{d}.bin", .{cse.id});
+        const p = try alloc.print("/lib/m{d}.bin", .{cse.id});
         try images.append(alloc, .{
             .id = cse.id,
             .path = p,
-            .filename = std.fs.path.basename(p),
+            .filename = std.Io.Dir.path.basename(p),
             .mtime = null,
             .media_type = cse.mt,
         });
@@ -1227,4 +1206,302 @@ test "viewer: currentIsPlayable is true for video and animated, false for static
         vs.navigateTo(i);
         try std.testing.expectEqual(cse.playable, vs.currentIsPlayable());
     }
+}
+
+// ── Design system ─────────────────────────────────────────────────────────────
+//
+// The palette and type scale have no visible failure mode: a wrong cap ratio or
+// an unregistered family shifts every size or silently substitutes dvui's
+// built-in Vera, and nothing errors. These tests are the only thing standing
+// between a font swap and a screen that quietly went generic.
+
+test "style: cap_ratio matches the bundled face" {
+    // The whole type scale is nominal px times this number. If a font update
+    // changed the face's cap height, every size in the app would shift and
+    // nothing would fail — so read it back out of the file.
+    const ttf = dk.fonts.plex_sans_regular;
+    const n = std.mem.readInt(u16, ttf[4..6], .big);
+    var head: ?usize = null;
+    var os2: ?usize = null;
+    for (0..n) |i| {
+        const rec = 12 + 16 * i;
+        const tag = ttf[rec..][0..4];
+        const off = std.mem.readInt(u32, ttf[rec + 8 ..][0..4], .big);
+        if (std.mem.eql(u8, tag, "head")) head = off;
+        if (std.mem.eql(u8, tag, "OS/2")) os2 = off;
+    }
+    const upem: f32 = @floatFromInt(std.mem.readInt(u16, ttf[head.? + 18 ..][0..2], .big));
+    const cap: f32 = @floatFromInt(std.mem.readInt(i16, ttf[os2.? + 88 ..][0..2], .big));
+    try std.testing.expectApproxEqAbs(dk.style.cap_ratio, cap / upem, 0.001);
+}
+
+test "style: type roles convert nominal px to dvui cap-height sizes" {
+    const F = dk.style.F;
+    // 12.5px prose at 1.65 line spacing, as the design states it, lifted by the
+    // one global scale knob.
+    try std.testing.expectApproxEqAbs(@as(f32, 12.5 * dk.style.ui_scale * dk.style.cap_ratio), F.prose.size, 0.001);
+    // Nothing may fall below dvui's own default cap height by more than a step:
+    // the roles are a hierarchy, not a licence to go unreadable. `mono_hd` is
+    // the floor, and it is the smallest thing the design has.
+    try std.testing.expect(F.mono_hd.size >= 9.0);
+    try std.testing.expect(dk.style.theme().font_body.size >= dvui.Font.DefaultSize);
+    // dvui multiplies its line-height factor by the hhea span, NOT the cap
+    // height, so the factor carries that division; recovering 1.65 proves the
+    // round trip through both conversions.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.65), F.prose.line_height_factor * dk.style.natural_line, 0.001);
+    // Every role must resolve to a family we actually register, or dvui
+    // silently substitutes its built-in Vera and the screen goes generic.
+    for ([_]dvui.Font{
+        F.app,   F.ui,    F.ui_sm,   F.ui_hi, F.row,      F.row_hi,
+        F.prose, F.input, F.mono,    F.code,  F.mono_sm,  F.mono_hd,
+        F.mono_val, F.caption,
+    }) |f| {
+        const fam = f.familyName();
+        const known = std.mem.eql(u8, fam, dk.fonts.sans) or std.mem.eql(u8, fam, dk.fonts.sans_med) or
+            std.mem.eql(u8, fam, dk.fonts.mono) or std.mem.eql(u8, fam, dk.fonts.mono_med);
+        errdefer std.debug.print("role family {s} is not a registered family\n", .{fam});
+        try std.testing.expect(known);
+    }
+}
+
+test "style: accents keep their reserved meanings distinct" {
+    const C = dk.style.C;
+    // Amber ("the machine is working") and blue ("the user owns this") must not
+    // drift toward each other: the whole screen's legibility rests on
+    // warm = machine, cool = user being obvious without a legend.
+    try std.testing.expect(C.amber.r > C.amber.b);
+    try std.testing.expect(C.blue.b > C.blue.r);
+    // Danger has to be tellable from amber at a glance, or a destructive
+    // confirm reads as a progress indicator.
+    try std.testing.expect(C.danger.r > C.danger.g * 2);
+    // Every surface is darker than every text colour, so no palette edit can
+    // produce an invisible label by swapping two constants.
+    const surfaces = [_]dvui.Color{ C.canvas, C.chrome, C.rail, C.sunken, C.card, C.chip, C.sel_row, C.thumb_well };
+    const texts = [_]dvui.Color{ C.text_hi, C.text, C.text_dim, C.text_faint, C.text_ghost };
+    for (surfaces) |s| {
+        for (texts) |t| {
+            try std.testing.expect(@as(u16, t.r) + t.g + t.b > @as(u16, s.r) + s.g + s.b);
+        }
+    }
+}
+
+test "fonts: tier 1 coverage parses to the Plex faces' real cmap" {
+    dk.fonts.buildCoverage();
+    const base = dvui.Font{ .family = dvui.Font.array(dk.fonts.sans), .size = 12 };
+    // Latin, plus the Greek / Cyrillic / Vietnamese that tier 1 also covers. A
+    // parse that silently found nothing would route these to tier 2 instead.
+    for ([_]u21{ 'A', 'z', '7', 'Ω', 'Д', 'ế', '·', '×', '→' }) |cp| {
+        const fam = dk.fonts.fontFor(cp, .{}, base).familyName();
+        errdefer std.debug.print("U+{X} went to {s}, want tier 1\n", .{ cp, fam });
+        try std.testing.expectEqualStrings(dk.fonts.sans, fam);
+    }
+}
+
+test "fonts: run splitting sends each codepoint to a face that has it" {
+    dk.fonts.buildCoverage();
+    const base = dvui.Font{ .family = dvui.Font.array(dk.fonts.sans), .size = 12 };
+    const Case = struct { cp: u21, want: []const u8 };
+    // A prompt or filename can hold any of these; each must land on a face that
+    // actually has the glyph, or it draws as a tofu box.
+    for ([_]Case{
+        .{ .cp = '日', .want = dk.fonts.cjk },
+        .{ .cp = '한', .want = dk.fonts.cjk },
+        .{ .cp = '─', .want = dk.fonts.cjk },
+        .{ .cp = 0x1F98A, .want = dk.fonts.emoji_family }, // 🦊 in a filename
+        .{ .cp = '⚙', .want = dk.fonts.emoji_family },
+    }) |c| {
+        const fam = dk.fonts.fontFor(c.cp, .{}, base).familyName();
+        errdefer std.debug.print("U+{X} -> {s}, want {s}\n", .{ c.cp, fam, c.want });
+        try std.testing.expectEqualStrings(c.want, fam);
+    }
+}
+
+test "fonts: mono content leaves mono rather than showing tofu" {
+    dk.fonts.buildCoverage();
+    const m = dvui.Font{ .family = dvui.Font.array(dk.fonts.mono), .size = 10 };
+    try std.testing.expectEqualStrings(dk.fonts.mono, dk.fonts.fontFor('4', .{ .code = true }, m).familyName());
+    // A CJK model name in a mono slot renders proportional, not as boxes. See
+    // fonts.zig on why the mono fallback is the proportional CJK face.
+    try std.testing.expectEqualStrings(dk.fonts.cjk, dk.fonts.fontFor('日', .{ .code = true }, m).familyName());
+}
+
+test "fonts: medium weight keeps its own family but borrows real bold and italic faces" {
+    dk.fonts.buildCoverage();
+    const med = dvui.Font{ .family = dvui.Font.array(dk.fonts.sans_med), .size = 11 };
+    // Upright 500 stays on the Medium family...
+    try std.testing.expectEqualStrings(dk.fonts.sans_med, dk.fonts.fontFor('A', .{}, med).familyName());
+    // ...but there is no Medium Bold or Medium Italic file, so those resolve to
+    // the regular family's SemiBold / Italic rather than a face that is absent.
+    const b = dk.fonts.fontFor('A', .{ .bold = true }, med);
+    try std.testing.expectEqualStrings(dk.fonts.sans, b.familyName());
+    try std.testing.expectEqual(dvui.Font.Weight.bold, b.weight);
+    const it = dk.fonts.fontFor('A', .{ .italic = true }, med);
+    try std.testing.expectEqualStrings(dk.fonts.sans, it.familyName());
+    try std.testing.expectEqual(dvui.Font.Style.italic, it.style);
+}
+
+test "style: ellipsize measures the text rather than counting characters" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    _ = try dvui.testing.step(struct {
+        fn frame() anyerror!dvui.App.Result {
+            dk.style.install();
+            const font = dk.style.F.row;
+            var buf: [256]u8 = undefined;
+
+            // Fits: returned unchanged, no copy into the buffer.
+            const short = "cat.png";
+            try std.testing.expectEqualStrings(short, dk.style.ellipsize(&buf, short, font, 400));
+
+            // Does not fit: cut and given an ellipsis, and the result is
+            // actually within the budget.
+            const long = "a-very-long-generated-filename-with-no-spaces-at-all.png";
+            const cut = dk.style.ellipsize(&buf, long, font, 80);
+            try std.testing.expect(cut.len < long.len);
+            try std.testing.expect(std.mem.endsWith(u8, cut, "\u{2026}"));
+            try std.testing.expect(font.textSize(cut).w <= 80);
+            // The cut never lands inside a UTF-8 sequence.
+            try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+
+            // An ideograph is twice a Latin letter's width, so a character
+            // budget would cut this at half the room it has. Measured, it keeps
+            // fewer characters than the Latin string at the same width.
+            const cjk = "猫の写真-------------------------------------.png";
+            const cjk_cut = dk.style.ellipsize(&buf, cjk, font, 80);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(cjk_cut));
+            try std.testing.expect(font.textSize(cjk_cut).w <= 80);
+
+            return .ok;
+        }
+    }.frame);
+}
+
+// ── Connection pool / missing files ──────────────────────────────────────────
+
+fn embeddingRowCount(db: *dk.VectorDb, table: []const u8) !i64 {
+    var buf: [96]u8 = undefined;
+    var stmt = try db.db.prepare(try std.mem.print(&buf, "SELECT count(*) FROM {s}", .{table}));
+    defer stmt.deinit();
+    _ = try stmt.step();
+    return stmt.columnInt64(0);
+}
+
+test "db: getConnection handles share one pool and return their connections" {
+    const path = "/tmp/diffkeep_test_pool_share.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try std.testing.expectEqual(@as(usize, 1), db.pool.outstanding);
+    const idle_before = db.pool.connections.items.len;
+
+    var a = try db.getConnection();
+    var b = try db.getConnection();
+    // Same pool object, not a copy: both acquisitions are visible to the owner.
+    try std.testing.expectEqual(db.pool, a.pool);
+    try std.testing.expectEqual(db.pool, b.pool);
+    try std.testing.expectEqual(@as(usize, 3), db.pool.outstanding);
+    try std.testing.expectEqual(idle_before - 2, db.pool.connections.items.len);
+
+    a.deinit();
+    b.deinit();
+    try std.testing.expectEqual(@as(usize, 1), db.pool.outstanding);
+    try std.testing.expectEqual(idle_before, db.pool.connections.items.len);
+}
+
+test "db: deleting an image drops its embeddings, so a recycled id starts clean" {
+    const path = "/tmp/diffkeep_test_embed_cascade.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer img.deinit(alloc);
+    var vec: [768]f32 = @splat(0);
+    vec[0] = 1.0;
+    try db.storePromptEmbedding(img.id, &vec);
+    try db.storeImageEmbedding(img.id, &vec);
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+
+    try db.deleteImage(img.id);
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+}
+
+test "db: deleteMissingImage only removes the live row at that path" {
+    const path = "/tmp/diffkeep_test_delete_missing.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+
+    // Wrong path for the id (e.g. the id was recycled): untouched.
+    try std.testing.expect(!try db.deleteMissingImage(a.id, "/lib/other.png"));
+    // A trashed row keeps living in the trash even though its file left the library.
+    try db.trashImage(b.id, "b_trash.png", 1, 1000);
+    try std.testing.expect(!try db.deleteMissingImage(b.id, "/lib/b.png"));
+    try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
+
+    try std.testing.expect(try db.deleteMissingImage(a.id, "/lib/a.png"));
+    try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
+}
+
+test "grid: fileDeleted needs the file gone but its directory present" {
+    const dir = "/tmp/diffkeep_test_file_deleted";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/here.png", .data = "x" });
+
+    try std.testing.expect(!dk.image_grid.fileDeleted(io, dir ++ "/here.png"));
+    try std.testing.expect(dk.image_grid.fileDeleted(io, dir ++ "/gone.png"));
+    // Whole directory missing (unmounted drive, moved folder): not a deletion.
+    try std.testing.expect(!dk.image_grid.fileDeleted(io, dir ++ "/nodir/gone.png"));
+}
+
+test "grid: a deleted file is removed from the DB and drained; other failures aren't retried" {
+    const dir = "/tmp/diffkeep_test_grid_missing";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    // Exists but isn't an image: the load fails without the file being gone.
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/broken.png", .data = "not a png" });
+
+    const path = "/tmp/diffkeep_test_grid_missing.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary(dir);
+    var gone = try db.findOrCreateImage(alloc, lib_id, dir ++ "/gone.png");
+    defer gone.deinit(alloc);
+    var broken = try db.findOrCreateImage(alloc, lib_id, dir ++ "/broken.png");
+    defer broken.deinit(alloc);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    grid.noteLoadFailure(gone.id, dir ++ "/gone.png");
+    grid.noteLoadFailure(broken.id, dir ++ "/broken.png");
+
+    var drained: std.ArrayList(u64) = .empty;
+    defer drained.deinit(alloc);
+    grid.drainMissingIds(alloc, &drained);
+    try std.testing.expectEqualSlices(u64, &.{gone.id}, drained.items);
+    try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
+
+    // The broken file stays in the library but is no longer re-requested...
+    try std.testing.expect(grid.load_failed.contains(broken.id));
+    // ...until it changes (or its id is recycled) and is invalidated.
+    grid.invalidateThumbnail(broken.id);
+    try std.testing.expect(!grid.load_failed.contains(broken.id));
 }

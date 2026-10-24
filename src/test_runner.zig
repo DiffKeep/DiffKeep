@@ -14,7 +14,7 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
-const BORDER = "=" ** 80;
+const BORDER = &@as([80]u8, @splat('='));
 
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
@@ -58,7 +58,7 @@ pub fn main() !void {
 
         const is_unnamed_test = isUnnamed(t);
         if (env.filter) |f| {
-            if (!is_unnamed_test and std.mem.indexOf(u8, t.name, f) == null) {
+            if (!is_unnamed_test and std.mem.find(u8, t.name, f) == null) {
                 continue;
             }
         }
@@ -297,7 +297,7 @@ pub const panic = std.debug.FullPanic(struct {
 fn isUnnamed(t: std.builtin.TestFn) bool {
     const marker = ".test_";
     const test_name = t.name;
-    const index = std.mem.indexOf(u8, test_name, marker) orelse return false;
+    const index = std.mem.find(u8, test_name, marker) orelse return false;
     _ = std.fmt.parseInt(u32, test_name[index + marker.len ..], 10) catch return false;
     return true;
 }

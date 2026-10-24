@@ -47,6 +47,7 @@ pub const Strings = struct {
     detail_trashed_at: [:0]const u8,
     detail_raw_metadata: [:0]const u8,
     detail_no_image: [:0]const u8,
+    detail_loading: [:0]const u8,
 
     settings_config_dir: [:0]const u8,
     settings_model_path: [:0]const u8,
@@ -70,6 +71,7 @@ pub const Strings = struct {
     settings_db_thumbnails_label: [:0]const u8,
     settings_db_prompt_embeddings_label: [:0]const u8,
     settings_db_image_embeddings_label: [:0]const u8,
+    settings_items: [:0]const u8,
 
     confirm_delete_title: [:0]const u8,
     confirm_trash_title: [:0]const u8,
@@ -77,6 +79,7 @@ pub const Strings = struct {
     confirm_trash_no_ask: [:0]const u8,
     confirm_delete: [:0]const u8,
     confirm_move_to_trash: [:0]const u8,
+    confirm_files_selected: [:0]const u8,
     confirm_dedupe_title: [:0]const u8,
     confirm_dedupe_body: [:0]const u8,
     confirm_empty_trash_title: [:0]const u8,
@@ -151,13 +154,13 @@ pub const Strings = struct {
     search_no_model: [:0]const u8,
     search_no_model_hint: [:0]const u8,
 
-    settings_download_snowflake: [:0]const u8,
+    settings_download_text_model: [:0]const u8,
     settings_download_siglip2: [:0]const u8,
     settings_download_running: [:0]const u8,
 
-    settings_gpu_section: [:0]const u8,
-    settings_use_gpu: [:0]const u8,
-    settings_gpu_device_id: [:0]const u8,
+    settings_backend_section: [:0]const u8,
+    settings_backend_cpu: [:0]const u8,
+    settings_gpu_threshold: [:0]const u8,
 
     status_indexing: [:0]const u8,
     status_embedding: [:0]const u8,
@@ -209,6 +212,7 @@ pub const en: Strings = .{
     .detail_trashed_at = "Trashed",
     .detail_raw_metadata = "Raw Metadata",
     .detail_no_image = "No image selected",
+    .detail_loading = "Loading\u{2026}",
 
     .settings_config_dir = "Config directory",
     .settings_model_path = "Text model directory",
@@ -232,6 +236,7 @@ pub const en: Strings = .{
     .settings_db_thumbnails_label = "Thumbnails: ",
     .settings_db_prompt_embeddings_label = "Prompt embeddings: ",
     .settings_db_image_embeddings_label = "Image embeddings: ",
+    .settings_items = "items",
 
     .confirm_delete_title = "Delete permanently?",
     .confirm_trash_title = "Move to Trash?",
@@ -239,6 +244,7 @@ pub const en: Strings = .{
     .confirm_trash_no_ask = "Move to Trash, don't ask again",
     .confirm_delete = "Delete",
     .confirm_move_to_trash = "Move to Trash",
+    .confirm_files_selected = "files selected",
     .confirm_dedupe_title = "Remove duplicate copies?",
     .confirm_dedupe_body = "duplicate copies will be moved to the trash, keeping one of each.",
     .confirm_empty_trash_title = "Empty the trash?",
@@ -308,18 +314,18 @@ pub const en: Strings = .{
     .search_mode_combined = "Combined",
     .search_loading = "Searching\u{2026}",
     .settings_mmproj_path = "Visual model directory",
-    .settings_model_placeholder = "Path to snowflake-arctic-embed-m-v2.0 directory",
+    .settings_model_placeholder = "Path to embeddinggemma-300m directory",
     .settings_mmproj_placeholder = "Path to ViT-B-16-SigLIP2 directory",
     .search_no_model = "No model configured",
     .search_no_model_hint = "No model configured \u{2014} open Settings to add a model path",
 
-    .settings_download_snowflake = "Download Snowflake Arctic",
+    .settings_download_text_model = "Download EmbeddingGemma",
     .settings_download_siglip2 = "Download SigLIP2",
     .settings_download_running = "Downloading\u{2026}",
 
-    .settings_gpu_section = "GPU",
-    .settings_use_gpu = "Use GPU acceleration (CUDA)",
-    .settings_gpu_device_id = "Device ID",
+    .settings_backend_section = "Embedding backend",
+    .settings_backend_cpu = "CPU",
+    .settings_gpu_threshold = "GPU batch threshold",
 
     .status_indexing = "Indexing",
     .status_embedding = "Embedding",

@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
             if (r) |item| {
                 const snippet = item.prompt[0..@min(100, item.prompt.len)];
                 std.log.info("  [{s}]\n    \"{s}...\"", .{
-                    std.fs.path.basename(item.path), snippet,
+                    std.Io.Dir.path.basename(item.path), snippet,
                 });
                 shown += 1;
             }
@@ -248,7 +248,7 @@ fn collectPaths(
 
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
-        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        const full_path = try std.Io.Dir.path.join(allocator, &.{ dir_path, entry.name });
         if (entry.kind == .directory) {
             try collectPaths(allocator, io, full_path, out);
             allocator.free(full_path);

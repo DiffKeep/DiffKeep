@@ -52,7 +52,7 @@ pub fn cleanPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
                 }
             },
             '<' => {
-                if (std.mem.indexOfScalarPos(u8, raw, i + 1, '>')) |end| {
+                if (std.mem.findScalarPos(u8, raw, i + 1, '>')) |end| {
                     i = end + 1;
                 } else {
                     stripped.appendAssumeCapacity(c);

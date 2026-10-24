@@ -3,16 +3,8 @@ const SDLBackend = @import("backend");
 const vips = @import("vips");
 const ghost_mod = @import("dnd_ghost.zig");
 
-const xlib = @cImport({
-    @cInclude("X11/Xlib.h");
-    @cInclude("X11/Xatom.h");
-    @cInclude("X11/Xcursor/Xcursor.h");
-    @cInclude("X11/extensions/XInput2.h");
-});
-
-const wl = @cImport({
-    @cInclude("wayland-client.h");
-});
+const xlib = @import("x11_c");
+const wl = @import("wayland_c");
 
 // ─── X11 constants ───────────────────────────────────────────────────────────
 

@@ -2,8 +2,8 @@ const std = @import("std");
 const dvui = @import("dvui");
 const i18n = @import("i18n.zig");
 const image_grid_mod = @import("image_grid.zig");
-
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 pub const DeleteDialogState = struct {
     skip_delete_confirm: bool = false,
@@ -31,19 +31,30 @@ pub const DeleteDialogState = struct {
 
         var content = dvui.box(@src(), .{}, .{
             .expand = .both,
-            .padding = .all(16),
+            .padding = .all(18),
         });
         defer content.deinit();
 
         const permanent = self.force or !trash_enabled;
         const title = if (permanent) i18n.t(.confirm_delete_title) else i18n.t(.confirm_trash_title);
-        dvui.label(@src(), "{s}", .{title}, .{ .font = bold, .margin = .{ .h = 8 } });
+        style.modalTitle(@src(), title);
 
         if (self.count == 1) {
             const name = self.name_buf[0..self.name_len];
-            dvui.label(@src(), "{s}", .{name}, .{ .margin = .{ .h = 12 } });
+            fonts.richLabel(@src(), name, .{
+                .font = style.F.row_hi,
+                .color_text = .{ .color = style.C.text_hi },
+                .margin = .{ .h = 16 },
+            });
         } else {
-            dvui.label(@src(), "{d} files selected", .{self.count}, .{ .margin = .{ .h = 12 } });
+            var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 16 } });
+            defer line.deinit();
+            dvui.label(@src(), "{d} ", .{self.count}, .{
+                .font = style.F.mono_val, .color_text = .{ .color = style.C.text_hi }, .gravity_y = 0.5,
+            });
+            dvui.label(@src(), "{s}", .{i18n.t(.confirm_files_selected)}, .{
+                .color_text = .{ .color = style.C.text_dim }, .gravity_y = 0.5,
+            });
         }
 
         var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
@@ -69,7 +80,11 @@ pub const DeleteDialogState = struct {
         }
 
         const confirm_label = if (permanent) i18n.t(.confirm_delete) else i18n.t(.confirm_move_to_trash);
-        if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+        const confirmed = if (permanent)
+            dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4), .style = .err })
+        else
+            style.primaryButton(@src(), confirm_label, .{ .margin = .all(4) });
+        if (confirmed) {
             self.open = false;
             if (grid) |g| {
                 if (dvui.App.main_init) |init| {

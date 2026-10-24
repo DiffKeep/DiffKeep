@@ -99,23 +99,39 @@ pub fn performTrash(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid_
             f.close(io);
         } else |_| {}
 
-        const basename = std.fs.path.basename(entry.path);
+        const basename = std.Io.Dir.path.basename(entry.path);
         var name_buf: [768]u8 = undefined;
-        const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch continue;
-
-        const dst = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch continue;
-        defer allocator.free(dst);
-
-        moveFile(io, allocator, entry.path, dst) catch |err| {
-            log.warn("trash {s}: {}", .{ basename, err });
+        const trash_name = std.mem.print(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch {
+            _ = ids.remove(entry.id);
             continue;
         };
 
-        if (ctx.db.*) |*db| {
-            db.trashImage(entry.id, trash_name, file_size, now_s) catch |err| {
-                log.warn("trashImage {d}: {}", .{ entry.id, err });
-            };
-        }
+        const dst = std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch {
+            _ = ids.remove(entry.id);
+            continue;
+        };
+        defer allocator.free(dst);
+
+        // Mark the row trashed BEFORE moving the file: anything that sees the
+        // file vanish from the library (fs watcher, grid loader) only deletes
+        // rows that aren't trashed, so it must never observe a moved file whose
+        // row still looks live.
+        const db = if (ctx.db.*) |*d| d else {
+            _ = ids.remove(entry.id);
+            continue;
+        };
+        db.trashImage(entry.id, trash_name, file_size, now_s) catch |err| {
+            log.warn("trashImage {d}: {}", .{ entry.id, err });
+            _ = ids.remove(entry.id);
+            continue;
+        };
+        moveFile(io, allocator, entry.path, dst) catch |err| {
+            log.warn("trash {s}: {}", .{ basename, err });
+            db.restoreImage(entry.id) catch |rerr|
+                log.warn("restoreImage {d}: {}", .{ entry.id, rerr });
+            _ = ids.remove(entry.id);
+            continue;
+        };
     }
 
     removeFromGrid(grid, &ids);
@@ -151,7 +167,7 @@ pub fn performDelete(io: std.Io, allocator: std.mem.Allocator, grid: *image_grid
         if (!ids.contains(entry.id)) continue;
 
         const file_path: []const u8 = if (entry.trash_name) |tn| blk: {
-            break :blk std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch continue;
+            break :blk std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", tn }) catch continue;
         } else entry.path;
         defer if (entry.trash_name != null) allocator.free(file_path);
 
@@ -185,7 +201,7 @@ pub fn performRestore(io: std.Io, allocator: std.mem.Allocator, grid: *image_gri
         if (!ids.contains(entry.id)) continue;
         const trash_name = entry.trash_name orelse continue;
 
-        const src = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch continue;
+        const src = std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch continue;
         defer allocator.free(src);
 
         moveFile(io, allocator, src, entry.path) catch |err| {
@@ -239,6 +255,15 @@ pub fn startEmptyTrash(io: std.Io) void {
     startBulk(io, .empty_trash);
 }
 
+/// Wait for a running bulk op to finish. Call at shutdown, before the DB it
+/// holds a connection from is torn down.
+pub fn bulkJoin() void {
+    if (g_bulk.thread) |t| {
+        t.join();
+        g_bulk.thread = null;
+    }
+}
+
 fn startBulk(io: std.Io, kind: BulkKind) void {
     if (g_bulk.thread != null) return; // already running
     g_bulk.kind = kind;
@@ -278,7 +303,7 @@ fn bulkWorker(io: std.Io) void {
                 alloc.free(names);
             }
             for (names) |trash_name| {
-                const p = std.fs.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
+                const p = std.Io.Dir.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
                 defer alloc.free(p);
                 std.Io.Dir.cwd().deleteFile(io, p) catch |err|
                     log.warn("empty trash unlink {s}: {}", .{ trash_name, err });
@@ -301,8 +326,8 @@ fn bulkWorker(io: std.Io) void {
                 } else |_| {}
 
                 var name_buf: [768]u8 = undefined;
-                const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ r.id, std.fs.path.basename(r.path) }) catch continue;
-                const dst = std.fs.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
+                const trash_name = std.mem.print(&name_buf, "{d}_{s}", .{ r.id, std.Io.Dir.path.basename(r.path) }) catch continue;
+                const dst = std.Io.Dir.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
                 defer alloc.free(dst);
 
                 // Mark trashed BEFORE moving. The move fires the fs-watcher's
@@ -315,7 +340,7 @@ fn bulkWorker(io: std.Io) void {
                 };
                 moveFile(io, alloc, r.path, dst) catch |err| {
                     // Row stays trashed; file remains in the library (recoverable).
-                    log.warn("dedupe move {s}: {}", .{ std.fs.path.basename(r.path), err });
+                    log.warn("dedupe move {s}: {}", .{ std.Io.Dir.path.basename(r.path), err });
                     continue;
                 };
                 moved += 1;

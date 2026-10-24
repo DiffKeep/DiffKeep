@@ -1,10 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.sqlite);
 
-pub const c = @cImport({
-    @cInclude("sqlite3.h");
-    @cInclude("sqlite-vec.h");
-});
+pub const c = @import("sqlite_c");
 
 pub const Error = error{
     SQLiteError,
@@ -18,34 +15,48 @@ pub const Error = error{
 
 pub const VecResult = struct { id: i64, distance: f32 };
 
+/// Heap-allocated so every `VectorDb` handle can share one pool by pointer:
+/// a copied pool would have its own mutex and its own view of `connections`.
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     db_path: []const u8,
     connections: std.ArrayList(Database),
+    /// Connections handed out by `acquire` and not yet `release`d.
+    outstanding: usize = 0,
     mutex: std.Io.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, init_pool_size: usize) !ConnectionPool {
-        var pool = ConnectionPool{
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, init_pool_size: usize) !*ConnectionPool {
+        const pool = try allocator.create(ConnectionPool);
+        errdefer allocator.destroy(pool);
+        pool.* = .{
             .allocator = allocator,
             .io = io,
             .db_path = try allocator.dupe(u8, db_path),
             .connections = .empty,
             .mutex = std.Io.Mutex.init,
         };
-        errdefer pool.deinit();
+        errdefer pool.closeAll();
 
         // Create the initial connections
         try pool.connections.ensureTotalCapacity(allocator, init_pool_size);
         for (0..init_pool_size) |_| {
             const db = try Database.open(allocator, db_path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX);
-            try pool.connections.append(allocator, db);
+            pool.connections.appendAssumeCapacity(db);
         }
 
         return pool;
     }
 
-    pub fn deinit(self: *ConnectionPool) void {
+    /// Close every pooled connection and free the pool. All acquired
+    /// connections must have been released first.
+    pub fn destroy(self: *ConnectionPool) void {
+        std.debug.assert(self.outstanding == 0);
+        self.closeAll();
+        self.allocator.destroy(self);
+    }
+
+    fn closeAll(self: *ConnectionPool) void {
         for (self.connections.items) |*conn| {
             conn.close();
         }
@@ -58,20 +69,20 @@ pub const ConnectionPool = struct {
         defer self.mutex.unlock(self.io);
         log.debug("Current pool size: {d}", .{self.connections.items.len});
 
-        if (self.connections.items.len == 0) {
-            // Create a new connection if pool is empty
-            const db = try Database.open(self.allocator, self.db_path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX);
-            try self.connections.append(self.allocator, db);
-        }
-
-        return self.connections.pop().?;
+        const db = self.connections.pop() orelse
+            try Database.open(self.allocator, self.db_path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX);
+        self.outstanding += 1;
+        return db;
     }
 
-    pub fn release(self: *ConnectionPool, db: *Database) !void {
+    pub fn release(self: *ConnectionPool, db: *Database) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        try self.connections.append(self.allocator, db.*);
+        std.debug.assert(self.outstanding > 0);
+        self.outstanding -= 1;
+        // A connection that can't go back into the pool is closed, not leaked.
+        self.connections.append(self.allocator, db.*) catch db.close();
     }
 };
 
@@ -194,8 +205,11 @@ pub const Database = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8, flags: usize) !Database {
         log.debug("Creating a new database connection", .{});
+        // sqlite3_open_v2 reads a C string: `path` is a plain slice, so terminate it.
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(path_z);
         var db: ?*c.sqlite3 = null;
-        const result = c.sqlite3_open_v2(path.ptr, &db, @intCast(flags), null);
+        const result = c.sqlite3_open_v2(path_z.ptr, &db, @intCast(flags), null);
 
         if (result != c.SQLITE_OK) {
             return Error.SQLiteError;
@@ -309,7 +323,7 @@ pub const Database = struct {
 
     // Create a vector search virtual table
     pub fn createVectorTable(self: *Database, table_name: []const u8, dimensions: usize) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "CREATE VIRTUAL TABLE IF NOT EXISTS {s} USING vec0(vector float[{d}])", .{ table_name, dimensions });
+        const sql = try self.allocator.print("CREATE VIRTUAL TABLE IF NOT EXISTS {s} USING vec0(vector float[{d}])", .{ table_name, dimensions });
         defer self.allocator.free(sql);
 
         try self.exec(sql);
@@ -317,7 +331,7 @@ pub const Database = struct {
 
     // Insert a vector into the table
     pub fn insertVector(self: *Database, table_name: []const u8, id: i64, vector: []const f32) !void {
-        const sql = try std.fmt.allocPrint(self.allocator, "INSERT OR REPLACE INTO {s}(rowid, vector) VALUES (?, ?)", .{table_name});
+        const sql = try self.allocator.print("INSERT OR REPLACE INTO {s}(rowid, vector) VALUES (?, ?)", .{table_name});
         defer self.allocator.free(sql);
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -344,7 +358,7 @@ pub const Database = struct {
     /// KNN via the vec0 MATCH fast path. `distance` is the table's metric
     /// (L2 by default); with L2-normalized vectors the ranking equals cosine.
     pub fn searchNearestVectors(self: *Database, table_name: []const u8, query_vector: []const f32, limit: usize) !std.ArrayList(VecResult) {
-        const sql = try std.fmt.allocPrint(self.allocator, "SELECT rowid, distance FROM {s} WHERE vector MATCH ? AND k = ?", .{table_name});
+        const sql = try self.allocator.print("SELECT rowid, distance FROM {s} WHERE vector MATCH ? AND k = ?", .{table_name});
         defer self.allocator.free(sql);
 
         var stmt: ?*c.sqlite3_stmt = null;

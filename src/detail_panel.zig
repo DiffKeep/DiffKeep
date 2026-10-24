@@ -5,8 +5,8 @@ const png_mod = @import("image/png-data.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
 const platform = @import("platform.zig");
-
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
 /// Copy the image at `path` to the system clipboard (as image data). Routed
 /// through the platform seam so this module stays backend-agnostic.
@@ -155,59 +155,113 @@ pub const DetailState = struct {
             .max_size_content = .{ .w = panel_w, .h = 0 },
             .expand = .vertical,
             .background = true,
+            .color_fill = .{ .color = style.C.rail },
+            .border = style.Edge.left,
+            .color_border = .{ .color = style.hairline_soft },
         });
         defer meta.deinit();
 
         {
+            // dvui cannot draw a one-edge border without a background
             var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .expand = .horizontal,
-                .padding = .{ .x = 8, .y = 6 },
+                .padding = .{ .x = 10, .y = 8, .w = 6, .h = 8 },
+                .background = true,
+                .color_fill = .{ .color = style.C.rail },
+                .border = style.Edge.bottom,
+                .color_border = .{ .color = style.hairline_soft },
             });
             defer header.deinit();
-            // Cap the filename width so a long (often space-less) name clips
-            // instead of overflowing and pushing the action buttons off-panel.
-            // A plain label (not textLayout) avoids a stray scrollbar in the header.
             const btn_reserve: f32 = if (self.detail != null) 64 else 0;
-            const name_w = @max(@as(f32, 0), panel_w - 16 - btn_reserve);
+            const name_w = @max(@as(f32, 0), panel_w - 20 - btn_reserve);
             const name = if (filename.len > 0) filename else i18n.t(.detail_no_image);
-            dvui.label(@src(), "{s}", .{name}, .{
-                .font = bold,
+            var name_buf: [512]u8 = undefined;
+            fonts.richLine(@src(), style.ellipsize(&name_buf, name, style.F.row_hi, name_w), .{
+                .font = style.F.row_hi,
+                .color_text = .{ .color = if (filename.len > 0) style.C.text_hi else style.C.text_ghost },
                 .gravity_y = 0.5,
                 .max_size_content = dvui.Options.MaxSize.width(name_w),
             });
             if (self.detail) |d| {
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-                if (dvui.buttonIcon(@src(), i18n.t(.action_reparse), icons.tvg.lucide.@"refresh-cw", .{}, .{},
-                    .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
-                {
+                if (dvui.buttonIcon(@src(), i18n.t(.action_reparse), icons.tvg.lucide.@"refresh-cw", .{}, .{}, .{
+                    .min_size_content = .{ .w = 14, .h = 14 },
+                    .gravity_y = 0.5,
+                    .padding = .all(4),
+                    .background = false,
+                    .corners = style.R.chip,
+                    .color_text = .{ .color = style.C.text_dim },
+                })) {
                     self.reparse_requested = true;
                 }
-                if (dvui.buttonIcon(@src(), i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", .{}, .{},
-                    .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
-                {
+                if (dvui.buttonIcon(@src(), i18n.t(.action_copy_image), icons.tvg.lucide.@"clipboard-copy", .{}, .{}, .{
+                    .min_size_content = .{ .w = 14, .h = 14 },
+                    .gravity_y = 0.5,
+                    .padding = .all(4),
+                    .background = false,
+                    .corners = style.R.chip,
+                    .color_text = .{ .color = style.C.text_dim },
+                })) {
                     copyImageToClipboard(d.library_path, gpa, io);
                 }
             }
         }
 
-        var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+        var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false });
         defer scroll.deinit();
 
         if (self.detail) |d| {
             renderContent(d);
         } else if (self.id != null) {
-            dvui.label(@src(), "(loading\u{2026})", .{}, .{ .padding = .all(8) });
+            dvui.label(@src(), "{s}", .{i18n.t(.detail_loading)}, .{
+                .padding = .all(10),
+                .font = style.F.mono,
+                .color_text = .{ .color = style.C.text_ghost },
+            });
         }
     }
 };
 
 // Shared option presets for the metadata layout.
-const meta_bold: dvui.Options = .{ .font = bold, .padding = .{ .x = 8, .y = 4, .h = 0 } };
-const meta_label: dvui.Options = .{ .padding = .{ .x = 8, .y = 2, .h = 6 }, .expand = .horizontal, .background = false };
-const meta_val: dvui.Options = .{ .padding = .{ .x = 8, .y = 2, .h = 6 }, .expand = .horizontal };
+const meta_bold: dvui.Options = .{
+    .font = style.F.mono_hd,
+    .color_text = .{ .color = style.C.text_ghost },
+    .padding = .{ .x = 10, .y = 8, .w = 10, .h = 2 },
+};
+const meta_label: dvui.Options = .{
+    .padding = .{ .x = 10, .y = 0, .w = 10, .h = 4 },
+    .expand = .horizontal,
+    .background = false,
+    .color_text = .{ .color = style.C.text },
+};
+const meta_val: dvui.Options = .{
+    .padding = .{ .x = 10, .y = 0, .w = 10, .h = 4 },
+    .expand = .horizontal,
+    .font = style.F.mono_val,
+    .color_text = .{ .color = style.C.text_hi },
+};
 
-/// One labelled metadata column: a bold caption above its value. `src` must be
-/// unique per call site (pass @src()) so dvui gives each column a distinct id.
+fn copyButton(src: std.builtin.SourceLocation, text: []const u8, tag: ?[]const u8) void {
+    if (dvui.buttonIcon(src, i18n.t(.action_copy), icons.tvg.lucide.copy, .{}, .{}, .{
+        .min_size_content = .{ .w = 13, .h = 13 },
+        .gravity_y = 0.5,
+        .padding = .all(4),
+        .background = false,
+        .corners = style.R.chip,
+        .color_text = .{ .color = style.C.text_ghost },
+        .tag = tag,
+    })) {
+        dvui.clipboardTextSet(text);
+    }
+}
+
+fn prose(src: std.builtin.SourceLocation, text: []const u8) void {
+    var tl = dvui.textLayout(src, .{}, meta_label.override(.{ .font = style.F.prose }));
+    defer tl.deinit();
+    fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = .{ .color = style.C.text } });
+}
+
+/// One labelled metadata column: a caption above its value.
 fn metaColumn(src: std.builtin.SourceLocation, label: []const u8, comptime fmt: []const u8, args: anytype) void {
     var col = dvui.box(src, .{}, .{ .expand = .horizontal });
     defer col.deinit();
@@ -215,8 +269,7 @@ fn metaColumn(src: std.builtin.SourceLocation, label: []const u8, comptime fmt: 
     dvui.label(@src(), fmt, args, meta_val);
 }
 
-/// Render all metadata fields for one image. Called by renderPanel and by the
-/// viewer's info pane so the same layout is reused without duplication.
+/// Render all metadata fields for one image.
 pub fn renderContent(d: db_mod.ImageDetails) void {
     const bp = meta_bold;
     const lp = meta_label;
@@ -227,36 +280,24 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
             var hdr = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
             defer hdr.deinit();
             dvui.label(@src(), "{s}", .{i18n.t(.detail_prompt)}, bp.override(.{ .expand = .horizontal }));
-            if (dvui.buttonIcon(@src(), i18n.t(.action_copy), icons.tvg.lucide.@"copy", .{}, .{},
-                .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4), .tag = "copy-prompt" }))
-            {
-                dvui.clipboardTextSet(v);
-            }
+            copyButton(@src(), v, "copy-prompt");
         }
-        var tl = dvui.textLayout(@src(), .{}, lp);
-        tl.addText(v, .{});
-        tl.deinit();
+        prose(@src(), v);
     }
     if (d.negative_prompt_text) |v| {
         {
             var hdr = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
             defer hdr.deinit();
             dvui.label(@src(), "{s}", .{i18n.t(.detail_negative_prompt)}, bp.override(.{ .expand = .horizontal }));
-            if (dvui.buttonIcon(@src(), i18n.t(.action_copy), icons.tvg.lucide.@"copy", .{}, .{},
-                .{ .min_size_content = .{ .w = 14, .h = 14 }, .gravity_y = 0.5, .padding = .all(4) }))
-            {
-                dvui.clipboardTextSet(v);
-            }
+            copyButton(@src(), v, null);
         }
-        var tl = dvui.textLayout(@src(), .{}, lp);
-        tl.addText(v, .{});
-        tl.deinit();
+        prose(@src(), v);
     }
 
     if (d.model) |v| {
         dvui.label(@src(), "{s}", .{i18n.t(.detail_model)}, bp);
-        var tl = dvui.textLayout(@src(), .{}, lp);
-        tl.addText(v, .{});
+        var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_hi } }));
+        fonts.addStyled(tl, v, .{ .code = true }, .{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_hi } });
         tl.deinit();
     }
 
@@ -289,8 +330,8 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
 
     if (d.loras) |v| {
         dvui.label(@src(), "{s}", .{i18n.t(.detail_loras)}, bp);
-        var tl = dvui.textLayout(@src(), .{}, lp);
-        tl.addText(v, .{});
+        var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_hi } }));
+        fonts.addStyled(tl, v, .{ .code = true }, .{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_hi } });
         tl.deinit();
     }
 
@@ -298,10 +339,15 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
         dvui.label(@src(), "{s}", .{i18n.t(.detail_trashed_at)}, bp);
         dvui.label(@src(), "{s}", .{v}, sp);
     }
-    dvui.label(@src(), "{s}", .{i18n.t(.detail_path)}, bp);
     {
-        var tl = dvui.textLayout(@src(), .{}, lp);
-        tl.addText(d.library_path, .{});
+        var hdr = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer hdr.deinit();
+        dvui.label(@src(), "{s}", .{i18n.t(.detail_path)}, bp.override(.{ .expand = .horizontal }));
+        copyButton(@src(), d.library_path, null);
+    }
+    {
+        var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_faint } }));
+        fonts.addStyled(tl, d.library_path, .{ .code = true }, .{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_faint } });
         tl.deinit();
     }
     if (d.creation_date) |v| {
@@ -312,9 +358,33 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
     if (d.raw_chunks.len > 0) {
         dvui.label(@src(), "{s}", .{i18n.t(.detail_raw_metadata)}, bp);
         for (d.raw_chunks, 0..) |rc, ci| {
-            if (dvui.expander(@src(), rc.keyword, .{ .default_expanded = false }, .{ .expand = .horizontal, .id_extra = ci })) {
-                var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .id_extra = ci }));
-                tl.addText(rc.display_text, .{});
+            if (dvui.expander(@src(), rc.keyword, .{ .default_expanded = false }, .{
+                .expand = .horizontal,
+                .id_extra = ci,
+                .padding = .{ .x = 10, .y = 3, .w = 6, .h = 3 },
+                .font = style.F.mono,
+                .color_text = .{ .color = style.C.text_dim },
+            })) {
+                var well = dvui.box(@src(), .{}, .{
+                    .id_extra = ci,
+                    .expand = .horizontal,
+                    .background = true,
+                    .color_fill = .{ .color = style.C.sunken },
+                    .corners = style.R.chip,
+                    .margin = .{ .x = 10, .y = 2, .w = 10, .h = 8 },
+                    .padding = .all(8),
+                });
+                defer well.deinit();
+                var tl = dvui.textLayout(@src(), .{}, .{
+                    .id_extra = ci,
+                    .expand = .horizontal,
+                    .background = false,
+                    .padding = .{},
+                });
+                fonts.addStyled(tl, rc.display_text, .{ .code = true }, .{
+                    .font = style.F.code,
+                    .color_text = .{ .color = style.C.text_dim },
+                });
                 tl.deinit();
             }
         }

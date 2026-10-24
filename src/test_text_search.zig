@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
         var iter = dir.iterate();
         while (try iter.next(io)) |de| {
             if (de.kind != .file or !std.mem.endsWith(u8, de.name, ".png")) continue;
-            const full = try std.fs.path.join(allocator, &.{ images_dir, de.name });
+            const full = try std.Io.Dir.path.join(allocator, &.{ images_dir, de.name });
             errdefer allocator.free(full);
             const prompt = extractPrompt(allocator, io, full) catch |err| {
                 std.log.warn("skip {s}: {}", .{ de.name, err });
@@ -229,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
         }
         for (corpus, 0..) |entry, i| {
             const text = if (cfg.doc_prefix.len > 0)
-                try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.doc_prefix, entry.prompt })
+                try allocator.print("{s}{s}", .{ cfg.doc_prefix, entry.prompt })
             else
                 entry.prompt;
             defer if (cfg.doc_prefix.len > 0) allocator.free(text);
@@ -248,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
         for (QUERIES) |q| {
             const t0_q = nanoNow();
             const qtext = if (cfg.query_prefix.len > 0)
-                try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.query_prefix, q.text })
+                try allocator.print("{s}{s}", .{ cfg.query_prefix, q.text })
             else
                 q.text;
             defer if (cfg.query_prefix.len > 0) allocator.free(qtext);
@@ -274,7 +274,7 @@ pub fn main(init: std.process.Init) !void {
                 try println(io, "  [{s}] \"{s}\"  rank=#{d}  ({d:.1}ms)", .{ tier_str, q.text, rank, q_ms });
                 const show = @min(top_k, corpus.len);
                 for (ranking[0..show], 0..) |idx, r| {
-                    const name = std.fs.path.basename(corpus[idx].path);
+                    const name = std.Io.Dir.path.basename(corpus[idx].path);
                     const rel  = isRelevant(name, q.relevant);
                     const snip = corpus[idx].prompt[0..@min(70, corpus[idx].prompt.len)];
                     try println(io, "      {s} #{d} {d:.4}  {s}  {s}...", .{
@@ -343,7 +343,7 @@ fn bestRank(corpus: []const ImageEntry, ranking: []const usize, relevant: []cons
     var best: usize = corpus.len + 1;
     for (relevant) |rel| {
         for (ranking, 0..) |idx, r| {
-            if (std.mem.eql(u8, std.fs.path.basename(corpus[idx].path), rel)) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(corpus[idx].path), rel)) {
                 if (r + 1 < best) best = r + 1;
                 break;
             }
@@ -424,7 +424,7 @@ fn nanoNow() i64 {
 
 fn println(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt ++ "\n", args);
+    const s = try std.mem.print(&buf, fmt ++ "\n", args);
     try std.Io.File.stdout().writeStreamingAll(io, s);
 }
 

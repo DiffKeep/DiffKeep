@@ -47,7 +47,7 @@ pub const LibraryParser = struct {
         var dir_iter = dir.iterate();
 
         while (try dir_iter.next(self.io)) |entry| {
-            const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ dir_path, entry.name });
+            const full_path = try std.Io.Dir.path.join(self.allocator, &[_][]const u8{ dir_path, entry.name });
 
             if (entry.kind == .directory) {
                 try self.walkDirectory(full_path);
@@ -139,7 +139,7 @@ fn processFile(path: []const u8, conn: *db.VectorDb, allocator: std.mem.Allocato
     // Gather all readable text sections (iTXt first, then tEXt) and let the
     // shared selector pick the best source (parameters → workflow → prompt),
     // independent of the order they appear in the file.
-    var sections: std.ArrayListUnmanaged(ComfyParser.RawSection) = .empty;
+    var sections: std.ArrayList(ComfyParser.RawSection) = .empty;
     {
         const itxt_chunks = pngParser.getITxtChunks() catch &[_]Chunk{};
         defer arena_allocator.free(itxt_chunks);

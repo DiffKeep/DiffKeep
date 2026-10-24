@@ -93,7 +93,7 @@ pub const VlContext = struct {
         }
 
         const model_ptr = pool.model.?.ptr;
-        const mmproj_z = try allocator.dupeZ(u8, mmproj_path);
+        const mmproj_z = try allocator.dupeSentinel(u8, mmproj_path, 0);
         defer allocator.free(mmproj_z);
 
         const n_threads: c_int = @intCast(std.Thread.getCpuCount() catch 4);
@@ -137,9 +137,9 @@ pub const VlContext = struct {
         c.llama_memory_clear(c.llama_get_memory(ctx.ptr), true);
         ctx.n_past = 0;
 
-        const path_z   = try allocator.dupeZ(u8, image_path);
+        const path_z   = try allocator.dupeSentinel(u8, image_path, 0);
         defer allocator.free(path_z);
-        const prefix_z = try allocator.dupeZ(u8, prefix);
+        const prefix_z = try allocator.dupeSentinel(u8, prefix, 0);
         defer allocator.free(prefix_z);
 
         const rc = mtmd_wrapper_embed_image_file(
@@ -174,7 +174,7 @@ pub const VlContext = struct {
         c.llama_memory_clear(c.llama_get_memory(ctx.ptr), true);
         ctx.n_past = 0;
 
-        const prefix_z = try allocator.dupeZ(u8, prefix);
+        const prefix_z = try allocator.dupeSentinel(u8, prefix, 0);
         defer allocator.free(prefix_z);
 
         const rc = mtmd_wrapper_embed_rgb(
@@ -234,7 +234,7 @@ pub const RerankContext = struct {
         }
         std.log.info("Reranker yes_id={d} no_id={d}", .{ yes_id, no_id });
 
-        const mmproj_z = try allocator.dupeZ(u8, mmproj_path);
+        const mmproj_z = try allocator.dupeSentinel(u8, mmproj_path, 0);
         defer allocator.free(mmproj_z);
         const n_threads: c_int = @intCast(std.Thread.getCpuCount() catch 4);
         const mctx = mtmd_wrapper_init(mmproj_z, model_ptr, n_threads) orelse {
@@ -271,11 +271,11 @@ pub const RerankContext = struct {
         const ctx = try self.pool.get(io, self.model_path, 60_000, null);
         defer self.pool.release(ctx);
 
-        const query_z = try allocator.dupeZ(u8, query);
+        const query_z = try allocator.dupeSentinel(u8, query, 0);
         defer allocator.free(query_z);
-        const instr_z = try allocator.dupeZ(u8, instruction);
+        const instr_z = try allocator.dupeSentinel(u8, instruction, 0);
         defer allocator.free(instr_z);
-        const path_z  = try allocator.dupeZ(u8, image_path);
+        const path_z  = try allocator.dupeSentinel(u8, image_path, 0);
         defer allocator.free(path_z);
 
         const score = reranker_wrapper_score_image_file(

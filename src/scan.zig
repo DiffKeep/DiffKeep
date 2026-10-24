@@ -5,7 +5,7 @@ const comfy_mod = @import("parse/comfy.zig");
 const prompt_clean = @import("parse/prompt_clean.zig");
 const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
-const onnx_mod = @import("onnx_embedder.zig");
+const embedder_mod = @import("embedder.zig");
 const video = @import("video");
 const vips = @import("vips");
 const media = @import("media.zig");
@@ -20,14 +20,14 @@ const log = std.log.scoped(.scan);
 fn gatherEmbeddedSections(
     aa: std.mem.Allocator,
     buffer: []const u8,
-    sections: *std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection),
+    sections: *std.ArrayList(comfy_mod.ComfyParser.RawSection),
 ) void {
     const markers = [_]struct { marker: []const u8, keyword: []const u8 }{
         .{ .marker = "workflow:{", .keyword = "workflow" },
         .{ .marker = "prompt:{", .keyword = "prompt" },
     };
     for (markers) |m| {
-        const at = std.mem.indexOf(u8, buffer, m.marker) orelse continue;
+        const at = std.mem.find(u8, buffer, m.marker) orelse continue;
         // The marker ends with '{', so the JSON object begins at that brace.
         const json = comfy_mod.extractJsonObject(buffer[at + m.marker.len - 1 ..]) orelse continue;
         const kw = aa.dupe(u8, m.keyword) catch continue;
@@ -52,17 +52,13 @@ fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]co
     return buf;
 }
 
-/// Number of files processed concurrently per batch. After each batch of CPU
-/// work (parse + thumbnail) completes, embeddings are run in a single GPU call.
-pub const EMBED_BATCH_SIZE: usize = 8;
-
-/// Number of embed-consumer goroutines draining the queue concurrently when the
-/// embedder is on the GPU. Each Run() is tiny; the per-item bottleneck is the
-/// CPU-side prep (vips image decode, tokenization) and the blocking GPU sync, so
-/// several consumers keep decode overlapping with in-flight GPU compute and
-/// stop the GPU from sitting idle between calls. On CPU we use a single consumer
-/// (see below) — the session already saturates every core per inference.
-pub const EMBED_GPU_CONSUMERS: usize = 16;
+/// Max items an embed consumer drains from the queue into one batched forward,
+/// and the number of files parsed/thumbnailed concurrently per CPU batch. 32 gives
+/// the CUDA batches enough work to beat CPU (see `test_tp_batch`: gemma 4.7 ms/item
+/// at b=32 vs 6.0 on CPU; snowflake/siglip even more) and keeps the queue deep
+/// enough that consumers hit full batches. The embedder's per-call router sends
+/// batches >= `config.embed_gpu_threshold` to the GPU and single items to the CPU.
+pub const EMBED_BATCH_SIZE: usize = 32;
 
 pub const ScanStats = struct {
     added: u32 = 0,
@@ -71,8 +67,8 @@ pub const ScanStats = struct {
     unchanged: u32 = 0,
 };
 
-/// Holds the inputs needed to embed a single file. Written by processFile in
-/// batch mode; consumed by batchEmbedAndStore after the concurrent group completes.
+/// Holds the inputs needed to embed a single file. Pushed by processFile onto the
+/// EmbedQueue; an embed consumer drains a mini-batch of these and runs embedBatch.
 pub const EmbedInput = struct {
     image_id: u64,
     prompt_text:  ?[]const u8,    // owned; null = no prompt embedding needed
@@ -134,6 +130,15 @@ const EmbedQueue = struct {
         if (q.items.items.len > 0) return q.items.pop();
         return null;
     }
+
+    /// Non-blocking pop: returns an item if one is queued right now, else null
+    /// (never waits). Used to grow a batch from whatever is already available.
+    fn tryPop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        if (q.items.items.len > 0) return q.items.pop();
+        return null;
+    }
 };
 
 pub const ScanCtx = struct {
@@ -150,7 +155,7 @@ pub const ScanCtx = struct {
     image_embeddings: bool,
     precomputed_mtime: i64,
     notifier: ?*notifier_mod.ImageNotifier,
-    embedder: ?*onnx_mod.OnnxEmbedder = null,
+    embedder: ?*embedder_mod.Embedder = null,
     has_prompt_embedding: bool = false,
     has_image_embedding: bool = false,
     /// Queue mode: when non-null, processFile pushes EmbedInputs here instead
@@ -178,7 +183,7 @@ pub const LibraryScanner = struct {
     allocator: std.mem.Allocator,
     db: *db_mod.VectorDb,
     notifier: ?*notifier_mod.ImageNotifier,
-    embedder: ?*onnx_mod.OnnxEmbedder = null,  // borrowed, not owned
+    embedder: ?*embedder_mod.Embedder = null,  // borrowed, not owned
 
     pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb, notifier: ?*notifier_mod.ImageNotifier) LibraryScanner {
         // c_allocator (glibc malloc) is used throughout because processFile tasks
@@ -258,10 +263,18 @@ pub const LibraryScanner = struct {
         };
         var embed_group: std.Io.Group = .init;
         if (self.embedder) |emb| {
-            // Multiple consumers only pay off on the GPU (concurrent Run() calls
-            // overlap CPU prep with GPU compute); on CPU one consumer already
-            // uses every core per inference, so more would just oversubscribe.
-            const n_consumers: usize = if (emb.isGpu()) EMBED_GPU_CONSUMERS else 1;
+            // Surface a misconfigured/failed encoder loudly: otherwise the matching
+            // sub-batch is silently skipped and the scan looks like it did nothing.
+            if (prompt_embeddings and !emb.hasPromptEncoder())
+                log.warn("prompt_embeddings on but no text encoder loaded — check text_model_dir; prompts will be skipped", .{});
+            if (image_embeddings and !emb.hasVisualEncoder())
+                log.warn("image_embeddings on but no visual encoder loaded — check visual_model_dir (needs a timm SigLIP2 dir with open_clip_model.safetensors); images will be skipped", .{});
+            // Multiple consumers only pay off on the GPU: the GPU forward is
+            // serialized by the embed mutex, but image decode (vips) is CPU-heavy
+            // and serial within a batch, so a few consumers decode concurrently to
+            // keep the GPU fed (~3 decode streams while one holds the GPU is plenty
+            // even for slow decodes). On CPU one consumer already uses every core.
+            const n_consumers: usize = if (emb.hasGpu()) 4 else 1;
             var spawned: usize = 0;
             for (0..n_consumers) |_| {
                 embed_group.concurrent(io, embedConsumer, .{EmbedConsumerCtx{
@@ -277,7 +290,7 @@ pub const LibraryScanner = struct {
                 };
                 spawned += 1;
             }
-            log.debug("embed consumers spawned: {d} (gpu={})", .{ spawned, emb.isGpu() });
+            log.debug("embed consumers spawned: {d} (gpu={})", .{ spawned, emb.hasGpu() });
         }
 
         var group: std.Io.Group = .init;
@@ -307,7 +320,7 @@ pub const LibraryScanner = struct {
             while (kit.next()) |entry| {
                 if (!entry.value_ptr.seen) {
                     _ = self.db.deleteImageByPath(library_id, entry.key_ptr.*) catch |err| {
-                        log.warn("delete {s}: {}", .{ std.fs.path.basename(entry.key_ptr.*), err });
+                        log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(entry.key_ptr.*), err });
                     };
                     removed += 1;
                 }
@@ -345,7 +358,10 @@ pub const LibraryScanner = struct {
         var iter = dir.iterate();
 
         while (try iter.next(io)) |entry| {
-            const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
+            // Abort the walk promptly when stopped (window close / rescan) instead
+            // of iterating the rest of the tree, so scan_group.await unblocks fast.
+            if (stop.load(.acquire)) return;
+            const full_path = try std.Io.Dir.path.join(self.allocator, &.{ dir_path, entry.name });
 
             if (entry.kind == .directory) {
                 defer self.allocator.free(full_path);
@@ -421,7 +437,7 @@ pub const LibraryScanner = struct {
                 .has_image_embedding = if (meta_ptr) |m| m.has_image_embedding else false,
                 .embed_queue = if (self.embedder != null) embed_queue else null,
             }}) catch |err| {
-                log.warn("spawn {s}: {}", .{ std.fs.path.basename(full_path), err });
+                log.warn("spawn {s}: {}", .{ std.Io.Dir.path.basename(full_path), err });
                 self.allocator.free(full_path);
                 continue;
             };
@@ -433,55 +449,145 @@ pub const LibraryScanner = struct {
 const EmbedConsumerCtx = struct {
     queue:     *EmbedQueue,
     db:        *db_mod.VectorDb,
-    emb:       *onnx_mod.OnnxEmbedder,
+    emb:       *embedder_mod.Embedder,
     allocator: std.mem.Allocator,
     stop:      *std.atomic.Value(bool),
     io:        std.Io,
 };
 
-/// Runs as a concurrent goroutine alongside CPU tasks. Drains the EmbedQueue
-/// and calls the embedder for each item, then stores the result in the DB.
+/// Runs as a concurrent goroutine alongside CPU tasks. Drains a mini-batch from
+/// the EmbedQueue (one blocking pop, then whatever else is already queued up to
+/// EMBED_BATCH_SIZE) and embeds it in one batched forward, so the embedder can
+/// route the batch to the GPU. Batch size = queue depth, so a lone new image
+/// stays on the CPU and a bulk scan batches onto the GPU (see embedder.zig).
 fn embedConsumer(ctx: EmbedConsumerCtx) void {
     log.debug("embed consumer: started", .{});
     var n: u32 = 0;
-    while (ctx.queue.pop(ctx.io)) |item| {
-        var ei = item;
-        defer ei.deinit();
-        n += 1;
-        if (!ctx.stop.load(.acquire)) embedSingle(ctx.allocator, ctx.db, ctx.emb, &ei);
-        _ = ctx.queue.embed_done.fetchAdd(1, .acq_rel);
+    var buf: [EMBED_BATCH_SIZE]EmbedInput = undefined;
+    while (!ctx.stop.load(.acquire)) {
+        const first = ctx.queue.pop(ctx.io) orelse break;
+        var count: usize = 1;
+        buf[0] = first;
+        while (count < EMBED_BATCH_SIZE) {
+            buf[count] = ctx.queue.tryPop(ctx.io) orelse break;
+            count += 1;
+        }
+        const batch = buf[0..count];
+        defer for (batch) |*it| it.deinit();
+        // Stopped while draining: drop this batch and bail — embed_queue.deinit
+        // frees whatever is still queued, so shutdown/cancel isn't blocked.
+        if (ctx.stop.load(.acquire)) break;
+        embedBatch(ctx.allocator, ctx.db, ctx.emb, batch, ctx.stop);
+        n += @intCast(count);
+        _ = ctx.queue.embed_done.fetchAdd(@intCast(count), .acq_rel);
     }
     log.debug("embed consumer: exiting after {d} items", .{n});
 }
 
-fn embedSingle(
+/// Embed a drained mini-batch: prompt documents and images are gathered into
+/// separate sub-batches and run through the batched embedder, then each vector is
+/// stored against its image_id. On a batch-level failure we retry that sub-batch
+/// per item (single items route to CPU) so one bad file can't sink the batch.
+fn embedBatch(
     allocator: std.mem.Allocator,
     db:        *db_mod.VectorDb,
-    emb:       *onnx_mod.OnnxEmbedder,
-    item:      *const EmbedInput,
+    emb:       *embedder_mod.Embedder,
+    items:     []EmbedInput,
+    stop:      *std.atomic.Value(bool),
 ) void {
-    if (item.prompt_text) |text| clean_blk: {
-        // Strip ComfyUI/A1111 markup so the embedder sees natural language.
-        const cleaned = prompt_clean.cleanPrompt(allocator, text) catch break :clean_blk;
-        defer allocator.free(cleaned);
-        if (cleaned.len == 0) break :clean_blk;
-        if (emb.embedPrompt(allocator, cleaned)) |vec| {
-            defer allocator.free(vec);
-            db.storePromptEmbedding(item.image_id, vec) catch |err|
-                log.warn("store prompt embed: {}", .{err});
-        } else |err| {
-            log.warn("prompt embed failed ({}); skipped", .{err});
+    // ── Prompt sub-batch ──────────────────────────────────────────────────────
+    // Guarded on the encoder being loaded: skip entirely (no work, no warnings)
+    // when there is no text encoder, rather than failing every item.
+    if (emb.hasPromptEncoder()) {
+        var texts:    [EMBED_BATCH_SIZE][]const u8 = undefined;
+        var text_ids: [EMBED_BATCH_SIZE]u64        = undefined;
+        var nt: usize = 0;
+        for (items) |*it| {
+            const raw = it.prompt_text orelse continue;
+            // Strip ComfyUI/A1111 markup so the embedder sees natural language.
+            const cleaned = prompt_clean.cleanPrompt(allocator, raw) catch continue;
+            if (cleaned.len == 0) {
+                allocator.free(cleaned);
+                continue;
+            }
+            // Skip prompts too long for the text encoder's window (would panic in TP).
+            if (!emb.promptFits(allocator, cleaned)) {
+                log.warn("prompt too long for image {d}; skipping prompt embedding", .{it.image_id});
+                allocator.free(cleaned);
+                continue;
+            }
+            texts[nt] = cleaned;
+            text_ids[nt] = it.image_id;
+            nt += 1;
+        }
+        defer for (texts[0..nt]) |t| allocator.free(t);
+        // Skip the GPU embed on stop (close/cancel) — the gathered texts are still
+        // freed by the defer above.
+        if (nt > 0 and !stop.load(.acquire)) {
+            if (emb.embedPromptBatch(allocator, texts[0..nt])) |vecs| {
+                defer {
+                    for (vecs) |v| allocator.free(v);
+                    allocator.free(vecs);
+                }
+                for (vecs, text_ids[0..nt]) |vec, id|
+                    db.storePromptEmbedding(id, vec) catch |err| log.warn("store prompt embed: {}", .{err});
+            } else |err| {
+                log.warn("prompt embed batch failed ({}); retrying per item", .{err});
+                for (texts[0..nt], text_ids[0..nt]) |t, id| embedOnePrompt(allocator, db, emb, id, t);
+            }
         }
     }
-    if (item.image_path_z) |path| {
-        if (emb.embedImage(allocator, path)) |vec| {
-            defer allocator.free(vec);
-            db.storeImageEmbedding(item.image_id, vec) catch |err|
-                log.warn("store image embed: {}", .{err});
-        } else |err| {
-            log.warn("image embed failed ({}); skipped", .{err});
+
+    // ── Image sub-batch ───────────────────────────────────────────────────────
+    // Bail before the expensive image decode + GPU forward if we've been stopped.
+    if (stop.load(.acquire)) return;
+    if (emb.hasVisualEncoder()) {
+        var paths:   [EMBED_BATCH_SIZE][:0]const u8 = undefined;
+        var img_ids: [EMBED_BATCH_SIZE]u64          = undefined;
+        var ni: usize = 0;
+        for (items) |*it| {
+            const p = it.image_path_z orelse continue;
+            paths[ni] = p;
+            img_ids[ni] = it.image_id;
+            ni += 1;
+        }
+        if (ni > 0) {
+            if (emb.embedImageBatch(allocator, paths[0..ni], stop)) |vecs| {
+                defer {
+                    for (vecs) |v| if (v.len != 0) allocator.free(v);
+                    allocator.free(vecs);
+                }
+                // Empty vec = that image failed to decode (skipped, not fatal to the
+                // batch); the rest still embedded on the GPU in one forward.
+                for (vecs, img_ids[0..ni]) |vec, id| {
+                    if (vec.len == 0) {
+                        log.warn("image decode failed for image {d}; skipped", .{id});
+                        continue;
+                    }
+                    db.storeImageEmbedding(id, vec) catch |err| log.warn("store image embed: {}", .{err});
+                }
+            } else |err| {
+                log.warn("image embed batch failed ({}); retrying per item", .{err});
+                for (paths[0..ni], img_ids[0..ni]) |p, id| embedOneImage(allocator, db, emb, id, p);
+            }
         }
     }
+}
+
+/// Fallback: embed one already-cleaned prompt (routes to CPU, n=1) and store it.
+fn embedOnePrompt(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embedder_mod.Embedder, id: u64, cleaned: []const u8) void {
+    if (emb.embedPrompt(allocator, cleaned)) |vec| {
+        defer allocator.free(vec);
+        db.storePromptEmbedding(id, vec) catch |err| log.warn("store prompt embed: {}", .{err});
+    } else |err| log.warn("prompt embed failed ({}); skipped", .{err});
+}
+
+/// Fallback: embed one image (routes to CPU, n=1) and store it.
+fn embedOneImage(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embedder_mod.Embedder, id: u64, path: [:0]const u8) void {
+    if (emb.embedImage(allocator, path)) |vec| {
+        defer allocator.free(vec);
+        db.storeImageEmbedding(id, vec) catch |err| log.warn("store image embed: {}", .{err});
+    } else |err| log.warn("image embed failed ({}); skipped", .{err});
 }
 
 /// Embed prompt and/or image inline (single-file watcher path) and store the
@@ -502,7 +608,7 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
         const vec = emb.embedPrompt(ctx.allocator, cleaned) catch break :prompt;
         defer ctx.allocator.free(vec);
         ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
-            log.warn("store prompt embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+            log.warn("store prompt embed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         };
         did_work = true;
     }
@@ -510,12 +616,12 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
         if (!do_image) break :image_blk;
         if (ctx.stop.load(.acquire)) break :image_blk;
         const emb = ctx.embedder orelse break :image_blk;
-        const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch break :image_blk;
+        const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch break :image_blk;
         defer ctx.allocator.free(path_z);
         const vec = emb.embedImage(ctx.allocator, path_z) catch break :image_blk;
         defer ctx.allocator.free(vec);
         ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
-            log.warn("store image embed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+            log.warn("store image embed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         };
         did_work = true;
     }
@@ -528,7 +634,7 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
 /// media_type of already-indexed animated images on a later rescan.
 fn classifyAnimatedImage(ctx: ScanCtx, image_id: u64) void {
     if (!media.isAnimatableImage(ctx.path)) return;
-    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch return;
+    const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return;
     defer ctx.allocator.free(path_z);
     const pages = vips.nPages(path_z) catch return;
     ctx.db.setMediaType(image_id, if (pages > 1) .animated else .image) catch {};
@@ -538,7 +644,7 @@ fn classifyAnimatedImage(ctx: ScanCtx, image_id: u64) void {
 /// grid loader can read it — libvips can't open video) + ComfyUI metadata from
 /// the container's format tags. `aa` is the per-file arena.
 fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.mem.Allocator, is_new: bool) void {
-    const path_z = ctx.allocator.dupeZ(u8, ctx.path) catch return;
+    const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return;
     defer ctx.allocator.free(path_z);
 
     // Poster frame → JPEG, stored on the image row.
@@ -546,11 +652,11 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
         if (vips.rgbaToJpeg(ctx.allocator, frame.pixels, frame.width, frame.height, 320)) |jpeg| {
             if (image.thumbnail) |t| ctx.allocator.free(t);
             image.thumbnail = jpeg;
-        } else |err| log.warn("video thumb encode {s}: {}", .{ std.fs.path.basename(ctx.path), err });
-    } else |err| log.warn("video decode {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        } else |err| log.warn("video thumb encode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
+    } else |err| log.warn("video decode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     // Metadata: ComfyUI stores the same workflow/prompt JSON as mp4 format tags.
-    var sections: std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection) = .empty;
+    var sections: std.ArrayList(comfy_mod.ComfyParser.RawSection) = .empty;
     if (video.readTag(aa, path_z, "workflow") catch null) |w|
         sections.append(aa, .{ .keyword = "workflow", .text = w }) catch {};
     if (video.readTag(aa, path_z, "prompt") catch null) |p|
@@ -597,7 +703,7 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
 
     image.mtime = current_mtime;
     ctx.db.saveImage(image) catch |err| {
-        log.warn("save video {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        log.warn("save video {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         return;
     };
     ctx.db.setMediaType(image.id, .video) catch |err|
@@ -606,7 +712,7 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
     if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
     else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
     if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
-    log.debug("processed video {s}", .{std.fs.path.basename(ctx.path)});
+    log.debug("processed video {s}", .{std.Io.Dir.path.basename(ctx.path)});
 }
 
 pub fn processFile(ctx: ScanCtx) void {
@@ -623,7 +729,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     // DB read — fetch existing record (or create new placeholder).
     var image = ctx.db.findOrCreateImage(ctx.allocator, ctx.library_id, ctx.path) catch |err| {
-        log.warn("db find {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        log.warn("db find {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         return;
     };
     defer image.deinit(ctx.allocator);
@@ -637,10 +743,10 @@ pub fn processFile(ctx: ScanCtx) void {
             var did_work = false;
             if (ctx.thumbnails_in_db and image.thumbnail == null) {
                 image.generate_thumbnail(ctx.io, ctx.allocator, ctx.path) catch |err| {
-                    log.warn("thumbnail {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+                    log.warn("thumbnail {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
                 };
                 ctx.db.saveImage(&image) catch |err| {
-                    log.warn("save thumb {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+                    log.warn("save thumb {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
                 };
                 did_work = true;
             }
@@ -656,7 +762,7 @@ pub fn processFile(ctx: ScanCtx) void {
                             if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
                             else null,
                         .image_path_z = if (needs_image_backfill)
-                            ctx.allocator.dupeZ(u8, ctx.path) catch null
+                            ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch null
                             else null,
                         .allocator    = ctx.allocator,
                     });
@@ -703,12 +809,12 @@ pub fn processFile(ctx: ScanCtx) void {
     // Gather metadata "sections" (keyword + text) for the shared ComfyUI/A1111
     // parser. ComfyUI PNGs carry the workflow/prompt JSON in tEXt/iTXt chunks;
     // other formats (notably ComfyUI WebP) carry the same JSON in EXIF.
-    var sections: std.ArrayListUnmanaged(comfy_mod.ComfyParser.RawSection) = .empty;
+    var sections: std.ArrayList(comfy_mod.ComfyParser.RawSection) = .empty;
     if (std.ascii.endsWithIgnoreCase(ctx.path, ".png")) {
         var png_parser = png_mod.PngParser.init(aa, ctx.io) catch return;
         defer png_parser.deinit();
         png_parser.parseBuffer(buffer) catch |err| {
-            log.warn("parse failed {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+            log.warn("parse failed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
             image.mtime = current_mtime;
             ctx.db.saveImage(&image) catch {};
             _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
@@ -748,7 +854,7 @@ pub fn processFile(ctx: ScanCtx) void {
     const maybe_result: ?comfy_mod.ParseResult = parser.parseImageMetadata(sections.items) catch null;
 
     var result = maybe_result orelse {
-        log.debug("no metadata: {s}", .{std.fs.path.basename(ctx.path)});
+        log.debug("no metadata: {s}", .{std.Io.Dir.path.basename(ctx.path)});
         // Persist mtime so this file is skipped on future scans.
         image.mtime = current_mtime;
         ctx.db.saveImage(&image) catch {};
@@ -772,7 +878,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     if (ctx.thumbnails_in_db) {
         image.generate_thumbnail(ctx.io, ctx.allocator, ctx.path) catch |err| {
-            log.warn("thumbnail {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+            log.warn("thumbnail {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         };
     }
 
@@ -798,7 +904,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     // DB write.
     ctx.db.saveImage(&image) catch |err| {
-        log.warn("save {s}: {}", .{ std.fs.path.basename(ctx.path), err });
+        log.warn("save {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         return;
     };
 
@@ -811,14 +917,14 @@ pub fn processFile(ctx: ScanCtx) void {
                     if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
                     else null,
                 .image_path_z = if (ctx.image_embeddings)
-                    ctx.allocator.dupeZ(u8, ctx.path) catch null
+                    ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch null
                     else null,
                 .allocator    = ctx.allocator,
             });
         }
         if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
         else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
-        log.debug("processed {s}", .{std.fs.path.basename(ctx.path)});
+        log.debug("processed {s}", .{std.Io.Dir.path.basename(ctx.path)});
         return;
     }
 
@@ -838,5 +944,5 @@ pub fn processFile(ctx: ScanCtx) void {
     // which otherwise only got the pre-parse push and showed stale data until a
     // second reparse.
     if (ctx.notifier) |n| n.push(ctx.io, image.id, ctx.path, current_mtime);
-    log.debug("processed {s}", .{std.fs.path.basename(ctx.path)});
+    log.debug("processed {s}", .{std.Io.Dir.path.basename(ctx.path)});
 }

@@ -33,7 +33,7 @@ fn walkDirectory(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8,
 
     var dir_iter = dir.iterate();
     while (try dir_iter.next(io)) |entry| {
-        const full_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
+        const full_path = try std.Io.Dir.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
         defer allocator.free(full_path);
 
         if (entry.kind == .directory) {

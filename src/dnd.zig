@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const SDLBackend = @import("backend");
 
-const platform = switch (builtin.os.tag) {
+const platform = switch (builtin.target.os.tag) {
     .linux   => @import("dnd_linux.zig"),
 
     // ── Windows ──────────────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ const platform = switch (builtin.os.tag) {
                 defer for (path_bufs[0..n]) |b| self.allocator.free(b);
 
                 for (0..n) |i| {
-                    path_bufs[i] = self.allocator.dupeZ(u8, items[i].path) catch return;
+                    path_bufs[i] = self.allocator.dupeSentinel(u8, items[i].path, 0) catch return;
                     path_ptrs[i] = path_bufs[i].ptr;
                 }
 

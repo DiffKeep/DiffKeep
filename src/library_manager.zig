@@ -3,7 +3,7 @@ const db_mod = @import("db.zig");
 const scan_mod = @import("scan.zig");
 const notifier_mod = @import("notifier.zig");
 const fs_watch_mod = @import("fs_watch.zig");
-const onnx_mod = @import("onnx_embedder.zig");
+const embedder_mod = @import("embedder.zig");
 const log = std.log.scoped(.library_manager);
 
 const ScanRequest = struct {
@@ -32,14 +32,14 @@ pub const LibraryManager = struct {
     wakeup_fn: ?*const fn () void = null,
     /// Image ids removed by the watcher (file deleted on disk).  Drained by frame()
     /// to drop them from the grid and viewers incrementally — no full reload.
-    removed_ids: std.ArrayListUnmanaged(u64) = .empty,
+    removed_ids: std.ArrayList(u64) = .empty,
     removed_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Embedding progress counters — updated by the scan embed consumer.
     embed_done:  std.atomic.Value(u32) = .init(0),
     embed_total: std.atomic.Value(u32) = .init(0),
     /// Separate io group for single-file processing tasks spawned by the watcher.
     file_group: std.Io.Group,
-    embedder: ?*onnx_mod.OnnxEmbedder = null,  // borrowed from dk.g_embedder, not owned
+    embedder: ?*embedder_mod.Embedder = null,  // borrowed from dk.g_embedder, not owned
 
     pub fn init(allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, prompt_embeddings: bool, image_embeddings: bool, notifier: ?*notifier_mod.ImageNotifier, watcher: ?*fs_watch_mod.FsWatcher) LibraryManager {
         return .{
@@ -75,7 +75,7 @@ pub const LibraryManager = struct {
 
     /// Move all watcher-removed image ids into `out` (owned by `self.allocator`).
     /// Main-thread only; called once per frame.
-    pub fn drainRemovedIds(self: *LibraryManager, io: std.Io, out: *std.ArrayListUnmanaged(u64)) void {
+    pub fn drainRemovedIds(self: *LibraryManager, io: std.Io, out: *std.ArrayList(u64)) void {
         self.removed_mutex.lockUncancelable(io);
         defer self.removed_mutex.unlock(io);
         if (self.removed_ids.items.len == 0) return;
@@ -95,7 +95,7 @@ pub const LibraryManager = struct {
     ) void {
         if (deleted) {
             const removed_id = self.db.deleteImageByPath(library_id, path) catch |err| blk: {
-                log.warn("delete {s}: {}", .{ std.fs.path.basename(path), err });
+                log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(path), err });
                 break :blk null;
             };
             self.allocator.free(path);
@@ -119,11 +119,21 @@ pub const LibraryManager = struct {
         };
     }
 
+    /// Queue a full scan of one library, to reconcile changes the watcher can
+    /// only report in the aggregate (a directory moved into, out of, or within
+    /// the tree).  `path` is heap-allocated and owned by this call.
+    pub fn rescanLibrary(self: *LibraryManager, io: std.Io, library_id: u64, path: []const u8) void {
+        defer self.allocator.free(path);
+        log.info("rescanning library {} ({s})", .{ library_id, path });
+        self.enqueue(io, library_id, path) catch |err|
+            log.warn("queue rescan of {s}: {}", .{ std.Io.Dir.path.basename(path), err });
+    }
+
     /// Force re-parse of a single image: resets its mtime in the DB (so the
     /// scanner treats it as changed) then dispatches a background file-event task.
     pub fn reparseImage(self: *LibraryManager, io: std.Io, id: u64, library_id: u64, path: []const u8) void {
         self.db.resetImageMtimeById(id) catch |err|
-            log.warn("resetImageMtime {s}: {}", .{ std.fs.path.basename(path), err });
+            log.warn("resetImageMtime {s}: {}", .{ std.Io.Dir.path.basename(path), err });
         const path_owned = self.allocator.dupe(u8, path) catch return;
         self.processFileEvent(io, library_id, path_owned, false);
     }
@@ -264,7 +274,7 @@ fn drainQueue(manager: *LibraryManager, io: std.Io) void {
         defer scanner.deinit();
         scanner.embedder = manager.embedder;
         _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, &manager.embed_done, &manager.embed_total, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
-            log.err("scan {s}: {}", .{ std.fs.path.basename(req.library_path), err });
+            log.err("scan {s}: {}", .{ std.Io.Dir.path.basename(req.library_path), err });
         };
     }
 }

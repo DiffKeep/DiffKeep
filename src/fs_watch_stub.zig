@@ -4,6 +4,9 @@ pub const DirtyEvent = struct {
     library_id: u64,
     path: []u8,
     deleted: bool,
+    kind: Kind = .file,
+
+    pub const Kind = enum { file, rescan_library };
 };
 
 pub const FsWatcher = struct {

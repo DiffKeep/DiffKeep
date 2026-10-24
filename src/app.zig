@@ -11,7 +11,7 @@ const config_mod = @import("config.zig");
 const library_manager_mod = @import("library_manager.zig");
 const fs_watch_mod = @import("fs_watch.zig");
 const image_grid_mod = @import("image_grid.zig");
-const onnx_mod = @import("onnx_embedder.zig");
+const embedder_mod = @import("embedder.zig");
 const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 const detail_panel_mod = @import("detail_panel.zig");
@@ -28,7 +28,7 @@ const image_ops_mod = @import("image_ops.zig");
 const toolbar_mod = @import("toolbar.zig");
 const platform = @import("platform.zig");
 const platform_sdl = @import("platform_sdl.zig");
-const fonts = @import("fonts.zig");
+const style = @import("style.zig");
 const dk = @import("diffkeep.zig");
 
 // Path to the config file: set from --config/-c flag, otherwise resolved from known folders.
@@ -70,7 +70,7 @@ var g_settings: settings_modal_mod.SettingsModalState = .{};
 
 // Background embedder loader — init runs on a dedicated thread so the main thread never blocks.
 var g_embedder_thread: ?std.Thread = null;
-var g_embedder_task_result: ?onnx_mod.OnnxEmbedder = null;
+var g_embedder_task_result: ?embedder_mod.Embedder = null;
 var g_embedder_task_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 // Pending reload: set when startEmbedderLoad is called while a thread is already
 // in flight. Holds the args (incl. heap-allocated model dirs) for the next load.
@@ -155,7 +155,7 @@ fn appStart() dvui.App.StartOptions {
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
                 if (it.next()) |val| {
-                    g_config = std.fs.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch null;
+                    g_config = std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch null;
                 }
             }
         }
@@ -187,7 +187,7 @@ fn appInit(win: *dvui.Window) !void {
         if (g_config == null) {
             if (try known_folders.getPath(init.io, init.gpa, init.environ_map, .local_configuration)) |config_dir| {
                 defer init.gpa.free(config_dir);
-                g_config = try std.fs.path.join(init.gpa, &.{ config_dir, "DiffKeep", "DiffKeep.cfg"});
+                g_config = try std.Io.Dir.path.join(init.gpa, &.{ config_dir, "DiffKeep", "DiffKeep.cfg"});
             }
         }
 
@@ -212,13 +212,13 @@ fn appInit(win: *dvui.Window) !void {
                 var data_dir = try std.Io.Dir.openDirAbsolute(init.io, data_base, .{});
                 defer data_dir.close(init.io);
                 try data_dir.createDirPath(init.io, "DiffKeep");
-                break :blk try std.fs.path.join(init.gpa, &.{ data_base, "DiffKeep", "diffkeep.db" });
+                break :blk try std.Io.Dir.path.join(init.gpa, &.{ data_base, "DiffKeep", "diffkeep.db" });
             }
             break :blk null;
         };
         if (db_path) |p| {
             defer init.gpa.free(p);
-            if (std.fs.path.dirname(p)) |dir| {
+            if (std.Io.Dir.path.dirname(p)) |dir| {
                 g_data_dir = try init.gpa.dupe(u8, dir);
             }
             dk.g_db = try db_mod.VectorDb.init(init.gpa, init.io, p);
@@ -241,7 +241,7 @@ fn appInit(win: *dvui.Window) !void {
                     init.gpa.free(expired);
                 }
                 for (expired) |trash_name| {
-                    const trash_path = std.fs.path.join(
+                    const trash_path = std.Io.Dir.path.join(
                         init.gpa, &.{ data_dir, "trash", trash_name },
                     ) catch continue;
                     defer init.gpa.free(trash_path);
@@ -369,13 +369,11 @@ fn appDeinit() void {
         }
     }
     g_embedder_pending = null;
+    image_ops_mod.bulkJoin();
     if (dk.g_embedder) |*emb| emb.deinit();
     if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
-    if (dk.g_db) |*database| {
-        database.deinit();
-        database.pool.deinit();
-    }
+    if (dk.g_db) |*database| database.deinit();
     if (dvui.App.main_init) |init| {
         g_detail.deinit(init.gpa);
         g_sidebar.deinit(init.gpa);
@@ -466,18 +464,18 @@ fn frame() !dvui.App.Result {
         grid.update();
         // Drop images removed by the filesystem watcher from the grid and any open
         // viewers incrementally — no full reload, so scroll/focus are preserved.
-        if (dk.g_library_manager) |*mgr| {
-            if (dvui.App.main_init) |init| {
-                var removed: std.ArrayListUnmanaged(u64) = .empty;
-                defer removed.deinit(init.gpa);
-                mgr.drainRemovedIds(init.io, &removed);
-                if (removed.items.len > 0) {
-                    var ids = std.AutoHashMap(u64, void).init(init.gpa);
-                    defer ids.deinit();
-                    for (removed.items) |id| ids.put(id, {}) catch {};
-                    image_ops_mod.removeFromGrid(grid, &ids);
-                    g_viewer_manager.removeImages(&ids);
-                }
+        // Same for images the thumbnail loader found deleted from disk.
+        if (dvui.App.main_init) |init| {
+            var removed: std.ArrayList(u64) = .empty;
+            defer removed.deinit(init.gpa);
+            if (dk.g_library_manager) |*mgr| mgr.drainRemovedIds(init.io, &removed);
+            grid.drainMissingIds(init.gpa, &removed);
+            if (removed.items.len > 0) {
+                var ids = std.AutoHashMap(u64, void).init(init.gpa);
+                defer ids.deinit();
+                for (removed.items) |id| ids.put(id, {}) catch {};
+                image_ops_mod.removeFromGrid(grid, &ids);
+                g_viewer_manager.removeImages(&ids);
             }
         }
         if (grid.images.items.len != prev_len) {
@@ -560,7 +558,7 @@ fn frame() !dvui.App.Result {
                 if (dk.g_db) |*db| {
                     if (db.getPositivePromptText(init.gpa, grid.copy_prompt_id) catch null) |prompt| {
                         defer init.gpa.free(prompt);
-                        if (init.gpa.dupeZ(u8, prompt)) |c_str| {
+                        if (init.gpa.dupeSentinel(u8, prompt, 0)) |c_str| {
                             defer init.gpa.free(c_str);
                             _ = SDLBackend.c.SDL_SetClipboardText(c_str.ptr);
                         } else |_| {}
@@ -690,7 +688,7 @@ fn frame() !dvui.App.Result {
                 for (new_events.items) |ev| {
                     var dup = false;
                     for (g_pending_file_events.items) |*existing| {
-                        if (std.mem.eql(u8, existing.path, ev.path)) {
+                        if (existing.kind == ev.kind and std.mem.eql(u8, existing.path, ev.path)) {
                             existing.deleted = ev.deleted;
                             init.gpa.free(ev.path);
                             dup = true;
@@ -710,9 +708,10 @@ fn frame() !dvui.App.Result {
             if (now_ns >= g_rescan_deadline_ns) {
                 g_rescan_deadline_ns = 0;
                 if (dk.g_library_manager) |*mgr| {
-                    for (g_pending_file_events.items) |ev| {
-                        mgr.processFileEvent(init.io, ev.library_id, ev.path, ev.deleted);
-                    }
+                    for (g_pending_file_events.items) |ev| switch (ev.kind) {
+                        .file => mgr.processFileEvent(init.io, ev.library_id, ev.path, ev.deleted),
+                        .rescan_library => mgr.rescanLibrary(init.io, ev.library_id, ev.path),
+                    };
                 } else {
                     for (g_pending_file_events.items) |ev| init.gpa.free(ev.path);
                 }
@@ -725,7 +724,13 @@ fn frame() !dvui.App.Result {
     }
 
     // ── Main column ──────────────────────────────────────────────────────
-    var col = dvui.box(@src(), .{}, .{ .expand = .both });
+    // The app ground. Every band below paints its own surface on top; this is
+    // what shows through the gaps and behind the grid.
+    var col = dvui.box(@src(), .{}, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = .{ .color = style.C.canvas },
+    });
     defer col.deinit();
 
     const render_ctx: toolbar_mod.RenderCtx = .{
@@ -772,6 +777,11 @@ fn frame() !dvui.App.Result {
                 startEmbedderLoad(init.io, init.gpa, &dk.g_cfg);
             }
         }
+        // Persist config as soon as the settings screen closes
+        if (dvui.App.main_init) |init| {
+            if (g_config) |cfg_path| config_mod.save(dk.g_cfg, init.io, cfg_path) catch |err|
+                log.warn("config save on settings close failed: {}", .{err});
+        }
     }
 
     // ── Delete confirmation modal ─────────────────────────────────────────────
@@ -803,12 +813,7 @@ fn frame() !dvui.App.Result {
 }
 
 fn initWindowFontsAndTheme() !void {
-    try fonts.register();
-    var theme = dvui.themeGet();
-    theme.font_body = theme.font_body.withFamily("NotoSansCJK");
-    theme.font_title = theme.font_title.withFamily("NotoSansCJKBold");
-    theme.font_mono = theme.font_mono.withFamily("NotoSansCJK");
-    dvui.themeSet(theme);
+    style.install();
 }
 
 var g_viewer_manager: viewer_manager_mod.ViewerManager = .{};
@@ -887,7 +892,7 @@ fn performViewerDeleteEntry(
     // deleted permanently, never re-trashed.
     if (force or entry.trash_name != null or !dk.g_cfg.trash_enabled) {
         const file_path: []const u8 = if (entry.trash_name) |tn|
-            std.fs.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
+            std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
         else
             entry.path;
         defer if (entry.trash_name != null) allocator.free(file_path);
@@ -904,10 +909,10 @@ fn performViewerDeleteEntry(
             if (f.length(io)) |len| file_size = @intCast(len) else |_| {}
             f.close(io);
         } else |_| {}
-        const basename = std.fs.path.basename(entry.path);
+        const basename = std.Io.Dir.path.basename(entry.path);
         var name_buf: [768]u8 = undefined;
-        const trash_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch return;
-        const dst = std.fs.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch return;
+        const trash_name = std.mem.print(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch return;
+        const dst = std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch return;
         defer allocator.free(dst);
         image_ops_mod.moveFile(io, allocator, entry.path, dst) catch |err| {
             log.warn("trash {s}: {}", .{ entry.filename, err });
@@ -960,15 +965,15 @@ const EmbedderLoadArgs = struct {
     gpa: std.mem.Allocator,
     text_dir: ?[]const u8,   // heap-allocated, freed by the thread
     visual_dir: ?[]const u8, // heap-allocated, freed by the thread
-    use_gpu: bool,
-    gpu_device_id: u32,
+    gpu_backend: embedder_mod.GpuBackend,
+    threshold: usize,
 };
 
 fn embedderLoadThread(args: EmbedderLoadArgs) void {
     defer if (args.text_dir) |p| args.gpa.free(p);
     defer if (args.visual_dir) |p| args.gpa.free(p);
-    g_embedder_task_result = onnx_mod.OnnxEmbedder.init(
-        args.io, args.gpa, args.text_dir, args.visual_dir, args.use_gpu, args.gpu_device_id,
+    g_embedder_task_result = embedder_mod.Embedder.init(
+        args.io, args.gpa, args.text_dir, args.visual_dir, args.gpu_backend, args.threshold,
     ) catch |err| blk: {
         log.warn("embedder init failed: {}", .{err});
         break :blk null;
@@ -993,8 +998,8 @@ fn startEmbedderLoad(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.
             .gpa = gpa,
             .text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null,
             .visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null,
-            .use_gpu = cfg.use_gpu,
-            .gpu_device_id = cfg.gpu_device_id,
+            .gpu_backend = cfg.embed_gpu_backend,
+            .threshold = cfg.embed_gpu_threshold,
         };
         return;
     }
@@ -1005,8 +1010,8 @@ fn startEmbedderLoad(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.
         .gpa = gpa,
         .text_dir = if (cfg.text_model_dir) |d| gpa.dupe(u8, d) catch null else null,
         .visual_dir = if (cfg.visual_model_dir) |d| gpa.dupe(u8, d) catch null else null,
-        .use_gpu = cfg.use_gpu,
-        .gpu_device_id = cfg.gpu_device_id,
+        .gpu_backend = cfg.embed_gpu_backend,
+        .threshold = cfg.embed_gpu_threshold,
     };
     g_embedder_thread = std.Thread.spawn(.{}, embedderLoadThread, .{args}) catch |err| {
         log.warn("embedder thread spawn failed: {}", .{err});
@@ -1028,7 +1033,7 @@ fn pollEmbedderLoad() void {
     if (dk.g_embedder) |*old| old.deinit();
     dk.g_embedder = g_embedder_task_result;
     g_embedder_task_result = null;
-    const emb_ptr: ?*onnx_mod.OnnxEmbedder = if (dk.g_embedder) |*e| e else null;
+    const emb_ptr: ?*embedder_mod.Embedder = if (dk.g_embedder) |*e| e else null;
     g_search.embedder = emb_ptr;
     if (dk.g_library_manager) |*mgr| mgr.embedder = emb_ptr;
     // If a reload was queued while this load was in flight, kick it off now.
@@ -1074,7 +1079,7 @@ fn captureMainWindowState(back: *SDLBackend) void {
 /// threadpool isn't serialised on a single malloc lock during scans. Linux/glibc
 /// only (mallopt is a no-op or absent elsewhere); must run before threads spawn.
 fn tuneAllocator() void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const glibc = struct {
         extern "c" fn mallopt(param: c_int, value: c_int) c_int;
     };
@@ -1085,7 +1090,7 @@ fn tuneAllocator() void {
 /// buffers (full-image decode + thumbnail generation) that glibc otherwise keeps
 /// in its arenas; calling this once a scan finishes hands that slack back.
 fn trimMemory() void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const glibc = struct {
         extern "c" fn malloc_trim(pad: usize) c_int;
     };
@@ -1094,8 +1099,6 @@ fn trimMemory() void {
 
 /// Tracks the scan-active edge so trimMemory() runs once when a scan completes.
 var g_was_scanning: bool = false;
-
-const bold = dvui.Font.find(.{ .family = "NotoSansCJKBold" });
 
 /// Confirmation state for the destructive bulk actions (duplicates / trash banner).
 const PendingBulk = enum { none, dedupe, empty_trash };
@@ -1113,7 +1116,7 @@ fn renderBulkConfirm() void {
     defer float.deinit();
     float.autoSize();
 
-    var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+    var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(18) });
     defer content.deinit();
 
     const title, const body, const confirm_label = switch (g_pending_bulk) {
@@ -1122,14 +1125,16 @@ fn renderBulkConfirm() void {
         .none => unreachable,
     };
 
-    dvui.label(@src(), "{s}", .{title}, .{ .font = bold, .margin = .{ .h = 8 } });
+    style.modalTitle(@src(), title);
     {
         // "<count> <count-free i18n body>" — fmt must be comptime, so the count
         // and the translatable text are rendered as two labels on one line.
-        var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 12 } });
+        var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 14 } });
         defer line.deinit();
-        dvui.label(@src(), "{d} ", .{g_pending_bulk_count}, .{ .font = bold, .gravity_y = 0.5 });
-        dvui.label(@src(), "{s}", .{body}, .{ .gravity_y = 0.5 });
+        dvui.label(@src(), "{d} ", .{g_pending_bulk_count}, .{
+            .font = style.F.mono_val, .color_text = .{ .color = style.C.text_hi }, .gravity_y = 0.5,
+        });
+        dvui.label(@src(), "{s}", .{body}, .{ .color_text = .{ .color = style.C.text_dim }, .gravity_y = 0.5 });
     }
 
     var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
@@ -1137,7 +1142,7 @@ fn renderBulkConfirm() void {
     if (dvui.button(@src(), i18n.t(.action_cancel), .{}, .{ .margin = .all(4) })) {
         g_pending_bulk = .none;
     }
-    if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4) })) {
+    if (dvui.button(@src(), confirm_label, .{}, .{ .margin = .all(4), .style = .err })) {
         switch (g_pending_bulk) {
             .dedupe => image_ops_mod.startRemoveRedundantDuplicates(init.io),
             .empty_trash => image_ops_mod.startEmptyTrash(init.io),
@@ -1155,12 +1160,13 @@ pub fn main(init: std.process.Init) !void {
     const opts = appStart();
     var back = try SDLBackend.initWindow(.{
         .io = init.io,
-        .allocator = init.gpa,
         .size = opts.size,
         .min_size = opts.min_size,
         .vsync = opts.vsync,
         .title = opts.title,
         .environ_map = init.environ_map,
+        // Geometry is persisted in our own config (window_state.zig).
+        .persist_window_geometry = false,
     });
     defer back.deinit();
 
@@ -1193,8 +1199,9 @@ pub fn main(init: std.process.Init) !void {
                 (e.evt == .app and e.evt.app.action == .quit)) res = .close;
         }
         captureMainWindowState(&back);
-        var end_micros: ?u32 = try win.end(.{});
-        try back.setCursor(win.cursorRequested());
+        // Backend is managed by hand below: the DnD cursor overrides dvui's.
+        var end_micros: ?u32 = try win.end(.{ .manage_backend = false });
+        back.setCursor(win.cursorRequested());
         if (g_dnd) |*dnd| {
             if (dnd.isDragging()) {
                 const thumb_cursor = dnd.getSdlCursor();
@@ -1211,8 +1218,8 @@ pub fn main(init: std.process.Init) !void {
                 g_dnd_drag_cursor = null;
             }
         }
-        try back.textInputRect(win.textInputRequested());
-        try back.renderPresent();
+        back.textInputRect(win.textInputRequested());
+        back.renderPresent();
         if (res == .close) break :main_loop;
 
         // ── Viewer windows ────────────────────────────────────────────────────
@@ -1278,8 +1285,8 @@ pub fn main(init: std.process.Init) !void {
                 if (!e.handled and e.evt == .window and e.evt.window.action == .close)
                     close = true;
             }
-            const vw_end: ?u32 = try vw.win.end(.{});
-            try vw.back.setCursor(vw.win.cursorRequested());
+            const vw_end: ?u32 = try vw.win.end(.{ .manage_backend = false });
+            vw.back.setCursor(vw.win.cursorRequested());
             if (vw.dnd) |*d| {
                 if (d.isDragging()) {
                     if (d.getSdlCursor()) |thumb_cursor| {
@@ -1295,7 +1302,7 @@ pub fn main(init: std.process.Init) !void {
                     vw.dnd_drag_cursor = null;
                 }
             }
-            try vw.back.renderPresent();
+            vw.back.renderPresent();
 
             // Reveal the window only after its first frame has been drawn and its
             // saved geometry applied (in viewer_manager.open, while hidden). This

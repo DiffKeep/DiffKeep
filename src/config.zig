@@ -13,8 +13,14 @@ pub const WindowState = struct {
     y: ?i32 = null,
 };
 
+/// Which GPU backend the embedder prefers for batched work. Per-call routing
+/// falls back to CPU for small batches (below `embed_gpu_threshold`) and entirely
+/// when the device/driver is unavailable at init (see embedder.zig).
+pub const GpuBackend = enum { none, vulkan, cuda };
+
 pub const Config = struct {
-    /// Override for the database directory. Falls back to the XDG data dir.
+    /// Override for the database FILE path (its directory becomes the data dir,
+    /// holding trash/ and models/). Falls back to <XDG data dir>/DiffKeep/diffkeep.db.
     data_path: ?[]const u8 = null,
 
     // Remembered window geometry, persisted across sessions.
@@ -37,19 +43,16 @@ pub const Config = struct {
     prompt_embeddings: bool = false,
     image_embeddings: bool = false,
     trash_enabled: bool = true,
-    text_model_dir: ?[]const u8 = null,    // path to snowflake-arctic-embed-m-v2.0 dir
-    visual_model_dir: ?[]const u8 = null,  // path to ViT-B-16-SigLIP2__webli dir
+    text_model_dir: ?[]const u8 = null,    // path to embeddinggemma-300m dir
+    visual_model_dir: ?[]const u8 = null,  // path to ViT-B-16-SigLIP2 timm dir (open_clip safetensors)
     // Minimum cosine similarity for vector search hits; anything below is
     // dropped instead of padding the grid with the irrelevant KNN tail.
-    // Ranges differ per embedding space; defaults calibrated on the labeled
-    // eval corpora (see search_quality_corpus.zig / test_onnx_search.zig):
-    // Snowflake relevant hits sit ≳0.17, irrelevant mass ≈0.11; SigLIP2
-    // relevant ≳0.035, irrelevant ≈0.04. Both chosen to cut the far tail
-    // without dropping real matches.
-    semantic_min_similarity: f32 = 0.15,
+    semantic_min_similarity: f32 = 0.25,
     visual_min_similarity: f32 = 0.03,
-    use_gpu: bool = false,
-    gpu_device_id: u32 = 0,
+    // Embedding compute backend for batched work, and the batch size at/above
+    // which a call uses the GPU.
+    embed_gpu_backend: GpuBackend = .cuda,
+    embed_gpu_threshold: usize = 4,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.data_path) |p| allocator.free(p);
@@ -153,7 +156,7 @@ test "config: unknown keys are ignored" {
 
 /// Writes the config to `path`, creating parent directories as needed.
 pub fn save(config: Config, io: std.Io, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| {
+    if (std.Io.Dir.path.dirname(path)) |dir| {
         try std.Io.Dir.cwd().createDirPath(io, dir);
     }
     var buf: [16384]u8 = undefined;

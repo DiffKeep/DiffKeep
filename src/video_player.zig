@@ -55,7 +55,7 @@ pub const VideoPlayer = struct {
 
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     not_full: std.Io.Condition = std.Io.Condition.init,
-    queue: [capacity]?video.DecodedFrame = .{null} ** capacity,
+    queue: [capacity]?video.DecodedFrame = @splat(null),
     head: usize = 0,
     count: usize = 0,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
