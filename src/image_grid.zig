@@ -47,7 +47,7 @@ pub const ImageEntry = struct {
     trash_name: ?[]const u8 = null, // heap-allocated, only set in trash view
     favorite: bool = false,
     // Playback classification. Defaults to a plain (static) image; set from the
-    // DB via markMediaTypes. Distinguishes animated webp/gif from static ones,
+    // DB via applyMediaTypes. Distinguishes animated webp/gif from static ones,
     // which extension alone cannot.
     media_type: db_mod.VectorDb.MediaType = .image,
 };
@@ -144,6 +144,152 @@ const CellPlayer = struct {
     last_touched: u64 = 0, // player_frame when this cell was last visible
 };
 
+// ── View loading ──────────────────────────────────────────────────────────────
+
+/// What a grid view shows. Borrows its strings; `ViewQuery.dupe` makes an owned
+/// copy for a background load.
+pub const ViewQuery = struct {
+    view_mode: ViewMode = .library,
+    search_mode: SearchMode = .fts,
+    /// Passed to the FTS query as-is (search.zig sanitizes before handing it in).
+    search_query: ?[]const u8 = null,
+    embeddings: QueryEmbeddings = .{},
+    semantic_min_similarity: f32 = 0.15,
+    visual_min_similarity: f32 = 0.03,
+    filter_library_id: ?u64 = null,
+    filter_folder_path: ?[]const u8 = null,
+    filters: []const db_mod.ActiveFilter = &.{},
+
+    pub fn dupe(q: ViewQuery, a: std.mem.Allocator) !ViewQuery {
+        var out: ViewQuery = q;
+        out.search_query = null;
+        out.embeddings = .{};
+        out.filter_folder_path = null;
+        out.filters = &.{};
+        errdefer out.deinit(a);
+        if (q.search_query) |t| out.search_query = try a.dupe(u8, t);
+        if (q.embeddings.prompt) |e| out.embeddings.prompt = try a.dupe(f32, e);
+        if (q.embeddings.visual) |e| out.embeddings.visual = try a.dupe(f32, e);
+        if (q.filter_folder_path) |f| out.filter_folder_path = try a.dupe(u8, f);
+        const filters = try a.alloc(db_mod.ActiveFilter, q.filters.len);
+        var n: usize = 0;
+        errdefer {
+            for (filters[0..n]) |f| a.free(f.value);
+            a.free(filters);
+        }
+        for (q.filters) |f| {
+            filters[n] = .{ .column = f.column, .value = try a.dupe(u8, f.value) };
+            n += 1;
+        }
+        out.filters = filters;
+        return out;
+    }
+
+    /// Frees a copy made by `dupe`.
+    pub fn deinit(q: *ViewQuery, a: std.mem.Allocator) void {
+        if (q.search_query) |t| a.free(t);
+        q.embeddings.free(a);
+        if (q.filter_folder_path) |f| a.free(f);
+        for (q.filters) |f| a.free(f.value);
+        a.free(q.filters);
+        q.* = .{};
+    }
+};
+
+/// A loaded view: its entries plus the favorite ids and playable media types
+/// used to flag them. Built off the main thread; the grid takes ownership.
+pub const LoadedView = struct {
+    entries: []db_mod.VectorDb.GridEntry,
+    favorite_ids: []u64,
+    media: []db_mod.VectorDb.MediaTypeRow,
+
+    pub fn deinit(v: LoadedView, a: std.mem.Allocator) void {
+        for (v.entries) |e| {
+            a.free(e.path);
+            if (e.trash_name) |t| a.free(t);
+        }
+        a.free(v.entries);
+        a.free(v.favorite_ids);
+        a.free(v.media);
+    }
+};
+
+/// Run a view's queries. Does DB IO: call it off the main thread.
+pub fn loadView(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) !LoadedView {
+    const entries = try queryEntries(db, a, q);
+    errdefer LoadedView.deinit(.{ .entries = entries, .favorite_ids = &.{}, .media = &.{} }, a);
+    const favorite_ids = try db.listFavoriteIds(a);
+    errdefer a.free(favorite_ids);
+    const media_rows = try db.listNonImageMediaTypes(a);
+    return .{ .entries = entries, .favorite_ids = favorite_ids, .media = media_rows };
+}
+
+fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_mod.VectorDb.GridEntry {
+    switch (q.view_mode) {
+        .trash => return db.listTrashImages(a),
+        .duplicates => return db.listDuplicateImages(a),
+        .favorites => return db.listFavorites(a),
+        .library => {},
+    }
+    // Vector search modes, only when the needed embedding is available.
+    // Combined degrades to a single-space search when only one encoder
+    // produced an embedding.
+    switch (q.search_mode) {
+        .semantic => if (q.embeddings.prompt) |e|
+            return db.searchByPromptEmbedding(a, e, 200, q.semantic_min_similarity),
+        .visual => if (q.embeddings.visual) |e|
+            return db.searchByImageEmbedding(a, e, 200, q.visual_min_similarity),
+        .combined => {
+            if (q.embeddings.prompt) |pe| {
+                if (q.embeddings.visual) |ve|
+                    return db.searchCombined(a, pe, ve, 200, q.semantic_min_similarity, q.visual_min_similarity);
+                return db.searchByPromptEmbedding(a, pe, 200, q.semantic_min_similarity);
+            }
+            if (q.embeddings.visual) |ve|
+                return db.searchByImageEmbedding(a, ve, 200, q.visual_min_similarity);
+        },
+        .fts => {},
+    }
+    const has_text = if (q.search_query) |t| t.len > 0 else false;
+    if (has_text or q.filters.len > 0) {
+        return db.listImagesFiltered(a, q.filter_library_id, q.filter_folder_path, if (has_text) q.search_query else null, q.filters);
+    }
+    if (q.filter_folder_path) |fp| {
+        const lib_id = q.filter_library_id orelse return db.listAllImages(a);
+        return db.listImagesInFolder(a, lib_id, fp);
+    }
+    if (q.filter_library_id) |lib_id| return db.listLibraryImages(a, lib_id);
+    return db.listAllImages(a);
+}
+
+const LoadCtx = struct {
+    grid: *GridState,
+    db: *db_mod.VectorDb,
+    query: ViewQuery, // owned
+    generation: u64,
+};
+
+fn loadTask(ctx: LoadCtx) void {
+    var q = ctx.query;
+    defer q.deinit(ctx.grid.allocator);
+    const g = ctx.grid;
+    if (g.load_gen.load(.acquire) != ctx.generation) return;
+    const loaded: ?LoadedView = loadView(ctx.db, g.allocator, q) catch |err| blk: {
+        log.warn("view load failed: {}", .{err});
+        break :blk null;
+    };
+    g.load_mutex.lockUncancelable(g.io);
+    defer g.load_mutex.unlock(g.io);
+    if (g.load_gen.load(.acquire) != ctx.generation) {
+        if (loaded) |v| v.deinit(g.allocator);
+        return;
+    }
+    if (g.load_result) |old| old.deinit(g.allocator);
+    g.load_result = loaded;
+    g.load_result_gen = ctx.generation;
+    if (g.wakeup_fn) |w| w();
+}
+
 // ── GridState ─────────────────────────────────────────────────────────────────
 
 pub const GridState = struct {
@@ -152,6 +298,19 @@ pub const GridState = struct {
 
     // Image list — main-thread only after startWorker()
     images: std.ArrayList(ImageEntry) = .empty,
+
+    // Background view loading (reloadImages). load_gen counts requests; a
+    // finished load is applied by update() only if it is still the latest.
+    load_group: std.Io.Group = .init,
+    load_gen: std.atomic.Value(u64) = .init(0),
+    load_mutex: std.Io.Mutex = .init,
+    load_result: ?LoadedView = null, // guarded by load_mutex
+    load_result_gen: u64 = 0, // guarded by load_mutex
+    applied_gen: u64 = 0, // main-thread
+    load_keep_scroll: bool = false, // main-thread
+    // Ids removed while a load was in flight; filtered out of its result so a
+    // just-deleted image can't come back. Main-thread.
+    load_dropped: std.AutoHashMap(u64, void),
 
     // Incoming images from scan threads — drained each frame in update()
     notifier: ImageNotifier = .{},
@@ -300,6 +459,7 @@ pub const GridState = struct {
             .queued = std.AutoHashMap(u64, void).init(allocator),
             .in_flight = std.AutoHashMap(u64, void).init(allocator),
             .load_failed = std.AutoHashMap(u64, void).init(allocator),
+            .load_dropped = std.AutoHashMap(u64, void).init(allocator),
             .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = try db.getConnection(),
@@ -310,19 +470,8 @@ pub const GridState = struct {
             .player_failed = std.AutoHashMap(u64, void).init(allocator),
         };
 
-        // Populate from DB synchronously so existing images appear immediately
-        const entries = try db.listAllImages(allocator);
-        defer allocator.free(entries);
-        try state.images.ensureTotalCapacity(allocator, entries.len);
-        for (entries) |e| {
-            state.images.appendAssumeCapacity(.{
-                .id = e.id,
-                .path = e.path,
-                .filename = std.Io.Dir.path.basename(e.path),
-                .mtime = e.mtime,
-            });
-        }
-
+        // The image list loads in the background: call reloadImages once the
+        // grid is at its final address (the load task points into it).
         const now_ns = std.Io.Clock.real.now(io).nanoseconds;
         state.last_eviction_s = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
         state.sort_seed = @truncate(@abs(now_ns));
@@ -348,6 +497,9 @@ pub const GridState = struct {
     }
 
     pub fn deinit(self: *GridState) void {
+        self.load_group.await(self.io) catch {};
+        if (self.load_result) |v| v.deinit(self.allocator);
+        self.load_dropped.deinit();
         self.stop.store(true, .release);
         self.queue_mutex.lockUncancelable(self.io);
         // Signal once per worker to wake all waiting threads
@@ -407,49 +559,92 @@ pub const GridState = struct {
         self.images.deinit(self.allocator);
     }
 
-    /// Replace the image list with pre-fetched entries from a background query task.
-    /// Takes ownership of all path strings in `entries`; the caller must free the
-    /// slice backing array itself (not the individual paths).
-    pub fn applySearchResults(self: *GridState, db: *db_mod.VectorDb, entries: []db_mod.VectorDb.GridEntry) void {
-        {
-            self.queue_mutex.lockUncancelable(self.io);
-            for (self.high_queue.items) |r| self.allocator.free(r.path);
-            for (self.low_queue.items) |r| self.allocator.free(r.path);
-            self.high_queue.clearRetainingCapacity();
-            self.low_queue.clearRetainingCapacity();
-            self.queued.clearRetainingCapacity();
-            self.queue_mutex.unlock(self.io);
-        }
-        for (self.images.items) |e| {
-            self.allocator.free(e.path);
-            if (e.trash_name) |tn| self.allocator.free(tn);
-        }
-        // Live cell players reference image ids; the list is about to change.
-        self.clearGridPlayers();
-        self.images.clearRetainingCapacity();
-        self.selection.clearRetainingCapacity();
-        self.focused_idx = null;
-        self.anchor_idx = null;
-        // Switching to a new view always starts at the top.
-        self.scroll_info.viewport.y = 0;
-
-        self.images.ensureTotalCapacity(self.allocator, entries.len) catch {};
-        for (entries) |e| {
-            self.images.appendAssumeCapacity(.{
-                .id = e.id,
-                .path = e.path,
-                .filename = std.Io.Dir.path.basename(e.path),
-                .mtime = e.mtime,
-            });
-        }
-        self.markFavorites(db);
-        self.markMediaTypes(db);
-        self.applySortOrder();
+    /// The query for the view the grid currently shows.
+    pub fn currentQuery(self: *const GridState) ViewQuery {
+        return .{
+            .view_mode = self.view_mode,
+            .search_mode = self.search_mode,
+            .search_query = self.search_query,
+            .embeddings = self.query_embeddings,
+            .semantic_min_similarity = self.semantic_min_similarity,
+            .visual_min_similarity = self.visual_min_similarity,
+            .filter_library_id = self.filter_library_id,
+            .filter_folder_path = self.filter_folder_path,
+            .filters = self.filters,
+        };
     }
 
-    /// Reload the image list from DB for the current view_mode.
-    /// Clears selection and resets navigation state.
+    pub const ReloadOptions = struct {
+        /// Keep the scroll position (an in-place refresh of the same view)
+        /// instead of starting at the top.
+        keep_scroll: bool = false,
+    };
+
+    /// Reload the image list for the current view in the background. The old
+    /// list stays on screen until update() swaps the result in; a newer
+    /// request supersedes an older one still loading.
     pub fn reloadImages(self: *GridState, db: *db_mod.VectorDb) !void {
+        return self.reloadImagesEx(db, .{});
+    }
+
+    pub fn reloadImagesEx(self: *GridState, db: *db_mod.VectorDb, opts: ReloadOptions) !void {
+        const query = try self.currentQuery().dupe(self.allocator);
+        const gen = self.load_gen.fetchAdd(1, .acq_rel) + 1;
+        self.load_keep_scroll = opts.keep_scroll;
+        self.load_group.concurrent(self.io, loadTask, .{LoadCtx{
+            .grid = self,
+            .db = db,
+            .query = query,
+            .generation = gen,
+        }}) catch |err| {
+            var q = query;
+            q.deinit(self.allocator);
+            return err;
+        };
+    }
+
+    /// True while a requested reload hasn't been applied yet.
+    pub fn reloadPending(self: *const GridState) bool {
+        return self.load_gen.load(.acquire) != self.applied_gen;
+    }
+
+    /// Wait for in-flight loads and apply the latest. For tests and tools: the
+    /// app lets update() apply loads as they finish.
+    pub fn awaitReload(self: *GridState) void {
+        self.load_group.await(self.io) catch {};
+        _ = self.applyReloadIfDone();
+    }
+
+    /// Record ids removed from the grid while a load is in flight.
+    pub fn noteRemoved(self: *GridState, id: u64) void {
+        if (self.reloadPending()) self.load_dropped.put(id, {}) catch {};
+    }
+
+    /// Main thread: swap in a finished load if it is the latest request.
+    fn applyReloadIfDone(self: *GridState) bool {
+        self.load_mutex.lockUncancelable(self.io);
+        const ready = self.load_result_gen == self.load_gen.load(.acquire) and self.load_result_gen != self.applied_gen;
+        const result = if (ready) self.load_result else null;
+        if (ready) {
+            self.load_result = null;
+            self.applied_gen = self.load_result_gen;
+        }
+        self.load_mutex.unlock(self.io);
+        if (!ready) return false;
+        // A failed load (null) keeps the current list.
+        if (result) |v| self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
+        self.load_dropped.clearRetainingCapacity();
+        return true;
+    }
+
+    /// Replace the image list with a loaded view. Takes ownership of `view`.
+    /// Clears selection and navigation state.
+    pub fn replaceImages(self: *GridState, view: LoadedView, opts: ReloadOptions) void {
+        defer {
+            self.allocator.free(view.entries);
+            self.allocator.free(view.favorite_ids);
+            self.allocator.free(view.media);
+        }
         // Clear queues before freeing images so workers don't access freed path pointers.
         {
             self.queue_mutex.lockUncancelable(self.io);
@@ -470,57 +665,16 @@ pub const GridState = struct {
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
         self.anchor_idx = null;
-        // Switching to a new view always starts at the top.
-        self.scroll_info.viewport.y = 0;
+        // Switching to a new view starts at the top.
+        if (!opts.keep_scroll) self.scroll_info.viewport.y = 0;
 
-        const entries = switch (self.view_mode) {
-            .library => blk: {
-                const has_text = if (self.search_query) |q| q.len > 0 else false;
-                // Vector search modes — only when the needed embedding is available.
-                // Combined degrades to a single-space search when only one
-                // encoder produced an embedding.
-                switch (self.search_mode) {
-                    .semantic => if (self.query_embeddings.prompt) |e|
-                        break :blk try db.searchByPromptEmbedding(self.allocator, e, 200, self.semantic_min_similarity),
-                    .visual => if (self.query_embeddings.visual) |e|
-                        break :blk try db.searchByImageEmbedding(self.allocator, e, 200, self.visual_min_similarity),
-                    .combined => {
-                        if (self.query_embeddings.prompt) |pe| {
-                            if (self.query_embeddings.visual) |ve|
-                                break :blk try db.searchCombined(self.allocator, pe, ve, 200, self.semantic_min_similarity, self.visual_min_similarity);
-                            break :blk try db.searchByPromptEmbedding(self.allocator, pe, 200, self.semantic_min_similarity);
-                        }
-                        if (self.query_embeddings.visual) |ve|
-                            break :blk try db.searchByImageEmbedding(self.allocator, ve, 200, self.visual_min_similarity);
-                    },
-                    .fts => {},
-                }
-                // FTS / filtered query
-                if (has_text or self.filters.len > 0) {
-                    break :blk try db.listImagesFiltered(
-                        self.allocator,
-                        self.filter_library_id,
-                        self.filter_folder_path,
-                        if (has_text) self.search_query else null,
-                        self.filters,
-                    );
-                }
-                if (self.filter_folder_path) |fp| {
-                    const lib_id = self.filter_library_id orelse break :blk try db.listAllImages(self.allocator);
-                    break :blk try db.listImagesInFolder(self.allocator, lib_id, fp);
-                } else if (self.filter_library_id) |lib_id| {
-                    break :blk try db.listLibraryImages(self.allocator, lib_id);
-                } else {
-                    break :blk try db.listAllImages(self.allocator);
-                }
-            },
-            .trash => try db.listTrashImages(self.allocator),
-            .duplicates => try db.listDuplicateImages(self.allocator),
-            .favorites => try db.listFavorites(self.allocator),
-        };
-        defer self.allocator.free(entries);
-        try self.images.ensureTotalCapacity(self.allocator, entries.len);
-        for (entries) |e| {
+        self.images.ensureTotalCapacity(self.allocator, view.entries.len) catch {};
+        for (view.entries) |e| {
+            if (self.load_dropped.contains(e.id) or self.images.items.len == self.images.capacity) {
+                self.allocator.free(e.path);
+                if (e.trash_name) |tn| self.allocator.free(tn);
+                continue;
+            }
             self.images.appendAssumeCapacity(.{
                 .id = e.id,
                 .path = e.path,
@@ -531,17 +685,14 @@ pub const GridState = struct {
                 .favorite = e.favorite,
             });
         }
-        self.markFavorites(db);
-        self.markMediaTypes(db);
+        self.applyFavorites(view.favorite_ids);
+        self.applyMediaTypes(view.media);
         self.applySortOrder();
     }
 
-    /// Mark which of the currently-loaded entries are favorites, in one query.
-    /// Keeps the per-entry `favorite` flag accurate without threading a column
-    /// through every grid query.
-    pub fn markFavorites(self: *GridState, db: *db_mod.VectorDb) void {
-        const fav_ids = db.listFavoriteIds(self.allocator) catch return;
-        defer self.allocator.free(fav_ids);
+    /// Flag which loaded entries are favorites. Keeps the per-entry flag
+    /// accurate without threading a column through every grid query.
+    pub fn applyFavorites(self: *GridState, fav_ids: []const u64) void {
         if (fav_ids.len == 0) {
             for (self.images.items) |*e| e.favorite = false;
             return;
@@ -553,13 +704,10 @@ pub const GridState = struct {
         for (self.images.items) |*e| e.favorite = set.contains(e.id);
     }
 
-    /// Mark the playback classification (animated / video) of loaded entries in
-    /// one query. Like markFavorites, this avoids threading a media_type column
-    /// through every grid query; the non-image set is small.
-    pub fn markMediaTypes(self: *GridState, db: *db_mod.VectorDb) void {
+    /// Set the playback classification (animated / video) of loaded entries
+    /// from the (small) list of non-image rows.
+    pub fn applyMediaTypes(self: *GridState, rows: []const db_mod.VectorDb.MediaTypeRow) void {
         for (self.images.items) |*e| e.media_type = .image;
-        const rows = db.listNonImageMediaTypes(self.allocator) catch return;
-        defer self.allocator.free(rows);
         if (rows.len == 0) return;
         var map = std.AutoHashMap(u64, db_mod.VectorDb.MediaType).init(self.allocator);
         defer map.deinit();
@@ -760,6 +908,9 @@ pub const GridState = struct {
         // Refresh set only reflects this frame's re-notifications; the detail
         // panel consults it later in the same frame.
         self.refreshed.clearRetainingCapacity();
+
+        // 0. Swap in a finished background view load.
+        _ = self.applyReloadIfDone();
 
         // 1. Drain new images from scan threads (library view only)
         if (self.view_mode == .library) {

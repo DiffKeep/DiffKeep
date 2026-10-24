@@ -20,6 +20,7 @@ pub const delete_dialog = @import("delete_dialog.zig");
 pub const search = @import("search.zig");
 pub const image_viewer = @import("image_viewer.zig");
 pub const image_grid = image_grid_mod;
+pub const image_ops = @import("image_ops.zig");
 
 pub const Config = config_mod.Config;
 pub const VectorDb = db_mod.VectorDb;

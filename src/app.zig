@@ -3,7 +3,8 @@ const builtin = @import("builtin");
 const dvui = @import("dvui");
 const known_folders = @import("known-folders");
 
-const build_options = @import("build_options");
+/// From git at build time (build.zig: tools/git_version.zig).
+const app_version = @embedFile("git_version");
 const icons = @import("icons");
 const i18n = @import("i18n.zig");
 const db_mod = @import("db.zig");
@@ -45,6 +46,9 @@ var g_rescan_deadline_ns: i96 = 0;
 var g_wakeup_event_type: u32 = 0;
 
 fn wakeupFrame() void {
+    // Background work can finish before the event type is registered at startup;
+    // the first frame picks its result up anyway.
+    if (g_wakeup_event_type == 0) return;
     var ev: SDLBackend.c.SDL_Event = std.mem.zeroes(SDLBackend.c.SDL_Event);
     ev.type = g_wakeup_event_type;
     _ = SDLBackend.c.SDL_PushEvent(&ev);
@@ -230,23 +234,11 @@ fn appInit(win: *dvui.Window) !void {
             defer dd.close(init.io);
             dd.createDirPath(init.io, "trash") catch {};
 
-            if (dk.g_db) |*db| {
+            if (dk.g_db != null) {
                 const now_s: i64 = @intCast(@divTrunc(
                     std.Io.Clock.real.now(init.io).nanoseconds, std.time.ns_per_s,
                 ));
-                const cutoff = now_s - 30 * 24 * 60 * 60;
-                const expired = db.purgeExpiredTrash(init.gpa, cutoff) catch &[_][]const u8{};
-                defer {
-                    for (expired) |n| init.gpa.free(n);
-                    init.gpa.free(expired);
-                }
-                for (expired) |trash_name| {
-                    const trash_path = std.Io.Dir.path.join(
-                        init.gpa, &.{ data_dir, "trash", trash_name },
-                    ) catch continue;
-                    defer init.gpa.free(trash_path);
-                    std.Io.Dir.cwd().deleteFile(init.io, trash_path) catch {};
-                }
+                image_ops_mod.startPurgeExpiredTrash(init.io, now_s - 30 * 24 * 60 * 60);
             }
         }
 
@@ -270,6 +262,8 @@ fn appInit(win: *dvui.Window) !void {
                 grid.semantic_min_similarity = dk.g_cfg.semantic_min_similarity;
                 grid.visual_min_similarity = dk.g_cfg.visual_min_similarity;
                 try grid.startWorker();
+                // The list loads in the background; the grid fills in when it lands.
+                try grid.reloadImages(db);
             }
 
             // Start the fs watcher before the library manager so it's ready to
@@ -335,7 +329,7 @@ fn appInit(win: *dvui.Window) !void {
     }
 
     std.log.info("DiffKeep {s} — config: {s}", .{
-        build_options.version,
+        app_version,
         g_config orelse "(none)",
     });
 
@@ -370,6 +364,7 @@ fn appDeinit() void {
     }
     g_embedder_pending = null;
     image_ops_mod.bulkJoin();
+    if (dvui.App.main_init) |init| image_ops_mod.fileOpsJoin(init.io);
     if (dk.g_embedder) |*emb| emb.deinit();
     if (dk.g_grid) |*grid| grid.deinit();
     vips_mod.deinit();
@@ -492,7 +487,7 @@ fn frame() !dvui.App.Result {
     if (dvui.App.main_init) |init| {
         if (dk.g_grid) |*grid| {
             if (dk.g_db) |*db| {
-                g_search.applyQueryIfDone(init.gpa, grid, db);
+                g_search.applyQueryIfDone(init.gpa, grid);
                 g_search.applyEmbedIfDone(init.gpa, init.io, grid, db);
             }
         }
@@ -547,6 +542,7 @@ fn frame() !dvui.App.Result {
         }
         // Surface completion of a background bulk op (reloads grid + counts).
         _ = image_ops_mod.bulkPoll(grid);
+        if (dvui.App.main_init) |init| _ = image_ops_mod.fileOpsPoll(init.io, init.gpa, grid);
         if (grid.open_viewer_requested) {
             grid.open_viewer_requested = false;
             g_viewer_manager.open(grid, grid.viewer_start_id, g_data_dir, if (dk.g_db) |*db| db else null, wakeupFrame, &dk.g_cfg);
@@ -764,7 +760,6 @@ fn frame() !dvui.App.Result {
     const settings_was_open = g_settings.open;
     try g_settings.render(&dk.g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
         if (dk.g_db) |*db| db else null,
-        if (dk.g_grid) |*g| g else null,
         wakeupFrame);
     if (settings_was_open and !g_settings.open) {
         g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
@@ -879,55 +874,13 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
 
 
 
-/// Perform trash/delete on a specific image entry owned by a viewer (not grid selection).
-fn performViewerDeleteEntry(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    entry: image_grid_mod.ImageEntry,
-    force: bool,
-) void {
-    const data_dir = g_data_dir orelse return;
-
+/// Trash or delete an image shown in a viewer (not the grid selection). Runs on
+/// the file-op worker; fileOpsPoll drops it from the grid and viewers when done.
+fn performViewerDeleteEntry(io: std.Io, entry: image_grid_mod.ImageEntry, force: bool) void {
     // A trashed entry (trash_name set) is already in the trash; it can only be
     // deleted permanently, never re-trashed.
-    if (force or entry.trash_name != null or !dk.g_cfg.trash_enabled) {
-        const file_path: []const u8 = if (entry.trash_name) |tn|
-            std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", tn }) catch return
-        else
-            entry.path;
-        defer if (entry.trash_name != null) allocator.free(file_path);
-        std.Io.Dir.cwd().deleteFile(io, file_path) catch |err|
-            log.warn("delete {s}: {}", .{ entry.filename, err });
-        if (dk.g_db) |*db| db.deleteImage(entry.id) catch |err|
-            log.warn("deleteImage {d}: {}", .{ entry.id, err });
-    } else {
-        const now_s: i64 = @intCast(@divTrunc(
-            std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s,
-        ));
-        var file_size: i64 = 0;
-        if (std.Io.Dir.cwd().openFile(io, entry.path, .{})) |f| {
-            if (f.length(io)) |len| file_size = @intCast(len) else |_| {}
-            f.close(io);
-        } else |_| {}
-        const basename = std.Io.Dir.path.basename(entry.path);
-        var name_buf: [768]u8 = undefined;
-        const trash_name = std.mem.print(&name_buf, "{d}_{s}", .{ entry.id, basename }) catch return;
-        const dst = std.Io.Dir.path.join(allocator, &.{ data_dir, "trash", trash_name }) catch return;
-        defer allocator.free(dst);
-        image_ops_mod.moveFile(io, allocator, entry.path, dst) catch |err| {
-            log.warn("trash {s}: {}", .{ entry.filename, err });
-            return;
-        };
-        if (dk.g_db) |*db| db.trashImage(entry.id, trash_name, file_size, now_s) catch |err|
-            log.warn("trashImage {d}: {}", .{ entry.id, err });
-    }
-
-    var ids = std.AutoHashMap(u64, void).init(allocator);
-    defer ids.deinit();
-    ids.put(entry.id, {}) catch {};
-    if (dk.g_grid) |*grid| image_ops_mod.removeFromGrid(grid, &ids);
-    g_viewer_manager.removeImages(&ids);
-    refreshCounts();
+    const permanent = force or entry.trash_name != null or !dk.g_cfg.trash_enabled;
+    image_ops_mod.performOnEntry(io, entry, if (permanent) .delete else .trash);
 }
 
 fn openViewerDeleteDialog(state: *image_viewer_mod.ViewerState, force: bool) void {
@@ -937,11 +890,11 @@ fn openViewerDeleteDialog(state: *image_viewer_mod.ViewerState, force: bool) voi
     const permanent = force or !dk.g_cfg.trash_enabled;
 
     if (!permanent and g_delete_dialog.skip_delete_confirm) {
-        performViewerDeleteEntry(init.io, init.gpa, img.*, force);
+        performViewerDeleteEntry(init.io, img.*, force);
         return;
     }
     if (permanent and g_delete_dialog.skip_permanent_delete_confirm) {
-        performViewerDeleteEntry(init.io, init.gpa, img.*, force);
+        performViewerDeleteEntry(init.io, img.*, force);
         return;
     }
 
@@ -1259,7 +1212,7 @@ pub fn main(init: std.process.Init) !void {
                     const iid = vw.state.delete_pending_id;
                     for (vw.state.images.items) |e| {
                         if (e.id == iid) {
-                            performViewerDeleteEntry(main_init.io, main_init.gpa, e, vw.state.delete_pending_permanent);
+                            performViewerDeleteEntry(main_init.io, e, vw.state.delete_pending_permanent);
                             break;
                         }
                     }

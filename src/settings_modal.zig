@@ -7,6 +7,7 @@ const image_grid_mod = @import("image_grid.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const search_mod = @import("search.zig");
+const image_ops = @import("image_ops.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 
@@ -219,7 +220,6 @@ pub const SettingsModalState = struct {
         trash_stats: *?db_mod.TrashStats,
         data_dir: ?[]const u8,
         db: ?*db_mod.VectorDb,
-        grid: ?*image_grid_mod.GridState,
         wakeup_fn: ?*const fn () void,
     ) !void {
         if (!self.open) return;
@@ -395,26 +395,9 @@ pub const SettingsModalState = struct {
                         // Emptying the trash deletes the files for good.
                         if (dvui.button(@src(), i18n.t(.settings_empty_trash), .{},
                             small_button.override(.{ .gravity_y = 0.5, .style = .err }))) {
-                            if (data_dir) |dd| {
-                                if (db) |d| {
-                                    if (dvui.App.main_init) |init| {
-                                        const names = d.purgeExpiredTrash(init.gpa, std.math.maxInt(i64)) catch &[_][]const u8{};
-                                        defer {
-                                            for (names) |n| init.gpa.free(n);
-                                            init.gpa.free(names);
-                                        }
-                                        for (names) |trash_name| {
-                                            const p = std.Io.Dir.path.join(init.gpa, &.{ dd, "trash", trash_name }) catch continue;
-                                            defer init.gpa.free(p);
-                                            std.Io.Dir.cwd().deleteFile(init.io, p) catch {};
-                                        }
-                                        trash_stats.* = d.getTrashStats() catch null;
-                                        if (grid) |g| {
-                                            if (g.view_mode == .trash) g.reloadImages(d) catch {};
-                                        }
-                                    }
-                                }
-                            }
+                            // Runs in the background; image_ops.bulkPoll refreshes
+                            // the counts and reloads the view when it finishes.
+                            if (dvui.App.main_init) |init| image_ops.startEmptyTrash(init.io);
                         }
                     }
                 }

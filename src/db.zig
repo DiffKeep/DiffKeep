@@ -182,6 +182,12 @@ const migrations = [_][]const u8{
     \\DELETE FROM image_embeddings WHERE rowid NOT IN (SELECT id FROM images);
     \\DELETE FROM positive_prompt_embeddings WHERE rowid NOT IN (SELECT id FROM images);
     ,
+    // v13: prompt_clean used to drop `<( ... ):w>` weighted groups and `<...>`
+    // placeholders with all their text. Drop the prompt vectors of every prompt
+    // with a '<' so the startup scan's backfill re-embeds them cleaned correctly.
+    \\DELETE FROM positive_prompt_embeddings WHERE rowid IN
+    \\  (SELECT id FROM images WHERE positive_prompt_text LIKE '%<%');
+    ,
 };
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables

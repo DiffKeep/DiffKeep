@@ -50,8 +50,10 @@ Build system:
   fetches every lazy dep) ever pulled them, configure fails with errors in
   `zig-pkg/cairo_zig-*/build.zig`. Fix: remove those packages from `zig-pkg/` and
   `~/.cache/zig/p/`, and don't use `zig build --fetch` here.
-- `get_git_version` shells out to git at configure time, which the configure cache does
-  not track: the embedded version string can go stale until `build.zig` changes.
+- Configure-time logic is cached, so anything it computes from the outside world (a
+  `std.process.run` of git, say) goes stale. Compute it in a build step instead: the app
+  version comes from `tools/git_version.zig`, run with `has_side_effects = true`, its
+  `captureStdOut()` added as an anonymous import and read with `@embedFile("git_version")`.
 
 dvui (pinned to the commit TensorPencil uses, 0.6.0-dev):
 - `Options.color_*` and path `.color` are `?ColorOrGradient`, not `Color`: wrap a

@@ -2,13 +2,22 @@ const std = @import("std");
 const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) !void {
-    const git_version = get_git_version(b.allocator, b.graph.io) catch "dev";
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const options = b.addOptions();
-    options.addOption([]const u8, "version", git_version);
+    // Version string from git, computed on every build: a configure-time
+    // lookup would be cached by Zig 0.17 and go stale. Embedded via
+    // @embedFile("git_version").
+    const git_version_tool = b.addExecutable(.{
+        .name = "git_version",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/git_version.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_git_version = b.addRunArtifact(git_version_tool);
+    run_git_version.has_side_effects = true;
+    const git_version = run_git_version.captureStdOut(.{});
 
     const known_folders = b.dependency("known_folders", .{
         .target = target,
@@ -32,7 +41,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     exe.root_module.strip = optimize != .debug;
-    exe.root_module.addOptions("build_options", options);
+    exe.root_module.addAnonymousImport("git_version", .{ .root_source_file = git_version });
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
     exe.root_module.addImport("known-folders", known_folders);
@@ -421,7 +430,7 @@ pub fn build(b: *std.Build) !void {
     diffkeep_test_module.addIncludePath(b.path("lib/vips"));
     diffkeep_test_module.addImport("video", video_module);
     diffkeep_test_module.addIncludePath(b.path("lib/video"));
-    diffkeep_test_module.addOptions("build_options", options);
+    diffkeep_test_module.addAnonymousImport("git_version", .{ .root_source_file = git_version });
     // icons is pure TVG data (no backend dependency); UI modules need it to compile.
     diffkeep_test_module.addImport("icons", icons_dep.module("icons"));
 
@@ -567,23 +576,4 @@ fn addTensorPencil(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !
         .ggml = false,
     });
     import_mod.addImport("TensorPencil", tp_dep.module("TensorPencil"));
-}
-
-fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
-    const version_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "describe", "--tags", "--always" } });
-    defer allocator.free(version_result.stdout);
-    defer allocator.free(version_result.stderr);
-
-    if (version_result.stdout.len == 0) return error.GitDescribeFailed;
-
-    const status_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "status", "--porcelain" } });
-    defer allocator.free(status_result.stdout);
-    defer allocator.free(status_result.stderr);
-
-    const trimmed_version = std.mem.trimEnd(u8, version_result.stdout, "\n");
-
-    if (status_result.stdout.len > 0) {
-        return try allocator.print("{s}(DIRTY)", .{trimmed_version});
-    }
-    return try allocator.dupe(u8, trimmed_version);
 }

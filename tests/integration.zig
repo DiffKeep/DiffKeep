@@ -445,6 +445,8 @@ test "grid: empty library shows placeholder" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     g_grid_test_ptr = &grid;
 
@@ -467,6 +469,8 @@ test "grid: render with images doesn't crash" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
 
     g_grid_test_ptr = &grid;
@@ -495,8 +499,11 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
     grid.autoplay = true;
     try grid.reloadImages(&db);
+    grid.awaitReload();
 
     g_grid_test_ptr = &grid;
     var t = try dvui.testing.init(.{});
@@ -539,6 +546,8 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
 
@@ -752,6 +761,8 @@ test "grid: incomingBelongs respects the active view filters" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     // Fully unfiltered "all images" view accepts anything.
     try std.testing.expect(grid.incomingBelongs("/lib/a.png"));
@@ -829,20 +840,25 @@ test "grid: reloadImages reflects the active view_mode" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     // Library view: every non-trashed image, trashed one excluded.
     grid.view_mode = .library;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b, c });
 
     // Trash view: only the trashed image.
     grid.view_mode = .trash;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     try expectGridIds(&grid, &.{d});
 
     // Duplicates view: only the images that share a hash.
     grid.view_mode = .duplicates;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b });
 }
 
@@ -854,10 +870,13 @@ test "grid: reloadImages resets the scroll position to the top" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     // Pretend the user had scrolled down, then switch view.
     grid.scroll_info.viewport.y = 500;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     try std.testing.expectEqual(@as(f32, 0), grid.scroll_info.viewport.y);
 }
 
@@ -870,6 +889,8 @@ test "grid: a scanned image is only injected if it belongs to the current view" 
     // Empty DB → grid starts empty in the (default) library view.
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
     grid.filter_library_path = "/lib";
     grid.filter_folder_path = "/lib/cats";
 
@@ -956,7 +977,7 @@ test "db: favorite flag set/count/list lifecycle" {
     try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
 }
 
-test "grid: favorites view lists only favorites; markFavorites flags entries" {
+test "grid: favorites view lists only favorites; loaded entries carry the favorite flag" {
     const path = "/tmp/diffkeep_test_grid_favorites.db";
     var db = try openDb(path);
     defer db.deinit();
@@ -971,10 +992,13 @@ test "grid: favorites view lists only favorites; markFavorites flags entries" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     // Library view: every entry carries the correct favorite flag.
     grid.view_mode = .library;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     for (grid.images.items) |e| {
         try std.testing.expectEqual(e.id == a or e.id == c, e.favorite);
     }
@@ -983,6 +1007,7 @@ test "grid: favorites view lists only favorites; markFavorites flags entries" {
     // Favorites view: only favorited images, all flagged.
     grid.view_mode = .favorites;
     try grid.reloadImages(&db);
+    grid.awaitReload();
     try expectGridIds(&grid, &.{ a, c });
     for (grid.images.items) |e| try std.testing.expect(e.favorite);
 }
@@ -1150,7 +1175,7 @@ test "db: resource_type filter (image includes animated; video separate)" {
 
 // ── Animated / video playback classification ─────────────────────────────────
 
-test "grid: markMediaTypes flags animated and video entries from the DB" {
+test "grid: a load flags animated and video entries from the DB" {
     const path = "/tmp/diffkeep_test_media_types.db";
     var db = try openDb(path);
     defer db.deinit();
@@ -1167,8 +1192,11 @@ test "grid: markMediaTypes flags animated and video entries from the DB" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
     grid.view_mode = .library;
     try grid.reloadImages(&db);
+    grid.awaitReload();
 
     for (grid.images.items) |e| {
         const want: dk.VectorDb.MediaType = if (e.id == clip)
@@ -1489,6 +1517,8 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
+    try grid.reloadImages(&db);
+    grid.awaitReload();
 
     grid.noteLoadFailure(gone.id, dir ++ "/gone.png");
     grid.noteLoadFailure(broken.id, dir ++ "/broken.png");
@@ -1504,4 +1534,133 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
     // ...until it changes (or its id is recycled) and is invalidated.
     grid.invalidateThumbnail(broken.id);
     try std.testing.expect(!grid.load_failed.contains(broken.id));
+}
+
+// ── Background file operations ───────────────────────────────────────────────
+
+var g_ops_db: ?dk.VectorDb = null;
+var g_ops_data_dir: ?[]const u8 = null;
+var g_ops_removed: usize = 0;
+
+fn opsNoop() void {}
+fn opsRemoved(ids: *const std.AutoHashMap(u64, void)) void {
+    g_ops_removed += ids.count();
+}
+
+/// Poll until the file-op worker has applied something (or time out).
+fn pollFileOps(grid: *dk.GridState) !void {
+    for (0..500) |_| {
+        if (dk.image_ops.fileOpsPoll(io, alloc, grid)) return;
+        try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
+    }
+    return error.FileOpTimedOut;
+}
+
+test "image_ops: trash, restore and delete run off the main thread and update the grid" {
+    const dir = "/tmp/diffkeep_test_file_ops";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data/trash");
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "a" });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/b.png", .data = "b" });
+
+    g_ops_db = try openDb(dir ++ "/data/test.db");
+    const db = &g_ops_db.?;
+    defer db.deinit();
+    g_ops_data_dir = dir ++ "/data";
+    g_ops_removed = 0;
+    dk.image_ops.init(.{
+        .db = &g_ops_db,
+        .data_dir = &g_ops_data_dir,
+        .cfg = &dk.g_cfg,
+        .on_counts_changed = opsNoop,
+        .on_images_removed = opsRemoved,
+        .on_wakeup = opsNoop,
+    });
+    defer dk.image_ops.fileOpsJoin(io);
+
+    const lib_id = try db.storeLibrary(dir ++ "/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/b.png");
+    defer b.deinit(alloc);
+
+    var grid = try dk.GridState.init(io, alloc, db, false, null);
+    defer grid.deinit();
+    try grid.reloadImages(db);
+    grid.awaitReload();
+    try std.testing.expectEqual(@as(usize, 2), grid.images.items.len);
+
+    // Trash a: the file moves to <data>/trash, the row is marked, the grid drops it.
+    try grid.selection.put(a.id, {});
+    dk.image_ops.performTrash(io, alloc, &grid);
+    try pollFileOps(&grid);
+    try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), g_ops_removed);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/lib/a.png", .{}));
+    try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
+
+    // Restore it from the trash view.
+    grid.view_mode = .trash;
+    try grid.reloadImages(db);
+    grid.awaitReload();
+    try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
+    grid.selection.clearRetainingCapacity();
+    try grid.selection.put(a.id, {});
+    dk.image_ops.performRestore(io, alloc, &grid);
+    try pollFileOps(&grid);
+    try cwd.access(io, dir ++ "/lib/a.png", .{});
+    try std.testing.expectEqual(@as(i64, 0), (try db.getTrashStats()).count);
+
+    // Permanently delete b: file and row are gone.
+    grid.view_mode = .library;
+    try grid.reloadImages(db);
+    grid.awaitReload();
+    grid.selection.clearRetainingCapacity();
+    try grid.selection.put(b.id, {});
+    dk.image_ops.performDelete(io, alloc, &grid);
+    try pollFileOps(&grid);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/lib/b.png", .{}));
+    try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
+}
+
+test "grid: background reloads apply only the latest request and keep removed images out" {
+    const path = "/tmp/diffkeep_test_async_reload.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+    try db.trashImage(b.id, "b.png", 1, 1000);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    // Nothing loads synchronously anymore.
+    try std.testing.expectEqual(@as(usize, 0), grid.images.items.len);
+
+    // Two requests in a row: the trash view is superseded by the library view.
+    grid.view_mode = .trash;
+    try grid.reloadImages(&db);
+    grid.view_mode = .library;
+    try grid.reloadImages(&db);
+    try std.testing.expect(grid.reloadPending());
+    grid.awaitReload();
+    try std.testing.expect(!grid.reloadPending());
+    try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
+    try std.testing.expectEqual(a.id, grid.images.items[0].id);
+
+    // An image removed while a load is in flight stays out of its result.
+    try grid.reloadImages(&db);
+    var ids = std.AutoHashMap(u64, void).init(alloc);
+    defer ids.deinit();
+    try ids.put(a.id, {});
+    dk.image_ops.removeFromGrid(&grid, &ids);
+    grid.awaitReload();
+    try std.testing.expectEqual(@as(usize, 0), grid.images.items.len);
 }

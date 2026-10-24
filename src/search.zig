@@ -41,47 +41,24 @@ const QueryTaskCtx = struct {
     filters: []db_mod.ActiveFilter, // owned (each .value duped); freed by task
     generation: u64,
     current_gen: *std.atomic.Value(u64),
-    result: *?[]db_mod.VectorDb.GridEntry,
+    result: *?image_grid_mod.LoadedView,
     result_gen: *u64,
     done: *std.atomic.Value(bool),
     wakeup_fn: ?*const fn () void,
 };
 
-fn runQuery(ctx: QueryTaskCtx) ![]db_mod.VectorDb.GridEntry {
-    // Vector modes; combined degrades to a single-space search when only one
-    // encoder produced an embedding.
-    switch (ctx.mode) {
-        .semantic => if (ctx.embeddings.prompt) |e|
-            return try ctx.db.searchByPromptEmbedding(ctx.allocator, e, 200, ctx.semantic_min_similarity),
-        .visual => if (ctx.embeddings.visual) |e|
-            return try ctx.db.searchByImageEmbedding(ctx.allocator, e, 200, ctx.visual_min_similarity),
-        .combined => {
-            if (ctx.embeddings.prompt) |pe| {
-                if (ctx.embeddings.visual) |ve|
-                    return try ctx.db.searchCombined(ctx.allocator, pe, ve, 200, ctx.semantic_min_similarity, ctx.visual_min_similarity);
-                return try ctx.db.searchByPromptEmbedding(ctx.allocator, pe, 200, ctx.semantic_min_similarity);
-            }
-            if (ctx.embeddings.visual) |ve|
-                return try ctx.db.searchByImageEmbedding(ctx.allocator, ve, 200, ctx.visual_min_similarity);
-        },
-        .fts => {},
-    }
-    const has_text = if (ctx.fts_query) |q| q.len > 0 else false;
-    if (has_text or ctx.filters.len > 0) {
-        return try ctx.db.listImagesFiltered(
-            ctx.allocator,
-            ctx.filter_library_id,
-            ctx.filter_folder_path,
-            if (has_text) ctx.fts_query else null,
-            ctx.filters,
-        );
-    }
-    if (ctx.filter_folder_path) |fp| {
-        const lib_id = ctx.filter_library_id orelse return try ctx.db.listAllImages(ctx.allocator);
-        return try ctx.db.listImagesInFolder(ctx.allocator, lib_id, fp);
-    }
-    if (ctx.filter_library_id) |lib_id| return try ctx.db.listLibraryImages(ctx.allocator, lib_id);
-    return try ctx.db.listAllImages(ctx.allocator);
+fn runQuery(ctx: QueryTaskCtx) !image_grid_mod.LoadedView {
+    return image_grid_mod.loadView(ctx.db, ctx.allocator, .{
+        .view_mode = .library,
+        .search_mode = ctx.mode,
+        .search_query = ctx.fts_query,
+        .embeddings = ctx.embeddings,
+        .semantic_min_similarity = ctx.semantic_min_similarity,
+        .visual_min_similarity = ctx.visual_min_similarity,
+        .filter_library_id = ctx.filter_library_id,
+        .filter_folder_path = ctx.filter_folder_path,
+        .filters = ctx.filters,
+    });
 }
 
 fn queryTask(ctx: QueryTaskCtx) void {
@@ -95,13 +72,12 @@ fn queryTask(ctx: QueryTaskCtx) void {
     }
     if (ctx.current_gen.load(.acquire) != ctx.generation) return;
 
-    if (runQuery(ctx)) |entries| {
+    if (runQuery(ctx)) |view| {
         if (ctx.current_gen.load(.acquire) != ctx.generation) {
-            for (entries) |e| ctx.allocator.free(e.path);
-            ctx.allocator.free(entries);
+            view.deinit(ctx.allocator);
             return;
         }
-        ctx.result.* = entries;
+        ctx.result.* = view;
     } else |err| {
         log.warn("queryTask gen={d} failed: {}", .{ ctx.generation, err });
         ctx.result.* = null;
@@ -197,7 +173,7 @@ pub const SearchState = struct {
     // Async DB query (runs after embed for vector modes, immediately for FTS)
     query_group: std.Io.Group = .init,
     query_done: std.atomic.Value(bool) = .init(false),
-    query_result: ?[]db_mod.VectorDb.GridEntry = null,
+    query_result: ?image_grid_mod.LoadedView = null,
     query_result_gen: u64 = 0,
     query_generation: std.atomic.Value(u64) = .init(0),
     query_in_flight: usize = 0,
@@ -206,10 +182,7 @@ pub const SearchState = struct {
     pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
         self.query_embeddings.free(gpa);
         self.pending_embeddings.free(gpa);
-        if (self.query_result) |r| {
-            for (r) |e| gpa.free(e.path);
-            gpa.free(r);
-        }
+        if (self.query_result) |r| r.deinit(gpa);
     }
 
     pub fn isSearchLoading(self: *const SearchState) bool {
@@ -299,11 +272,8 @@ pub const SearchState = struct {
 
         const gen = self.query_generation.fetchAdd(1, .acq_rel) + 1;
         self.query_done.store(false, .release);
-        if (self.query_result) |r| {
-            for (r) |e| allocator.free(e.path);
-            allocator.free(r);
-            self.query_result = null;
-        }
+        if (self.query_result) |r| r.deinit(allocator);
+        self.query_result = null;
         self.query_pending = true;
 
         const ctx = QueryTaskCtx{
@@ -339,7 +309,6 @@ pub const SearchState = struct {
         self: *SearchState,
         allocator: std.mem.Allocator,
         grid: *image_grid_mod.GridState,
-        db: *db_mod.VectorDb,
     ) void {
         if (!self.query_done.load(.acquire)) return;
         self.query_done.store(false, .release);
@@ -349,17 +318,11 @@ pub const SearchState = struct {
         self.query_result = null;
 
         if (self.query_result_gen != self.query_generation.load(.acquire)) {
-            if (result) |r| {
-                for (r) |e| allocator.free(e.path);
-                allocator.free(r);
-            }
+            if (result) |r| r.deinit(allocator);
             return;
         }
 
-        if (result) |r| {
-            grid.applySearchResults(db, r);
-            allocator.free(r);
-        }
+        if (result) |r| grid.replaceImages(r, .{});
         // null result = query failed; keep stale grid intact.
     }
 

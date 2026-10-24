@@ -1,8 +1,8 @@
 //! Strips ComfyUI/A1111 prompt syntax so the text-retrieval embedder sees
 //! something close to natural language instead of markup:
-//!   - `<lora:name:0.8>` and other `<...>` tags are dropped entirely
+//!   - `<lora:name:0.8>`, `<lyco:...>` and other `<name:...>` tags are dropped
 //!   - `(text:1.2)` weight suffixes are removed, keeping `text`
-//!   - grouping parens/brackets `((text))`, `[text]` are unwrapped
+//!   - grouping `((text))`, `[text]`, `<(text):0.9>` is unwrapped
 //!   - `\(` `\)` `\[` `\]` escapes become literal characters
 //!   - comma runs and whitespace runs are collapsed
 //! Queries typed by users are natural language already and must NOT be
@@ -14,9 +14,18 @@ fn isGroupChar(c: u8) bool {
     return c == '(' or c == ')' or c == '[' or c == ']';
 }
 
+/// End index of a `<name:...>` network tag starting at `raw[i] == '<'`, or
+/// null when the `<` opens something else (a weighted group, a placeholder).
+fn tagEnd(raw: []const u8, i: usize) ?usize {
+    var j = i + 1;
+    while (j < raw.len and (std.ascii.isAlphanumeric(raw[j]) or raw[j] == '_' or raw[j] == '-')) j += 1;
+    if (j == i + 1 or j >= raw.len or raw[j] != ':') return null;
+    return std.mem.findScalarPos(u8, raw, j, '>');
+}
+
 /// Length of a numeric weight suffix at the start of `rest` (just after a
 /// ':'), e.g. "1.2)" -> 3. Only treated as a weight when the number is
-/// immediately followed by a closing paren/bracket, so "16:9" survives.
+/// immediately followed by a closing ')', ']' or '>', so "16:9" survives.
 fn weightSuffixLen(rest: []const u8) ?usize {
     var j: usize = 0;
     if (j < rest.len and (rest[j] == '+' or rest[j] == '-')) j += 1;
@@ -27,7 +36,7 @@ fn weightSuffixLen(rest: []const u8) ?usize {
         while (j < rest.len and std.ascii.isDigit(rest[j])) : (j += 1) digits = true;
     }
     if (!digits) return null;
-    if (j < rest.len and (rest[j] == ')' or rest[j] == ']')) return j;
+    if (j < rest.len and (rest[j] == ')' or rest[j] == ']' or rest[j] == '>')) return j;
     return null;
 }
 
@@ -52,13 +61,16 @@ pub fn cleanPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
                 }
             },
             '<' => {
-                if (std.mem.findScalarPos(u8, raw, i + 1, '>')) |end| {
+                if (tagEnd(raw, i)) |end| {
                     i = end + 1;
+                } else if (std.mem.findScalarPos(u8, raw, i + 1, '>') != null) {
+                    i += 1; // opens a group: keep its text, drop the bracket
                 } else {
                     stripped.appendAssumeCapacity(c);
                     i += 1;
                 }
             },
+            '>' => i += 1,
             '(', ')', '[', ']' => i += 1,
             ':' => {
                 if (weightSuffixLen(raw[i + 1 ..])) |n| {
@@ -82,7 +94,8 @@ pub fn cleanPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var it = std.mem.splitAny(u8, stripped.items, ",\n");
     var first = true;
     while (it.next()) |piece_raw| {
-        const piece = std.mem.trim(u8, piece_raw, " \t\r");
+        // A trailing ':' is left behind by "text:)" before a group weight.
+        const piece = std.mem.trimEnd(u8, std.mem.trim(u8, piece_raw, " \t\r"), ":");
         if (piece.len == 0) continue;
         if (!first) try out.appendSlice(allocator, ", ");
         first = false;
@@ -131,6 +144,17 @@ test "cleanPrompt: whitespace and newlines collapsed" {
         "a cat, sitting on a mat",
         "a   cat,\nsitting  on\ta mat",
     );
+}
+
+test "cleanPrompt: weighted angle groups keep their text" {
+    try expectClean(
+        "a summerscape sunset, light rain, perfect masterpiece, deep color, fantastical",
+        "<(a summerscape sunset, light rain, perfect masterpiece:):1.0>,\n<(deep color, fantastical):0.9>",
+    );
+}
+
+test "cleanPrompt: lyco and hypernet tags dropped, placeholders keep text" {
+    try expectClean("the grinch, Main Subject", "the grinch,  <lyco:GoodHands-beta2:1.0>, <Main Subject>");
 }
 
 test "cleanPrompt: unclosed angle bracket kept verbatim" {
