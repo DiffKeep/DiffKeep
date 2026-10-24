@@ -1664,3 +1664,96 @@ test "grid: background reloads apply only the latest request and keep removed im
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 0), grid.images.items.len);
 }
+
+test "db: vector search fills the limit past trashed nearest neighbours" {
+    const path = "/tmp/diffkeep_test_vec_trash_fill.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    // Six images whose prompt vectors get steadily further from the query
+    // (axis 0); the four nearest are trashed.
+    var ids: [6]u64 = undefined;
+    for (&ids, 0..) |*id, k| {
+        var buf: [32]u8 = undefined;
+        var img = try db.findOrCreateImage(alloc, lib_id, try std.mem.print(&buf, "/lib/{d}.png", .{k}));
+        defer img.deinit(alloc);
+        id.* = img.id;
+        var v: [768]f32 = @splat(0);
+        const t: f32 = @as(f32, @floatFromInt(k)) * 0.1;
+        v[0] = @cos(t);
+        v[1] = @sin(t);
+        try db.storePromptEmbedding(img.id, &v);
+        if (k < 4) try db.trashImage(img.id, "t", 1, 1000);
+    }
+    var q: [768]f32 = @splat(0);
+    q[0] = 1.0;
+    // limit 2 over-fetches k = 4 at first: all four are trashed, so the search
+    // must widen to reach the two live images.
+    const hits = try db.searchByPromptEmbedding(alloc, &q, 2, -1.0);
+    defer {
+        for (hits) |e| alloc.free(e.path);
+        alloc.free(hits);
+    }
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(ids[4], hits[0].id);
+    try std.testing.expectEqual(ids[5], hits[1].id);
+}
+
+test "search: a late search result or embedding can't replace a different view" {
+    const path = "/tmp/diffkeep_test_search_race.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+    try db.trashImage(b.id, "b.png", 1, 1000);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var search: dk.search.SearchState = .{};
+    defer search.deinit(alloc);
+
+    // A search is fired, then the user opens the trash before it lands.
+    search.run(&grid, &db);
+    try std.testing.expect(search.isSearchLoading(&grid));
+    grid.view_mode = .trash;
+    try grid.reloadImages(&db);
+    grid.awaitReload();
+    try std.testing.expect(!search.isSearchLoading(&grid));
+    try expectGridIds(&grid, &.{b.id});
+
+    // An embedding finishing now doesn't pull the user back to the library.
+    search.embed_done.store(true, .release);
+    search.pending_embeddings_gen = search.embed_generation.load(.acquire);
+    search.applyEmbedIfDone(alloc, &grid, &db);
+    try std.testing.expectEqual(dk.image_grid.ViewMode.trash, grid.view_mode);
+    try std.testing.expect(!grid.reloadPending());
+}
+
+test "grid: an image scanned in while a load is running survives the load" {
+    const path = "/tmp/diffkeep_test_scan_during_load.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // Hold the DB so the load can't finish, then let a scan report an image the
+    // load's query won't contain.
+    db.db_mutex.lockUncancelable(io);
+    try grid.reloadImages(&db);
+    grid.notifier.push(io, 77, "/lib/new.png", 0);
+    grid.update();
+    try expectGridIds(&grid, &.{77});
+    db.db_mutex.unlock(io);
+
+    grid.awaitReload();
+    try expectGridIds(&grid, &.{77});
+}

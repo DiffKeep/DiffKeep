@@ -140,7 +140,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
     // A search in flight is the machine working, so it is amber.
-    if (ctx.search.isSearchLoading()) {
+    if (ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g else null)) {
         _ = dvui.spinner(@src(), .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 12, .h = 12 },
@@ -566,7 +566,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
         defer activity_box.deinit();
 
         const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
-        const is_searching = ctx.search.isSearchLoading();
+        const is_searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g else null);
         const is_downloading = ctx.settings.gemma_dl_running.load(.acquire) or
             ctx.settings.siglip2_dl_running.load(.acquire);
 

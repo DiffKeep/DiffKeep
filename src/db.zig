@@ -260,6 +260,9 @@ pub const ActiveFilter = struct {
 /// One SQLite connection plus a shared pool. The handle returned by `init` owns
 /// the pool; `getConnection` hands out further handles (one per thread) that
 /// share it by pointer. Deinit every `getConnection` handle before the owner.
+/// sqlite-vec's largest accepted KNN `k` (SQLITE_VEC_VEC0_K_MAX).
+const vec0_k_max: usize = 4096;
+
 pub const VectorDb = struct {
     db: sqlite.Database,
     allocator: std.mem.Allocator,
@@ -372,25 +375,6 @@ pub const VectorDb = struct {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
 
-        // Over-fetch to absorb rows the trash filter removes afterwards.
-        var ids: std.ArrayList(i64) = .empty;
-        defer ids.deinit(allocator);
-        {
-            var knn = try self.db.prepare(
-                "SELECT rowid, distance FROM " ++ table ++ " WHERE vector MATCH ? AND k = ?",
-            );
-            defer knn.deinit();
-            try knn.bindBlob(1, std.mem.sliceAsBytes(query));
-            try knn.bind(2, @as(i64, @intCast(limit * 2)));
-            while (try knn.step()) {
-                const d: f32 = @floatCast(knn.columnDouble(1));
-                const sim = 1.0 - (d * d) / 2.0;
-                // KNN returns nearest-first; the first miss ends the useful prefix.
-                if (sim < min_similarity) break;
-                try ids.append(allocator, knn.columnInt64(0));
-            }
-        }
-
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
             for (list.items) |e| allocator.free(e.path);
@@ -400,16 +384,46 @@ pub const VectorDb = struct {
             "SELECT id, library_path, mtime FROM images WHERE id = ? AND trashed_at IS NULL",
         );
         defer stmt.deinit();
-        for (ids.items) |rowid| {
-            if (list.items.len >= limit) break;
-            try stmt.reset();
-            try stmt.bind(1, rowid);
-            if (!try stmt.step()) continue; // trashed or deleted
-            const id: u64 = @intCast(stmt.columnInt64(0));
-            const path = try allocator.dupe(u8, stmt.columnText(1));
-            errdefer allocator.free(path);
-            const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
-            try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+        var knn = try self.db.prepare(
+            "SELECT rowid, distance FROM " ++ table ++ " WHERE vector MATCH ? AND k = ?",
+        );
+        defer knn.deinit();
+
+        // Over-fetch to absorb rows the trash filter removes. If trashed rows
+        // still leave the result short and KNN hasn't run out of neighbours
+        // above the similarity floor, re-query with a larger k and continue
+        // past the rows already checked (KNN order is stable).
+        var k: usize = @min(limit * 2, vec0_k_max);
+        var checked: usize = 0;
+        while (true) {
+            try knn.reset();
+            try knn.bindBlob(1, std.mem.sliceAsBytes(query));
+            try knn.bind(2, @as(i64, @intCast(k)));
+            var rows: usize = 0;
+            var exhausted = false;
+            while (try knn.step()) : (rows += 1) {
+                const d: f32 = @floatCast(knn.columnDouble(1));
+                const sim = 1.0 - (d * d) / 2.0;
+                // KNN returns nearest-first; the first miss ends the useful prefix.
+                if (sim < min_similarity) {
+                    exhausted = true;
+                    break;
+                }
+                if (rows < checked) continue;
+                if (list.items.len >= limit) break;
+                try stmt.reset();
+                try stmt.bind(1, knn.columnInt64(0));
+                if (!try stmt.step()) continue; // trashed or deleted
+                const id: u64 = @intCast(stmt.columnInt64(0));
+                const path = try allocator.dupe(u8, stmt.columnText(1));
+                errdefer allocator.free(path);
+                const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
+                try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
+            }
+            if (rows < k) exhausted = true; // fewer neighbours than asked for
+            checked = rows;
+            if (list.items.len >= limit or exhausted or k >= vec0_k_max) break;
+            k = @min(k * 4, vec0_k_max);
         }
         return list.toOwnedSlice(allocator);
     }
@@ -417,7 +431,7 @@ pub const VectorDb = struct {
     /// RRF-merged KNN search over both prompt and image embeddings.
     /// The two tables live in different embedding spaces, so each leg takes its
     /// own query vector: `prompt_query` from the text-retrieval encoder
-    /// (Snowflake) and `visual_query` from the cross-modal text encoder
+    /// (EmbeddingGemma) and `visual_query` from the cross-modal text encoder
     /// (SigLIP2).  Runs both KNNs independently (top `limit` each), merges via
     /// Reciprocal Rank Fusion (k=60), and returns the top `limit` results
     /// sorted by combined score descending.  Both vectors must be

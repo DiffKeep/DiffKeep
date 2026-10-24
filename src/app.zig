@@ -346,7 +346,6 @@ fn appDeinit() void {
         if (dk.g_library_manager) |*mgr| mgr.deinit(init.io);
     }
     if (dvui.App.main_init) |init| {
-        g_search.awaitQuery(init.io);
         g_search.awaitEmbed(init.io);
         g_search.deinit(init.gpa);
     }
@@ -487,8 +486,7 @@ fn frame() !dvui.App.Result {
     if (dvui.App.main_init) |init| {
         if (dk.g_grid) |*grid| {
             if (dk.g_db) |*db| {
-                g_search.applyQueryIfDone(init.gpa, grid);
-                g_search.applyEmbedIfDone(init.gpa, init.io, grid, db);
+                g_search.applyEmbedIfDone(init.gpa, grid, db);
             }
         }
     }
@@ -634,9 +632,7 @@ fn frame() !dvui.App.Result {
                         grid.query_embeddings = .{};
                         g_search.query_embeddings.free(init.gpa);
                         log.info("fts search: query={?s}", .{grid.search_query});
-                        if (dk.g_db) |*db| g_search.spawnQueryTask(init.io, init.gpa, db, grid) catch |err| {
-                            log.warn("spawnQueryTask (fts): {}", .{err});
-                        };
+                        if (dk.g_db) |*db| g_search.run(grid, db);
                     },
                     .semantic, .visual, .combined => {
                         grid.search_query = null;
@@ -648,12 +644,10 @@ fn frame() !dvui.App.Result {
                                 log.warn("search embed spawn: {}", .{err});
                             };
                             // Keep showing current results while embedding is generated.
-                            // applyEmbedIfDone → spawnQueryTask will update the grid.
+                            // applyEmbedIfDone runs the search when the embedding lands.
                         } else {
                             // Empty query: show all/library images without embedding.
-                            if (dk.g_db) |*db| g_search.spawnQueryTask(init.io, init.gpa, db, grid) catch |err| {
-                                log.warn("spawnQueryTask (clear): {}", .{err});
-                            };
+                            if (dk.g_db) |*db| g_search.run(grid, db);
                         }
                     },
                 }

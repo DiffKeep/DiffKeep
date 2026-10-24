@@ -250,9 +250,10 @@ fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_
         },
         .fts => {},
     }
-    const has_text = if (q.search_query) |t| t.len > 0 else false;
-    if (has_text or q.filters.len > 0) {
-        return db.listImagesFiltered(a, q.filter_library_id, q.filter_folder_path, if (has_text) q.search_query else null, q.filters);
+    const fts = if (q.search_query) |t| try sanitizeFtsQuery(a, t) else null;
+    defer if (fts) |t| a.free(t);
+    if (fts != null or q.filters.len > 0) {
+        return db.listImagesFiltered(a, q.filter_library_id, q.filter_folder_path, fts, q.filters);
     }
     if (q.filter_folder_path) |fp| {
         const lib_id = q.filter_library_id orelse return db.listAllImages(a);
@@ -260,6 +261,20 @@ fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_
     }
     if (q.filter_library_id) |lib_id| return db.listLibraryImages(a, lib_id);
     return db.listAllImages(a);
+}
+
+/// Strip FTS5 syntax characters that cause parse errors in user-typed queries.
+/// Returns null when nothing searchable is left. Caller owns the result.
+pub fn sanitizeFtsQuery(a: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    const buf = try a.dupe(u8, raw);
+    defer a.free(buf);
+    for (buf) |*c| switch (c.*) {
+        '(', ')', '"', '*', '^' => c.* = ' ',
+        else => {},
+    };
+    const trimmed = std.mem.trim(u8, buf, " \t\n\r");
+    if (trimmed.len == 0) return null;
+    return try a.dupe(u8, trimmed);
 }
 
 const LoadCtx = struct {
@@ -311,6 +326,10 @@ pub const GridState = struct {
     // Ids removed while a load was in flight; filtered out of its result so a
     // just-deleted image can't come back. Main-thread.
     load_dropped: std.AutoHashMap(u64, void),
+    // Images a scan added while a load was in flight; the load's query may have
+    // run before they were inserted, so they are re-added if it lacks them.
+    // Owns each path copy. Main-thread.
+    load_added: std.ArrayList(ImageNotifier.Entry) = .empty,
 
     // Incoming images from scan threads — drained each frame in update()
     notifier: ImageNotifier = .{},
@@ -500,6 +519,8 @@ pub const GridState = struct {
         self.load_group.await(self.io) catch {};
         if (self.load_result) |v| v.deinit(self.allocator);
         self.load_dropped.deinit();
+        for (self.load_added.items) |e| self.allocator.free(e.path);
+        self.load_added.deinit(self.allocator);
         self.stop.store(true, .release);
         self.queue_mutex.lockUncancelable(self.io);
         // Signal once per worker to wake all waiting threads
@@ -632,9 +653,38 @@ pub const GridState = struct {
         self.load_mutex.unlock(self.io);
         if (!ready) return false;
         // A failed load (null) keeps the current list.
-        if (result) |v| self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
+        if (result) |v| {
+            self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
+            self.readdScannedImages();
+        }
+        for (self.load_added.items) |e| self.allocator.free(e.path);
+        self.load_added.clearRetainingCapacity();
         self.load_dropped.clearRetainingCapacity();
         return true;
+    }
+
+    /// Re-add images scanned in while the applied load was running that its
+    /// result doesn't have (it may have queried before they were inserted).
+    fn readdScannedImages(self: *GridState) void {
+        if (self.load_added.items.len == 0) return;
+        var present = std.AutoHashMap(u64, void).init(self.allocator);
+        defer present.deinit();
+        for (self.images.items) |img| present.put(img.id, {}) catch {};
+        var added = false;
+        for (self.load_added.items) |*e| {
+            if (present.contains(e.id) or self.load_dropped.contains(e.id)) continue;
+            if (!self.incomingBelongs(e.path)) continue;
+            self.images.append(self.allocator, .{
+                .id = e.id,
+                .path = e.path,
+                .filename = std.Io.Dir.path.basename(e.path),
+                .mtime = e.mtime,
+            }) catch continue;
+            e.path = ""; // ownership moved to the grid
+            present.put(e.id, {}) catch {};
+            added = true;
+        }
+        if (added) self.applySortOrder();
     }
 
     /// Replace the image list with a loaded view. Takes ownership of `view`.
@@ -956,6 +1006,12 @@ pub const GridState = struct {
                     continue;
                 };
                 existing.put(e.id, {}) catch {};
+                // A load in flight may not include it; remember it until applied.
+                if (self.reloadPending()) {
+                    if (self.allocator.dupe(u8, e.path)) |copy| {
+                        self.load_added.append(self.allocator, .{ .id = e.id, .path = copy, .mtime = e.mtime }) catch self.allocator.free(copy);
+                    } else |_| {}
+                }
             }
         }
         self.incoming.clearAndFree(self.allocator);
