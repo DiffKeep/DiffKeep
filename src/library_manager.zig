@@ -250,7 +250,9 @@ fn processFileEventTask(ctx: FileEventCtx) void {
 fn drainQueue(manager: *LibraryManager, io: std.Io) void {
     while (true) {
         manager.queue_mutex.lockUncancelable(io);
-        const maybe_req: ?ScanRequest = if (manager.pending.items.len > 0)
+        // Once stopped (quit), start no further libraries; deinit frees the rest.
+        const stopped = manager.stop_scan.load(.acquire);
+        const maybe_req: ?ScanRequest = if (!stopped and manager.pending.items.len > 0)
             manager.pending.orderedRemove(0)
         else blk: {
             // Set inactive while still holding the lock so a concurrent enqueue()

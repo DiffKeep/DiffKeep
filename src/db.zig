@@ -861,14 +861,17 @@ pub const VectorDb = struct {
             while (it.next()) |k| allocator.free(k.*);
             map.deinit();
         }
+        // Embedding presence is checked against vec0's plain `<table>_rowids`
+        // shadow tables: a rowid lookup through the vec0 virtual table costs
+        // ~0.4 ms, so joining it took ~17 s for a 44k-image library (39 ms this
+        // way). The prefetch test in tests/integration.zig catches a sqlite-vec
+        // upgrade that renames them.
         var stmt = try self.db.prepare(
             \\SELECT i.id, i.library_path, i.mtime,
             \\       (i.thumbnail IS NOT NULL),
-            \\       (pe.rowid IS NOT NULL),
-            \\       (ie.rowid IS NOT NULL)
+            \\       EXISTS (SELECT 1 FROM positive_prompt_embeddings_rowids r WHERE r.rowid = i.id),
+            \\       EXISTS (SELECT 1 FROM image_embeddings_rowids r WHERE r.rowid = i.id)
             \\FROM images i
-            \\LEFT JOIN positive_prompt_embeddings pe ON pe.rowid = i.id
-            \\LEFT JOIN image_embeddings ie ON ie.rowid = i.id
             \\WHERE i.library_id = ? AND i.trashed_at IS NULL
         );
         defer stmt.deinit();

@@ -336,24 +336,48 @@ fn appInit(win: *dvui.Window) !void {
     try initWindowFontsAndTheme();
 }
 
+/// Logs how long each shutdown step takes (debug level), to find what holds
+/// up a quit.
+const ShutdownTimer = struct {
+    io: ?std.Io,
+    last: i96 = 0,
+
+    fn start() ShutdownTimer {
+        const io = if (dvui.App.main_init) |init| init.io else return .{ .io = null };
+        return .{ .io = io, .last = std.Io.Clock.awake.now(io).nanoseconds };
+    }
+
+    fn lap(t: *ShutdownTimer, step: []const u8) void {
+        const io = t.io orelse return;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        log.debug("shutdown: {s} took {d} ms", .{ step, @divTrunc(now - t.last, std.time.ns_per_ms) });
+        t.last = now;
+    }
+};
+
 fn appDeinit() void {
+    var timer = ShutdownTimer.start();
     if (g_dnd) |*dnd| dnd.deinit();
     // Stop the fs watcher thread before anything else so it can't fire callbacks
     // against already-freed state.
     if (g_fs_watcher) |*watcher| watcher.deinit();
+    timer.lap("fs watcher");
     // Stop all threads that use VIPS before calling vips_shutdown().
     if (dvui.App.main_init) |init| {
         if (dk.g_library_manager) |*mgr| mgr.deinit(init.io);
     }
+    timer.lap("library manager (scans)");
     if (dvui.App.main_init) |init| {
         g_search.awaitEmbed(init.io);
         g_search.deinit(init.gpa);
     }
+    timer.lap("search");
     // Join the background embedder load thread (if running) and discard any result.
     if (g_embedder_thread) |t| {
         t.join();
         g_embedder_thread = null;
     }
+    timer.lap("embedder load thread");
     if (g_embedder_task_result) |*emb| { emb.deinit(); g_embedder_task_result = null; }
     if (dvui.App.main_init) |init| {
         if (g_embedder_pending) |p| {
@@ -364,10 +388,14 @@ fn appDeinit() void {
     g_embedder_pending = null;
     image_ops_mod.bulkJoin();
     if (dvui.App.main_init) |init| image_ops_mod.fileOpsJoin(init.io);
+    timer.lap("file ops");
     if (dk.g_embedder) |*emb| emb.deinit();
+    timer.lap("embedder");
     if (dk.g_grid) |*grid| grid.deinit();
+    timer.lap("grid");
     vips_mod.deinit();
     if (dk.g_db) |*database| database.deinit();
+    timer.lap("vips + db");
     if (dvui.App.main_init) |init| {
         g_detail.deinit(init.gpa);
         g_sidebar.deinit(init.gpa);
@@ -385,6 +413,7 @@ fn appDeinit() void {
         g_pending_file_events.deinit(init.gpa);
         g_filter_modal.deinit(init.gpa);
     }
+    timer.lap("config + state");
 }
 
 
@@ -1167,7 +1196,13 @@ pub fn main(init: std.process.Init) !void {
         }
         back.textInputRect(win.textInputRequested());
         back.renderPresent();
-        if (res == .close) break :main_loop;
+        if (res == .close) {
+            // Hide right away: shutdown below waits for background work, and a
+            // window that stays up looks hung.
+            _ = SDLBackend.c.SDL_HideWindow(back.window);
+            for (g_viewer_manager.windows.items) |vw| _ = SDLBackend.c.SDL_HideWindow(vw.back.window);
+            break :main_loop;
+        }
 
         // ── Viewer windows ────────────────────────────────────────────────────
         var vi: usize = 0;

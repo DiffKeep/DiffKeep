@@ -1757,3 +1757,31 @@ test "grid: an image scanned in while a load is running survives the load" {
     grid.awaitReload();
     try expectGridIds(&grid, &.{77});
 }
+
+test "db: scan prefetch reports which images already have embeddings" {
+    const path = "/tmp/diffkeep_test_prefetch_embeds.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+    var v: [768]f32 = @splat(0);
+    v[0] = 1.0;
+    try db.storePromptEmbedding(a.id, &v);
+    try db.storeImageEmbedding(b.id, &v);
+
+    var known = try db.prefetchLibraryImages(alloc, lib_id);
+    defer {
+        var it = known.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        known.deinit();
+    }
+    const ma = known.get("/lib/a.png").?;
+    const mb = known.get("/lib/b.png").?;
+    try std.testing.expect(ma.has_prompt_embedding and !ma.has_image_embedding);
+    try std.testing.expect(!mb.has_prompt_embedding and mb.has_image_embedding);
+}
