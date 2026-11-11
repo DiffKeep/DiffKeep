@@ -26,7 +26,6 @@ pub const RenderCtx = struct {
     active_filters: *std.ArrayList(db_mod.ActiveFilter),
     filter_modal: *filter_modal_mod.FilterModalState,
     grid: *?image_grid_mod.GridState,
-    db: *?db_mod.VectorDb,
     cfg: *const config_mod.Config,
     settings: *settings_modal_mod.SettingsModalState,
     db_stats: *?db_mod.DbStats,
@@ -145,7 +144,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
     // A search in flight is the machine working, so it is amber.
-    if (ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g else null)) {
+    if (ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g.appliedGen() else null)) {
         _ = dvui.spinner(@src(), .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 12, .h = 12 },
@@ -443,7 +442,6 @@ pub fn renderContent(ctx: RenderCtx) !void {
             if (try ctx.sidebar.render(
                 ctx.left_w.*,
                 init.gpa,
-                if (ctx.db.*) |*db| db else null,
                 if (ctx.grid.*) |*g| g else null,
                 if (ctx.library_manager.*) |*mgr| mgr else null,
                 ctx.cfg.trash_enabled,
@@ -495,7 +493,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
                     if (grid.wasRefreshedThisFrame(fid)) ctx.detail.id = null;
                 }
             }
-            if (ctx.db.*) |*db| ctx.detail.update(focused_id, db, init.gpa, init.io);
+            ctx.detail.update(focused_id, init.gpa, init.io);
             ctx.detail.renderPanel(ctx.right_w.*, filename, init.gpa, init.io);
             if (ctx.detail.reparse_requested) {
                 ctx.detail.reparse_requested = false;
@@ -578,7 +576,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
         defer activity_box.deinit();
 
         const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
-        const is_searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g else null);
+        const is_searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g.appliedGen() else null);
         const is_downloading = ctx.settings.gemma_dl != null or ctx.settings.siglip2_dl != null;
 
         if (is_scanning) {

@@ -6,6 +6,7 @@ const image_grid_mod = @import("image_grid.zig");
 const i18n = @import("i18n.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
+const bg = @import("bg.zig");
 
 pub fn filterColumnLabel(kind: db_mod.FilterColumn) [:0]const u8 {
     return switch (kind) {
@@ -30,42 +31,89 @@ fn filterMatchesTyped(opt: []const u8, typed: []const u8) bool {
     return false;
 }
 
+/// A column's distinct values, the autocomplete options.
+const Options = struct {
+    values: [][]const u8,
+
+    fn free(o: *Options, a: std.mem.Allocator) void {
+        for (o.values) |v| a.free(v);
+        a.free(o.values);
+    }
+};
+
+const OptionsLoad = bg.Latest(Options, Options.free);
+
+/// Read `kind`'s distinct values on a connection of its own. The query scans
+/// the whole table, so it runs in the background.
+fn optionsTask(_: OptionsLoad.Ticket, db: *db_mod.VectorDb, gpa: std.mem.Allocator, kind: db_mod.FilterColumn) ?Options {
+    var conn = db.getConnection() catch |err| {
+        log.warn("filter options connection: {}", .{err});
+        return null;
+    };
+    defer conn.deinit();
+    const values = conn.getDistinctColumnValues(gpa, kind) catch |err| {
+        log.warn("filter options: {}", .{err});
+        return null;
+    };
+    return .{ .values = values };
+}
+
 pub const FilterModalState = struct {
     open: bool = false,
     kind: db_mod.FilterColumn = .model,
     value_buf: [256]u8 = std.mem.zeroes([256]u8),
-    options: ?[][]const u8 = null,
+    /// The shown kind's options; null until they have loaded.
+    options: ?Options = null,
+    /// The kind whose options were last requested.
     options_kind: ?db_mod.FilterColumn = null,
+    load: OptionsLoad = .{},
+    /// The library, set once by the owner; options load on a connection of
+    /// their own. Without it there are no options.
+    db: ?*db_mod.VectorDb = null,
 
+    /// Waits for a running options load.
     pub fn deinit(self: *FilterModalState, gpa: std.mem.Allocator) void {
-        if (self.options) |opts| {
-            for (opts) |s| gpa.free(s);
-            gpa.free(opts);
-            self.options = null;
+        self.load.deinit();
+        self.freeOptions(gpa);
+    }
+
+    fn freeOptions(self: *FilterModalState, gpa: std.mem.Allocator) void {
+        if (self.options) |*o| o.free(gpa);
+        self.options = null;
+    }
+
+    /// Request `kind`'s options when it changes (or the dialog first opens),
+    /// and show them once they arrive.
+    pub fn updateOptions(self: *FilterModalState, gpa: std.mem.Allocator, io: std.Io, wakeup: ?*const fn () void) void {
+        const db = self.db orelse return;
+        if (self.options_kind != self.kind) {
+            self.freeOptions(gpa);
+            self.options_kind = self.kind;
+            self.load.wakeup_fn = wakeup;
+            _ = self.load.start(io, gpa, optionsTask, .{ db, gpa, self.kind }) catch |err|
+                log.warn("filter options load: {}", .{err});
         }
+        const outcome = self.load.take() orelse return;
+        const o = outcome.value orelse return;
+        self.freeOptions(gpa);
+        self.options = o;
+    }
+
+    /// Wait for the running options load and show it (tests).
+    pub fn awaitOptions(self: *FilterModalState, gpa: std.mem.Allocator, io: std.Io) void {
+        self.load.awaitAll();
+        self.updateOptions(gpa, io, null);
     }
 
     pub fn render(
         self: *FilterModalState,
         active_filters: *std.ArrayList(db_mod.ActiveFilter),
-        db: ?*db_mod.VectorDb,
         grid: ?*image_grid_mod.GridState,
+        wakeup: ?*const fn () void,
     ) !void {
         if (!self.open) return;
 
-        // Fetch autocomplete options when kind changes or first open.
-        if (self.options_kind == null or self.options_kind.? != self.kind) {
-            if (dvui.App.main_init) |init| {
-                self.deinit(init.gpa);
-                if (db) |d| {
-                    self.options = d.getDistinctColumnValues(init.gpa, self.kind) catch |err| blk: {
-                        log.warn("filter options: {}", .{err});
-                        break :blk null;
-                    };
-                }
-            }
-            self.options_kind = self.kind;
-        }
+        if (dvui.App.main_init) |init| self.updateOptions(init.gpa, init.io, wakeup);
 
         var float = dvui.floatingWindow(@src(), .{
             .modal = true,
@@ -134,7 +182,7 @@ pub const FilterModalState = struct {
         // user picks from.
         {
             const typed = std.mem.sliceTo(&self.value_buf, 0);
-            const opts = self.options orelse &.{};
+            const opts: []const []const u8 = if (self.options) |o| o.values else &.{};
             var shown: usize = 0;
             for (opts, 0..) |opt, oi| {
                 if (shown >= 8) break;

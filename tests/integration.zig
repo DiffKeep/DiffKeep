@@ -582,10 +582,22 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
 
 var g_sidebar: *dk.sidebar.SidebarState = undefined;
 var g_sidebar_db: *dk.VectorDb = undefined;
+
+/// What AppState gives the sidebar at startup: the library list and a
+/// folder loader.
+fn loadSidebar(sb: *dk.sidebar.SidebarState, db: *dk.VectorDb) !void {
+    const libs = try db.listLibraries(alloc);
+    defer {
+        for (libs) |li| alloc.free(li.path);
+        alloc.free(libs);
+    }
+    try sb.setLibraries(alloc, libs);
+    sb.setFolderLoader(dk.folder_loader.FolderLoader.init(alloc, io, db));
+}
 var g_sidebar_grid: *dk.GridState = undefined;
 
 fn sidebarFrame() anyerror!dvui.App.Result {
-    _ = g_sidebar.render(220, alloc, g_sidebar_db, g_sidebar_grid, null, true, null, 0, 0) catch {};
+    _ = g_sidebar.render(220, alloc, g_sidebar_grid, null, true, null, 0, 0) catch {};
     return .ok;
 }
 
@@ -704,7 +716,6 @@ const ToolbarFix = struct {
             .active_filters = &self.filters,
             .filter_modal = &self.filter_modal,
             .grid = &self.grid,
-            .db = &self.db,
             .cfg = &self.cfg,
             .settings = &self.settings,
             .db_stats = &self.db_stats,
@@ -1833,20 +1844,22 @@ test "search: a late search result or embedding can't replace a different view" 
     defer search.deinit(alloc);
 
     // A search is fired, then the user opens the trash before it lands.
-    search.run(&grid);
-    try std.testing.expect(search.isSearchLoading(&grid));
+    search.noteShown(grid.showSearch(.{ .mode = .fts }));
+    try std.testing.expect(search.isSearchLoading(grid.appliedGen()));
     grid.view_mode = .trash;
     grid.reloadImages();
     grid.awaitReload();
-    try std.testing.expect(!search.isSearchLoading(&grid));
+    try std.testing.expect(!search.isSearchLoading(grid.appliedGen()));
     try expectGridIds(&grid, &.{b.id});
 
-    // An embedding finishing now doesn't pull the user back to the library.
+    // An embedding finishing now doesn't pull the user back to the library
+    // (AppState keeps it with `setSearch` instead of `showSearch`).
     const gen = search.startEmbedGeneration(io, alloc);
     try std.testing.expect(search.deliverEmbedding(gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
-    search.applyEmbedIfDone(alloc, &grid);
+    try grid.setSearch(search.takeEmbedded(alloc).?);
     try std.testing.expectEqual(dk.image_grid.ViewMode.trash, grid.view_mode);
     try std.testing.expect(!grid.reloadPending());
+    try std.testing.expect(grid.query_embeddings.prompt != null);
 }
 
 test "grid: an image scanned in while a load is running survives the load" {
@@ -2685,7 +2698,7 @@ test "search: the grid keeps its own copy of the FTS query" {
     defer search.deinit(alloc);
 
     @memcpy(search.buf[0..3], "cat");
-    search.fire(io, alloc, &grid);
+    search.noteShown(grid.showSearch(search.fire(io, alloc).?));
     grid.awaitReload();
     // The user keeps typing; a later, unrelated reload must still use "cat".
     @memcpy(search.buf[0..3], "dog");
@@ -2706,16 +2719,16 @@ test "search: a superseded query embedding is dropped and doesn't end the newer 
     const new_gen = search.startEmbedGeneration(io, alloc);
     // The old task finishes after the new one started: refused (and freed).
     try std.testing.expect(!search.deliverEmbedding(old_gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
-    search.applyEmbedIfDone(alloc, &grid);
-    try std.testing.expect(search.isSearchLoading(&grid));
+    try std.testing.expect(search.takeEmbedded(alloc) == null);
+    try std.testing.expect(search.isSearchLoading(grid.appliedGen()));
     try std.testing.expect(!grid.query_embeddings.any());
 
     try std.testing.expect(search.deliverEmbedding(new_gen, .{ .prompt = try alloc.dupe(f32, &dupVec(1)) }));
-    search.applyEmbedIfDone(alloc, &grid);
+    search.noteShown(grid.showSearch(search.takeEmbedded(alloc).?));
     try std.testing.expect(grid.query_embeddings.prompt != null);
     try std.testing.expectEqual(@as(f32, 1.0), grid.query_embeddings.prompt.?[1]);
     grid.awaitReload();
-    try std.testing.expect(!search.isSearchLoading(&grid));
+    try std.testing.expect(!search.isSearchLoading(grid.appliedGen()));
 }
 
 test "search: clearing the box cancels a semantic query still embedding" {
@@ -2731,12 +2744,12 @@ test "search: clearing the box cancels a semantic query still embedding" {
     search.mode = .semantic;
     const gen = search.startEmbedGeneration(io, alloc); // "dog" is embedding…
     @memset(&search.buf, 0); // …and the user clears the box.
-    search.fire(io, alloc, &grid);
+    search.noteShown(grid.showSearch(search.fire(io, alloc).?));
     grid.awaitReload();
     try std.testing.expect(!search.deliverEmbedding(gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
-    search.applyEmbedIfDone(alloc, &grid);
+    try std.testing.expect(search.takeEmbedded(alloc) == null);
     try std.testing.expect(!grid.query_embeddings.any());
-    try std.testing.expect(!search.isSearchLoading(&grid));
+    try std.testing.expect(!search.isSearchLoading(grid.appliedGen()));
 }
 
 // ── Review regressions (2026-11): decoding ───────────────────────────────────
@@ -2900,8 +2913,7 @@ test "sidebar: an expanded library keeps its folders after the counts refresh" {
     defer grid.deinit();
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
-    try sb.loadLibraries(alloc, &db);
-    sb.initFolderLoader(alloc, io, &db);
+    try loadSidebar(&sb, &db);
     sb.libraries.items[0].expanded = true;
 
     g_sidebar = &sb;
@@ -2940,8 +2952,7 @@ test "sidebar: folder lists load in the background; a refresh keeps the open tre
 
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
-    try sb.loadLibraries(alloc, &db);
-    sb.initFolderLoader(alloc, io, &db);
+    try loadSidebar(&sb, &db);
     const lib = &sb.libraries.items[0];
     const loader = &sb.folders.?;
 
@@ -3223,16 +3234,16 @@ test "detail panel: details load in the background and the newest selection wins
     var b = try db.findOrCreateImage(alloc, lib_id, dir ++ "/b.png");
     defer b.deinit(alloc);
 
-    var ds: dk.detail_panel.DetailState = .{};
+    var ds: dk.detail_panel.DetailState = .{ .db = &db };
     defer ds.deinit(alloc);
     // Arrowing quickly: a, then b. Only b's details may be shown.
-    ds.update(a.id, &db, alloc, io);
-    ds.update(b.id, &db, alloc, io);
+    ds.update(a.id, alloc, io);
+    ds.update(b.id, alloc, io);
     ds.awaitLoad(alloc);
     try std.testing.expectEqual(b.id, ds.detail.?.id);
     try std.testing.expectEqual(@as(?u32, 1), ds.detail.?.width);
 
-    ds.update(a.id, &db, alloc, io);
+    ds.update(a.id, alloc, io);
     ds.awaitLoad(alloc);
     try std.testing.expectEqual(a.id, ds.detail.?.id);
     try std.testing.expect(ds.detail.?.raw_chunks.len == 2);
@@ -4241,4 +4252,144 @@ test "notifier: an image it can't pass on is reported, so the grid reloads" {
     n.push(io, 2, "/lib/b.png", 0);
     try std.testing.expect(!n.drain(io, alloc, &out));
     try std.testing.expectEqual(1, out.items.len);
+}
+
+test "filter dialog: options load in the background, per field" {
+    const path = "/tmp/diffkeep_test_filter_options.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+    _ = try searchableImage(&db, lib, "/lib/a.png", "modelA", 0);
+    _ = try searchableImage(&db, lib, "/lib/b.png", "modelB", 0.1);
+
+    var fm: dk.filter_modal.FilterModalState = .{ .db = &db };
+    defer fm.deinit(alloc);
+
+    fm.updateOptions(alloc, io, null);
+    fm.awaitOptions(alloc, io);
+    try std.testing.expectEqual(2, fm.options.?.values.len);
+
+    // Another field replaces the options with its own.
+    fm.kind = .format;
+    fm.updateOptions(alloc, io, null);
+    fm.awaitOptions(alloc, io);
+    try std.testing.expectEqual(1, fm.options.?.values.len); // png
+}
+
+// ── Viewer background work ───────────────────────────────────────────────────
+
+var g_viewer_test_ptr: *dk.image_viewer.ViewerState = undefined;
+
+fn viewerFrame() anyerror!dvui.App.Result {
+    g_viewer_test_ptr.render();
+    return .ok;
+}
+
+/// Viewer entries for files under `dir` (paths owned by the list).
+fn viewerFiles(dir: []const u8, names: []const []const u8) !std.ArrayList(dk.ImageEntry) {
+    var images: std.ArrayList(dk.ImageEntry) = .empty;
+    for (names, 0..) |n, i| {
+        const p = try std.fs.path.join(alloc, &.{ dir, n });
+        try images.append(alloc, .{ .id = i + 1, .path = p, .filename = std.Io.Dir.path.basename(p), .mtime = null });
+    }
+    return images;
+}
+
+/// Render viewer frames until `done` holds (or about 5 s pass).
+fn viewerFramesUntil(vs: *dk.image_viewer.ViewerState, comptime done: fn (*dk.image_viewer.ViewerState) bool) !void {
+    g_viewer_test_ptr = vs;
+    for (0..500) |_| {
+        _ = try dvui.testing.step(viewerFrame);
+        if (done(vs)) return;
+        try std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake);
+    }
+    return error.Timeout;
+}
+
+test "viewer: prefetch decodes land in their slots, and close waits for them" {
+    const dir = "/tmp/diffkeep_test_viewer_prefetch";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const names = [_][]const u8{ "a.jpg", "b.jpg", "c.jpg" };
+    var px: [8 * 8 * 4]u8 = @splat(200);
+    for (names) |n| {
+        const jpeg = try dk.vips.rgbaToJpeg(alloc, &px, 8, 8, 8);
+        defer alloc.free(jpeg);
+        const p = try std.fs.path.join(alloc, &.{ dir, n });
+        defer alloc.free(p);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = jpeg });
+    }
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, try viewerFiles(dir, &names), 0, null, null, io, null, null);
+    defer vs.deinit();
+
+    // The current image shows once its decode lands; its neighbours are
+    // decoded into the cache meanwhile.
+    try viewerFramesUntil(&vs, struct {
+        fn f(v: *dk.image_viewer.ViewerState) bool {
+            return v.image_pixels != null and v.closeReady();
+        }
+    }.f);
+    try std.testing.expectEqual(8, vs.image_width);
+    var ready: usize = 0;
+    for (vs.cache_slots) |slot| {
+        if (slot.active and slot.ready) ready += 1;
+    }
+    try std.testing.expectEqual(2, ready);
+
+    // Moving on shows the prefetched neighbour at once, from the cache.
+    vs.navigateTo(1);
+    g_viewer_test_ptr = &vs;
+    _ = try dvui.testing.step(viewerFrame);
+    try std.testing.expect(vs.image_pixels != null);
+}
+
+test "viewer: an animation's player opens in the background and is adopted" {
+    const dir = "/tmp/diffkeep_test_viewer_player";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/anim.gif", .data = anim_small_gif });
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    var images = try viewerFiles(dir, &.{"anim.gif"});
+    images.items[0].media_type = .animated;
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, images, 0, null, null, io, null, null);
+    defer vs.deinit();
+
+    try viewerFramesUntil(&vs, struct {
+        fn f(v: *dk.image_viewer.ViewerState) bool {
+            return v.video_player != null or v.video_failed;
+        }
+    }.f);
+    try std.testing.expect(!vs.video_failed);
+    try std.testing.expectEqual(0, vs.video_player_idx);
+}
+
+test "search: the grid keeps its own copy of a shown search" {
+    const path = "/tmp/diffkeep_test_search_copy.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var search: dk.search.SearchState = .{};
+    defer search.deinit(alloc);
+    search.mode = .semantic;
+
+    const g1 = search.startEmbedGeneration(io, alloc);
+    try std.testing.expect(search.deliverEmbedding(g1, .{ .prompt = try alloc.dupe(f32, &dupVec(1)) }));
+    search.noteShown(grid.showSearch(search.takeEmbedded(alloc).?));
+    grid.awaitReload();
+
+    // The next query's embedding replaces (frees) the search's own copy
+    // before the view shows it; the grid's must be unaffected.
+    const g2 = search.startEmbedGeneration(io, alloc);
+    try std.testing.expect(search.deliverEmbedding(g2, .{ .prompt = try alloc.dupe(f32, &dupVec(2)) }));
+    _ = search.takeEmbedded(alloc).?;
+    try std.testing.expectEqual(@as(f32, 1.0), grid.query_embeddings.prompt.?[1]);
+    try std.testing.expectEqual(dk.image_grid.SearchMode.semantic, grid.search_mode);
 }

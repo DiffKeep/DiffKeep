@@ -179,7 +179,11 @@ pub const GridState = struct {
     filters: []const db_mod.ActiveFilter = &.{},
     // Search mode and query embeddings for semantic/visual search
     search_mode: SearchMode = .fts,
-    query_embeddings: QueryEmbeddings = .{},  // borrowed, not owned
+    /// What the view searches with; points at `search_embeddings` after
+    /// `setSearch` (tests may point it elsewhere).
+    query_embeddings: QueryEmbeddings = .{},
+    /// The grid's copy of the shown search's embeddings. Owned.
+    search_embeddings: QueryEmbeddings = .{},
     // Minimum cosine similarity per vector space (from config; set at startup).
     semantic_min_similarity: f32 = 0.15,
     visual_min_similarity: f32 = 0.03,
@@ -238,9 +242,42 @@ pub const GridState = struct {
         self.search_query = null;
     }
 
+    /// Take `s`'s parameters (copied) for the next load, without loading.
+    pub fn setSearch(self: *GridState, s: vq.Search) !void {
+        const a = self.allocator;
+        const text = if (s.text) |t| try a.dupe(u8, t) else null;
+        errdefer if (text) |t| a.free(t);
+        var emb: QueryEmbeddings = .{};
+        errdefer emb.free(a);
+        if (s.embeddings.prompt) |e| emb.prompt = try a.dupe(f32, e);
+        if (s.embeddings.visual) |e| emb.visual = try a.dupe(f32, e);
+        self.clearSearchQuery();
+        self.search_query = text;
+        self.search_embeddings.free(a);
+        self.search_embeddings = emb;
+        self.query_embeddings = self.search_embeddings;
+        self.search_mode = s.mode;
+    }
+
+    /// Show search `s` in the library view (searches are library loads).
+    /// Returns the load's generation: the search is loading until
+    /// `appliedGen` reaches it.
+    pub fn showSearch(self: *GridState, s: vq.Search) u64 {
+        self.view_mode = .library;
+        self.setSearch(s) catch |err| {
+            log.warn("search: {}", .{err});
+            self.load.cancel();
+            self.showLoadError(err);
+            return self.requestedGen();
+        };
+        self.reloadImages();
+        return self.requestedGen();
+    }
+
     pub fn deinit(self: *GridState) void {
         self.load.deinit();
         if (self.search_query) |q| self.allocator.free(q);
+        self.search_embeddings.free(self.allocator);
         self.load_dropped.deinit();
         for (self.load_added.items) |e| self.allocator.free(e.path);
         self.load_added.deinit(self.allocator);

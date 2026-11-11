@@ -1,28 +1,28 @@
 const std = @import("std");
 const embedder_mod = @import("embedder.zig");
-const image_grid_mod = @import("image_grid.zig");
+const vq = @import("view_query.zig");
 const bg = @import("bg.zig");
 
 const log = std.log.scoped(.search);
 
 // ── Embed task ────────────────────────────────────────────────────────────────
 
-const EmbedLoad = bg.Latest(image_grid_mod.QueryEmbeddings, image_grid_mod.QueryEmbeddings.free);
+const EmbedLoad = bg.Latest(vq.QueryEmbeddings, vq.QueryEmbeddings.free);
 
 /// Embed `query` (owned; freed here) in each vector space `mode` searches.
 fn embedTask(
     ticket: EmbedLoad.Ticket,
     allocator: std.mem.Allocator,
     query: []const u8,
-    mode: image_grid_mod.SearchMode,
+    mode: vq.SearchMode,
     embedder: *embedder_mod.Embedder,
-) ?image_grid_mod.QueryEmbeddings {
+) ?vq.QueryEmbeddings {
     defer allocator.free(query);
     if (!ticket.current()) return null; // the user typed on
 
     // Each vector space needs a query embedding from its own encoder;
     // combined mode needs both.
-    var embeddings: image_grid_mod.QueryEmbeddings = .{};
+    var embeddings: vq.QueryEmbeddings = .{};
     if (mode == .semantic or mode == .combined) {
         embeddings.prompt = embedder.embedPromptQuery(allocator, query) catch |err| blk: {
             log.warn("embedPromptQuery failed: {}", .{err});
@@ -46,9 +46,9 @@ pub const SearchState = struct {
     // Tracks buf from the previous frame to detect actual keystrokes.
     // Only changes to buf (vs last_buf) reset the debounce deadline.
     last_buf: [256]u8 = std.mem.zeroes([256]u8),
-    mode: image_grid_mod.SearchMode = .fts,
+    mode: vq.SearchMode = .fts,
     embedder: ?*embedder_mod.Embedder = null,
-    query_embeddings: image_grid_mod.QueryEmbeddings = .{},
+    query_embeddings: vq.QueryEmbeddings = .{},
 
     // Debounce: fire search 300 ms after the last keystroke.
     // Set to 1 to fire on the very next frame (used by mode-button clicks).
@@ -60,8 +60,8 @@ pub const SearchState = struct {
     embed: EmbedLoad = .{},
     wakeup_fn: ?*const fn () void = null,
 
-    // The grid load generation the latest search requested; the search is
-    // still loading until the grid has applied it.
+    // The view load generation the latest search requested; the search is
+    // still loading until the view has applied it (`noteShown`).
     search_gen: u64 = 0,
 
     pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
@@ -69,10 +69,18 @@ pub const SearchState = struct {
         self.query_embeddings.free(gpa);
     }
 
-    pub fn isSearchLoading(self: *const SearchState, grid: ?*const image_grid_mod.GridState) bool {
+    /// Whether the latest search is still embedding, or its view load
+    /// (generation `search_gen`) hasn't been applied: `applied_gen` is the
+    /// view's applied generation, null when there is no view.
+    pub fn isSearchLoading(self: *const SearchState, applied_gen: ?u64) bool {
         if (self.embed.pending()) return true;
-        const g = grid orelse return false;
-        return g.appliedGen() < self.search_gen;
+        const g = applied_gen orelse return false;
+        return g < self.search_gen;
+    }
+
+    /// The view started load `gen` to show this search's results.
+    pub fn noteShown(self: *SearchState, gen: u64) void {
+        self.search_gen = gen;
     }
 
     /// Wait for every query-embed task to finish (they hold the embedder).
@@ -95,81 +103,48 @@ pub const SearchState = struct {
 
     /// Hand a finished query embedding to the main thread. Returns false (and
     /// frees `embeddings`) when `gen` was superseded.
-    pub fn deliverEmbedding(self: *SearchState, gen: u64, embeddings: image_grid_mod.QueryEmbeddings) bool {
+    pub fn deliverEmbedding(self: *SearchState, gen: u64, embeddings: vq.QueryEmbeddings) bool {
         return self.embed.deliver(gen, embeddings);
     }
 
-    /// Called from the main thread every frame; applies a delivered query
-    /// embedding to the grid and runs the search.
-    pub fn applyEmbedIfDone(
-        self: *SearchState,
-        allocator: std.mem.Allocator,
-        grid: *image_grid_mod.GridState,
-    ) void {
-        const outcome = self.embed.take() orelse return;
-        const taken = outcome.value orelse return;
+    /// A query embedding that landed since the last call, as the search to
+    /// show (borrowing this state's embeddings until the next one). Main
+    /// thread, every frame.
+    pub fn takeEmbedded(self: *SearchState, allocator: std.mem.Allocator) ?vq.Search {
+        const outcome = self.embed.take() orelse return null;
+        const taken = outcome.value orelse return null;
         self.query_embeddings.free(allocator);
         self.query_embeddings = taken;
-        grid.query_embeddings = self.query_embeddings;
-        // The user left the library while the embedding computed: keep it for
-        // when they return rather than pulling them back.
-        if (grid.view_mode != .library) return;
-        self.run(grid);
+        return .{ .mode = self.mode, .embeddings = self.query_embeddings };
     }
 
-    /// Show the results of the grid's current search parameters. Searches are
-    /// library-view loads, so they go through the grid's own background load
-    /// and supersede (or are superseded by) any other view change.
-    pub fn run(self: *SearchState, grid: *image_grid_mod.GridState) void {
-        grid.view_mode = .library;
-        grid.reloadImages();
-        self.search_gen = grid.requestedGen();
-    }
-
-    /// Run the search for the current text box and mode (debounce elapsed or a
-    /// mode button was clicked). Main thread.
-    pub fn fire(self: *SearchState, io: std.Io, gpa: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+    /// The search for the current text box and mode (debounce elapsed or a
+    /// mode button was clicked), to show now; null while its query embedding
+    /// is computed (`takeEmbedded` hands it over then; meanwhile the current
+    /// results stay). Borrows the text box. Main thread.
+    pub fn fire(self: *SearchState, io: std.Io, gpa: std.mem.Allocator) ?vq.Search {
         @memcpy(&self.prev, &self.buf);
         const q = std.mem.sliceTo(&self.buf, 0);
-        grid.search_mode = self.mode;
-        grid.query_embeddings = .{};
-        self.query_embeddings.free(gpa);
-        switch (self.mode) {
-            .fts => {
-                self.cancelEmbed();
-                if (q.len == 0) grid.clearSearchQuery() else grid.setSearchQuery(q) catch |err| {
-                    log.warn("search query: {}", .{err});
-                    grid.showLoadError(err);
-                    return;
-                };
-                self.run(grid);
-            },
-            .semantic, .visual, .combined => {
-                grid.clearSearchQuery();
-                if (q.len == 0) {
-                    // Empty query: show all/library images without embedding.
-                    self.cancelEmbed();
-                    self.run(grid);
-                    return;
-                }
-                // Keep showing the current results while the embedding is
-                // computed; applyEmbedIfDone runs the search when it lands.
-                self.spawnEmbedQuery(io, gpa, q, self.mode) catch |err| {
-                    log.warn("search embed spawn: {}", .{err});
-                    self.cancelEmbed();
-                };
-            },
+        if (self.mode == .fts or q.len == 0) {
+            // Nothing to embed: a text search, or an empty box (everything).
+            self.cancelEmbed();
+            return .{ .mode = self.mode, .text = if (self.mode == .fts and q.len > 0) q else null };
         }
+        self.spawnEmbedQuery(io, gpa, q, self.mode) catch |err| {
+            log.warn("search embed spawn: {}", .{err});
+            self.cancelEmbed();
+        };
+        return null;
     }
 
     /// Spawn a background task to compute a query embedding.
-    /// Returns immediately; the result is applied to the grid via applyEmbedIfDone().
+    /// Returns immediately; the result is handed over by `takeEmbedded`.
     pub fn spawnEmbedQuery(
         self: *SearchState,
         io: std.Io,
         allocator: std.mem.Allocator,
         query: []const u8,
-        mode: image_grid_mod.SearchMode,
+        mode: vq.SearchMode,
     ) !void {
         if (mode == .fts) return;
         const embedder = self.embedder orelse return error.NoEmbedder;

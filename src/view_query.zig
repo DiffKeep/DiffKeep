@@ -11,7 +11,7 @@ pub const ViewMode = enum { library, trash, duplicates, favorites };
 pub const SearchMode = enum { fts, semantic, visual, combined };
 
 /// One query embedding per vector space: `prompt` targets
-/// positive_prompt_embeddings (Snowflake), `visual` targets image_embeddings
+/// positive_prompt_embeddings (EmbeddingGemma), `visual` targets image_embeddings
 /// (SigLIP2 text encoder). Combined mode uses both; the spaces are not
 /// interchangeable.
 pub const QueryEmbeddings = struct {
@@ -27,6 +27,15 @@ pub const QueryEmbeddings = struct {
         if (self.visual) |e| allocator.free(e);
         self.* = .{};
     }
+};
+
+/// A search to show: a library-view load with these parameters. Borrows its
+/// text and embeddings; whoever shows it copies them.
+pub const Search = struct {
+    mode: SearchMode,
+    /// Full-text query; null for none.
+    text: ?[]const u8 = null,
+    embeddings: QueryEmbeddings = .{},
 };
 
 pub const ImageEntry = struct {

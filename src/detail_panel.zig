@@ -42,6 +42,9 @@ pub const DetailState = struct {
     reparse_requested: bool = false,
     /// Wakes the render loop when a background load finishes.
     wakeup_fn: ?*const fn () void = null,
+    /// The library, set once by the owner; loads run on connections of
+    /// their own. Without it nothing loads.
+    db: ?*db_mod.VectorDb = null,
 
     /// Background load of `id`'s details: a new selection supersedes the
     /// load of the previous one.
@@ -62,10 +65,10 @@ pub const DetailState = struct {
     pub fn update(
         self: *DetailState,
         focused_id: ?u64,
-        db: *db_mod.VectorDb,
         gpa: std.mem.Allocator,
         io: std.Io,
     ) void {
+        const db = self.db orelse return;
         self.takeLoaded(gpa);
         if (focused_id == self.id) return;
 

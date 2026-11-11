@@ -22,6 +22,7 @@ const detail_panel_mod = @import("detail_panel.zig");
 const sidebar_mod = @import("sidebar.zig");
 const image_viewer_mod = @import("image_viewer.zig");
 const filter_modal_mod = @import("filter_modal.zig");
+const folder_loader_mod = @import("folder_loader.zig");
 const delete_dialog_mod = @import("delete_dialog.zig");
 const settings_modal_mod = @import("settings_modal.zig");
 const search_mod = @import("search.zig");
@@ -191,8 +192,19 @@ pub const AppState = struct {
         }
 
         const db = if (self.db) |*d| d else return;
-        // The grid's own load fails the same way and says so on screen.
-        self.sidebar.loadLibraries(gpa, db) catch |err| log.warn("library list: {}", .{err});
+        // One point query at startup, for the sidebar and the watcher. On
+        // failure the grid's own load fails the same way and says so.
+        const libs = db.listLibraries(gpa) catch |err| blk: {
+            log.warn("library list: {}", .{err});
+            break :blk &[_]db_mod.LibraryInfo{};
+        };
+        defer {
+            for (libs) |li| gpa.free(li.path);
+            gpa.free(libs);
+        }
+        self.sidebar.setLibraries(gpa, libs) catch |err| log.warn("library list: {}", .{err});
+        self.detail.db = db;
+        self.filter_modal.db = db;
 
         // The grid comes first so the library manager can take its notifier.
         self.grid = try image_grid_mod.GridState.init(io, gpa, db, self.cfg.thumbnails_in_db, hooks.wakeup);
@@ -230,7 +242,7 @@ pub const AppState = struct {
         mgr.wakeup_fn = hooks.wakeup;
         self.search.wakeup_fn = hooks.wakeup;
         self.sidebar.wakeup_fn = hooks.wakeup;
-        self.sidebar.initFolderLoader(gpa, io, db);
+        self.sidebar.setFolderLoader(folder_loader_mod.FolderLoader.init(gpa, io, db));
         self.detail.wakeup_fn = hooks.wakeup;
 
         // The embedder loads in the background; search and scans run without
@@ -240,14 +252,6 @@ pub const AppState = struct {
 
         // Register all existing libraries with the watcher.
         if (self.fs_watcher) |*watcher| {
-            const libs = db.listLibraries(gpa) catch |err| blk: {
-                log.warn("libraries not watched: {}", .{err});
-                break :blk &[_]db_mod.LibraryInfo{};
-            };
-            defer {
-                for (libs) |li| gpa.free(li.path);
-                gpa.free(libs);
-            }
             for (libs) |li| watcher.addLibrary(li.id, li.path) catch |err|
                 log.warn("watch library {s}: {} (changes show up on the next scan)", .{ li.path, err });
         }
@@ -483,7 +487,14 @@ pub const AppState = struct {
             // Some removals couldn't be applied here: reload from the DB.
             if (lost) grid.reloadImagesEx(.{ .keep_scroll = true });
             if (grid.images.items.len != prev_len) self.refreshCounts();
-            self.search.applyEmbedIfDone(self.gpa, grid);
+            if (self.search.takeEmbedded(self.gpa)) |s| {
+                // The user left the library while it embedded: keep the search
+                // for when they return rather than pulling them back.
+                if (grid.view_mode == .library)
+                    self.search.noteShown(grid.showSearch(s))
+                else
+                    grid.setSearch(s) catch |err| log.warn("search: {}", .{err});
+            }
             // Finished file operations leave the grid (and viewers).
             if (self.file_ops) |*ops| _ = ops.poll(self.gpa, grid);
         }
@@ -599,7 +610,7 @@ pub const AppState = struct {
         if (!due) return;
         s.force_search = false;
         s.debounce_deadline_ns = 0;
-        if (self.grid) |*grid| s.fire(self.io, self.gpa, grid);
+        if (self.grid) |*grid| if (s.fire(self.io, self.gpa)) |search| s.noteShown(grid.showSearch(search));
     }
 
     /// Collect watcher events, and hand them to the library manager once
@@ -650,7 +661,6 @@ pub const AppState = struct {
             .active_filters = &self.active_filters,
             .filter_modal = &self.filter_modal,
             .grid = &self.grid,
-            .db = &self.db,
             .cfg = &self.cfg,
             .settings = &self.settings,
             .db_stats = &self.db_stats,
@@ -685,7 +695,7 @@ pub const AppState = struct {
         // ── Delete confirmation, bulk confirmation, filters ───────────────
         try self.delete_dialog.render(self.cfg.trash_enabled, if (self.grid) |*g| g else null, if (self.file_ops) |*o| o else null, self.gpa);
         self.renderBulkConfirm();
-        try self.filter_modal.render(&self.active_filters, if (self.db) |*db| db else null, if (self.grid) |*g| g else null);
+        try self.filter_modal.render(&self.active_filters, if (self.grid) |*g| g else null, self.hooks.wakeup);
 
         // Mirror remembered grid layout into the config (saved on exit).
         if (self.grid) |*grid| {

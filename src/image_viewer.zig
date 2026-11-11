@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.image_viewer);
+const bg = @import("bg.zig");
 const dvui = @import("dvui");
 const image_grid_mod = @import("image_grid.zig");
 const video_player_mod = @import("video_player.zig");
@@ -31,13 +32,6 @@ const CacheSlot = struct {
     height: u32 = 0,
 };
 
-/// A background decode thread and the flag it sets on exit, so the main
-/// thread can join (reap) it without blocking.
-const LoadWorker = struct {
-    thread: std.Thread,
-    done: *std.atomic.Value(bool),
-};
-
 /// New `pan` after zooming from `z` to `z2` with the cursor `u` image units from
 /// the image centre, so the image point under the cursor stays put. (The
 /// image's screen offset is `pan * zoom * scale`.)
@@ -47,14 +41,19 @@ pub fn zoomPanAbout(pan: f32, u: f32, z: f32, z2: f32) f32 {
 
 pub const DecodedImage = struct { pixels: []u8, width: u32, height: u32 };
 
-/// A media player being opened on a background thread: opening probes the
-/// file and, for an animation small enough to cache, decodes every frame.
-const PlayerOpen = struct {
-    thread: std.Thread,
+/// A media player opened in the background (opening probes the file and,
+/// for an animation small enough to cache, decodes every frame), for entry
+/// `idx`; `player` is null when it failed to open.
+const OpenedPlayer = struct {
+    player: ?*video_player_mod.VideoPlayer,
     idx: usize,
-    done: std.atomic.Value(bool) = .init(false),
-    result: ?*video_player_mod.VideoPlayer = null, // written before `done`
+
+    fn free(o: *OpenedPlayer, _: std.mem.Allocator) void {
+        if (o.player) |p| p.deinit();
+    }
 };
+
+const PlayerLoad = bg.Latest(OpenedPlayer, OpenedPlayer.free);
 
 pub const ViewerState = struct {
     id: u64,
@@ -72,17 +71,17 @@ pub const ViewerState = struct {
     video_player: ?*video_player_mod.VideoPlayer = null,
     video_player_idx: usize = 0,
     /// The player for some entry being opened in the background.
-    player_open: ?*PlayerOpen = null,
+    player_load: PlayerLoad = .{},
 
-    // Prefetch cache.  cache_mutex protects both cache_slots and cache_threads.
-    // Thread handles are managed only by the main thread.
+    // Prefetch cache, guarded by cache_mutex. A decode delivers into its slot
+    // only while the slot's generation still matches, so evicted or
+    // superseded decodes just finish and drop their result.
     cache_slots: [cache_size]CacheSlot,
-    cache_threads: [cache_size]?LoadWorker,
     cache_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Last slot generation handed out (guarded by cache_mutex).
     cache_gen: u64 = 0,
-    // Evicted threads still decoding; reaped by `reapOrphans` once done.
-    orphan_threads: std.ArrayList(LoadWorker) = .empty,
+    /// The prefetch decodes; awaited in `deinit` (after `closeReady`).
+    decodes: std.Io.Group = .init,
     /// The current static image failed to decode: show an error, not a spinner.
     image_failed: bool = false,
     /// The current entry's player failed to open: don't retry every frame.
@@ -102,7 +101,6 @@ pub const ViewerState = struct {
     info_w: f32 = 280,
     info_w_open: f32 = 280,
     detail_state: detail_panel_mod.DetailState = .{},
-    db: ?*db_mod.VectorDb = null,
 
     // Window state
     open: bool = true,
@@ -157,13 +155,10 @@ pub const ViewerState = struct {
             .current_idx = start_idx,
             .wakeup_fn = wakeup_fn,
             .data_dir = data_dir,
-            .db = db,
             .cfg = cfg,
             .cache_slots = undefined,
-            .cache_threads = undefined,
         };
         for (&state.cache_slots) |*s| s.* = .{};
-        for (&state.cache_threads) |*t| t.* = null;
         // Restore remembered UI preferences.
         if (cfg) |c| {
             state.fullscreen = c.viewer_window.fullscreen;
@@ -172,6 +167,7 @@ pub const ViewerState = struct {
             state.info_w_open = c.viewer_info_w;
         }
         state.detail_state.wakeup_fn = wakeup_fn;
+        state.detail_state.db = db;
         // Load threads are spawned on the first render() call, once self is stable.
         return state;
     }
@@ -201,17 +197,11 @@ pub const ViewerState = struct {
     pub fn deinit(self: *ViewerState) void {
         // Stop the video decode thread first (joins it).
         self.teardownVideo();
-        if (self.player_open) |po| {
-            po.thread.join();
-            if (po.result) |p| p.deinit();
-            self.gpa.destroy(po);
-            self.player_open = null;
-        }
+        self.player_load.deinit();
         // Mark all slots inactive so in-flight threads will discard their results.
         // Collect thread handles while holding the lock, then join without it.
         self.flushCache();
-        for (self.orphan_threads.items) |w| joinWorker(self.gpa, w);
-        self.orphan_threads.deinit(self.gpa);
+        self.decodes.await(self.io) catch {};
 
         if (self.image_pixels) |p| self.gpa.free(p);
         for (self.images.items) |e| {
@@ -231,7 +221,7 @@ pub const ViewerState = struct {
         self.cache_mutex.lockUncancelable(self.io);
         defer self.cache_mutex.unlock(self.io);
 
-        for (&self.cache_slots, 0..) |*slot, i| {
+        for (&self.cache_slots) |*slot| {
             if (!slot.active or !slot.ready or slot.image_idx != self.current_idx) continue;
             const pixels = slot.pixels orelse continue;
 
@@ -249,13 +239,6 @@ pub const ViewerState = struct {
             } };
             self.image_texture_hash = src.hash();
 
-            // Its thread is finishing; reap it once it has exited.
-            if (self.cache_threads[i]) |w| {
-                // Out of memory it can't be reaped later: wait for it now
-                // (it is already finishing).
-                self.orphan_threads.append(self.gpa, w) catch joinWorker(self.gpa, w);
-                self.cache_threads[i] = null;
-            }
             return;
         }
         // A failed decode of the current image: show the error state.
@@ -301,18 +284,6 @@ pub const ViewerState = struct {
         return true;
     }
 
-    /// Join evicted load threads that have exited. Never blocks.
-    fn reapOrphans(self: *ViewerState) void {
-        var i: usize = 0;
-        while (i < self.orphan_threads.items.len) {
-            const w = self.orphan_threads.items[i];
-            if (w.done.load(.acquire)) {
-                joinWorker(self.gpa, w);
-                _ = self.orphan_threads.swapRemove(i);
-            } else i += 1;
-        }
-    }
-
     // Maintain the cache window [current_idx-2, current_idx+2].
     // Evicts entries that have fallen outside and starts loads for missing ones.
     // Guards against duplicate loads: an index is skipped if it is already
@@ -328,21 +299,18 @@ pub const ViewerState = struct {
         const LoadTask = struct { slot_i: usize, gen: u64, path: [:0]u8 };
         var tasks: [cache_size]LoadTask = undefined;
         var task_count: usize = 0;
-        var evicted: [cache_size]?LoadWorker = @splat(null);
 
         {
             self.cache_mutex.lockUncancelable(self.io);
             defer self.cache_mutex.unlock(self.io);
 
             // Evict slots that have fallen outside the window.
-            for (&self.cache_slots, 0..) |*slot, i| {
+            for (&self.cache_slots) |*slot| {
                 if (!slot.active) continue;
                 if (slot.image_idx < lo or slot.image_idx > hi) {
                     if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
                     slot.active = false;
                     slot.ready = false;
-                    evicted[i] = self.cache_threads[i];
-                    self.cache_threads[i] = null;
                 }
             }
 
@@ -376,38 +344,17 @@ pub const ViewerState = struct {
             }
         }
 
-        // Park evicted threads (outside the lock); reapOrphans joins them later.
-        for (evicted) |maybe_w| if (maybe_w) |w| self.parkWorker(w);
-
-        // Spawn threads outside the lock. At most `cache_size` decodes run at
-        // once beyond the evicted ones still finishing.
+        // Start the decodes outside the lock. At most `cache_size` run at
+        // once beyond evicted ones still finishing.
         for (tasks[0..task_count]) |task| {
-            const done = self.gpa.create(std.atomic.Value(bool)) catch {
-                self.gpa.free(task.path);
-                _ = self.deliverDecode(task.slot_i, task.gen, null);
-                continue;
-            };
-            done.* = .init(false);
             _ = self.inflight.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, loadCacheThread, .{
-                self.gpa, self, task.slot_i, task.gen, task.path, done,
-            }) catch {
+            self.decodes.concurrent(self.io, decodeTask, .{ self, task.slot_i, task.gen, task.path }) catch |err| {
                 _ = self.inflight.fetchSub(1, .acq_rel);
+                std.log.scoped(.viewer).warn("start decode: {}", .{err});
                 self.gpa.free(task.path);
-                self.gpa.destroy(done);
                 _ = self.deliverDecode(task.slot_i, task.gen, null);
-                continue;
             };
-            self.cache_mutex.lockUncancelable(self.io);
-            self.cache_threads[task.slot_i] = .{ .thread = t, .done = done };
-            self.cache_mutex.unlock(self.io);
         }
-    }
-
-    /// Keep an evicted load thread for reaping; join it now only if it can't
-    /// be tracked (out of memory).
-    fn parkWorker(self: *ViewerState, w: LoadWorker) void {
-        self.orphan_threads.append(self.gpa, w) catch joinWorker(self.gpa, w);
     }
 
     pub fn navigateTo(self: *ViewerState, idx: usize) void {
@@ -497,23 +444,16 @@ pub const ViewerState = struct {
     // Mark all cache slots inactive and park their threads as orphans.
     // Called when the images list is mutated (indices shift).
     pub fn flushCache(self: *ViewerState) void {
-        var threads: [cache_size]?LoadWorker = undefined;
-        {
-            self.cache_mutex.lockUncancelable(self.io);
-            for (&self.cache_slots, 0..) |*slot, i| {
-                if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
-                slot.* = .{};
-                threads[i] = self.cache_threads[i];
-                self.cache_threads[i] = null;
-            }
-            self.cache_mutex.unlock(self.io);
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        for (&self.cache_slots) |*slot| {
+            if (slot.pixels) |p| self.gpa.free(p);
+            slot.* = .{};
         }
-        for (threads) |maybe_w| if (maybe_w) |w| self.parkWorker(w);
     }
 
     pub fn render(self: *ViewerState) void {
         self.captureWindowState();
-        self.reapOrphans();
         // Videos and animated images play through the media player; static
         // images use the prefetch cache.
         if (self.currentIsPlayable()) {
@@ -570,21 +510,17 @@ pub const ViewerState = struct {
         const cur = self.currentImage() orelse return;
 
         // Adopt a player that finished opening, if it's still for this entry.
-        if (self.player_open) |po| if (po.done.load(.acquire)) {
-            po.thread.join();
-            const opened = po.result;
-            const for_current = po.idx == self.current_idx and self.video_player == null;
-            self.gpa.destroy(po);
-            self.player_open = null;
-            if (for_current) {
-                self.video_player = opened;
+        if (self.player_load.take()) |outcome| if (outcome.value) |o| {
+            if (o.idx == self.current_idx and self.video_player == null) {
+                self.video_player = o.player;
                 self.video_player_idx = self.current_idx;
                 // A failure is shown, not retried every frame.
-                self.video_failed = opened == null;
-            } else if (opened) |p| p.deinit();
+                self.video_failed = o.player == null;
+            } else if (o.player) |p| p.deinit();
         };
         const want_player = self.video_player == null or self.video_player_idx != self.current_idx;
-        if (want_player and !self.video_failed and self.player_open == null) {
+        // One open at a time: an animation's open can decode every frame.
+        if (want_player and !self.video_failed and !self.player_load.pending()) {
             self.teardownVideo();
             self.startPlayerOpen(cur) catch |err| {
                 std.log.scoped(.viewer).warn("open player: {}", .{err});
@@ -616,13 +552,10 @@ pub const ViewerState = struct {
     fn startPlayerOpen(self: *ViewerState, cur: *const image_grid_mod.ImageEntry) !void {
         const path_z = try self.diskPathZ(cur);
         errdefer self.gpa.free(path_z);
-        const po = try self.gpa.create(PlayerOpen);
-        errdefer self.gpa.destroy(po);
-        po.* = .{ .thread = undefined, .idx = self.current_idx };
         _ = self.inflight.fetchAdd(1, .acq_rel);
         errdefer _ = self.inflight.fetchSub(1, .acq_rel);
-        po.thread = try std.Thread.spawn(.{}, openPlayerThread, .{ self, po, path_z });
-        self.player_open = po;
+        self.player_load.wakeup_fn = self.wakeup_fn;
+        _ = try self.player_load.start(self.io, self.gpa, openPlayerTask, .{ self, self.current_idx, path_z });
     }
 
     fn handleKeyEvents(self: *ViewerState) void {
@@ -1240,8 +1173,7 @@ pub const ViewerState = struct {
             self.images.items[self.current_idx].filename
         else "";
         // Details load (in the background) only while the pane is open.
-        if (self.db) |db| if (self.currentImage()) |cur|
-            self.detail_state.update(cur.id, db, self.gpa, self.io);
+        if (self.currentImage()) |cur| self.detail_state.update(cur.id, self.gpa, self.io);
         self.detail_state.renderPanel(self.info_w, filename, self.gpa, self.io);
     }
 
@@ -1271,31 +1203,18 @@ pub const ViewerState = struct {
     }
 };
 
-fn openPlayerThread(state: *ViewerState, po: *PlayerOpen, path_z: [:0]u8) void {
+fn openPlayerTask(_: PlayerLoad.Ticket, state: *ViewerState, idx: usize, path_z: [:0]u8) ?OpenedPlayer {
     defer _ = state.inflight.fetchSub(1, .acq_rel);
     defer state.gpa.free(path_z);
-    po.result = video_player_mod.VideoPlayer.init(state.gpa, state.io, path_z, .{ .wakeup_fn = state.wakeup_fn }) catch |err| blk: {
+    const player = video_player_mod.VideoPlayer.init(state.gpa, state.io, path_z, .{ .wakeup_fn = state.wakeup_fn }) catch |err| blk: {
         std.log.scoped(.viewer).warn("open {s}: {}", .{ std.Io.Dir.path.basename(path_z), err });
         break :blk null;
     };
-    po.done.store(true, .release);
-    if (state.wakeup_fn) |w| w();
+    return .{ .player = player, .idx = idx };
 }
 
-fn joinWorker(gpa: std.mem.Allocator, w: LoadWorker) void {
-    w.thread.join();
-    gpa.destroy(w.done);
-}
-
-fn loadCacheThread(
-    gpa: std.mem.Allocator,
-    state: *ViewerState,
-    slot_i: usize,
-    gen: u64,
-    path: [:0]u8,
-    done: *std.atomic.Value(bool),
-) void {
-    defer done.store(true, .release);
+fn decodeTask(state: *ViewerState, slot_i: usize, gen: u64, path: [:0]u8) void {
+    const gpa = state.gpa;
     defer _ = state.inflight.fetchSub(1, .acq_rel);
     defer gpa.free(path);
     defer vips_mod.threadShutdown();

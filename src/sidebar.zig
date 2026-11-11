@@ -140,12 +140,13 @@ pub const SidebarState = struct {
     add_error: ?[:0]const u8 = null,
     filter_library_id: ?u64 = null,
     filter_folder: ?[]const u8 = null, // heap-allocated, owned
-    /// Loads folder lists in the background. Set with `initFolderLoader`;
+    /// Loads folder lists in the background. Set with `setFolderLoader`;
     /// without it the library trees stay empty.
     folders: ?folder_loader_mod.FolderLoader = null,
 
-    pub fn initFolderLoader(self: *SidebarState, gpa: std.mem.Allocator, io: std.Io, db: *db_mod.VectorDb) void {
-        self.folders = folder_loader_mod.FolderLoader.init(gpa, io, db);
+    /// Take `loader` (the sidebar owns it from here).
+    pub fn setFolderLoader(self: *SidebarState, loader: folder_loader_mod.FolderLoader) void {
+        self.folders = loader;
         self.folders.?.wakeup_fn = self.wakeup_fn;
     }
 
@@ -156,13 +157,9 @@ pub const SidebarState = struct {
         if (self.filter_folder) |f| gpa.free(f);
     }
 
-    /// The library list. Counts arrive from the counts loader (`applyLibraryCounts`).
-    pub fn loadLibraries(self: *SidebarState, gpa: std.mem.Allocator, db: *db_mod.VectorDb) !void {
-        const libs = try db.listLibraries(gpa);
-        defer {
-            for (libs) |li| gpa.free(li.path);
-            gpa.free(libs);
-        }
+    /// Show `libs` (copied). Counts arrive from the counts loader
+    /// (`applyLibraryCounts`).
+    pub fn setLibraries(self: *SidebarState, gpa: std.mem.Allocator, libs: []const db_mod.LibraryInfo) !void {
         try self.libraries.ensureUnusedCapacity(gpa, libs.len);
         for (libs) |li| self.libraries.appendAssumeCapacity(.{
             .id = li.id,
@@ -276,7 +273,6 @@ pub const SidebarState = struct {
         lib: *LibraryState,
         depth: usize,
         gpa: std.mem.Allocator,
-        db: ?*db_mod.VectorDb,
         grid: ?*image_grid_mod.GridState,
     ) void {
         const in_lib_view = if (grid) |g| g.view_mode == .library else false;
@@ -361,7 +357,7 @@ pub const SidebarState = struct {
 
         if (node.expanded) {
             for (node.children) |*child| {
-                self.renderFolderNode(child, lib, depth + 1, gpa, db, grid);
+                self.renderFolderNode(child, lib, depth + 1, gpa, grid);
             }
         }
     }
@@ -371,7 +367,6 @@ pub const SidebarState = struct {
         self: *SidebarState,
         panel_w: f32,
         gpa: std.mem.Allocator,
-        db: ?*db_mod.VectorDb,
         grid: ?*image_grid_mod.GridState,
         library_manager: ?*library_manager_mod.LibraryManager,
         cfg_trash_enabled: bool,
@@ -567,7 +562,7 @@ pub const SidebarState = struct {
 
                 if (lib.expanded) {
                     for (lib.top_folders) |*node| {
-                        self.renderFolderNode(node, lib, 1, gpa, db, grid);
+                        self.renderFolderNode(node, lib, 1, gpa, grid);
                     }
                 }
             }
@@ -721,11 +716,11 @@ pub const SidebarState = struct {
                         self.confirm_remove_idx = null;
                         var removed = self.libraries.orderedRemove(idx);
                         const removed_id = removed.id;
+                        // In the background (rows, trashed files); there is a
+                        // manager whenever there is a library to remove.
                         if (library_manager) |mgr| {
                             if (dvui.App.main_init) |init| mgr.removeLibrary(init.io, removed.path) catch |err|
                                 log.warn("remove library: {}", .{err});
-                        } else if (db) |d| {
-                            d.removeLibrary(removed.path) catch |err| log.warn("remove library: {}", .{err});
                         }
                         removed.deinit(gpa);
                         if (self.filter_library_id == removed_id) {
