@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const db_mod = @import("db.zig");
+const bg = @import("bg.zig");
 
 const log = std.log.scoped(.counts);
 
@@ -74,28 +75,33 @@ pub fn load(db: *db_mod.VectorDb, a: std.mem.Allocator, with_stats: bool) !Count
     return c;
 }
 
+/// A request for one more load. Queued at most once (`pushUnique`), so any
+/// number of requests made while a load runs coalesce into one more load.
+const Refresh = struct {
+    fn eql(_: Refresh, _: Refresh) bool {
+        return true;
+    }
+};
+
 pub const CountsLoader = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    /// Pool owner; the load task takes its own connection from it.
+    /// Pool owner; the worker takes its own connection from it.
     db: *db_mod.VectorDb,
     wakeup_fn: ?*const fn () void = null,
-    group: std.Io.Group = .init,
+    queue: bg.WorkQueue(Refresh),
     mutex: std.Io.Mutex = .init,
     // Guarded by `mutex`.
-    running: bool = false,
-    again: bool = false,
     want_stats: bool = false,
     clears: ClearSet = .empty,
     result: ?Counts = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, db: *db_mod.VectorDb) CountsLoader {
-        return .{ .allocator = allocator, .io = io, .db = db };
+        return .{ .allocator = allocator, .db = db, .queue = .init(allocator, io, 1, worker, null) };
     }
 
     /// Wait for a running load; free an unclaimed result.
     pub fn deinit(self: *CountsLoader) void {
-        self.group.await(self.io) catch {};
+        self.queue.deinit();
         if (self.result) |*r| r.deinit(self.allocator);
         self.result = null;
     }
@@ -103,91 +109,78 @@ pub const CountsLoader = struct {
     /// Ask for fresh counts. Main thread; cheap, so call it as often as
     /// anything changes.
     pub fn request(self: *CountsLoader) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.running) {
-            self.again = true;
-            return;
-        }
-        self.group.await(self.io) catch {}; // reap the finished task
-        self.group = .init;
-        self.running = true;
-        self.group.concurrent(self.io, loadTask, .{self}) catch |err| {
-            log.warn("spawn counts load: {}", .{err});
-            self.running = false;
-        };
+        _ = self.queue.pushUnique(.{}, Refresh.eql) catch |err| log.warn("queue counts load: {}", .{err});
     }
 
     /// Ask for fresh counts and database stats. Main thread.
     pub fn requestStats(self: *CountsLoader) void {
-        self.mutex.lockUncancelable(self.io);
+        self.lock();
         self.want_stats = true;
-        self.mutex.unlock(self.io);
+        self.unlock();
         self.request();
     }
 
     /// Clear `cache` in the background, then load fresh counts and stats.
     /// Main thread.
     pub fn clear(self: *CountsLoader, cache: Cache) void {
-        self.mutex.lockUncancelable(self.io);
+        self.lock();
         self.clears.insert(cache);
         self.want_stats = true;
-        self.mutex.unlock(self.io);
+        self.unlock();
         self.request();
     }
 
-    /// Wait for a running load (tests).
+    /// Wait for queued loads (tests).
     pub fn awaitIdle(self: *CountsLoader) void {
-        self.group.await(self.io) catch {};
+        self.queue.awaitIdle();
     }
 
     /// The newest counts, if a load finished since the last poll. Main thread;
     /// the caller owns the result (free with `Counts.deinit(loader.allocator)`).
     pub fn poll(self: *CountsLoader) ?Counts {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.lock();
+        defer self.unlock();
         const r = self.result orelse return null;
         self.result = null;
         return r;
     }
 
-    fn loadTask(self: *CountsLoader) void {
+    fn lock(self: *CountsLoader) void {
+        self.mutex.lockUncancelable(self.queue.io);
+    }
+    fn unlock(self: *CountsLoader) void {
+        self.mutex.unlock(self.queue.io);
+    }
+
+    fn worker(q: *bg.WorkQueue(Refresh)) void {
+        const self: *CountsLoader = @fieldParentPtr("queue", q);
         var conn = self.db.getConnection() catch |err| {
             log.warn("counts db connection: {}", .{err});
-            self.mutex.lockUncancelable(self.io);
-            self.running = false;
-            self.mutex.unlock(self.io);
+            while (q.next()) |_| {}
             return;
         };
         defer conn.deinit();
-        while (true) {
-            self.mutex.lockUncancelable(self.io);
+        while (q.next()) |_| {
+            self.lock();
             const clears = self.clears;
             const with_stats = self.want_stats;
             self.clears = .empty;
             self.want_stats = false;
-            self.mutex.unlock(self.io);
+            self.unlock();
             clearCaches(&conn, clears) catch |err| log.warn("clear caches: {}", .{err});
-            const loaded: ?Counts = load(&conn, self.allocator, with_stats) catch |err| blk: {
+            var c = load(&conn, self.allocator, with_stats) catch |err| {
                 log.warn("counts load: {}", .{err});
-                break :blk null;
+                continue;
             };
-            self.mutex.lockUncancelable(self.io);
-            if (loaded) |c| {
-                var fresh = c;
-                if (self.result) |*old| {
-                    // Unclaimed stats survive a newer load that skipped them.
-                    if (fresh.db_stats == null) fresh.db_stats = old.db_stats;
-                    old.deinit(self.allocator);
-                }
-                self.result = fresh;
+            self.lock();
+            if (self.result) |*old| {
+                // Unclaimed stats survive a newer load that skipped them.
+                if (c.db_stats == null) c.db_stats = old.db_stats;
+                old.deinit(self.allocator);
             }
-            const again = self.again;
-            self.again = false;
-            if (!again) self.running = false;
-            self.mutex.unlock(self.io);
-            if (loaded != null) if (self.wakeup_fn) |w| w();
-            if (!again) return;
+            self.result = c;
+            self.unlock();
+            if (self.wakeup_fn) |w| w();
         }
     }
 };

@@ -589,11 +589,9 @@ pub const SettingsModalState = struct {
 
         if (need_rescan) {
             if (library_manager.*) |*mgr| {
-                if (dvui.App.main_init) |init| {
-                    mgr.scanAllLibraries(init.io) catch |err| {
-                        std.log.warn("rescan after config change: {}", .{err});
-                    };
-                }
+                mgr.scanAllLibraries() catch |err| {
+                    std.log.warn("rescan after config change: {}", .{err});
+                };
             }
         }
     }

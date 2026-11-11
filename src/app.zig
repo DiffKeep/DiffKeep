@@ -302,7 +302,7 @@ fn appInit(win: *dvui.Window) !void {
             // rather than a pointer to a stack-local that becomes dangling after appInit returns.
             const notifier = if (dk.g_grid) |*grid| &grid.notifier else null;
             const watcher_ptr: ?*fs_watch_mod.FsWatcher = if (g_fs_watcher != null) &g_fs_watcher.? else null;
-            dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
+            dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, init.io, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
             g_search.wakeup_fn = wakeupFrame;
             g_sidebar.wakeup_fn = wakeupFrame;
             g_sidebar.initFolderLoader(init.gpa, init.io, db);
@@ -317,7 +317,7 @@ fn appInit(win: *dvui.Window) !void {
             if (dk.g_library_manager) |*mgr| {
                 mgr.embedder = null;
                 mgr.wakeup_fn = wakeupFrame;
-                mgr.scanAllLibraries(init.io) catch |err| {
+                mgr.scanAllLibraries() catch |err| {
                     std.log.warn("startup scan queue failed: {}", .{err});
                 };
             }
@@ -383,7 +383,7 @@ fn appDeinit() void {
     }
     timer.lap("library manager (scans)");
     if (dvui.App.main_init) |init| {
-        g_search.awaitEmbed(init.io);
+        g_search.awaitEmbed();
         g_search.deinit(init.gpa);
     }
     timer.lap("search");
@@ -401,7 +401,7 @@ fn appDeinit() void {
         }
     }
     g_embedder_pending = null;
-    if (dvui.App.main_init) |init| image_ops_mod.fileOpsJoin(init.io);
+    image_ops_mod.fileOpsJoin();
     timer.lap("file ops");
     if (dk.g_embedder) |*emb| emb.deinit();
     timer.lap("embedder");
@@ -614,7 +614,7 @@ fn frame() !dvui.App.Result {
                         if (db.getImageDetails(init.gpa, grid.reparse_id) catch null) |det| {
                             var d = det;
                             defer d.deinit(init.gpa);
-                            mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
+                            mgr.reparseImage(d.id, d.library_id, d.library_path);
                             // The detail panel reloads once the background reparse
                             // lands its new data (driven by the grid refresh set).
                         }
@@ -666,7 +666,6 @@ fn frame() !dvui.App.Result {
     if (dvui.App.main_init) |init| {
         try g_sidebar.drainPendingLibrary(
             init.gpa,
-            init.io,
             if (dk.g_library_manager) |*mgr| mgr else null,
         );
     }
@@ -966,7 +965,7 @@ fn startEmbedderLoad(io: std.Io, gpa: std.mem.Allocator, cfg: *const config_mod.
 /// next load fills in what they skipped).
 fn releaseEmbedder(io: std.Io) void {
     g_search.embedder = null;
-    g_search.awaitEmbed(io);
+    g_search.awaitEmbed();
     if (dk.g_library_manager) |*mgr| {
         mgr.embedder = null;
         mgr.quiesce(io);
@@ -1009,11 +1008,9 @@ fn pollEmbedderLoad() void {
     if (emb_ptr != null) {
         if (dk.g_library_manager) |*mgr| {
             if (mgr.prompt_embeddings or mgr.image_embeddings) {
-                if (dvui.App.main_init) |init| {
-                    mgr.scanAllLibraries(init.io) catch |err| {
-                        log.warn("embedder-ready backfill scan failed: {}", .{err});
-                    };
-                }
+                mgr.scanAllLibraries() catch |err| {
+                    log.warn("embedder-ready backfill scan failed: {}", .{err});
+                };
             }
         }
     }

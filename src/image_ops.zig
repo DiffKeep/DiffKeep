@@ -2,6 +2,7 @@ const std = @import("std");
 const db_mod = @import("db.zig");
 const image_grid_mod = @import("image_grid.zig");
 const config_mod = @import("config.zig");
+const bg = @import("bg.zig");
 
 const log = std.log.scoped(.image_ops);
 
@@ -161,8 +162,11 @@ const Job = struct {
 };
 
 const FileOps = struct {
+    /// Jobs, run one at a time by one worker (`fileOpsWorker`). Created by
+    /// the first `submit`.
+    queue: ?bg.WorkQueue(Job) = null,
+    /// Guards the fields below.
     mutex: std.Io.Mutex = .init,
-    queue: std.ArrayList(Job) = .empty,
     /// Ids handed to a job and not yet applied; never queued twice.
     pending: std.AutoHashMap(u64, void) = undefined,
     pending_init: bool = false,
@@ -172,8 +176,6 @@ const FileOps = struct {
     purged: bool = false,
     /// Empty-trash / dedupe jobs queued or running (for the toolbar indicator).
     user_bulk: std.atomic.Value(u32) = .init(0),
-    running: bool = false,
-    thread: ?std.Thread = null,
 };
 var g_ops: FileOps = .{};
 
@@ -251,6 +253,14 @@ fn freeJob(job: Job) void {
     job_alloc.free(job.items);
 }
 
+fn freeQueuedJob(_: std.mem.Allocator, job: Job) void {
+    freeJob(job);
+}
+
+fn sameKind(kind: FileOpKind, job: Job) bool {
+    return job.kind == kind;
+}
+
 /// Queue `job` (dropping ids already in flight) and make sure a worker runs.
 fn submit(io: std.Io, job_in: Job) void {
     var job = job_in;
@@ -279,40 +289,25 @@ fn submit(io: std.Io, job_in: Job) void {
         return;
     };
     if (job.items.len == 0 and !isBulk(job.kind)) return;
+    if (g_ops.queue == null) g_ops.queue = .init(job_alloc, io, 1, fileOpsWorker, freeQueuedJob);
+    const queue = &g_ops.queue.?;
     // Asking for the same bulk operation again while one waits is a no-op.
-    if (isBulk(job.kind)) for (g_ops.queue.items) |q| {
-        if (q.kind == job.kind) {
-            freeJob(job);
-            return;
-        }
-    };
-    g_ops.queue.append(job_alloc, job) catch {
-        for (job.items) |it| _ = g_ops.pending.remove(it.id);
+    if (isBulk(job.kind) and queue.anyQueued(job.kind, sameKind)) {
         freeJob(job);
         return;
+    }
+    const bulk = job.kind == .empty_trash or job.kind == .dedupe;
+    if (bulk) _ = g_ops.user_bulk.fetchAdd(1, .acq_rel);
+    queue.push(job) catch {
+        if (bulk) _ = g_ops.user_bulk.fetchSub(1, .acq_rel);
+        for (job.items) |it| _ = g_ops.pending.remove(it.id);
+        freeJob(job);
     };
-    if (job.kind == .empty_trash or job.kind == .dedupe) _ = g_ops.user_bulk.fetchAdd(1, .acq_rel);
-    if (g_ops.running) return;
-    // The previous worker has already marked itself done; reap it.
-    if (g_ops.thread) |t| t.join();
-    g_ops.thread = std.Thread.spawn(.{}, fileOpsWorker, .{io}) catch |err| blk: {
-        log.warn("spawn file-op worker: {}", .{err});
-        break :blk null;
-    };
-    g_ops.running = g_ops.thread != null;
 }
 
-fn fileOpsWorker(io: std.Io) void {
-    while (true) {
-        g_ops.mutex.lockUncancelable(io);
-        if (g_ops.queue.items.len == 0) {
-            g_ops.running = false;
-            g_ops.mutex.unlock(io);
-            return;
-        }
-        const job = g_ops.queue.orderedRemove(0);
-        g_ops.mutex.unlock(io);
-
+fn fileOpsWorker(q: *bg.WorkQueue(Job)) void {
+    const io = q.io;
+    while (q.next()) |job| {
         var succeeded: std.ArrayList(u64) = .empty;
         defer succeeded.deinit(job_alloc);
         runJob(io, job, &succeeded);
@@ -514,16 +509,11 @@ pub fn fileOpsPoll(io: std.Io, allocator: std.mem.Allocator, grid: ?*image_grid_
 }
 
 /// Finish queued file operations. Call at shutdown, before the DB is torn down.
-pub fn fileOpsJoin(io: std.Io) void {
-    g_ops.mutex.lockUncancelable(io);
-    const t = g_ops.thread;
-    g_ops.thread = null;
-    g_ops.mutex.unlock(io);
-    if (t) |th| th.join();
-    // A job submitted after the worker exited would have spawned a new thread;
-    // shutdown submits none, so one join suffices.
-    for (g_ops.queue.items) |job| freeJob(job);
-    g_ops.queue.deinit(job_alloc);
+pub fn fileOpsJoin() void {
+    if (g_ops.queue) |*q| {
+        q.awaitIdle(); // runs every queued job (shutdown submits none)
+        q.deinit();
+    }
     g_ops.done.deinit(job_alloc);
     if (g_ops.pending_init) g_ops.pending.deinit();
     g_ops = .{};

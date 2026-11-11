@@ -1,6 +1,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
+const bg = @import("bg.zig");
 const vips = @import("vips");
 const notifier_mod = @import("notifier.zig");
 const i18n = @import("i18n.zig");
@@ -204,6 +205,10 @@ pub const LoadedView = struct {
     favorite_ids: []u64,
     media: []db_mod.VectorDb.MediaTypeRow,
 
+    fn free(v: *LoadedView, a: std.mem.Allocator) void {
+        v.deinit(a);
+    }
+
     pub fn deinit(v: LoadedView, a: std.mem.Allocator) void {
         for (v.entries) |e| {
             a.free(e.path);
@@ -287,31 +292,18 @@ pub fn sanitizeFtsQuery(a: std.mem.Allocator, raw: []const u8) !?[]u8 {
     return try a.dupe(u8, trimmed);
 }
 
-const LoadCtx = struct {
-    grid: *GridState,
-    query: ViewQuery, // owned
-    generation: u64,
-};
+const ViewLoad = bg.Latest(LoadedView, LoadedView.free);
 
-fn loadTask(ctx: LoadCtx) void {
-    var q = ctx.query;
-    defer q.deinit(ctx.grid.allocator);
-    const g = ctx.grid;
-    if (g.load_gen.load(.acquire) != ctx.generation) return;
-    const loaded: ?LoadedView = loadView(&g.view_db, g.allocator, q) catch |err| blk: {
+/// Load `query` (owned; freed here) on the grid's own connection.
+fn loadTask(ticket: ViewLoad.Ticket, g: *GridState, query: ViewQuery) ?LoadedView {
+    var q = query;
+    defer q.deinit(g.allocator);
+    // A newer view request is already on its way: don't run this query.
+    if (!ticket.current()) return null;
+    return loadView(&g.view_db, g.allocator, q) catch |err| {
         log.warn("view load failed: {}", .{err});
-        break :blk null;
+        return null;
     };
-    g.load_mutex.lockUncancelable(g.io);
-    defer g.load_mutex.unlock(g.io);
-    if (g.load_gen.load(.acquire) != ctx.generation) {
-        if (loaded) |v| v.deinit(g.allocator);
-        return;
-    }
-    if (g.load_result) |old| old.deinit(g.allocator);
-    g.load_result = loaded;
-    g.load_result_gen = ctx.generation;
-    if (g.wakeup_fn) |w| w();
 }
 
 // ── GridState ─────────────────────────────────────────────────────────────────
@@ -323,14 +315,9 @@ pub const GridState = struct {
     // Image list — main-thread only after startWorker()
     images: std.ArrayList(ImageEntry) = .empty,
 
-    // Background view loading (reloadImages). load_gen counts requests; a
-    // finished load is applied by update() only if it is still the latest.
-    load_group: std.Io.Group = .init,
-    load_gen: std.atomic.Value(u64) = .init(0),
-    load_mutex: std.Io.Mutex = .init,
-    load_result: ?LoadedView = null, // guarded by load_mutex
-    load_result_gen: u64 = 0, // guarded by load_mutex
-    applied_gen: u64 = 0, // main-thread
+    // Background view loading (reloadImages): a newer request supersedes an
+    // older one, and update() applies only the latest.
+    load: ViewLoad = .{},
     load_keep_scroll: bool = false, // main-thread
     // Ids removed while a load was in flight; filtered out of its result so a
     // just-deleted image can't come back. Main-thread.
@@ -552,9 +539,8 @@ pub const GridState = struct {
     }
 
     pub fn deinit(self: *GridState) void {
-        self.load_group.await(self.io) catch {};
+        self.load.deinit();
         if (self.search_query) |q| self.allocator.free(q);
-        if (self.load_result) |v| v.deinit(self.allocator);
         self.load_dropped.deinit();
         for (self.load_added.items) |e| self.allocator.free(e.path);
         self.load_added.deinit(self.allocator);
@@ -649,13 +635,9 @@ pub const GridState = struct {
 
     pub fn reloadImagesEx(self: *GridState, opts: ReloadOptions) !void {
         const query = try self.currentQuery().dupe(self.allocator);
-        const gen = self.load_gen.fetchAdd(1, .acq_rel) + 1;
         self.load_keep_scroll = opts.keep_scroll;
-        self.load_group.concurrent(self.io, loadTask, .{LoadCtx{
-            .grid = self,
-            .query = query,
-            .generation = gen,
-        }}) catch |err| {
+        self.load.wakeup_fn = self.wakeup_fn;
+        _ = self.load.start(self.io, self.allocator, loadTask, .{ self, query }) catch |err| {
             var q = query;
             q.deinit(self.allocator);
             return err;
@@ -664,13 +646,22 @@ pub const GridState = struct {
 
     /// True while a requested reload hasn't been applied yet.
     pub fn reloadPending(self: *const GridState) bool {
-        return self.load_gen.load(.acquire) != self.applied_gen;
+        return self.load.pending();
+    }
+
+    /// Generation of the newest reload request, and of the last one applied
+    /// (a search is loading until the second reaches the first).
+    pub fn requestedGen(self: *const GridState) u64 {
+        return self.load.gen.load(.acquire);
+    }
+    pub fn appliedGen(self: *const GridState) u64 {
+        return self.load.taken_gen;
     }
 
     /// Wait for in-flight loads and apply the latest. For tests and tools: the
     /// app lets update() apply loads as they finish.
     pub fn awaitReload(self: *GridState) void {
-        self.load_group.await(self.io) catch {};
+        self.load.awaitAll();
         _ = self.applyReloadIfDone();
     }
 
@@ -681,17 +672,9 @@ pub const GridState = struct {
 
     /// Main thread: swap in a finished load if it is the latest request.
     fn applyReloadIfDone(self: *GridState) bool {
-        self.load_mutex.lockUncancelable(self.io);
-        const ready = self.load_result_gen == self.load_gen.load(.acquire) and self.load_result_gen != self.applied_gen;
-        const result = if (ready) self.load_result else null;
-        if (ready) {
-            self.load_result = null;
-            self.applied_gen = self.load_result_gen;
-        }
-        self.load_mutex.unlock(self.io);
-        if (!ready) return false;
+        const outcome = self.load.take() orelse return false;
         // A failed load (null) keeps the current list.
-        if (result) |v| {
+        if (outcome.value) |v| {
             self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
             self.readdScannedImages();
         }

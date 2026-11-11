@@ -57,6 +57,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/image_ops.zig` | Trash / delete / restore and bulk ops (empty trash, dedupe), all on background threads; `fileOpsPoll` / `bulkPoll` apply results each frame. |
 | `src/config.zig` | `Config` struct loaded/saved as JSON in the XDG config dir (saved via temp file + rename; an unparseable file loads as defaults, kept as `.bak`). |
 | `src/counts.zig` | `CountsLoader` — sidebar/toolbar/settings counts (total, trash, duplicates, favorites, per library; DB stats on `requestStats`) loaded in the background, plus the settings' clear-cache ops (`clear`); `app.zig` `refreshCounts()` requests, `applyCounts()` shows. |
+| `src/bg.zig` | Background-task building blocks: `Latest(T)` (a newer request supersedes older ones; only the newest result is taken — grid view loads, search query embeddings, detail panel) and `WorkQueue(Item)` (FIFO drained by up to N workers — library scans, watcher file workers, file ops, folder lists, count refreshes). Use these rather than hand-writing spawn/flag/poll code. |
 | `src/folder_loader.zig` | `FolderLoader` — the sidebar's folder lists (`listImmediateSubdirs`) loaded on one background worker; `SidebarState.applyFolderResults` merges them into the tree, keeping its open folders. |
 | `src/i18n.zig` | Compile-time string table (English only so far). |
 | `src/app_icons.zig` | Vendored TVG icons. The `icons` package's heroicons/solid set is broken (stored as hollow strokes), so the favorite star lives in `src/icons/` instead. Don't use `icons.tvg.heroicons.solid.*`. |
@@ -77,7 +78,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 
 ### Threading model
 
-The render loop runs on the main thread and does no file or DB IO beyond small point queries. Background work, each waking the render loop via a custom SDL event (`g_wakeup_event_type`):
+The render loop runs on the main thread and does no file or DB IO beyond small point queries. Background work, each waking the render loop via a custom SDL event (`g_wakeup_event_type`); new background work should use `bg.zig`'s `Latest` or `WorkQueue`:
 1. `LibraryManager` dispatches `std.Io` concurrent tasks for library scans. Each scan produces thumbnail bytes and embeddings, then calls `ImageNotifier` to push new IDs. Watcher-reported new/changed files go to a queue drained by at most `max_file_workers` file workers.
 2. `GridState` worker threads load thumbnails from disk/DB. A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`).
 3. `GridState.reloadImages` loads a view (list + favorites + media types) as a background task on the grid's own connection (`view_db`); `update()` swaps in the newest result. Tests call `awaitReload()`.

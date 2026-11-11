@@ -1646,7 +1646,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin(io);
+    defer dk.image_ops.fileOpsJoin();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
@@ -2201,18 +2201,18 @@ test "library_manager: a library inside or around an existing one is refused" {
     var db = try openDb(dir ++ "/test.db");
     defer db.deinit();
 
-    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    var mgr = dk.LibraryManager.init(alloc, io, &db, false, false, false, null, null);
     defer mgr.deinit(io);
 
-    _ = try mgr.addLibrary(io, dir ++ "/pics/");
+    _ = try mgr.addLibrary(dir ++ "/pics/");
     // Stored without the trailing slash, so folder queries line up.
     try std.testing.expect((try db.getLibraryIdByPath(dir ++ "/pics")) != null);
-    try std.testing.expectError(error.LibraryExists, mgr.addLibrary(io, dir ++ "/pics"));
-    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, dir ++ "/pics/sub"));
-    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, dir));
-    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, "/"));
+    try std.testing.expectError(error.LibraryExists, mgr.addLibrary(dir ++ "/pics"));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(dir ++ "/pics/sub"));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(dir));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary("/"));
     // A sibling that merely shares a prefix is fine.
-    _ = try mgr.addLibrary(io, dir ++ "/pictures");
+    _ = try mgr.addLibrary(dir ++ "/pictures");
 }
 
 test "image_ops: restoring next to a new file at the old path keeps both" {
@@ -2236,7 +2236,7 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin(io);
+    defer dk.image_ops.fileOpsJoin();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
@@ -2293,11 +2293,11 @@ test "image_ops: trashing an entry whose row is gone leaves the file alone" {
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin(io);
+    defer dk.image_ops.fileOpsJoin();
 
     // A viewer still shows id 77 for a.png, but that row no longer exists.
     dk.image_ops.performOnEntry(io, .{ .id = 77, .path = dir ++ "/lib/a.png", .filename = "a.png", .mtime = null }, .trash);
-    dk.image_ops.fileOpsJoin(io);
+    dk.image_ops.fileOpsJoin();
     try cwd.access(io, dir ++ "/lib/a.png", .{});
 }
 
@@ -2413,7 +2413,7 @@ fn waitForScans(mgr: *dk.LibraryManager) !void {
 }
 
 fn rescanAll(mgr: *dk.LibraryManager) !void {
-    try mgr.scanAllLibraries(io);
+    try mgr.scanAllLibraries();
     try waitForScans(mgr);
 }
 
@@ -2434,8 +2434,8 @@ const ScanFixture = struct {
         const db_path = try std.mem.concat(alloc, u8, &.{ dir, ".db" });
         defer alloc.free(db_path);
         self.db = try openDb(db_path);
-        self.mgr = dk.LibraryManager.init(alloc, &self.db, thumbnails_in_db, false, false, null, null);
-        self.lib_id = try self.mgr.addLibrary(io, dir);
+        self.mgr = dk.LibraryManager.init(alloc, io, &self.db, thumbnails_in_db, false, false, null, null);
+        self.lib_id = try self.mgr.addLibrary(dir);
         try waitForScans(&self.mgr);
     }
 
@@ -2579,11 +2579,11 @@ test "library_manager: quiesce stops running scans and resumes them afterwards" 
     var db = try openDb(dir ++ ".db");
     defer std.Io.Dir.cwd().deleteFile(io, dir ++ ".db") catch {};
     defer db.deinit();
-    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    var mgr = dk.LibraryManager.init(alloc, io, &db, false, false, false, null, null);
     defer mgr.deinit(io);
 
-    _ = try mgr.addLibrary(io, dir ++ "/a");
-    _ = try mgr.addLibrary(io, dir ++ "/b");
+    _ = try mgr.addLibrary(dir ++ "/a");
+    _ = try mgr.addLibrary(dir ++ "/b");
     // Swapping the embedder: nothing may still be scanning when this returns.
     mgr.quiesce(io);
     try std.testing.expect(!mgr.scanUsesEmbedder());
@@ -2705,7 +2705,7 @@ test "image_ops: duplicate removal runs on the file-op queue and updates grid an
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin(io);
+    defer dk.image_ops.fileOpsJoin();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var ids: [2]u64 = undefined;
@@ -2767,7 +2767,7 @@ test "library_manager: files deleted on disk are removed in the background and r
     var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
     defer b.deinit(alloc);
 
-    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    var mgr = dk.LibraryManager.init(alloc, io, &db, false, false, false, null, null);
     defer mgr.deinit(io);
     var batch: dk.library_manager.PendingFileEvents = .{};
     defer batch.deinit(alloc);
@@ -2797,14 +2797,14 @@ test "library_manager: a burst of new files is indexed by a bounded set of worke
         var buf: [96]u8 = undefined;
         const p = try std.mem.print(&buf, dir ++ "/f{d}.png", .{k});
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = plain_png });
-        fx.mgr.processFileEvent(io, fx.lib_id, try alloc.dupe(u8, p));
+        fx.mgr.processFileEvent(fx.lib_id, try alloc.dupe(u8, p));
         // The same file reported again while queued is not queued twice.
-        fx.mgr.processFileEvent(io, fx.lib_id, try alloc.dupe(u8, p));
-        try std.testing.expect(fx.mgr.file_workers <= dk.library_manager.max_file_workers);
+        fx.mgr.processFileEvent(fx.lib_id, try alloc.dupe(u8, p));
+        try std.testing.expect(fx.mgr.file_queue.load().workers <= dk.library_manager.max_file_workers);
     }
     fx.mgr.awaitFileTasks(io);
-    try std.testing.expectEqual(@as(u32, 0), fx.mgr.file_workers);
-    try std.testing.expectEqual(@as(usize, 0), fx.mgr.file_queue.items.len);
+    try std.testing.expectEqual(@as(u32, 0), fx.mgr.file_queue.load().workers);
+    try std.testing.expectEqual(@as(usize, 0), fx.mgr.file_queue.load().queued);
     try std.testing.expectEqual(@as(i64, n), try fx.db.getTotalImageCount());
 }
 
@@ -2966,11 +2966,11 @@ test "library_manager: removing a library stops its scan, reports its images and
     }
     var db = try openDb(dir ++ "/data/test.db");
     defer db.deinit();
-    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    var mgr = dk.LibraryManager.init(alloc, io, &db, false, false, false, null, null);
     defer mgr.deinit(io);
     mgr.data_dir = dir ++ "/data";
 
-    const lib_id = try mgr.addLibrary(io, dir ++ "/lib");
+    const lib_id = try mgr.addLibrary(dir ++ "/lib");
     try waitForScans(&mgr);
     // One image is in the trash (its file moved to <data>/trash).
     var t = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/0.png");
@@ -2979,7 +2979,7 @@ test "library_manager: removing a library stops its scan, reports its images and
     try cwd.writeFile(io, .{ .sub_path = dir ++ "/data/trash/1_0.png", .data = plain_png });
 
     // Removed while a rescan is running.
-    try mgr.scanAllLibraries(io);
+    try mgr.scanAllLibraries();
     try mgr.removeLibrary(io, dir ++ "/lib");
     try std.testing.expect(!mgr.isScanActive() or mgr.activeLibrary() != lib_id);
     mgr.awaitFileTasks(io);

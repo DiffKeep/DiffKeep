@@ -500,7 +500,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
                 ctx.detail.reparse_requested = false;
                 if (ctx.detail.detail) |d| {
                     if (ctx.library_manager.*) |*mgr|
-                        mgr.reparseImage(init.io, d.id, d.library_id, d.library_path);
+                        mgr.reparseImage(d.id, d.library_id, d.library_path);
                 }
             }
         }

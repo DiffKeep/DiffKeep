@@ -1,6 +1,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
+const bg = @import("bg.zig");
 const png_mod = @import("image/png-data.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
@@ -41,20 +42,12 @@ pub const DetailState = struct {
     /// Wakes the render loop when a background load finishes.
     wakeup_fn: ?*const fn () void = null,
 
-    // Background load of `id`'s details. The task delivers into `loaded` under
-    // `mutex`, tagged with the generation it was started for; only the latest
-    // generation's result is shown.
-    io: ?std.Io = null,
-    group: std.Io.Group = .init,
-    mutex: std.Io.Mutex = .init,
-    gen: u64 = 0, // written under mutex
-    loaded: ?db_mod.ImageDetails = null, // guarded by mutex
-    loaded_gen: u64 = 0, // guarded by mutex
+    /// Background load of `id`'s details: a new selection supersedes the
+    /// load of the previous one.
+    load: Load = .{},
 
     pub fn deinit(self: *DetailState, allocator: std.mem.Allocator) void {
-        if (self.io) |io| self.group.await(io) catch {};
-        if (self.loaded) |*d| d.deinit(allocator);
-        self.loaded = null;
+        self.load.deinit();
         if (self.detail) |*d| {
             d.deinit(allocator);
             self.detail = null;
@@ -72,7 +65,6 @@ pub const DetailState = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
     ) void {
-        self.io = io;
         self.takeLoaded(gpa);
         if (focused_id == self.id) return;
 
@@ -81,49 +73,31 @@ pub const DetailState = struct {
             self.detail = null;
         }
         self.id = focused_id;
-        self.mutex.lockUncancelable(io);
-        self.gen += 1;
-        const gen = self.gen;
-        self.mutex.unlock(io);
-        const fid = focused_id orelse return;
-        self.group.concurrent(io, loadTask, .{ self, db, gpa, io, fid, gen }) catch |err|
+        const fid = focused_id orelse return self.load.cancel();
+        self.load.wakeup_fn = self.wakeup_fn;
+        _ = self.load.start(io, gpa, loadTask, .{ db, gpa, io, fid }) catch |err|
             std.log.scoped(.detail_panel).warn("spawn details load: {}", .{err});
     }
 
     /// Wait for the running load and show it (tests).
     pub fn awaitLoad(self: *DetailState, gpa: std.mem.Allocator) void {
-        if (self.io) |io| self.group.await(io) catch {};
-        self.group = .init;
+        self.load.awaitAll();
         self.takeLoaded(gpa);
     }
 
     fn takeLoaded(self: *DetailState, gpa: std.mem.Allocator) void {
-        const io = self.io orelse return;
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        var d = self.loaded orelse return;
-        self.loaded = null;
-        if (self.loaded_gen != self.gen) return d.deinit(gpa);
+        const outcome = self.load.take() orelse return;
+        const d = outcome.value orelse return;
         if (self.detail) |*old| old.deinit(gpa);
         self.detail = d;
     }
 
-    fn loadTask(self: *DetailState, db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64, gen: u64) void {
-        var conn = db.getConnection() catch return;
+    const Load = bg.Latest(db_mod.ImageDetails, db_mod.ImageDetails.deinit);
+
+    fn loadTask(_: Load.Ticket, db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64) ?db_mod.ImageDetails {
+        var conn = db.getConnection() catch return null;
         defer conn.deinit();
-        var d = loadDetails(&conn, gpa, io, id) orelse return;
-        self.mutex.lockUncancelable(io);
-        // A newer selection's load may have finished first: never replace it.
-        if (gen != self.gen) {
-            self.mutex.unlock(io);
-            d.deinit(gpa);
-            return;
-        }
-        if (self.loaded) |*old| old.deinit(gpa);
-        self.loaded = d;
-        self.loaded_gen = gen;
-        self.mutex.unlock(io);
-        if (self.wakeup_fn) |w| w();
+        return loadDetails(&conn, gpa, io, id);
     }
 
     pub fn renderPanel(self: *DetailState, panel_w: f32, filename: []const u8, gpa: std.mem.Allocator, io: std.Io) void {

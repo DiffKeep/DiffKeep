@@ -237,7 +237,6 @@ pub const SidebarState = struct {
     pub fn drainPendingLibrary(
         self: *SidebarState,
         gpa: std.mem.Allocator,
-        io: std.Io,
         library_manager: ?*library_manager_mod.LibraryManager,
     ) !void {
         const len = self.pending_library_len.load(.acquire);
@@ -246,7 +245,7 @@ pub const SidebarState = struct {
         defer self.pending_library_len.store(0, .release);
         self.add_error = null;
         const mgr = library_manager orelse return;
-        const lib_id = mgr.addLibrary(io, path) catch |err| {
+        const lib_id = mgr.addLibrary(path) catch |err| {
             self.add_error = switch (err) {
                 error.LibraryExists => i18n.t(.library_add_exists),
                 error.LibraryOverlaps => i18n.t(.library_add_overlaps),
