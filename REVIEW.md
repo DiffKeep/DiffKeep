@@ -290,14 +290,17 @@ Tests went red then green unless marked *(fix only)*. "Red" was sometimes a comp
 - `setFavorite` matches id AND path.
 - The sidebar and detail panel are shut down before the DB closes (their background loads use it).
 
+### Structural work (2026-11-10)
+
+- Build: llama.cpp research tools and orphaned files removed; app and tests wired through one `wireCore`.
+- `bg.zig` (`Latest`, `WorkQueue`) replaces the hand-written background-task code in eight places.
+- `image_grid.zig` split into the widget, `view_query.zig`, `thumb_loader.zig` and `grid_players.zig`.
+- `fs_watch_common.zig` (`DirtyEvent`, `EventQueue`) shared by the watcher backends. The stronger cross-target check this added found the Windows watcher didn't compile under 0.17; fixed.
+- `AppState` (`app_state.zig`) replaces app.zig's globals and runs headless in tests; `FileOps` is an instance.
+- Still open from the structural list: viewer decode slots, video player threads, model downloads and the embedder load thread keep their own threading (different shapes from `bg.zig`'s); search.zig still drives the grid widget directly; the Windows/macOS parts of `dnd.zig` and `app.zig` can't be type-checked from Linux (a Windows build stops at finding libvips/libav).
+
 ### Not done (deliberately left; say if you want any)
 
-- **Structural recommendations:**
-  - task abstraction;
-  - `image_grid` split;
-  - `AppState`;
-  - build cleanup (research tools still built by default; orphaned files kept);
-  - `fs_watch_common`.
 - **Efficiency:**
   - `vips_concurrency_set` (needs measuring);
   - video opened 3× per scan;
