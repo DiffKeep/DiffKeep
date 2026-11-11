@@ -114,7 +114,7 @@ pub fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashM
             _ = grid.selection.remove(e.id);
             // Drop the cached thumbnail: SQLite recycles this row's id for the
             // next inserted image, which would otherwise inherit this thumbnail.
-            grid.invalidateThumbnail(e.id);
+            grid.thumbs.invalidate(e.id);
             grid.allocator.free(e.path);
             if (e.trash_name) |tn| grid.allocator.free(tn);
         } else {

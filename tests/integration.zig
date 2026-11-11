@@ -521,12 +521,12 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
     // its poster — the point is that the autoplay path (create/fail/evict) is
     // exercised over several frames without crashing or leaking a live player.
     try dvui.testing.settle(gridFrame);
-    try std.testing.expectEqual(@as(usize, 0), grid.grid_players.count());
+    try std.testing.expectEqual(@as(usize, 0), grid.players.live.count());
 
     // Toggling autoplay off is a no-op here (nothing live) and must not crash.
     grid.autoplay = false;
     try dvui.testing.settle(gridFrame);
-    try std.testing.expectEqual(@as(usize, 0), grid.grid_players.count());
+    try std.testing.expectEqual(@as(usize, 0), grid.players.live.count());
 }
 
 // ── UI panel tests (headless dvui, driving real widgets via tags) ───────────────
@@ -1556,10 +1556,10 @@ test "grid: fileDeleted needs the file gone but its directory present" {
     defer cwd.deleteTree(io, dir) catch {};
     try cwd.writeFile(io, .{ .sub_path = dir ++ "/here.png", .data = "x" });
 
-    try std.testing.expect(!dk.image_grid.fileDeleted(io, dir ++ "/here.png"));
-    try std.testing.expect(dk.image_grid.fileDeleted(io, dir ++ "/gone.png"));
+    try std.testing.expect(!dk.thumb_loader.fileDeleted(io, dir ++ "/here.png"));
+    try std.testing.expect(dk.thumb_loader.fileDeleted(io, dir ++ "/gone.png"));
     // Whole directory missing (unmounted drive, moved folder): not a deletion.
-    try std.testing.expect(!dk.image_grid.fileDeleted(io, dir ++ "/nodir/gone.png"));
+    try std.testing.expect(!dk.thumb_loader.fileDeleted(io, dir ++ "/nodir/gone.png"));
 }
 
 test "grid: a deleted file is removed from the DB and drained; other failures aren't retried" {
@@ -1587,20 +1587,20 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
     try grid.reloadImages();
     grid.awaitReload();
 
-    grid.noteLoadFailure(gone.id, dir ++ "/gone.png");
-    grid.noteLoadFailure(broken.id, dir ++ "/broken.png");
+    grid.thumbs.noteLoadFailure(gone.id, dir ++ "/gone.png");
+    grid.thumbs.noteLoadFailure(broken.id, dir ++ "/broken.png");
 
     var drained: std.ArrayList(u64) = .empty;
     defer drained.deinit(alloc);
-    grid.drainMissingIds(alloc, &drained);
+    grid.thumbs.drainMissingIds(alloc, &drained);
     try std.testing.expectEqualSlices(u64, &.{gone.id}, drained.items);
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
 
     // The broken file stays in the library but is no longer re-requested...
-    try std.testing.expect(grid.load_failed.contains(broken.id));
+    try std.testing.expect(grid.thumbs.load_failed.contains(broken.id));
     // ...until it changes (or its id is recycled) and is invalidated.
-    grid.invalidateThumbnail(broken.id);
-    try std.testing.expect(!grid.load_failed.contains(broken.id));
+    grid.thumbs.invalidate(broken.id);
+    try std.testing.expect(!grid.thumbs.load_failed.contains(broken.id));
 }
 
 // ── Background file operations ───────────────────────────────────────────────
@@ -2927,28 +2927,28 @@ test "grid: a thumbnail load in flight when its id is invalidated is discarded" 
     defer grid.deinit();
 
     // A worker is decoding id 7's old file when the id is recycled.
-    grid.queue_mutex.lockUncancelable(io);
-    try grid.in_flight.put(7, {});
-    grid.queue_mutex.unlock(io);
-    grid.invalidateThumbnail(7);
+    grid.thumbs.queue_mutex.lockUncancelable(io);
+    try grid.thumbs.in_flight.put(7, {});
+    grid.thumbs.queue_mutex.unlock(io);
+    grid.thumbs.invalidate(7);
 
     // The old image's thumbnail must not land in the cache…
-    grid.finishLoad(7, "/lib/old.png", try alloc.dupe(u8, "old-jpeg"));
-    try std.testing.expect(grid.pending.get(7) == null);
+    grid.thumbs.finishLoad(7, "/lib/old.png", try alloc.dupe(u8, "old-jpeg"));
+    try std.testing.expect(grid.thumbs.pending.get(7) == null);
     // …nor may a failed old load block the new image's thumbnail.
-    grid.queue_mutex.lockUncancelable(io);
-    try grid.in_flight.put(7, {});
-    grid.queue_mutex.unlock(io);
-    grid.invalidateThumbnail(7);
-    grid.finishLoad(7, "/lib/old.png", null);
-    try std.testing.expect(!grid.load_failed.contains(7));
+    grid.thumbs.queue_mutex.lockUncancelable(io);
+    try grid.thumbs.in_flight.put(7, {});
+    grid.thumbs.queue_mutex.unlock(io);
+    grid.thumbs.invalidate(7);
+    grid.thumbs.finishLoad(7, "/lib/old.png", null);
+    try std.testing.expect(!grid.thumbs.load_failed.contains(7));
 
     // A load that wasn't invalidated is kept.
-    grid.queue_mutex.lockUncancelable(io);
-    try grid.in_flight.put(8, {});
-    grid.queue_mutex.unlock(io);
-    grid.finishLoad(8, "/lib/new.png", try alloc.dupe(u8, "new-jpeg"));
-    try std.testing.expect(grid.pending.get(8) != null);
+    grid.thumbs.queue_mutex.lockUncancelable(io);
+    try grid.thumbs.in_flight.put(8, {});
+    grid.thumbs.queue_mutex.unlock(io);
+    grid.thumbs.finishLoad(8, "/lib/new.png", try alloc.dupe(u8, "new-jpeg"));
+    try std.testing.expect(grid.thumbs.pending.get(8) != null);
 }
 
 // ── Review regressions (2026-11): removing a library ─────────────────────────

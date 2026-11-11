@@ -2,7 +2,9 @@ const std = @import("std");
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const bg = @import("bg.zig");
-const vips = @import("vips");
+const vq = @import("view_query.zig");
+const thumb_loader = @import("thumb_loader.zig");
+const grid_players = @import("grid_players.zig");
 const notifier_mod = @import("notifier.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
@@ -16,281 +18,29 @@ pub const ImageNotifier = notifier_mod.ImageNotifier;
 
 const log = std.log.scoped(.image_grid);
 
-pub const SortMode = enum { date, name, random };
-pub const SortDir = enum { asc, desc };
-pub const ViewMode = enum { library, trash, duplicates, favorites };
-pub const SearchMode = enum { fts, semantic, visual, combined };
-
-/// One query embedding per vector space: `prompt` targets
-/// positive_prompt_embeddings (Snowflake), `visual` targets image_embeddings
-/// (SigLIP2 text encoder). Combined mode uses both; the spaces are not
-/// interchangeable.
-pub const QueryEmbeddings = struct {
-    prompt: ?[]const f32 = null,
-    visual: ?[]const f32 = null,
-
-    pub fn any(self: QueryEmbeddings) bool {
-        return self.prompt != null or self.visual != null;
-    }
-
-    pub fn free(self: *QueryEmbeddings, allocator: std.mem.Allocator) void {
-        if (self.prompt) |e| allocator.free(e);
-        if (self.visual) |e| allocator.free(e);
-        self.* = .{};
-    }
-};
-
-pub const ImageEntry = struct {
-    id: u64,
-    path: []const u8,     // heap-allocated, owned by GridState.images
-    filename: []const u8, // slice into path (basename), not separately allocated
-    mtime: ?i64,
-    trashed_at: ?i64 = null,
-    trash_name: ?[]const u8 = null, // heap-allocated, only set in trash view
-    favorite: bool = false,
-    // Playback classification. Defaults to a plain (static) image; set from the
-    // DB via applyMediaTypes. Distinguishes animated webp/gif from static ones,
-    // which extension alone cannot.
-    media_type: db_mod.VectorDb.MediaType = .image,
-};
-
-// ── Cache ─────────────────────────────────────────────────────────────────────
-
-const CacheEntry = struct {
-    bytes: []u8,
-    last_seen_s: i64,
-    width: f32,  // natural JPEG pixel width
-    height: f32, // natural JPEG pixel height
-};
-
-/// Parse JPEG SOF marker to get image dimensions without decoding the image.
-fn jpegDimensions(bytes: []const u8) struct { w: f32, h: f32 } {
-    if (bytes.len < 2 or bytes[0] != 0xFF or bytes[1] != 0xD8)
-        return .{ .w = 10, .h = 10 };
-    var i: usize = 2;
-    while (i + 3 < bytes.len) {
-        if (bytes[i] != 0xFF) break;
-        const marker = bytes[i + 1];
-        // SOF markers: C0-CF except C4 (DHT), C8 (JPG), CC (DAC)
-        if (marker >= 0xC0 and marker <= 0xCF and
-            marker != 0xC4 and marker != 0xC8 and marker != 0xCC)
-        {
-            if (i + 8 >= bytes.len) break;
-            // Segment layout: FF Cn [2-len] [1-precision] [2-height] [2-width]
-            const h: f32 = @floatFromInt((@as(u16, bytes[i + 5]) << 8) | bytes[i + 6]);
-            const w: f32 = @floatFromInt((@as(u16, bytes[i + 7]) << 8) | bytes[i + 8]);
-            if (w > 0 and h > 0) return .{ .w = w, .h = h };
-        }
-        const seg_len: usize = (@as(usize, bytes[i + 2]) << 8) | bytes[i + 3];
-        if (seg_len < 2) break;
-        i += 2 + seg_len;
-    }
-    return .{ .w = 10, .h = 10 };
-}
-
-// ── Load queue ────────────────────────────────────────────────────────────────
-
-const LoadRequest = struct {
-    id: u64,
-    path: []const u8, // heap-allocated copy; freed by worker after use or by reloadImages on queue clear
-};
+// The view types live in view_query.zig (no UI); re-exported for the grid's users.
+pub const SortMode = vq.SortMode;
+pub const SortDir = vq.SortDir;
+pub const ViewMode = vq.ViewMode;
+pub const SearchMode = vq.SearchMode;
+pub const QueryEmbeddings = vq.QueryEmbeddings;
+pub const ImageEntry = vq.ImageEntry;
+pub const ViewQuery = vq.ViewQuery;
+pub const LoadedView = vq.LoadedView;
+pub const loadView = vq.loadView;
+pub const sanitizeFtsQuery = vq.sanitizeFtsQuery;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
 pub const thumb_size_min: f32 = 80;
 pub const thumb_size_max: f32 = 320;
-const max_workers = 8;
 // Favorite star overlay (top-right of each thumbnail), in logical px.
 const star_sz: f32 = 22;
 const star_margin: f32 = 4;
 const gap: f32 = 8;
 const cell_border: f32 = 2; // border on each side; must be factored into h_margin
 const label_h: f32 = 20;
-const evict_interval_s: i64 = 5;
-const ttl_s: i64 = 45;
 const prefetch_screens: usize = 2;
-
-// ── Grid autoplay ──────────────────────────────────────────────────────────────
-// Live playback of animated/video cells in the grid (opt-in, muted). Currently
-// UNBOUNDED: every visible playable cell gets a player, created as soon as it
-// scrolls into view (no concurrency cap or per-frame open throttle). Off-screen
-// players are still evicted after a short grace so memory/threads don't grow
-// without bound as you scroll.
-// Frames decoded to fit this many px (long edge). Kept modest: animated cells are
-// decoded whole into an in-memory cache (see the vips anim decoder), so this
-// directly bounds per-clip memory, and it's only a grid preview so slight softness
-// is fine.
-const grid_player_dim = 256;
-// Keep a player alive briefly after its cell scrolls off, so scrubbing back and
-// forth doesn't thrash open/close (each close joins a decode thread).
-const player_evict_grace_frames: u64 = 30;
-// Opening a player does file I/O (avformat/vips header read) + spawns a decode
-// thread — too slow for the render thread. A small pool opens them off-thread and
-// hands the ready player back to be installed on the next frame.
-const max_player_openers = 4;
-
-/// A request to open a player for a cell, handed to an opener thread. `path_z` is
-/// heap-owned; the opener frees it after use.
-const PlayerOpenReq = struct { id: u64, path_z: [:0]u8 };
-/// An opened player handed back to the main thread (player == null on open error).
-const ReadyPlayer = struct { id: u64, player: ?*video_player_mod.VideoPlayer };
-
-/// A live player bound to one animated/video grid cell. Owns the current decoded
-/// frame (packed RGBA8) shown in place of the static thumbnail.
-const CellPlayer = struct {
-    player: *video_player_mod.VideoPlayer,
-    pixels: ?[]u8 = null,
-    width: u32 = 0,
-    height: u32 = 0,
-    tex_hash: u64 = 0,
-    last_touched: u64 = 0, // player_frame when this cell was last visible
-};
-
-// ── View loading ──────────────────────────────────────────────────────────────
-
-/// What a grid view shows. Borrows its strings; `ViewQuery.dupe` makes an owned
-/// copy for a background load.
-pub const ViewQuery = struct {
-    view_mode: ViewMode = .library,
-    search_mode: SearchMode = .fts,
-    /// Passed to the FTS query as-is (search.zig sanitizes before handing it in).
-    search_query: ?[]const u8 = null,
-    embeddings: QueryEmbeddings = .{},
-    semantic_min_similarity: f32 = 0.15,
-    visual_min_similarity: f32 = 0.03,
-    filter_library_id: ?u64 = null,
-    filter_folder_path: ?[]const u8 = null,
-    filters: []const db_mod.ActiveFilter = &.{},
-
-    pub fn dupe(q: ViewQuery, a: std.mem.Allocator) !ViewQuery {
-        var out: ViewQuery = q;
-        out.search_query = null;
-        out.embeddings = .{};
-        out.filter_folder_path = null;
-        out.filters = &.{};
-        errdefer out.deinit(a);
-        if (q.search_query) |t| out.search_query = try a.dupe(u8, t);
-        if (q.embeddings.prompt) |e| out.embeddings.prompt = try a.dupe(f32, e);
-        if (q.embeddings.visual) |e| out.embeddings.visual = try a.dupe(f32, e);
-        if (q.filter_folder_path) |f| out.filter_folder_path = try a.dupe(u8, f);
-        const filters = try a.alloc(db_mod.ActiveFilter, q.filters.len);
-        var n: usize = 0;
-        errdefer {
-            for (filters[0..n]) |f| a.free(f.value);
-            a.free(filters);
-        }
-        for (q.filters) |f| {
-            filters[n] = .{ .column = f.column, .value = try a.dupe(u8, f.value) };
-            n += 1;
-        }
-        out.filters = filters;
-        return out;
-    }
-
-    /// Frees a copy made by `dupe`.
-    pub fn deinit(q: *ViewQuery, a: std.mem.Allocator) void {
-        if (q.search_query) |t| a.free(t);
-        q.embeddings.free(a);
-        if (q.filter_folder_path) |f| a.free(f);
-        for (q.filters) |f| a.free(f.value);
-        a.free(q.filters);
-        q.* = .{};
-    }
-};
-
-/// A loaded view: its entries plus the favorite ids and playable media types
-/// used to flag them. Built off the main thread; the grid takes ownership.
-pub const LoadedView = struct {
-    entries: []db_mod.VectorDb.GridEntry,
-    favorite_ids: []u64,
-    media: []db_mod.VectorDb.MediaTypeRow,
-
-    fn free(v: *LoadedView, a: std.mem.Allocator) void {
-        v.deinit(a);
-    }
-
-    pub fn deinit(v: LoadedView, a: std.mem.Allocator) void {
-        for (v.entries) |e| {
-            a.free(e.path);
-            if (e.trash_name) |t| a.free(t);
-        }
-        a.free(v.entries);
-        a.free(v.favorite_ids);
-        a.free(v.media);
-    }
-};
-
-/// Run a view's queries. Does DB IO: call it off the main thread.
-pub fn loadView(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) !LoadedView {
-    const entries = try queryEntries(db, a, q);
-    errdefer LoadedView.deinit(.{ .entries = entries, .favorite_ids = &.{}, .media = &.{} }, a);
-    const favorite_ids = try db.listFavoriteIds(a);
-    errdefer a.free(favorite_ids);
-    const media_rows = try db.listNonImageMediaTypes(a);
-    return .{ .entries = entries, .favorite_ids = favorite_ids, .media = media_rows };
-}
-
-fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_mod.VectorDb.GridEntry {
-    switch (q.view_mode) {
-        .trash => return db.listTrashImages(a),
-        .duplicates => return db.listDuplicateImages(a),
-        .favorites => return db.listFavorites(a),
-        .library => {},
-    }
-    // Vector search modes, only when the needed embedding is available.
-    // Combined degrades to a single-space search when only one encoder
-    // produced an embedding.
-    switch (q.search_mode) {
-        .semantic => if (q.embeddings.prompt) |e|
-            return db.searchByPromptEmbedding(a, e, 200, q.semantic_min_similarity),
-        .visual => if (q.embeddings.visual) |e|
-            return db.searchByImageEmbedding(a, e, 200, q.visual_min_similarity),
-        .combined => {
-            if (q.embeddings.prompt) |pe| {
-                if (q.embeddings.visual) |ve|
-                    return db.searchCombined(a, pe, ve, 200, q.semantic_min_similarity, q.visual_min_similarity);
-                return db.searchByPromptEmbedding(a, pe, 200, q.semantic_min_similarity);
-            }
-            if (q.embeddings.visual) |ve|
-                return db.searchByImageEmbedding(a, ve, 200, q.visual_min_similarity);
-        },
-        .fts => {},
-    }
-    const fts = if (q.search_query) |t| try sanitizeFtsQuery(a, t) else null;
-    defer if (fts) |t| a.free(t);
-    if (fts != null or q.filters.len > 0) {
-        return db.listImagesFiltered(a, q.filter_library_id, q.filter_folder_path, fts, q.filters);
-    }
-    if (q.filter_folder_path) |fp| {
-        const lib_id = q.filter_library_id orelse return db.listAllImages(a);
-        return db.listImagesInFolder(a, lib_id, fp);
-    }
-    if (q.filter_library_id) |lib_id| return db.listLibraryImages(a, lib_id);
-    return db.listAllImages(a);
-}
-
-/// Whether `raw` has anything left to search after `sanitizeFtsQuery`.
-fn hasFtsTerms(raw: ?[]const u8) bool {
-    for (raw orelse return false) |c| switch (c) {
-        '(', ')', '"', '*', '^', ' ', '\t', '\n', '\r' => {},
-        else => return true,
-    };
-    return false;
-}
-
-/// Strip FTS5 syntax characters that cause parse errors in user-typed queries.
-/// Returns null when nothing searchable is left. Caller owns the result.
-pub fn sanitizeFtsQuery(a: std.mem.Allocator, raw: []const u8) !?[]u8 {
-    const buf = try a.dupe(u8, raw);
-    defer a.free(buf);
-    for (buf) |*c| switch (c.*) {
-        '(', ')', '"', '*', '^' => c.* = ' ',
-        else => {},
-    };
-    const trimmed = std.mem.trim(u8, buf, " \t\n\r");
-    if (trimmed.len == 0) return null;
-    return try a.dupe(u8, trimmed);
-}
 
 const ViewLoad = bg.Latest(LoadedView, LoadedView.free);
 
@@ -335,50 +85,12 @@ pub const GridState = struct {
     // reload once the new data has landed. Main-thread only.
     refreshed: std.AutoHashMap(u64, void),
 
-    // Two-tier thumbnail cache
-    // committed: main-thread only, no lock needed
-    committed: std.AutoHashMap(u64, CacheEntry),
-    // pending: worker writes; main drains into committed in update()
-    pending: std.AutoHashMap(u64, []u8),
-    pending_mutex: std.Io.Mutex = std.Io.Mutex.init,
-
-    last_eviction_s: i64 = 0,
-
-    // Load queues — protected by queue_mutex
-    // high = visible range, low = prefetch zone
-    high_queue: std.ArrayList(LoadRequest) = .empty,
-    low_queue: std.ArrayList(LoadRequest) = .empty,
-    queued: std.AutoHashMap(u64, void), // IDs sitting in high_queue/low_queue
-    // IDs a worker has popped and is currently loading. Tracked separately from
-    // `queued` so the per-frame queue rebuild (which drops stale queued requests)
-    // doesn't re-request something already in flight and load it twice.
-    in_flight: std.AutoHashMap(u64, void),
-    /// In-flight loads whose id was invalidated meanwhile (the id now names
-    /// another image): their result is dropped. Guarded by queue_mutex.
-    stale_in_flight: std.AutoHashMap(u64, void),
-    // Ids whose thumbnail couldn't be produced: not re-requested until
-    // invalidateThumbnail (refresh / recycled id). Guarded by queue_mutex.
-    load_failed: std.AutoHashMap(u64, void),
-    // Ids the loader deleted from the DB because their file is gone. Drained by
-    // app.zig each frame to drop them from the grid and viewers. Guarded by queue_mutex.
-    missing_ids: std.ArrayList(u64) = .empty,
-    queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    queue_cond: std.Io.Condition = std.Io.Condition.init,
-
-    // Dedicated DB connection shared by all loader workers, serialized via mutex
-    loader_db: db_mod.VectorDb,
-    loader_db_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Connection for background view loads, so a long list / FTS / KNN query
     /// never holds the main connection's mutex while the UI needs it. Its own
     /// `db_mutex` serializes overlapping loads.
     view_db: db_mod.VectorDb,
-    /// Read by the loader workers; the settings screen may change it.
-    thumbnails_in_db: std.atomic.Value(bool),
-
-    // Worker thread pool
-    workers: [max_workers]std.Thread = undefined,
-    worker_count: usize = 0,
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Thumbnail cache and its loader threads.
+    thumbs: thumb_loader.ThumbLoader,
 
     // Persistent scroll state for the grid's scroll area.  Using vertical=.given
     // prevents the full content height from being reported as min_size.h to the
@@ -398,23 +110,9 @@ pub const GridState = struct {
 
     // ── Grid autoplay ─────────────────────────────────────────────────────────
     // When enabled, visible animated/video cells play live (muted). Mirrored from
-    // config each frame by app.zig. Players are created/ticked during render and
-    // evicted when their cell scrolls off. Main-thread only.
+    // config each frame by app.zig. Main-thread only.
     autoplay: bool = false,
-    grid_players: std.AutoHashMap(u64, CellPlayer) = undefined, // main-thread only
-    player_frame: u64 = 0, // bumped once per render for touch/evict
-    // Background opener pipeline. player_queue/player_ready/player_in_flight are
-    // shared with opener threads (guarded by player_mutex); player_failed is
-    // main-thread only. The queue is rebuilt each frame from the visible cells,
-    // like the thumbnail loader's high/low queues.
-    player_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    player_cond: std.Io.Condition = std.Io.Condition.init,
-    player_queue: std.ArrayList(PlayerOpenReq) = .empty,
-    player_ready: std.ArrayList(ReadyPlayer) = .empty,
-    player_in_flight: std.AutoHashMap(u64, void) = undefined,
-    player_failed: std.AutoHashMap(u64, void) = undefined, // opens that errored; don't retry
-    player_openers: [max_player_openers]std.Thread = undefined,
-    player_opener_count: usize = 0,
+    players: grid_players.PlayerPool,
 
     // UI state
     view_mode: ViewMode = .library,
@@ -474,35 +172,25 @@ pub const GridState = struct {
     data_dir: ?[]const u8 = null,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
-        var loader_db = try db.getConnection();
-        errdefer loader_db.deinit();
+        var thumbs = try thumb_loader.ThumbLoader.init(io, allocator, db, thumbnails_in_db, @intFromFloat(thumb_size_max), wakeup_fn);
+        errdefer thumbs.deinit();
         var view_db = try db.getConnection();
         errdefer view_db.deinit();
         var state = GridState{
             .io = io,
             .allocator = allocator,
-            .committed = std.AutoHashMap(u64, CacheEntry).init(allocator),
-            .pending = std.AutoHashMap(u64, []u8).init(allocator),
-            .queued = std.AutoHashMap(u64, void).init(allocator),
-            .in_flight = std.AutoHashMap(u64, void).init(allocator),
-            .stale_in_flight = std.AutoHashMap(u64, void).init(allocator),
-            .load_failed = std.AutoHashMap(u64, void).init(allocator),
             .load_dropped = std.AutoHashMap(u64, void).init(allocator),
             .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
-            .loader_db = loader_db,
+            .thumbs = thumbs,
             .view_db = view_db,
-            .thumbnails_in_db = .init(thumbnails_in_db),
             .wakeup_fn = wakeup_fn,
-            .grid_players = std.AutoHashMap(u64, CellPlayer).init(allocator),
-            .player_in_flight = std.AutoHashMap(u64, void).init(allocator),
-            .player_failed = std.AutoHashMap(u64, void).init(allocator),
+            .players = .init(io, allocator, wakeup_fn),
         };
 
         // The image list loads in the background: call reloadImages once the
         // grid is at its final address (the load task points into it).
         const now_ns = std.Io.Clock.real.now(io).nanoseconds;
-        state.last_eviction_s = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
         state.sort_seed = @truncate(@abs(now_ns));
         state.applySortOrder();
         return state;
@@ -511,18 +199,8 @@ pub const GridState = struct {
     /// Start the background loader thread pool. Call this after the GridState is at its
     /// final stable address (e.g. stored as a module-level global).
     pub fn startWorker(self: *GridState) !void {
-        const n = @min(std.Thread.getCpuCount() catch 4, max_workers);
-        for (0..n) |_| {
-            self.workers[self.worker_count] = try std.Thread.spawn(.{}, workerFn, .{self});
-            self.worker_count += 1;
-        }
-        // Background player-opener pool (grid autoplay). Idle until autoplay
-        // requests opens, so it's cheap to always have running.
-        const np = @min(std.Thread.getCpuCount() catch 2, max_player_openers);
-        for (0..np) |_| {
-            self.player_openers[self.player_opener_count] = try std.Thread.spawn(.{}, playerOpenerFn, .{self});
-            self.player_opener_count += 1;
-        }
+        try self.thumbs.start();
+        try self.players.start();
     }
 
     /// The entry with `id`, if it's in the current list.
@@ -544,52 +222,11 @@ pub const GridState = struct {
         self.load_dropped.deinit();
         for (self.load_added.items) |e| self.allocator.free(e.path);
         self.load_added.deinit(self.allocator);
-        self.stop.store(true, .release);
-        self.queue_mutex.lockUncancelable(self.io);
-        // Signal once per worker to wake all waiting threads
-        for (0..self.worker_count) |_| self.queue_cond.signal(self.io);
-        self.queue_mutex.unlock(self.io);
-        for (self.workers[0..self.worker_count]) |w| w.join();
+        self.thumbs.deinit();
+        self.players.deinit();
 
-        // Stop the player-opener pool (they wait on player_cond).
-        self.player_mutex.lockUncancelable(self.io);
-        for (0..self.player_opener_count) |_| self.player_cond.signal(self.io);
-        self.player_mutex.unlock(self.io);
-        for (self.player_openers[0..self.player_opener_count]) |t| t.join();
-
-        // No opener threads left, so the pipeline is now ours alone to tear down.
-        // Tear down live players first (clearGridPlayersEx still reads player_failed),
-        // then the pipeline maps/lists. deinit runs at shutdown, outside any dvui
-        // frame: don't touch the texture cache (the window is already being torn down).
-        self.clearGridPlayersEx(false);
-        self.grid_players.deinit();
-        for (self.player_queue.items) |r| self.allocator.free(r.path_z);
-        self.player_queue.deinit(self.allocator);
-        for (self.player_ready.items) |rp| if (rp.player) |p| p.deinit();
-        self.player_ready.deinit(self.allocator);
-        self.player_in_flight.deinit();
-        self.player_failed.deinit();
-
-        var ci = self.committed.iterator();
-        while (ci.next()) |kv| self.allocator.free(kv.value_ptr.bytes);
-        self.committed.deinit();
-
-        var pi = self.pending.iterator();
-        while (pi.next()) |kv| self.allocator.free(kv.value_ptr.*);
-        self.pending.deinit();
-
-        for (self.high_queue.items) |r| self.allocator.free(r.path);
-        for (self.low_queue.items) |r| self.allocator.free(r.path);
-        self.high_queue.deinit(self.allocator);
-        self.low_queue.deinit(self.allocator);
-        self.queued.deinit();
-        self.in_flight.deinit();
-        self.stale_in_flight.deinit();
-        self.load_failed.deinit();
-        self.missing_ids.deinit(self.allocator);
         self.refreshed.deinit();
 
-        self.loader_db.deinit();
         self.view_db.deinit();
         self.notifier.deinit();
         self.selection.deinit();
@@ -717,21 +354,13 @@ pub const GridState = struct {
             self.allocator.free(view.media);
         }
         // Clear queues before freeing images so workers don't access freed path pointers.
-        {
-            self.queue_mutex.lockUncancelable(self.io);
-            for (self.high_queue.items) |r| self.allocator.free(r.path);
-            for (self.low_queue.items) |r| self.allocator.free(r.path);
-            self.high_queue.clearRetainingCapacity();
-            self.low_queue.clearRetainingCapacity();
-            self.queued.clearRetainingCapacity();
-            self.queue_mutex.unlock(self.io);
-        }
+        self.thumbs.clearQueued();
         for (self.images.items) |e| {
             self.allocator.free(e.path);
             if (e.trash_name) |tn| self.allocator.free(tn);
         }
         // Live cell players reference image ids; the list is about to change.
-        self.clearGridPlayers();
+        self.players.clear();
         self.images.clearRetainingCapacity();
         self.selection.clearRetainingCapacity();
         self.focused_idx = null;
@@ -789,168 +418,9 @@ pub const GridState = struct {
         }
     }
 
-    // ── Grid autoplay players ──────────────────────────────────────────────────
-
     /// Whether an entry is a live-playable type (animated image or video).
     fn isPlayable(e: *const ImageEntry) bool {
         return e.media_type == .animated or e.media_type == .video;
-    }
-
-    /// Advance the (already-open) player for a visible cell and return it so its
-    /// current frame can be drawn, or null if no player exists yet (opening, or
-    /// never requested). Never opens — that happens off-thread via requestPlayer.
-    fn drawCellPlayer(self: *GridState, id: u64, now_ns: i128) ?*CellPlayer {
-        const cp = self.grid_players.getPtr(id) orelse return null;
-        cp.last_touched = self.player_frame;
-        if (cp.player.tick(now_ns)) |frame| {
-            if (cp.pixels) |old| {
-                dvui.textureInvalidateCache(cp.tex_hash);
-                self.allocator.free(old);
-            }
-            cp.pixels = frame.pixels;
-            cp.width = frame.width;
-            cp.height = frame.height;
-            cp.tex_hash = (dvui.ImageSource{ .pixels = .{
-                .rgba = frame.pixels, .width = frame.width, .height = frame.height,
-            } }).hash();
-        }
-        return cp;
-    }
-
-    /// Queue an off-thread open for a visible playable cell that has no player yet.
-    /// No-op if the open is already in flight or previously failed. The queue is
-    /// rebuilt each frame (see syncPlayerPipeline), so only currently-visible cells
-    /// stay queued.
-    fn requestPlayer(self: *GridState, entry: *const ImageEntry) void {
-        const id = entry.id;
-        if (self.player_failed.contains(id)) return; // main-thread only; no lock
-        const path = self.diskPath(entry);
-        defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
-        const path_z = self.allocator.dupeSentinel(u8, path, 0) catch return;
-
-        self.player_mutex.lockUncancelable(self.io);
-        defer self.player_mutex.unlock(self.io);
-        if (self.player_in_flight.contains(id)) { self.allocator.free(path_z); return; }
-        for (self.player_queue.items) |r| if (r.id == id) { self.allocator.free(path_z); return; };
-        self.player_queue.append(self.allocator, .{ .id = id, .path_z = path_z }) catch {
-            self.allocator.free(path_z);
-            return;
-        };
-        self.player_cond.signal(self.io);
-    }
-
-    /// Per-frame pipeline sync: drop stale open requests (visible cells re-queue
-    /// during row render) and take the players the openers finished. When
-    /// `install` is true, ready players are installed into grid_players; otherwise
-    /// (autoplay off) they're discarded. Runs on the main thread.
-    fn syncPlayerPipeline(self: *GridState, install: bool) void {
-        self.player_mutex.lockUncancelable(self.io);
-        for (self.player_queue.items) |r| self.allocator.free(r.path_z);
-        self.player_queue.clearRetainingCapacity();
-        var ready = self.player_ready; // move the finished list out from under the lock
-        self.player_ready = .empty;
-        self.player_mutex.unlock(self.io);
-        defer ready.deinit(self.allocator);
-
-        for (ready.items) |rp| {
-            const player = rp.player orelse {
-                if (install) self.player_failed.put(rp.id, {}) catch {};
-                continue;
-            };
-            if (!install) { player.deinit(); continue; }
-            const gop = self.grid_players.getOrPut(rp.id) catch { player.deinit(); continue; };
-            if (gop.found_existing) { player.deinit(); continue; } // already have one
-            gop.value_ptr.* = .{ .player = player, .last_touched = self.player_frame };
-        }
-    }
-
-    /// Free a single cell player (joins its decode thread and releases frames).
-    /// `invalidate` drops the frame's cached GPU texture — only valid mid-frame
-    /// (dvui requires an active window); the deinit path passes false since the
-    /// whole window is being torn down.
-    fn destroyCellPlayer(self: *GridState, cp: *CellPlayer, invalidate: bool) void {
-        cp.player.deinit();
-        if (cp.pixels) |p| {
-            if (invalidate) dvui.textureInvalidateCache(cp.tex_hash);
-            self.allocator.free(p);
-        }
-    }
-
-    /// Evict players whose cell hasn't been visible for `player_evict_grace_frames`.
-    /// Also returns true if any surviving player is still playing (so the render
-    /// loop keeps spinning to advance playback).
-    fn evictStaleCellPlayers(self: *GridState) bool {
-        var any_playing = false;
-        // Collect stale keys first — removing during iteration can invalidate the
-        // iterator, and (with no cap) any number may go stale in one frame. Only
-        // destroy after collecting, so a player is never freed while its map entry
-        // survives (that would be a use-after-free next frame).
-        var stale: std.ArrayList(u64) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.grid_players.iterator();
-        while (it.next()) |kv| {
-            const cp = kv.value_ptr;
-            if (self.player_frame - cp.last_touched > player_evict_grace_frames) {
-                // If the append fails (OOM), leave the entry: it stays alive and is
-                // retried next frame — never destroyed-but-orphaned.
-                stale.append(self.allocator, kv.key_ptr.*) catch {};
-            } else if (cp.player.isPlaying()) {
-                any_playing = true;
-            }
-        }
-        for (stale.items) |id| {
-            if (self.grid_players.getPtr(id)) |cp| self.destroyCellPlayer(cp, true);
-            _ = self.grid_players.remove(id);
-        }
-        return any_playing;
-    }
-
-    /// Tear down all grid players (autoplay turned off, view reloaded, or deinit).
-    /// `invalidate` must be false when called outside a dvui frame (deinit).
-    /// Also drops any queued (not-yet-opened) requests and the failed-open set;
-    /// in-flight opens still complete but their players are discarded on the next
-    /// syncPlayerPipeline. (deinit clears the queue itself after joining openers.)
-    fn clearGridPlayersEx(self: *GridState, invalidate: bool) void {
-        var it = self.grid_players.iterator();
-        while (it.next()) |kv| self.destroyCellPlayer(kv.value_ptr, invalidate);
-        self.grid_players.clearRetainingCapacity();
-        self.player_failed.clearRetainingCapacity();
-    }
-
-    /// Tear down all grid players from within a frame (autoplay off / view reload).
-    pub fn clearGridPlayers(self: *GridState) void {
-        self.clearGridPlayersEx(true);
-    }
-
-    /// Background opener: pops a request, opens the player (file I/O + decode
-    /// thread spawn — the work we keep off the render thread), and hands it back.
-    fn playerOpenerFn(self: *GridState) void {
-        while (true) {
-            self.player_mutex.lockUncancelable(self.io);
-            while (self.player_queue.items.len == 0 and !self.stop.load(.acquire))
-                self.player_cond.waitUncancelable(self.io, &self.player_mutex);
-            if (self.stop.load(.acquire)) { self.player_mutex.unlock(self.io); break; }
-            const req = self.player_queue.orderedRemove(0);
-            self.player_in_flight.put(req.id, {}) catch {};
-            self.player_mutex.unlock(self.io);
-
-            const player = video_player_mod.VideoPlayer.init(self.allocator, self.io, req.path_z, .{
-                .wakeup_fn = self.wakeup_fn,
-                .audio = false,
-                .max_dim = grid_player_dim,
-            }) catch null;
-            self.allocator.free(req.path_z);
-
-            self.player_mutex.lockUncancelable(self.io);
-            _ = self.player_in_flight.remove(req.id);
-            self.player_ready.append(self.allocator, .{ .id = req.id, .player = player }) catch {
-                self.player_mutex.unlock(self.io);
-                if (player) |p| p.deinit(); // couldn't hand it back; don't leak
-                continue;
-            };
-            self.player_mutex.unlock(self.io);
-            if (self.wakeup_fn) |w| w();
-        }
     }
 
     /// True if `path` names a file directly or transitively inside `root`.
@@ -990,7 +460,7 @@ pub const GridState = struct {
         self.notifier.drain(self.io, self.allocator, &self.incoming);
         if (self.view_mode != .library) {
             for (self.incoming.items) |e| {
-                self.invalidateThumbnail(e.id);
+                self.thumbs.invalidate(e.id);
                 self.allocator.free(e.path);
             }
             self.incoming.clearRetainingCapacity();
@@ -1008,7 +478,7 @@ pub const GridState = struct {
                     // Already present: a reparse / change re-notified it. Drop the
                     // now-stale cached thumbnail so it regenerates, and flag the id
                     // so the detail panel reloads from the freshly-saved DB row.
-                    self.invalidateThumbnail(e.id);
+                    self.thumbs.invalidate(e.id);
                     self.refreshed.put(e.id, {}) catch {};
                     self.allocator.free(e.path);
                     continue;
@@ -1018,7 +488,7 @@ pub const GridState = struct {
                 // stale in-flight load result) so this image loads its own thumb.
                 // Do this even when the image isn't shown here, so the stale
                 // thumbnail can't resurface when it later appears in its own view.
-                self.invalidateThumbnail(e.id);
+                self.thumbs.invalidate(e.id);
                 // Don't inject images that don't belong in the current view
                 // (different folder/library, or not matching the active search).
                 if (!self.incomingBelongs(e.path)) {
@@ -1046,141 +516,10 @@ pub const GridState = struct {
         self.incoming.clearAndFree(self.allocator);
         if (self.images.items.len != before_count) self.applySortOrder();
 
-        // 2. Drain pending thumbnails into committed
-        const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
-        {
-            self.pending_mutex.lockUncancelable(self.io);
-            defer self.pending_mutex.unlock(self.io);
-            var it = self.pending.iterator();
-            while (it.next()) |kv| {
-                const dims = jpegDimensions(kv.value_ptr.*);
-                const entry = CacheEntry{
-                    .bytes = kv.value_ptr.*,
-                    .last_seen_s = now_s,
-                    .width = dims.w,
-                    .height = dims.h,
-                };
-                if (self.committed.fetchPut(kv.key_ptr.*, entry) catch null) |old| {
-                    self.allocator.free(old.value.bytes);
-                }
-            }
-            self.pending.clearRetainingCapacity();
-        }
-
-        // 3. Periodic eviction (~every 5 seconds)
-        if (now_s - self.last_eviction_s >= evict_interval_s) {
-            self.last_eviction_s = now_s;
-            self.evictStale(now_s - ttl_s);
-        }
+        // 2. Move finished thumbnails into the cache; evict old ones.
+        self.thumbs.commitPending();
     }
 
-    fn evictStale(self: *GridState, cutoff_s: i64) void {
-        var stale: std.ArrayList(u64) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.committed.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.last_seen_s < cutoff_s) {
-                stale.append(self.allocator, kv.key_ptr.*) catch continue;
-            }
-        }
-        for (stale.items) |id| {
-            if (self.committed.fetchRemove(id)) |kv| {
-                self.allocator.free(kv.value.bytes);
-            }
-        }
-    }
-
-    /// Drop any cached/queued thumbnail for `id` so the next render re-requests
-    /// it. Used when an image's pixels may have changed (reparse / overwrite) and
-    /// when an image is removed — SQLite recycles the deleted row's id for the
-    /// next insert, so a lingering cache entry would show the old thumbnail under
-    /// the new image.
-    pub fn invalidateThumbnail(self: *GridState, id: u64) void {
-        if (self.committed.fetchRemove(id)) |kv| self.allocator.free(kv.value.bytes);
-        {
-            // Drop a stale, not-yet-drained worker result so step 2 of update()
-            // doesn't re-commit it; an in-flight load regenerates from disk.
-            self.pending_mutex.lockUncancelable(self.io);
-            defer self.pending_mutex.unlock(self.io);
-            if (self.pending.fetchRemove(id)) |kv| self.allocator.free(kv.value);
-        }
-        {
-            self.queue_mutex.lockUncancelable(self.io);
-            defer self.queue_mutex.unlock(self.io);
-            _ = self.queued.remove(id);
-            _ = self.load_failed.remove(id);
-            // A worker still decoding the id's previous file: drop its result.
-            if (self.in_flight.contains(id)) self.stale_in_flight.put(id, {}) catch {};
-        }
-    }
-
-    /// Worker side: hand over a finished load (`bytes` null = it failed),
-    /// unless `invalidateThumbnail` made it stale meanwhile.
-    pub fn finishLoad(self: *GridState, id: u64, path: []const u8, bytes: ?[]u8) void {
-        self.queue_mutex.lockUncancelable(self.io);
-        const stale = self.stale_in_flight.remove(id);
-        if (stale) {
-            self.queue_mutex.unlock(self.io);
-            if (bytes) |b| self.allocator.free(b);
-            return;
-        }
-        const b = bytes orelse {
-            self.queue_mutex.unlock(self.io);
-            self.noteLoadFailure(id, path);
-            return;
-        };
-        // Still under queue_mutex, so an invalidate can't slip in between the
-        // stale check and the store (it would then remove the stored result).
-        self.pending_mutex.lockUncancelable(self.io);
-        if (self.pending.fetchRemove(id)) |old| self.allocator.free(old.value);
-        self.pending.put(id, b) catch self.allocator.free(b);
-        self.pending_mutex.unlock(self.io);
-        self.queue_mutex.unlock(self.io);
-        if (self.wakeup_fn) |wakeup| wakeup();
-    }
-
-    /// Worker side: no thumbnail could be produced for `id`. A file deleted
-    /// outside the app (gone from a directory that still exists) has its row
-    /// removed now and its id queued for `drainMissingIds`; anything else (an
-    /// undecodable file, or a whole directory missing, e.g. an unmounted drive,
-    /// which the library scan reconciles) is just not retried.
-    pub fn noteLoadFailure(self: *GridState, id: u64, path: []const u8) void {
-        {
-            // Covers both outcomes: a deleted id must not be re-requested before
-            // the main thread drains it (removal then invalidates it).
-            self.queue_mutex.lockUncancelable(self.io);
-            defer self.queue_mutex.unlock(self.io);
-            self.load_failed.put(id, {}) catch {};
-        }
-        if (fileDeleted(self.io, path)) {
-            self.loader_db_mutex.lockUncancelable(self.io);
-            const deleted = self.loader_db.deleteMissingImage(id, path) catch |err| blk: {
-                log.warn("remove missing {s}: {}", .{ std.Io.Dir.path.basename(path), err });
-                break :blk false;
-            };
-            self.loader_db_mutex.unlock(self.io);
-            if (deleted) {
-                log.info("removed missing file {s} from the library", .{std.Io.Dir.path.basename(path)});
-                self.queue_mutex.lockUncancelable(self.io);
-                self.missing_ids.append(self.allocator, id) catch {};
-                self.queue_mutex.unlock(self.io);
-                if (self.wakeup_fn) |wakeup| wakeup();
-            }
-        }
-    }
-
-    /// Move the ids `noteLoadFailure` deleted from the DB into `out` (which
-    /// grows with `gpa`). Main-thread only; called once per frame.
-    pub fn drainMissingIds(self: *GridState, gpa: std.mem.Allocator, out: *std.ArrayList(u64)) void {
-        self.queue_mutex.lockUncancelable(self.io);
-        defer self.queue_mutex.unlock(self.io);
-        if (self.missing_ids.items.len == 0) return;
-        out.appendSlice(gpa, self.missing_ids.items) catch return;
-        self.missing_ids.clearRetainingCapacity();
-    }
-
-    /// True if `id` was re-notified (reparsed / changed) during this frame's
-    /// update(). Lets the detail panel reload exactly when fresh data is ready.
     pub fn wasRefreshedThisFrame(self: *const GridState, id: u64) bool {
         return self.refreshed.contains(id);
     }
@@ -1211,41 +550,18 @@ pub const GridState = struct {
     /// settings don't apply then, and take effect again once it is cleared.
     /// Mirrors `queryEntries`.
     pub fn isRelevanceRanked(self: *const GridState) bool {
-        if (self.view_mode != .library) return false;
-        const e = self.query_embeddings;
-        const vector = switch (self.search_mode) {
-            .fts => false,
-            .semantic => e.prompt != null,
-            .visual => e.visual != null,
-            .combined => e.prompt != null or e.visual != null,
-        };
-        return vector or hasFtsTerms(self.search_query);
+        return vq.isRelevanceRanked(self.currentQuery());
     }
 
     pub fn applySortOrder(self: *GridState) void {
         // Duplicates view keeps the DB order (grouped by hash) so duplicate sets
-        // stay contiguous, and a vector search keeps its relevance ranking;
+        // stay contiguous, and a search keeps its relevance ranking;
         // user-facing sort controls don't apply there.
         if (self.view_mode == .duplicates or self.isRelevanceRanked()) return;
 
         // Remember focused image ID so we can restore focused_idx after reorder.
         const focused_id: ?u64 = if (self.focused_idx) |fi| self.images.items[fi].id else null;
-
-        switch (self.sort_mode) {
-            .date => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageDateLt),
-            .name => std.mem.sort(ImageEntry, self.images.items, self.sort_dir, imageNameLt),
-            .random => {
-                // Sort by hash(seed, id) so each image has a stable position
-                // independent of list size — deleting one image won't reorder the rest.
-                std.mem.sort(ImageEntry, self.images.items, self.sort_seed, struct {
-                    fn lt(seed: u64, a: ImageEntry, b: ImageEntry) bool {
-                        const ha = std.hash.Wyhash.hash(seed, std.mem.asBytes(&a.id));
-                        const hb = std.hash.Wyhash.hash(seed, std.mem.asBytes(&b.id));
-                        return ha < hb;
-                    }
-                }.lt);
-            },
-        }
+        vq.sortEntries(self.images.items, self.sort_mode, self.sort_dir, self.sort_seed);
 
         // Re-anchor focused_idx to the same image after sort.
         if (focused_id) |fid| {
@@ -1282,29 +598,6 @@ pub const GridState = struct {
         const tn = entry.trash_name orelse return entry.path;
         const dd = self.data_dir orelse return entry.path;
         return std.Io.Dir.path.join(self.allocator, &.{ dd, "trash", tn }) catch entry.path;
-    }
-
-    fn requestLoad(self: *GridState, id: u64, path: []const u8, high: bool) void {
-        if (self.committed.contains(id)) return;
-
-        self.queue_mutex.lockUncancelable(self.io);
-        defer self.queue_mutex.unlock(self.io);
-
-        if (self.queued.contains(id) or self.in_flight.contains(id) or self.load_failed.contains(id)) return;
-
-        const path_copy = self.allocator.dupe(u8, path) catch return;
-        const req = LoadRequest{ .id = id, .path = path_copy };
-        const queue = if (high) &self.high_queue else &self.low_queue;
-        queue.append(self.allocator, req) catch {
-            self.allocator.free(path_copy);
-            return;
-        };
-        self.queued.put(id, {}) catch {
-            _ = queue.pop();
-            self.allocator.free(path_copy);
-            return;
-        };
-        self.queue_cond.signal(self.io);
     }
 
     pub fn render(self: *GridState) void {
@@ -1540,20 +833,7 @@ pub const GridState = struct {
         // through that stale backlog before it reaches what's now on screen — so
         // visible thumbnails take ages to appear. In-flight loads are tracked
         // separately and finish on their own.
-        {
-            self.queue_mutex.lockUncancelable(self.io);
-            for (self.high_queue.items) |r| {
-                _ = self.queued.remove(r.id);
-                self.allocator.free(r.path);
-            }
-            for (self.low_queue.items) |r| {
-                _ = self.queued.remove(r.id);
-                self.allocator.free(r.path);
-            }
-            self.high_queue.clearRetainingCapacity();
-            self.low_queue.clearRetainingCapacity();
-            self.queue_mutex.unlock(self.io);
-        }
+        self.thumbs.clearQueued();
 
         // Touch last_seen for visible items; queue loads for prefetch zone
         const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
@@ -1563,12 +843,12 @@ pub const GridState = struct {
                 const idx = row * cols + col;
                 if (idx >= n) break;
                 const entry = &self.images.items[idx];
-                if (self.committed.getPtr(entry.id)) |ce| {
+                if (self.thumbs.committed.getPtr(entry.id)) |ce| {
                     if (is_visible) ce.last_seen_s = now_s;
                 } else {
                     const path = self.diskPath(entry);
                     defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
-                    self.requestLoad(entry.id, path, is_visible);
+                    self.thumbs.request(entry.id, path, is_visible);
                 }
             }
         }
@@ -1591,13 +871,7 @@ pub const GridState = struct {
         // Grid autoplay bookkeeping: bump the frame counter (used to evict players
         // whose cell has scrolled off), install players the openers finished, and
         // drop stale open requests. renderItem ticks/requests the visible cells.
-        if (self.autoplay) {
-            self.player_frame +%= 1;
-            self.syncPlayerPipeline(true);
-        } else {
-            if (self.grid_players.count() > 0) self.clearGridPlayers(); // just turned off
-            self.syncPlayerPipeline(false); // discard any in-flight opens that land
-        }
+        self.players.beginFrame(self.autoplay);
 
         // Visible rows
         for (first_row..last_row) |row| {
@@ -1617,7 +891,7 @@ pub const GridState = struct {
         // Evict players whose cell scrolled off; keep the loop spinning while any
         // survivor is still playing so playback advances without further input.
         if (self.autoplay) {
-            if (self.evictStaleCellPlayers()) dvui.refresh(null, @src(), null);
+            if (self.players.endFrame()) dvui.refresh(null, @src(), null);
         }
 
         // Bottom spacer (same max_size_content override as the top spacer).
@@ -1746,7 +1020,7 @@ pub const GridState = struct {
             var drew_live = false;
             if (self.autoplay and isPlayable(&entry)) {
                 const now_ns = video_player_mod.VideoPlayer.nowNs(self.io);
-                if (self.drawCellPlayer(entry.id, now_ns)) |cp| {
+                if (self.players.draw(entry.id, now_ns)) |cp| {
                     if (cp.pixels) |px| {
                         const fw: f32 = @floatFromInt(cp.width);
                         const fh: f32 = @floatFromInt(cp.height);
@@ -1770,11 +1044,13 @@ pub const GridState = struct {
                         drew_live = true;
                     }
                 } else {
-                    self.requestPlayer(&entry);
+                    const path = self.diskPath(&entry);
+                    defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
+                    self.players.request(entry.id, path);
                 }
             }
 
-            if (!drew_live) if (self.committed.get(entry.id)) |ce| {
+            if (!drew_live) if (self.thumbs.committed.get(entry.id)) |ce| {
                 // Scale to fit ts×ts while preserving aspect ratio, then center with margin.
                 // Using explicit margin avoids DVUI layout bugs caused by gravity_y=0.5
                 // triggering child_positioned mode in the vertical BoxWidget.
@@ -1950,98 +1226,3 @@ pub const GridState = struct {
         });
     }
 };
-
-/// True when `path` no longer exists but its directory does, i.e. the file
-/// was deleted. A missing directory is not treated as a deletion.
-pub fn fileDeleted(io: std.Io, path: []const u8) bool {
-    const cwd = std.Io.Dir.cwd();
-    cwd.access(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            const dir = std.Io.Dir.path.dirname(path) orelse return false;
-            cwd.access(io, dir, .{}) catch return false;
-            return true;
-        },
-        else => return false,
-    };
-    return false;
-}
-
-/// Whether a path is a video DiffKeep indexes (poster thumbnail stored in DB).
-pub fn isVideoPath(path: []const u8) bool {
-    return media.isVideoFile(path);
-}
-
-// ── Sort comparators ──────────────────────────────────────────────────────────
-
-fn imageDateLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
-    // null mtime sorts to end regardless of direction
-    if (a.mtime == null and b.mtime == null) return false;
-    if (a.mtime == null) return false;
-    if (b.mtime == null) return true;
-    return if (dir == .desc) a.mtime.? > b.mtime.? else a.mtime.? < b.mtime.?;
-}
-
-fn imageNameLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
-    const cmp = std.mem.order(u8, a.filename, b.filename);
-    return if (dir == .asc) cmp == .lt else cmp == .gt;
-}
-
-// ── Worker thread ─────────────────────────────────────────────────────────────
-
-fn workerFn(state: *GridState) void {
-    while (true) {
-        state.queue_mutex.lockUncancelable(state.io);
-        while (!state.stop.load(.acquire) and
-            state.high_queue.items.len == 0 and
-            state.low_queue.items.len == 0)
-        {
-            state.queue_cond.waitUncancelable(state.io, &state.queue_mutex);
-        }
-
-        if (state.stop.load(.acquire)) {
-            state.queue_mutex.unlock(state.io);
-            break;
-        }
-
-        const req: LoadRequest = if (state.high_queue.items.len > 0)
-            state.high_queue.orderedRemove(0)
-        else
-            state.low_queue.orderedRemove(0);
-
-        // Move from queued → in_flight so requestLoad won't re-queue it while the
-        // per-frame queue rebuild is dropping stale requests.
-        _ = state.queued.remove(req.id);
-        state.in_flight.put(req.id, {}) catch {};
-        state.queue_mutex.unlock(state.io);
-        defer {
-            state.queue_mutex.lockUncancelable(state.io);
-            _ = state.in_flight.remove(req.id);
-            _ = state.stale_in_flight.remove(req.id);
-            state.queue_mutex.unlock(state.io);
-        }
-        defer state.allocator.free(req.path);
-
-        // Video posters live in the DB (libvips can't open mp4/webm); for those,
-        // always read the stored blob. Otherwise use the DB only when configured.
-        const is_video = isVideoPath(req.path);
-        var bytes: ?[]u8 = null;
-        if (state.thumbnails_in_db.load(.acquire) or is_video) {
-            state.loader_db_mutex.lockUncancelable(state.io);
-            bytes = state.loader_db.getThumbnailBytes(state.allocator, req.id) catch null;
-            state.loader_db_mutex.unlock(state.io);
-        }
-
-        // Fall back to on-the-fly VIPS generation (images only).
-        if (bytes == null and !is_video) {
-            const path_z = state.allocator.dupeSentinel(u8, req.path, 0) catch continue;
-            defer state.allocator.free(path_z);
-            bytes = vips.thumbnailToJpeg(state.allocator, path_z, @as(c_int, @intFromFloat(thumb_size_max))) catch |err| blk: {
-                log.warn("vips thumbnail {s}: {}", .{ std.Io.Dir.path.basename(req.path), err });
-                break :blk null;
-            };
-        }
-
-        state.finishLoad(req.id, req.path, bytes);
-    }
-    vips.threadShutdown();
-}

@@ -512,7 +512,7 @@ fn frame() !dvui.App.Result {
             var removed: std.ArrayList(u64) = .empty;
             defer removed.deinit(init.gpa);
             if (dk.g_library_manager) |*mgr| mgr.drainRemovedIds(init.io, &removed);
-            grid.drainMissingIds(init.gpa, &removed);
+            grid.thumbs.drainMissingIds(init.gpa, &removed);
             if (removed.items.len > 0) {
                 var ids = std.AutoHashMap(u64, void).init(init.gpa);
                 defer ids.deinit();
@@ -631,7 +631,7 @@ fn frame() !dvui.App.Result {
                     for (grid.drag_requested_ids.items) |id| {
                         for (grid.images.items) |entry| {
                             if (entry.id != id) continue;
-                            const thumb = grid.committed.get(id);
+                            const thumb = grid.thumbs.committed.get(id);
                             items.append(init.gpa, .{
                                 .path       = entry.path,
                                 .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
@@ -747,7 +747,7 @@ fn frame() !dvui.App.Result {
     }
     if (settings_was_open and !g_settings.open) {
         g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
-        if (dk.g_grid) |*grid| grid.thumbnails_in_db.store(dk.g_cfg.thumbnails_in_db, .release);
+        if (dk.g_grid) |*grid| grid.thumbs.thumbnails_in_db.store(dk.g_cfg.thumbnails_in_db, .release);
         if (g_settings.model_paths_changed) {
             g_settings.model_paths_changed = false;
             if (dvui.App.main_init) |init| {
@@ -1227,7 +1227,7 @@ pub fn main(init: std.process.Init) !void {
                 vw.state.drag_requested = false;
                 if (vw.dnd) |*d| {
                     if (vw.state.currentImage()) |img| {
-                        const thumb = if (dk.g_grid) |*grid| grid.committed.get(img.id) else null;
+                        const thumb = if (dk.g_grid) |*grid| grid.thumbs.committed.get(img.id) else null;
                         const drag_item = dnd_mod.DragItem{
                             .path = img.path,
                             .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
