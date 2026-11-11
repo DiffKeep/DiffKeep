@@ -204,35 +204,62 @@ pub fn isRelevanceRanked(q: ViewQuery) bool {
     return vector or hasFtsTerms(q.search_query);
 }
 
-/// Sort `entries` by the user's sort. `seed` orders `.random`: each image
-/// gets a position from hash(seed, id), so removing one doesn't reorder the
-/// rest.
-pub fn sortEntries(entries: []ImageEntry, mode: SortMode, dir: SortDir, seed: u64) void {
-    switch (mode) {
-        .date => std.mem.sort(ImageEntry, entries, dir, imageDateLt),
-        .name => std.mem.sort(ImageEntry, entries, dir, imageNameLt),
-        .random => std.mem.sort(ImageEntry, entries, seed, struct {
-            fn lt(sd: u64, a: ImageEntry, b: ImageEntry) bool {
-                const ha = std.hash.Wyhash.hash(sd, std.mem.asBytes(&a.id));
-                const hb = std.hash.Wyhash.hash(sd, std.mem.asBytes(&b.id));
-                return ha < hb;
-            }
-        }.lt),
+/// A user sort order (not used for relevance-ranked or duplicates views).
+pub const Order = struct {
+    mode: SortMode,
+    dir: SortDir,
+    /// Orders `.random`: each image gets a position from hash(seed, id), so
+    /// removing one doesn't reorder the rest.
+    seed: u64,
+
+    pub fn lessThan(o: Order, a: ImageEntry, b: ImageEntry) bool {
+        return switch (o.mode) {
+            .date => {
+                // null mtime sorts to the end regardless of direction
+                if (b.mtime == null) return a.mtime != null;
+                if (a.mtime == null) return false;
+                return if (o.dir == .desc) a.mtime.? > b.mtime.? else a.mtime.? < b.mtime.?;
+            },
+            .name => {
+                const cmp = std.mem.order(u8, a.filename, b.filename);
+                return if (o.dir == .asc) cmp == .lt else cmp == .gt;
+            },
+            .random => std.hash.Wyhash.hash(o.seed, std.mem.asBytes(&a.id)) <
+                std.hash.Wyhash.hash(o.seed, std.mem.asBytes(&b.id)),
+        };
+    }
+};
+
+pub fn sortEntries(entries: []ImageEntry, order: Order) void {
+    std.mem.sort(ImageEntry, entries, order, Order.lessThan);
+}
+
+/// Sort the entries appended at `split` into the already-sorted
+/// `entries[0..split]`: the same order `sortEntries` would give the whole
+/// slice (both are stable), in O(n + k log k) for k appended instead of
+/// O(n log n). The grid gets a few new images most frames of a scan.
+pub fn sortAppended(a: std.mem.Allocator, entries: []ImageEntry, split: usize, order: Order) void {
+    const tail = entries[split..];
+    sortEntries(tail, order);
+    if (split == 0 or tail.len == 0) return;
+    if (!order.lessThan(tail[0], entries[split - 1])) return; // already in place
+    const added = a.dupe(ImageEntry, tail) catch return sortEntries(entries, order);
+    defer a.free(added);
+    // Merge from the back. On a tie the earlier (head) entry stays first, as
+    // in a stable sort. The write slot is always past the unread head.
+    var i = split; // head entries left: entries[0..i]
+    var j = added.len; // appended entries left: added[0..j]
+    var w = entries.len;
+    while (j > 0) {
+        w -= 1;
+        if (i > 0 and order.lessThan(added[j - 1], entries[i - 1])) {
+            i -= 1;
+            entries[w] = entries[i];
+        } else {
+            j -= 1;
+            entries[w] = added[j];
+        }
     }
 }
 
-// ── Sort comparators ──────────────────────────────────────────────────────────
-
-fn imageDateLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
-    // null mtime sorts to end regardless of direction
-    if (a.mtime == null and b.mtime == null) return false;
-    if (a.mtime == null) return false;
-    if (b.mtime == null) return true;
-    return if (dir == .desc) a.mtime.? > b.mtime.? else a.mtime.? < b.mtime.?;
-}
-
-fn imageNameLt(dir: SortDir, a: ImageEntry, b: ImageEntry) bool {
-    const cmp = std.mem.order(u8, a.filename, b.filename);
-    return if (dir == .asc) cmp == .lt else cmp == .gt;
-}
 

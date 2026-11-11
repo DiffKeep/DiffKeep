@@ -26,6 +26,22 @@ int diffkeep_video_read_tag(const char *filename, const char *key, char **out);
    On success returns 0; *buf is malloc'd (free with diffkeep_video_free). */
 int diffkeep_video_first_frame_rgba(const char *filename, void **buf, int *width, int *height);
 
+/* Everything a library scan needs from a video, from one open of the file. */
+typedef struct {
+    void *pixels;   /* first frame, packed RGBA8 width*height*4, or NULL if it didn't decode */
+    int width;
+    int height;
+    char *workflow; /* "workflow" tag (ComfyUI), or NULL */
+    char *prompt;   /* "prompt" tag (ComfyUI), or NULL */
+} DiffkeepVideoScan;
+
+/* Open `filename` once: read its ComfyUI tags and decode the first frame,
+   fitted to max_dim on the long edge (0 = native). Returns -1 if the file
+   can't be opened; otherwise 0, with any part that failed left NULL. Free
+   with diffkeep_video_scan_free. */
+int diffkeep_video_scan(const char *filename, int max_dim, DiffkeepVideoScan *out);
+void diffkeep_video_scan_free(DiffkeepVideoScan *s);
+
 void diffkeep_video_free(void *p);
 
 /* ── Stateful decoder session (for playback) ─────────────────────────────── */

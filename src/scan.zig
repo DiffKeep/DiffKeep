@@ -829,24 +829,26 @@ fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
 /// Process a video file: poster-frame thumbnail (always stored in the DB so the
 /// grid loader can read it — libvips can't open video) + ComfyUI metadata from
 /// the container's format tags. `aa` is the per-file arena.
+/// Long edge of a video's poster thumbnail.
+const video_thumb_px = 320;
+
 fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.mem.Allocator, is_new: bool) void {
     const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return;
     defer ctx.allocator.free(path_z);
 
-    // Poster frame → JPEG, stored on the image row.
-    if (video.firstFrameRgba(aa, path_z)) |frame| {
-        if (vips.rgbaToJpeg(ctx.allocator, frame.pixels, frame.width, frame.height, 320)) |jpeg| {
-            if (image.thumbnail) |t| ctx.allocator.free(t);
-            image.thumbnail = jpeg;
-        } else |err| log.warn("video thumb encode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-    } else |err| log.warn("video decode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-
-    // Metadata: ComfyUI stores the same workflow/prompt JSON as mp4 format tags.
+    // One open of the file for the poster frame (already scaled to thumbnail
+    // size) and the ComfyUI metadata, which is stored as mp4 format tags.
     var sections: std.ArrayList(comfy_mod.ComfyParser.RawSection) = .empty;
-    if (video.readTag(aa, path_z, "workflow") catch null) |w|
-        sections.append(aa, .{ .keyword = "workflow", .text = w }) catch {};
-    if (video.readTag(aa, path_z, "prompt") catch null) |p|
-        sections.append(aa, .{ .keyword = "prompt", .text = p }) catch {};
+    if (video.scanFile(aa, path_z, video_thumb_px)) |data| {
+        if (data.frame) |frame| {
+            if (vips.rgbaToJpeg(ctx.allocator, frame.pixels, frame.width, frame.height, video_thumb_px)) |jpeg| {
+                if (image.thumbnail) |t| ctx.allocator.free(t);
+                image.thumbnail = jpeg;
+            } else |err| log.warn("video thumb encode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
+        } else log.warn("video decode {s}: no first frame", .{std.Io.Dir.path.basename(ctx.path)});
+        if (data.workflow) |w| sections.append(aa, .{ .keyword = "workflow", .text = w }) catch {};
+        if (data.prompt) |p| sections.append(aa, .{ .keyword = "prompt", .text = p }) catch {};
+    } else |err| log.warn("video open {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     var parser = comfy_mod.ComfyParser.init(aa);
     applyParseResult(ctx.allocator, image, parser.parseImageMetadata(sections.items) catch null);

@@ -24,6 +24,7 @@ pub const thumb_loader = @import("thumb_loader.zig");
 pub const view_query = @import("view_query.zig");
 pub const image_ops = @import("image_ops.zig");
 pub const vips = @import("vips");
+pub const video = @import("video");
 pub const library_manager = library_manager_mod;
 pub const counts = @import("counts.zig");
 pub const video_player = @import("video_player.zig");

@@ -1,5 +1,6 @@
 #include "vips_helper.h"
 #include <vips/vips.h>
+#include <stdlib.h>
 
 /* Convert *img in place to 4-band sRGB uchar (RGBA8), the layout every caller
    indexes as w*h*4. vips keeps greyscale as 1 band (2 with alpha) and 16-bit
@@ -40,6 +41,13 @@ int diffkeep_vips_init(const char *name) {
         vips_cache_set_max(0);
         vips_cache_set_max_mem(0);
         vips_cache_set_max_files(0);
+        /* One worker per operation. Our callers already run many vips
+         * operations in parallel (scan tasks, thumbnail loaders, viewer
+         * decodes), and vips's default pool per operation (one thread per
+         * core) only adds threads and memory: on an 8-core scan of 1.5k PNGs,
+         * 1 was ~11% faster than the default, with ~100 fewer threads and
+         * ~220 MB less peak RSS. VIPS_CONCURRENCY still overrides it. */
+        if (getenv("VIPS_CONCURRENCY") == NULL) vips_concurrency_set(1);
     }
     return rc;
 }

@@ -103,6 +103,50 @@ test "db: image create, save metadata, and retrieve details" {
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
 }
 
+fn totalChanges(db: *dk.VectorDb) !i64 {
+    var stmt = try db.db.prepare("SELECT total_changes()");
+    defer stmt.deinit();
+    _ = try stmt.step();
+    return stmt.columnInt64(0);
+}
+
+test "db: saving an image re-indexes its prompt only when the prompt changed" {
+    const path = "/tmp/diffkeep_test_fts_unchanged.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer img.deinit(alloc);
+    img.positivePromptText = try alloc.dupe(u8, "a fluffy kitten");
+    try db.saveImage(&img);
+
+    // Same prompt, other columns changed: only the row itself is written
+    // (total_changes counts the trigger's FTS writes too).
+    img.steps = 30;
+    var before = try totalChanges(&db);
+    try db.saveImage(&img);
+    try std.testing.expectEqual(before + 1, try totalChanges(&db));
+
+    // A new prompt still re-indexes, and search follows it.
+    alloc.free(img.positivePromptText.?);
+    img.positivePromptText = try alloc.dupe(u8, "a soaring eagle");
+    before = try totalChanges(&db);
+    try db.saveImage(&img);
+    try std.testing.expect(try totalChanges(&db) > before + 1);
+
+    const old_hits = try db.searchPrompts(alloc, "kitten");
+    defer alloc.free(old_hits);
+    try std.testing.expectEqual(@as(usize, 0), old_hits.len);
+    const hits = try db.searchPrompts(alloc, "eagle");
+    defer {
+        for (hits) |e| alloc.free(e.path);
+        alloc.free(hits);
+    }
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+}
+
 test "db: FTS5 prompt search" {
     const path = "/tmp/diffkeep_test_fts.db";
     var db = try openDb(path);
@@ -3290,4 +3334,81 @@ test "app: whole main-window frames run headless, from start-up to shutdown" {
     try dvui.testing.writeText("zzz");
     try framesUntil(&app, showsNoImages);
     try std.testing.expect(app.grid.?.isRelevanceRanked());
+}
+
+// ── Videos ────────────────────────────────────────────────────────────────────
+
+/// 640x360, 2 frames, with a ComfyUI API-format "prompt" tag.
+const tagged_mp4 = @embedFile("fixtures/tagged.mp4");
+
+test "video: scanFile reads the tags and a first frame fitted to the thumbnail size" {
+    const dir = "/tmp/diffkeep_test_video_scanfile";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/v.mp4", .data = tagged_mp4 });
+
+    const data = try dk.video.scanFile(alloc, dir ++ "/v.mp4", 320);
+    defer data.deinit(alloc);
+    const frame = data.frame.?;
+    try std.testing.expectEqual(@as(u32, 320), frame.width);
+    try std.testing.expectEqual(@as(u32, 180), frame.height);
+    try std.testing.expectEqual(@as(usize, 320 * 180 * 4), frame.pixels.len);
+    // Solid red (mpeg4 at low quality, so roughly).
+    try std.testing.expect(frame.pixels[0] > 200 and frame.pixels[1] < 60 and frame.pixels[2] < 60);
+    try std.testing.expect(std.mem.indexOf(u8, data.prompt.?, "a red fox in snow") != null);
+    try std.testing.expect(data.workflow == null);
+
+    try std.testing.expectError(error.VideoOpenFailed, dk.video.scanFile(alloc, dir ++ "/missing.mp4", 320));
+}
+
+test "scan: a video gets its poster thumbnail and prompt from the scan" {
+    const dir = "/tmp/diffkeep_test_scan_video";
+    try freshDir(dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/v.mp4", .data = tagged_mp4 });
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, true);
+    defer fx.deinit();
+
+    var img = try fx.row("v.mp4");
+    defer img.deinit(alloc);
+    try std.testing.expect(img.thumbnail != null);
+    try std.testing.expectEqualStrings("a red fox in snow", img.positivePromptText.?);
+    var details = (try fx.db.getImageDetails(alloc, img.id)).?;
+    defer details.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 5), details.seed.?);
+}
+
+// ── Sorting ───────────────────────────────────────────────────────────────────
+
+test "view_query: sortAppended gives the same order as sorting everything" {
+    const vq = dk.view_query;
+    var prng: std.Random.DefaultPrng = .init(42);
+    const rand = prng.random();
+    const names = [_][]const u8{ "a.png", "b.png", "c.png", "d.png", "e.png" };
+
+    for ([_]vq.SortMode{ .date, .name, .random }) |mode| {
+        for ([_]vq.SortDir{ .asc, .desc }) |dir| {
+            const order: vq.Order = .{ .mode = mode, .dir = dir, .seed = 7 };
+            for ([_]usize{ 0, 1, 3, 40 }) |k| {
+                const n = 60;
+                var all: [n + 40]vq.ImageEntry = undefined;
+                for (all[0 .. n + k], 0..) |*e, i| {
+                    const name = names[rand.uintLessThan(usize, names.len)];
+                    // Few distinct values, so ties (and stability) matter; some null mtimes.
+                    const mtime: ?i64 = if (rand.uintLessThan(u8, 8) == 0) null else @as(i64, rand.uintLessThan(u8, 6));
+                    e.* = .{ .id = i, .path = name, .filename = name, .mtime = mtime };
+                }
+                var want: [n + 40]vq.ImageEntry = undefined;
+                @memcpy(want[0 .. n + k], all[0 .. n + k]);
+                // The grid's invariant: what it already shows is sorted.
+                vq.sortEntries(all[0..n], order);
+                @memcpy(want[0..n], all[0..n]);
+                vq.sortEntries(want[0 .. n + k], order);
+
+                vq.sortAppended(alloc, all[0 .. n + k], n, order);
+                for (want[0 .. n + k], all[0 .. n + k]) |w, g|
+                    try std.testing.expectEqual(w.id, g.id);
+            }
+        }
+    }
 }

@@ -25,6 +25,42 @@ pub fn probe(path: [:0]const u8) !Info {
     };
 }
 
+/// What a library scan reads from a video. All parts are allocator-owned.
+pub const ScanData = struct {
+    /// First frame fitted to the requested size, or null if it didn't decode.
+    frame: ?Frame,
+    workflow: ?[]u8,
+    prompt: ?[]u8,
+
+    pub fn deinit(self: ScanData, allocator: std.mem.Allocator) void {
+        if (self.frame) |f| allocator.free(f.pixels);
+        if (self.workflow) |w| allocator.free(w);
+        if (self.prompt) |p| allocator.free(p);
+    }
+};
+
+/// Open `path` once for a scan: its ComfyUI "workflow"/"prompt" tags and its
+/// first frame, fitted to `max_dim` px on the long edge (0 = native).
+pub fn scanFile(allocator: std.mem.Allocator, path: [:0]const u8, max_dim: u32) !ScanData {
+    var raw: c.DiffkeepVideoScan = undefined;
+    if (c.diffkeep_video_scan(path.ptr, @intCast(max_dim), &raw) != 0) return error.VideoOpenFailed;
+    defer c.diffkeep_video_scan_free(&raw);
+
+    const workflow = if (raw.workflow) |w| try allocator.dupe(u8, std.mem.span(w)) else null;
+    errdefer if (workflow) |w| allocator.free(w);
+    const prompt = if (raw.prompt) |p| try allocator.dupe(u8, std.mem.span(p)) else null;
+    errdefer if (prompt) |p| allocator.free(p);
+    const frame: ?Frame = if (raw.pixels) |px| blk: {
+        const len: usize = @intCast(raw.width * raw.height * 4);
+        break :blk .{
+            .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(px))[0..len]),
+            .width = @intCast(raw.width),
+            .height = @intCast(raw.height),
+        };
+    } else null;
+    return .{ .frame = frame, .workflow = workflow, .prompt = prompt };
+}
+
 /// Read a format-level metadata tag (e.g. "workflow"/"prompt"); null if absent.
 /// The returned slice is allocator-owned.
 pub fn readTag(allocator: std.mem.Allocator, path: [:0]const u8, key: [:0]const u8) !?[]u8 {

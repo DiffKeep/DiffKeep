@@ -289,6 +289,22 @@ pub fn build(b: *std.Build) !void {
     const bench_embed_step = b.step("bench_embed", "A/B retrieval quality + speed: current encoders vs EmbeddingGemma 2");
     bench_embed_step.dependOn(&run_bench_embed.step);
 
+    // Dev tool: time a full library scan into a throwaway DB
+    const bench_scan_exe = b.addExecutable(.{
+        .name = "bench_scan",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_scan.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    try wireCore(b, bench_scan_exe, bench_scan_exe.root_module, core);
+    const run_bench_scan = b.addRunArtifact(bench_scan_exe);
+    run_bench_scan.addPassthruArgs();
+    const bench_scan_step = b.step("bench_scan", "Time a full library scan (parse/hash/thumbnail, no embeddings) of a folder");
+    bench_scan_step.dependOn(&run_bench_scan.step);
+
     const exe_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test.zig"),

@@ -205,6 +205,16 @@ const migrations = [_][:0]const u8{
     \\CREATE UNIQUE INDEX idx_images_live_path ON images (library_id, library_path)
     \\  WHERE trashed_at IS NULL;
     ,
+    // v15: `saveImage` sets every column, so the FTS update trigger re-indexed
+    // the prompt on every save (each scan of a changed file, each reparse)
+    // even when the prompt was the same. Only re-index when it changed.
+    \\DROP TRIGGER prompt_fts_au;
+    \\CREATE TRIGGER prompt_fts_au AFTER UPDATE OF positive_prompt_text ON images
+    \\WHEN old.positive_prompt_text IS NOT new.positive_prompt_text BEGIN
+    \\  INSERT INTO prompt_fts(prompt_fts, rowid, positive_prompt_text) VALUES ('delete', old.id, old.positive_prompt_text);
+    \\  INSERT INTO prompt_fts(rowid, positive_prompt_text) VALUES (new.id, new.positive_prompt_text);
+    \\END;
+    ,
 };
 
 /// Bounds of the half-open range [`folder/`, `folder0`) holding exactly the

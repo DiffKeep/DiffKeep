@@ -34,6 +34,7 @@ zig build test
 zig build video_probe -- file.mp4         # probe a media file's streams/metadata/first frame
 zig build test_tp_batch -- ...            # TensorPencil single vs batch embed throughput
 zig build bench_embed -Doptimize=ReleaseFast -- --corpus FILE  # encoder quality/speed A/B
+zig build bench_scan -Doptimize=ReleaseFast -- DIR [--runs N]    # full-scan time/RSS (no embeddings), throwaway DB
 
 # Pass --config / -c <dir> to use <dir>/DiffKeep.cfg. The DB stays at the XDG data dir
 # unless that config sets data_path (the DB file path) — set it for throwaway runs.
@@ -69,7 +70,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/models.zig` | Shared data structs (`Library`, `Image`). |
 | `src/parse/comfy.zig` | Parses ComfyUI workflow JSON embedded in PNG metadata (`tEXt` chunks). |
 | `src/image/png-data.zig` | Low-level PNG chunk reader for extracting raw metadata bytes. |
-| `src/vips.zig` | Thin Zig wrapper around libvips (via `lib/vips/vips_helper.c`) for thumbnail generation. |
+| `src/vips.zig` | Thin Zig wrapper around libvips (via `lib/vips/vips_helper.c`) for thumbnail generation. `vips.init` sets one worker per vips operation (our own threads supply the parallelism; measured faster and leaner than the per-core default). |
 | `src/sqlite.zig` | Low-level Zig bindings for the bundled SQLite + sqlite-vec C libraries. |
 | `src/notifier.zig` | `ImageNotifier` — channel used by the scan/load worker threads to push new image IDs to `GridState` without blocking. |
 

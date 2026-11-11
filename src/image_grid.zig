@@ -467,12 +467,19 @@ pub const GridState = struct {
         }
         const before_count = self.images.items.len;
         if (self.incoming.items.len > 0) {
-            // Build a set of ids already in the grid so re-notified images (e.g.
-            // after a reparse) update in place instead of appearing twice.
+            // Ids already in the grid (a reparse or change re-notified them)
+            // update in place instead of appearing twice. One pass over the
+            // grid against the few incoming ids, rather than hashing the grid.
             var existing = std.AutoHashMap(u64, void).init(self.allocator);
             defer existing.deinit();
-            existing.ensureTotalCapacity(@intCast(self.images.items.len)) catch {};
-            for (self.images.items) |img| existing.put(img.id, {}) catch {};
+            {
+                var wanted = std.AutoHashMap(u64, void).init(self.allocator);
+                defer wanted.deinit();
+                for (self.incoming.items) |e| wanted.put(e.id, {}) catch {};
+                for (self.images.items) |img| {
+                    if (wanted.contains(img.id)) existing.put(img.id, {}) catch {};
+                }
+            }
             for (self.incoming.items) |e| {
                 if (existing.contains(e.id)) {
                     // Already present: a reparse / change re-notified it. Drop the
@@ -514,7 +521,7 @@ pub const GridState = struct {
             }
         }
         self.incoming.clearAndFree(self.allocator);
-        if (self.images.items.len != before_count) self.applySortOrder();
+        if (self.images.items.len != before_count) self.reorder(before_count);
 
         // 2. Move finished thumbnails into the cache; evict old ones.
         self.thumbs.commitPending();
@@ -554,6 +561,13 @@ pub const GridState = struct {
     }
 
     pub fn applySortOrder(self: *GridState) void {
+        self.reorder(0);
+    }
+
+    /// Restore the sort order, assuming `images[0..split]` already has it: a
+    /// scan appends a few images most frames, and merging them in is far
+    /// cheaper than re-sorting the whole grid.
+    fn reorder(self: *GridState, split: usize) void {
         // Duplicates view keeps the DB order (grouped by hash) so duplicate sets
         // stay contiguous, and a search keeps its relevance ranking;
         // user-facing sort controls don't apply there.
@@ -561,7 +575,10 @@ pub const GridState = struct {
 
         // Remember focused image ID so we can restore focused_idx after reorder.
         const focused_id: ?u64 = if (self.focused_idx) |fi| self.images.items[fi].id else null;
-        vq.sortEntries(self.images.items, self.sort_mode, self.sort_dir, self.sort_seed);
+        if (split == 0)
+            vq.sortEntries(self.images.items, self.order())
+        else
+            vq.sortAppended(self.allocator, self.images.items, split, self.order());
 
         // Re-anchor focused_idx to the same image after sort.
         if (focused_id) |fid| {
@@ -573,6 +590,10 @@ pub const GridState = struct {
                 }
             }
         }
+    }
+
+    fn order(self: *const GridState) vq.Order {
+        return .{ .mode = self.sort_mode, .dir = self.sort_dir, .seed = self.sort_seed };
     }
 
     pub fn thumbSize(self: *const GridState) f32 {

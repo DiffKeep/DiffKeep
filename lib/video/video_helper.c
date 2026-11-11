@@ -36,32 +36,45 @@ int diffkeep_video_probe(const char *filename, DiffkeepVideoInfo *out) {
     return 0;
 }
 
-int diffkeep_video_read_tag(const char *filename, const char *key, char **out) {
-    *out = NULL;
-
-    AVFormatContext *fmt = NULL;
-    if (avformat_open_input(&fmt, filename, NULL, NULL) != 0) return -1;
-    if (avformat_find_stream_info(fmt, NULL) < 0) {
-        avformat_close_input(&fmt);
-        return -1;
-    }
-
-    int rc = -1;
-    /* flags=0 → case-insensitive exact match on the whole dictionary. */
-    AVDictionaryEntry *e = av_dict_get(fmt->metadata, key, NULL, 0);
-    if (e && e->value) {
-        *out = strdup(e->value);
-        rc = (*out != NULL) ? 0 : -1;
-    }
-
-    avformat_close_input(&fmt);
-    return rc;
+/* Scale (sw,sh) to fit max_dim on the long edge, preserving aspect. Never
+   upscales. Dimensions stay even (some pixel formats/scalers prefer it). */
+static void fit_dims(int sw, int sh, int max_dim, int *dw, int *dh) {
+    if (max_dim <= 0 || (sw <= max_dim && sh <= max_dim)) { *dw = sw; *dh = sh; return; }
+    double scale = (sw >= sh) ? (double)max_dim / sw : (double)max_dim / sh;
+    int w = (int)(sw * scale + 0.5);
+    int h = (int)(sh * scale + 0.5);
+    *dw = w < 2 ? 2 : (w & ~1);
+    *dh = h < 2 ? 2 : (h & ~1);
 }
 
-int diffkeep_video_first_frame_rgba(const char *filename, void **buf, int *width, int *height) {
-    *buf = NULL;
+static int open_input(const char *filename, AVFormatContext **fmt) {
+    *fmt = NULL;
+    if (avformat_open_input(fmt, filename, NULL, NULL) != 0) return -1;
+    if (avformat_find_stream_info(*fmt, NULL) < 0) {
+        avformat_close_input(fmt);
+        return -1;
+    }
+    return 0;
+}
 
+/* malloc'd copy of format-level tag `key` (case-insensitive), or NULL. */
+static char *dup_tag(AVFormatContext *fmt, const char *key) {
+    AVDictionaryEntry *e = av_dict_get(fmt->metadata, key, NULL, 0);
+    return (e && e->value) ? strdup(e->value) : NULL;
+}
+
+int diffkeep_video_read_tag(const char *filename, const char *key, char **out) {
     AVFormatContext *fmt = NULL;
+    *out = NULL;
+    if (open_input(filename, &fmt) != 0) return -1;
+    *out = dup_tag(fmt, key);
+    avformat_close_input(&fmt);
+    return *out ? 0 : -1;
+}
+
+/* Decode the first video frame of an opened input to packed RGBA8, fitted to
+   max_dim on the long edge (0 = native). 0 on success, *buf malloc'd. */
+static int first_frame(AVFormatContext *fmt, int max_dim, void **buf, int *width, int *height) {
     AVCodecContext *ctx = NULL;
     AVPacket *pkt = NULL;
     AVFrame *frame = NULL;
@@ -72,12 +85,10 @@ int diffkeep_video_first_frame_rgba(const char *filename, void **buf, int *width
     const AVCodec *dec = NULL;
     int vidx = -1;
     int got = 0;
-    int w = 0, h = 0;
+    int w = 0, h = 0, dw = 0, dh = 0;
     int rc = -1;
 
-    if (avformat_open_input(&fmt, filename, NULL, NULL) != 0) return -1;
-    if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
-
+    *buf = NULL;
     vidx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (vidx < 0 || dec == NULL) goto done;
 
@@ -105,28 +116,29 @@ int diffkeep_video_first_frame_rgba(const char *filename, void **buf, int *width
     w = ctx->width;
     h = ctx->height;
     if (w <= 0 || h <= 0) goto done;
+    fit_dims(w, h, max_dim, &dw, &dh);
 
-    sws = sws_getContext(w, h, ctx->pix_fmt, w, h, AV_PIX_FMT_RGBA,
+    sws = sws_getContext(w, h, ctx->pix_fmt, dw, dh, AV_PIX_FMT_RGBA,
                          SWS_BILINEAR, NULL, NULL, NULL);
     if (sws == NULL) goto done;
 
     /* Scale into a SIMD-aligned, padded buffer (swscale may write past a tight
        w*4 row), then copy tight rows into the contiguous output. */
-    if (av_image_alloc(dst_data, dst_linesize, w, h, AV_PIX_FMT_RGBA, 32) < 0) goto done;
+    if (av_image_alloc(dst_data, dst_linesize, dw, dh, AV_PIX_FMT_RGBA, 32) < 0) goto done;
     sws_scale(sws, (const uint8_t * const *)frame->data, frame->linesize, 0, h, dst_data, dst_linesize);
 
-    out = (uint8_t *)malloc((size_t)w * (size_t)h * 4);
+    out = (uint8_t *)malloc((size_t)dw * (size_t)dh * 4);
     if (out == NULL) goto done;
-    for (int y = 0; y < h; y++) {
-        memcpy(out + (size_t)y * (size_t)w * 4,
+    for (int y = 0; y < dh; y++) {
+        memcpy(out + (size_t)y * (size_t)dw * 4,
                dst_data[0] + (size_t)y * (size_t)dst_linesize[0],
-               (size_t)w * 4);
+               (size_t)dw * 4);
     }
 
     *buf = out;
     out = NULL;
-    *width = w;
-    *height = h;
+    *width = dw;
+    *height = dh;
     rc = 0;
 
 done:
@@ -136,8 +148,34 @@ done:
     if (frame) av_frame_free(&frame);
     if (pkt) av_packet_free(&pkt);
     if (ctx) avcodec_free_context(&ctx);
-    if (fmt) avformat_close_input(&fmt);
     return rc;
+}
+
+int diffkeep_video_first_frame_rgba(const char *filename, void **buf, int *width, int *height) {
+    AVFormatContext *fmt = NULL;
+    *buf = NULL;
+    if (open_input(filename, &fmt) != 0) return -1;
+    int rc = first_frame(fmt, 0, buf, width, height);
+    avformat_close_input(&fmt);
+    return rc;
+}
+
+int diffkeep_video_scan(const char *filename, int max_dim, DiffkeepVideoScan *out) {
+    AVFormatContext *fmt = NULL;
+    memset(out, 0, sizeof(*out));
+    if (open_input(filename, &fmt) != 0) return -1;
+    out->workflow = dup_tag(fmt, "workflow");
+    out->prompt = dup_tag(fmt, "prompt");
+    first_frame(fmt, max_dim, &out->pixels, &out->width, &out->height);
+    avformat_close_input(&fmt);
+    return 0;
+}
+
+void diffkeep_video_scan_free(DiffkeepVideoScan *s) {
+    free(s->pixels);
+    free(s->workflow);
+    free(s->prompt);
+    memset(s, 0, sizeof(*s));
 }
 
 void diffkeep_video_free(void *p) {
@@ -157,17 +195,6 @@ struct DiffkeepDecoder {
     int sws_fmt;
     int max_dim; /* downscale long edge to this if > 0; 0 = native */
 };
-
-/* Scale (sw,sh) to fit max_dim on the long edge, preserving aspect. Never
-   upscales. Dimensions stay even (some pixel formats/scalers prefer it). */
-static void fit_dims(int sw, int sh, int max_dim, int *dw, int *dh) {
-    if (max_dim <= 0 || (sw <= max_dim && sh <= max_dim)) { *dw = sw; *dh = sh; return; }
-    double scale = (sw >= sh) ? (double)max_dim / sw : (double)max_dim / sh;
-    int w = (int)(sw * scale + 0.5);
-    int h = (int)(sh * scale + 0.5);
-    *dw = w < 2 ? 2 : (w & ~1);
-    *dh = h < 2 ? 2 : (h & ~1);
-}
 
 DiffkeepDecoder *diffkeep_decoder_open(const char *filename, int max_dim) {
     DiffkeepDecoder *d = (DiffkeepDecoder *)calloc(1, sizeof(DiffkeepDecoder));

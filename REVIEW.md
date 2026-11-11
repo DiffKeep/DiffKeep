@@ -299,14 +299,18 @@ Tests went red then green unless marked *(fix only)*. "Red" was sometimes a comp
 - `AppState` (`app_state.zig`) replaces app.zig's globals and runs headless in tests; `FileOps` is an instance.
 - Still open from the structural list: viewer decode slots, video player threads, model downloads and the embedder load thread keep their own threading (different shapes from `bg.zig`'s); search.zig still drives the grid widget directly; the Windows/macOS parts of `dnd.zig` and `app.zig` can't be type-checked from Linux (a Windows build stops at finding libvips/libav).
 
+### Efficiency pass (2026-11-11)
+
+Measured with the new `zig build bench_scan` (1,500 PNGs plus a few videos, 8 cores, embeddings off, quiet machine):
+- libvips runs one worker per operation (`vips_concurrency_set(1)`; `VIPS_CONCURRENCY` still overrides). Scan ~11% faster, peak threads 230 → 130, peak RSS ~1 GB → ~0.68 GB.
+- The FTS update trigger fires only when the prompt changed (migration v15). Tested: an unchanged save writes 1 row instead of 9.
+- A video is opened once per scan instead of three times, and its poster frame is scaled during conversion rather than copied at full size. Tested with a small tagged MP4 fixture (`tests/fixtures/tagged.mp4`).
+- New grid images during a scan are merged into the sorted list (O(n + k log k)) instead of re-sorting the whole grid, and the "already shown" check no longer hashes the whole grid. Tested against a full stable sort for every mode; not timed.
+
 ### Not done (deliberately left; say if you want any)
 
 - **Efficiency:**
-  - `vips_concurrency_set` (needs measuring);
-  - video opened 3× per scan;
   - fewer frame copies;
-  - the `saveImage` FTS trigger guard;
-  - per-frame incoming sort;
   - thumbnail TTL/cap;
   - `ellipsize`;
   - raw-JSON relayout;
