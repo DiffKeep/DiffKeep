@@ -3967,3 +3967,103 @@ test "search: filters apply before ranking, so a rare filter still finds its nea
     try std.testing.expectEqual(near, v.entries[0].id);
     try std.testing.expectEqual(far, v.entries[1].id);
 }
+
+// ── Long prompts: chunk, embed, average ──────────────────────────────────────
+
+test "embedder: long prompts split into at most max_prompt_chunks budget-sized runs" {
+    const E = dk.embedder;
+    const size = E.prompt_chunk_tokens;
+    try std.testing.expectEqual(@as(usize, 1), E.promptChunkCount(1, size));
+    try std.testing.expectEqual(@as(usize, 1), E.promptChunkCount(size, size));
+    try std.testing.expectEqual(@as(usize, 2), E.promptChunkCount(size + 1, size));
+    // A runaway prompt (the 360 KB one) is capped: its meaning is at the start.
+    try std.testing.expectEqual(E.max_prompt_chunks, E.promptChunkCount(100 * size, size));
+}
+
+test "embedder: chunk vectors average to one unit vector" {
+    var a: [768]f32 = @splat(0);
+    var b: [768]f32 = @splat(0);
+    a[0] = 1;
+    b[1] = 1;
+    const mean = try dk.embedder.meanNormalized(alloc, &.{ &a, &b });
+    defer alloc.free(mean);
+    const h = @sqrt(0.5);
+    try std.testing.expectApproxEqAbs(h, mean[0], 1e-6);
+    try std.testing.expectApproxEqAbs(h, mean[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), mean[2], 1e-6);
+}
+
+/// The real text encoder, or a skip when the model isn't on this machine.
+fn loadTextEncoder() !dk.embedder.Embedder {
+    std.Io.Dir.cwd().access(io, "Models/embeddinggemma-300m", .{}) catch return error.SkipZigTest;
+    const e = try dk.embedder.Embedder.init(io, alloc, "Models/embeddinggemma-300m", null, .none, 4);
+    if (!e.hasPromptEncoder()) return error.SkipZigTest;
+    return e;
+}
+
+test "embedder: a prompt is embedded from its chunks, averaged" {
+    // Small chunks so the CPU forwards stay quick and the test doesn't depend
+    // on the encoder's window (prompts over it use `prompt_chunk_tokens`).
+    var emb = try loadTextEncoder();
+    defer emb.deinit();
+    const text = "a knight in ornate silver armor stands on a cliff above a stormy sea at dusk, " ++
+        "lightning over the waves, a red banner in the wind, a ruined castle behind him, cinematic";
+
+    const chunks = try emb.promptChunks(alloc, text, 12);
+    defer {
+        for (chunks) |c| alloc.free(c);
+        alloc.free(chunks);
+    }
+    try std.testing.expect(chunks.len >= 3 and chunks.len <= dk.embedder.max_prompt_chunks);
+    // The chunks are the prompt, in order.
+    try std.testing.expect(std.mem.startsWith(u8, text, chunks[0]));
+    try std.testing.expect(std.mem.endsWith(u8, text, std.mem.trim(u8, chunks[chunks.len - 1], " ")));
+
+    const vec = try emb.embedPromptChunked(alloc, text, 12);
+    defer alloc.free(vec);
+    var norm: f32 = 0;
+    for (vec) |x| norm += x * x;
+    try std.testing.expectApproxEqAbs(@as(f32, 1), norm, 1e-4);
+    // The average stays close to the prompt embedded whole.
+    const whole = try emb.embedPrompt(alloc, text);
+    defer alloc.free(whole);
+    var dot: f32 = 0;
+    for (vec, whole) |x, y| dot += x * y;
+    try std.testing.expect(dot > 0.7);
+}
+
+fn hasPromptVector(db: *dk.VectorDb, id: u64) !bool {
+    var stmt = try db.db.prepare("SELECT 1 FROM positive_prompt_embeddings_rowids WHERE rowid = ?");
+    defer stmt.deinit();
+    try stmt.bind(1, id);
+    return stmt.step();
+}
+
+test "db: upgrading drops prompt vectors that may span past the local attention window" {
+    // TensorPencil used to run full attention where EmbeddingGemma's local
+    // layers see 256 tokens either side: prompts over 257 tokens were
+    // embedded slightly off. The upgrade drops their vectors to redo them.
+    const path = "/tmp/diffkeep_test_window_migration.db";
+    var short_id: u64 = 0;
+    var long_id: u64 = 0;
+    {
+        var db = try openDb(path);
+        defer db.deinit();
+        const lib = try db.storeLibrary("/lib");
+        short_id = try searchableImage(&db, lib, "/lib/short.png", "m", 0);
+        long_id = try searchableImage(&db, lib, "/lib/long.png", "m", 0);
+        var img = try db.findOrCreateImage(alloc, lib, "/lib/long.png");
+        defer img.deinit(alloc);
+        alloc.free(img.positivePromptText.?);
+        img.positivePromptText = try alloc.alloc(u8, 241);
+        @memset(@constCast(img.positivePromptText.?), 'a');
+        try db.saveImage(&img);
+        try db.db.exec("PRAGMA user_version = 15");
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try dk.VectorDb.init(alloc, io, path);
+    defer db.deinit();
+    try std.testing.expect(try hasPromptVector(&db, short_id));
+    try std.testing.expect(!try hasPromptVector(&db, long_id));
+}

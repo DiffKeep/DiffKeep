@@ -34,12 +34,46 @@ const SIGLIP_IMAGE_SIZE  = 224;
 const SIGLIP_MEAN: [3]f32 = .{ 0.5, 0.5, 0.5 };
 const SIGLIP_STD:  [3]f32 = .{ 0.5, 0.5, 0.5 };
 
-/// Conservative gemma content-token budget. The model asserts framed length
-/// (content + <bos> + <eos>) <= sliding_window (512); the reserve leaves room for
-/// the role prefix (~8 tokens), the 2 frame tokens, and tokenization-boundary
-/// slack. Prompts whose content exceeds this are skipped (see `promptFits`) — a
-/// temporary guard until TensorPencil handles > window inputs itself.
-const GEMMA_CONTENT_BUDGET: usize = tp.models.embed_gemma.config_300m.sliding_window - 16;
+/// Conservative gemma content-token budget. The model takes up to `max_seq`
+/// (2048) framed tokens (content + role prefix + <bos> + <eos>) and returns
+/// error.SequenceTooLong past it; the reserve leaves room for the prefix
+/// (~8 tokens), the 2 frame tokens, and tokenization-boundary slack. A prompt
+/// over it is embedded in chunks (see `embedPrompt`).
+const GEMMA_CONTENT_BUDGET: usize = tp.models.embed_gemma.max_seq - 16;
+
+/// Tokens per chunk of a prompt too long to embed in one pass. Below the
+/// budget: a chunk decoded from token ids can tokenize a few tokens longer
+/// at its edges.
+pub const prompt_chunk_tokens: usize = GEMMA_CONTENT_BUDGET - 8;
+
+/// The most chunks a long prompt is embedded from; the rest is left to text
+/// search. Prompts that long are runaway generations repeating themselves
+/// (one of 51k real prompts is 360 KB of a looping LLM output): what they
+/// mean is at the start, and every chunk costs a forward pass.
+pub const max_prompt_chunks: usize = 8;
+
+/// How many chunks of `size` tokens a prompt of `n` tokens is embedded from.
+pub fn promptChunkCount(n: usize, size: usize) usize {
+    return @min(std.math.divCeil(usize, n, size) catch unreachable, max_prompt_chunks);
+}
+
+/// The normalized mean of unit vectors: one prompt vector from its chunks.
+/// Averaging blurs a prompt that changes subject, but image prompts mostly
+/// describe one scene. Caller owns the result.
+pub fn meanNormalized(allocator: std.mem.Allocator, vecs: []const []const f32) ![]f32 {
+    const out = try allocator.alloc(f32, vecs[0].len);
+    @memset(out, 0);
+    for (vecs) |v| for (out, v) |*o, x| {
+        o.* += x;
+    };
+    var norm: f32 = 0;
+    for (out) |x| norm += x * x;
+    norm = @sqrt(norm);
+    if (norm > 0) for (out) |*x| {
+        x.* /= norm;
+    };
+    return out;
+}
 
 /// Which GPU backend to prefer for batched work (falls back to CPU per call when
 /// the batch is below the threshold, or entirely when the handle failed to open).
@@ -215,11 +249,73 @@ pub const Embedder = struct {
         return self.embedTextOne(enc, allocator, text, .query);
     }
 
+    /// Split a prompt into at most `max_prompt_chunks` texts of `chunk_tokens`
+    /// tokens each (`prompt_chunk_tokens` for real use), cut on token
+    /// boundaries. A chunk that doesn't fit the budget once re-tokenized is
+    /// dropped. Caller owns them.
+    pub fn promptChunks(self: *Embedder, allocator: std.mem.Allocator, text: []const u8, chunk_tokens: usize) ![][]u8 {
+        const enc = if (self.text) |*e| e else return error.ModelNotLoaded;
+        var chunks: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (chunks.items) |c| allocator.free(c);
+            chunks.deinit(allocator);
+        }
+        {
+            // The tokenizer isn't safe to run concurrently with an encode.
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var ids: std.ArrayList(u32) = .empty;
+            defer ids.deinit(allocator);
+            try enc.tok.encode(allocator, text, &ids);
+            const n = promptChunkCount(ids.items.len, chunk_tokens);
+            for (0..n) |i| {
+                const run = ids.items[i * chunk_tokens .. @min(ids.items.len, (i + 1) * chunk_tokens)];
+                const piece = try enc.tok.decodeAlloc(allocator, run);
+                errdefer allocator.free(piece);
+                try chunks.append(allocator, piece);
+            }
+        }
+        // Checked outside the lock (promptFits takes it itself).
+        var kept: usize = 0;
+        for (chunks.items) |c| {
+            if (self.promptFits(allocator, c)) {
+                chunks.items[kept] = c;
+                kept += 1;
+            } else {
+                log.warn("prompt chunk over the budget after re-tokenizing; dropped", .{});
+                allocator.free(c);
+            }
+        }
+        chunks.shrinkRetainingCapacity(kept);
+        return chunks.toOwnedSlice(allocator);
+    }
+
     /// Embed an index-time prompt *document* (gemma, 768-dim, L2-norm).
+    /// One over the token budget is embedded from its chunks, averaged
+    /// (`promptChunks`, `meanNormalized`).
     pub fn embedPrompt(self: *Embedder, allocator: std.mem.Allocator, text: []const u8) ![]f32 {
         const enc = if (self.text) |*e| e else return error.ModelNotLoaded;
-        if (!self.promptFits(allocator, text)) return error.PromptTooLong;
-        return self.embedTextOne(enc, allocator, text, .document);
+        if (self.promptFits(allocator, text)) return self.embedTextOne(enc, allocator, text, .document);
+        return self.embedPromptChunked(allocator, text, prompt_chunk_tokens);
+    }
+
+    /// Embed `text` from its chunks of `chunk_tokens` tokens, averaged.
+    pub fn embedPromptChunked(self: *Embedder, allocator: std.mem.Allocator, text: []const u8, chunk_tokens: usize) ![]f32 {
+        const chunks = try self.promptChunks(allocator, text, chunk_tokens);
+        defer {
+            for (chunks) |c| allocator.free(c);
+            allocator.free(chunks);
+        }
+        if (chunks.len == 0) return error.PromptTooLong;
+        // On the GPU whenever there is one, however few chunks: each is a
+        // near-full window, far more work than the short single items the
+        // CPU threshold is for (a 2-chunk prompt took ~7 s on the CPU).
+        const vecs = try self.embedDocuments(allocator, @ptrCast(chunks), std.math.maxInt(usize));
+        defer {
+            for (vecs) |v| allocator.free(v);
+            allocator.free(vecs);
+        }
+        return meanNormalized(allocator, @ptrCast(vecs));
     }
 
     /// Embed a query text for visual search (siglip2 text encoder, 768-dim, L2-norm).
@@ -253,10 +349,16 @@ pub const Embedder = struct {
         allocator: std.mem.Allocator,
         texts:     []const []const u8,
     ) ![][]f32 {
+        return self.embedDocuments(allocator, texts, texts.len);
+    }
+
+    /// `embedPromptBatch`, routed as if it were a batch of `route_n` items
+    /// (see `backendFor`).
+    fn embedDocuments(self: *Embedder, allocator: std.mem.Allocator, texts: []const []const u8, route_n: usize) ![][]f32 {
         const enc = if (self.text) |*e| e else return error.ModelNotLoaded;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const backend = self.backendFor(texts.len);
+        const backend = self.backendFor(route_n);
         enc.backend = backend;
         self.bindThreadFor(backend);
         return enc.embedTextBatch(allocator, texts, .{ .role = .document });

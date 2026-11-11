@@ -663,6 +663,12 @@ fn embedBatch(
         var text_ids: [EMBED_BATCH_SIZE]u64        = undefined;
         var text_paths: [EMBED_BATCH_SIZE][]const u8 = undefined;
         var nt: usize = 0;
+        // Prompts over the encoder's window: embedded one by one from their
+        // chunks (`Embedder.embedPrompt`) after the batch.
+        var long_texts: [EMBED_BATCH_SIZE][]const u8 = undefined;
+        var long_ids: [EMBED_BATCH_SIZE]u64 = undefined;
+        var long_paths: [EMBED_BATCH_SIZE][]const u8 = undefined;
+        var nl: usize = 0;
         for (items) |*it| {
             const raw = it.prompt_text orelse continue;
             // Strip ComfyUI/A1111 markup so the embedder sees natural language.
@@ -671,10 +677,11 @@ fn embedBatch(
                 allocator.free(cleaned);
                 continue;
             }
-            // Skip prompts too long for the text encoder's window (would panic in TP).
             if (!emb.promptFits(allocator, cleaned)) {
-                log.warn("prompt too long for image {d}; skipping prompt embedding", .{it.image_id});
-                allocator.free(cleaned);
+                long_texts[nl] = cleaned;
+                long_ids[nl] = it.image_id;
+                long_paths[nl] = it.path;
+                nl += 1;
                 continue;
             }
             texts[nt] = cleaned;
@@ -683,6 +690,7 @@ fn embedBatch(
             nt += 1;
         }
         defer for (texts[0..nt]) |t| allocator.free(t);
+        defer for (long_texts[0..nl]) |t| allocator.free(t);
         // Skip the GPU embed on stop (close/cancel) — the gathered texts are still
         // freed by the defer above.
         if (nt > 0 and !stop.load(.acquire)) {
@@ -697,6 +705,10 @@ fn embedBatch(
                 log.warn("prompt embed batch failed ({}); retrying per item", .{err});
                 for (texts[0..nt], text_ids[0..nt], text_paths[0..nt]) |t, id, path| embedOnePrompt(allocator, db, emb, id, path, t);
             }
+        }
+        for (long_texts[0..nl], long_ids[0..nl], long_paths[0..nl]) |t, id, path| {
+            if (stop.load(.acquire)) break;
+            embedOnePrompt(allocator, db, emb, id, path, t);
         }
     }
 

@@ -215,6 +215,16 @@ const migrations = [_][:0]const u8{
     \\  INSERT INTO prompt_fts(rowid, positive_prompt_text) VALUES (new.id, new.positive_prompt_text);
     \\END;
     ,
+    // v16: TensorPencil's EmbeddingGemma ran full attention where the model's
+    // local layers attend 256 tokens either side, so prompts over 257 framed
+    // tokens were embedded slightly off (cosine ~0.998 to the reference at
+    // 300 tokens). Drop those prompt vectors so the next scan re-embeds them.
+    // A token is at least a byte, so a prompt of at most 240 bytes (plus
+    // ~10 framing tokens) is under 257 tokens: anything longer is redone.
+    // Re-embedding a shorter one changes nothing, so the cut only costs time.
+    \\DELETE FROM positive_prompt_embeddings WHERE rowid IN
+    \\  (SELECT id FROM images WHERE length(positive_prompt_text) > 240);
+    ,
 };
 
 /// Bounds of the half-open range [`folder/`, `folder0`) holding exactly the
