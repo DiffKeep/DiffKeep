@@ -476,17 +476,16 @@ pub fn ellipsize(buf: []u8, text: []const u8, font: dvui.Font, max_w: f32) []con
     const ell_w = font.textSize(ell).w;
     if (max_w <= ell_w) return "";
 
-    // Walk whole codepoints so a cut never lands inside a UTF-8 sequence.
+    // One measuring pass: dvui reports where the text stops fitting, at a
+    // codepoint boundary. (Measuring every prefix was quadratic, per label,
+    // per frame.)
     var end: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const next = @min(text.len, i + n);
-        if (font.textSize(text[0..next]).w + ell_w > max_w) break;
-        end = next;
-        i = next;
+    _ = font.textSizeEx(text, .{ .max_width = max_w - ell_w, .end_idx = &end, .end_metric = .before });
+    if (end + ell.len > buf.len) {
+        end = @min(end, buf.len -| ell.len);
+        // Back off to a codepoint boundary.
+        while (end > 0 and end < text.len and text[end] & 0xC0 == 0x80) end -= 1;
     }
-    if (end + ell.len > buf.len) end = @min(end, buf.len -| ell.len);
     @memcpy(buf[0..end], text[0..end]);
     @memcpy(buf[end..][0..ell.len], ell);
     return buf[0 .. end + ell.len];
@@ -526,4 +525,15 @@ pub fn hsep(src: std.builtin.SourceLocation) void {
         .margin = .{ .y = 6, .h = 6 },
     });
     b.deinit();
+}
+
+/// Wake the render loop at monotonic time `due_ns` (from `now_ns`), with a
+/// dvui timer on `id`: a playing video asks for its next frame's time rather
+/// than a redraw every frame.
+pub fn wakeAt(id: dvui.Id, now_ns: i128, due_ns: i128) void {
+    const us = @divTrunc(due_ns - now_ns, std.time.ns_per_us);
+    // dvui only wakes for a timer still in the future: one already due is a
+    // plain redraw.
+    if (us <= 0) return dvui.refresh(null, @src(), id);
+    dvui.timer(id, @intCast(@min(us, std.math.maxInt(i32))));
 }

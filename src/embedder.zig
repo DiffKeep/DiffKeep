@@ -125,11 +125,21 @@ pub const Embedder = struct {
     }
 
     pub fn deinit(self: *Embedder) void {
-        if (self.text)   |*e| e.deinit();
-        if (self.xmodal) |*e| e.deinit();
-        if (self.image)  |*e| e.deinit();
+        // TensorPencil drops an encoder's device weights through its current
+        // `.backend`, which the router leaves at whatever the last call used
+        // (often `.cpu`, after a one-item search query): point every encoder
+        // at the GPU handle first, or a reload leaves the old weights on the
+        // device. Under the mutex, with the CUDA context bound to this thread,
+        // like any other device call. (Callers have already stopped all users.)
+        self.mutex.lockUncancelable(self.io);
+        const gpu = self.backendFor(std.math.maxInt(usize)); // .cpu without a GPU
+        self.bindThreadFor(gpu);
+        if (self.text)   |*e| { e.backend = gpu; e.deinit(); }
+        if (self.xmodal) |*e| { e.backend = gpu; e.deinit(); }
+        if (self.image)  |*e| { e.backend = gpu; e.deinit(); }
         if (self.cuda)   |be|  be.deinit();
         if (self.vk)     |ctx| ctx.deinit();
+        self.mutex.unlock(self.io);
         self.* = undefined;
     }
 

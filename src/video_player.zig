@@ -20,11 +20,12 @@ pub const Source = union(enum) {
         };
     }
 
-    fn next(self: Source, gpa: std.mem.Allocator) !?video.DecodedFrame {
+    /// `reuse` is consumed (see `video.Decoder.next`).
+    fn next(self: Source, gpa: std.mem.Allocator, reuse: ?[]u8) !?video.DecodedFrame {
         switch (self) {
-            .video => |d| return d.next(gpa),
+            .video => |d| return d.next(gpa, reuse),
             .anim => |d| {
-                const f = (try d.next(gpa)) orelse return null;
+                const f = (try d.next(gpa, reuse)) orelse return null;
                 return .{ .pixels = f.pixels, .width = f.width, .height = f.height, .pts_ms = f.pts_ms };
             },
         }
@@ -65,6 +66,9 @@ pub const VideoPlayer = struct {
     seek_gen: u64 = 0,
     head: usize = 0,
     count: usize = 0,
+    /// Pixel buffers of shown or dropped frames, for the decoder to fill again
+    /// instead of allocating one per frame (guarded by mutex).
+    spare: [max_spare]?[]u8 = @splat(null),
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
     /// Pending seek target (ms). Set by the UI thread, consumed by the decoder.
@@ -91,6 +95,8 @@ pub const VideoPlayer = struct {
     muted: bool = false,
 
     const capacity = 4;
+    /// The queue, plus the frame on screen, plus one being decoded.
+    const max_spare = capacity + 2;
     // Pacing debt beyond this (ns) resyncs the clock to now rather than
     // fast-forwarding — covers startup buffering gaps and decode stalls.
     const resync_threshold_ns: i128 = 250 * std.time.ns_per_ms;
@@ -290,7 +296,7 @@ pub const VideoPlayer = struct {
             if (now_ns < due) break;
             // If the render loop is slower than the clip, several frames come
             // due at once: keep only the last, so speed stays correct.
-            if (result) |prev| self.gpa.free(prev.pixels);
+            if (result) |prev| self.recycleLocked(prev.pixels);
             result = self.popLocked().?;
             self.started = true;
             self.last_due_ns = due;
@@ -298,6 +304,22 @@ pub const VideoPlayer = struct {
         }
         if (result) |frame| self.current_pts_ms = frame.pts_ms;
         return result;
+    }
+
+    /// When `tick` next has a frame to return (monotonic ns, see `nowNs`), or
+    /// null if that depends on the decoder (nothing queued: its push wakes the
+    /// app) or nothing will play. The UI sets a timer for it instead of
+    /// redrawing every frame (a 24 fps clip on a 144 Hz screen drew 6x over).
+    pub fn nextDueNs(self: *VideoPlayer, now_ns: i128) ?i128 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.count == 0) return null;
+        if (self.queue_gen[self.head] != self.seek_gen) return now_ns; // stale: drop now
+        if (self.pending_step > 0) return now_ns;
+        if (!self.playing) return null;
+        if (!self.started) return now_ns;
+        const due = self.dueOf(self.queue[self.head].?.pts_ms);
+        return if (now_ns - due > resync_threshold_ns) now_ns else due;
     }
 
     /// When the frame with `pts_ms` is due, following the last shown frame.
@@ -316,11 +338,37 @@ pub const VideoPlayer = struct {
     fn dropStaleLocked(self: *VideoPlayer) void {
         while (self.count > 0 and self.queue_gen[self.head] != self.seek_gen) {
             const f = self.popLocked().?;
-            self.gpa.free(f.pixels);
+            self.recycleLocked(f.pixels);
         }
     }
 
-    /// Free every queued frame (deinit, tests).
+    /// Give back the pixels of a frame from `tick` once it is no longer shown
+    /// (instead of freeing them), so the decoder can reuse the buffer.
+    pub fn recycle(self: *VideoPlayer, pixels: []u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.recycleLocked(pixels);
+    }
+
+    fn recycleLocked(self: *VideoPlayer, pixels: []u8) void {
+        for (&self.spare) |*b| if (b.* == null) {
+            b.* = pixels;
+            return;
+        };
+        self.gpa.free(pixels);
+    }
+
+    fn takeSpare(self: *VideoPlayer) ?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (&self.spare) |*b| if (b.*) |px| {
+            b.* = null;
+            return px;
+        };
+        return null;
+    }
+
+    /// Free every queued frame and spare buffer (deinit, tests).
     pub fn freeQueued(self: *VideoPlayer) void {
         while (self.count > 0) {
             const f = self.queue[self.head].?;
@@ -329,6 +377,10 @@ pub const VideoPlayer = struct {
             self.head = (self.head + 1) % capacity;
             self.count -= 1;
         }
+        for (&self.spare) |*b| if (b.*) |px| {
+            self.gpa.free(px);
+            b.* = null;
+        };
     }
 
     /// Monotonic time for `tick`: unaffected by wall-clock changes.
@@ -353,7 +405,7 @@ pub const VideoPlayer = struct {
         self.mutex.lockUncancelable(self.io);
         while (self.count > 0) {
             const f = self.queue[self.head].?;
-            self.gpa.free(f.pixels);
+            self.recycleLocked(f.pixels);
             self.queue[self.head] = null;
             self.head = (self.head + 1) % capacity;
             self.count -= 1;
@@ -366,8 +418,8 @@ pub const VideoPlayer = struct {
     pub fn pushFrame(self: *VideoPlayer, frame: video.DecodedFrame, gen: u64) void {
         self.mutex.lockUncancelable(self.io);
         if (self.count >= capacity) { // only possible across a seek; drop
+            self.recycleLocked(frame.pixels);
             self.mutex.unlock(self.io);
-            self.gpa.free(frame.pixels);
             return;
         }
         const tail = (self.head + self.count) % capacity;
@@ -387,14 +439,14 @@ pub const VideoPlayer = struct {
         // seeking to the end shows the last frame rather than looping to the start.
         var nearest: ?video.DecodedFrame = null;
         while (!self.stop.load(.acquire)) {
-            const r = self.source.next(self.gpa) catch break;
+            const r = self.source.next(self.gpa, self.takeSpare()) catch break;
             const frame = r orelse break; // EOF
+            if (nearest) |n| self.recycle(n.pixels);
+            nearest = null;
             if (frame.pts_ms < target_ms) {
-                if (nearest) |n| self.gpa.free(n.pixels);
                 nearest = frame;
                 continue;
             }
-            if (nearest) |n| self.gpa.free(n.pixels);
             self.pushFrame(frame, gen);
             return;
         }
@@ -424,7 +476,7 @@ pub const VideoPlayer = struct {
             if (stopping) break;
             if (has_seek) continue;
 
-            const res = self.source.next(self.gpa) catch break;
+            const res = self.source.next(self.gpa, self.takeSpare()) catch break;
             if (res) |frame| {
                 self.pushFrame(frame, gen);
             } else {

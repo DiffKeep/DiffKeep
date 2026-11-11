@@ -145,6 +145,14 @@ fn wlPointerButton(
         self.last_serial = serial;
         std.log.debug("dnd/wl: captured button serial={d}", .{serial});
     }
+    // A drag the compositor started holds the pointer, so its release goes to
+    // the drop, not to us. A release we do see means it refused start_drag
+    // (a stale serial, or the button was already up): no `cancelled` will
+    // come, and the drag would stay stuck.
+    if (button == BTN_LEFT and state != WL_POINTER_BUTTON_STATE_PRESSED and self.phase == .dragging) {
+        std.log.debug("dnd/wl: release during drag: compositor refused it", .{});
+        self.resetToIdle();
+    }
 }
 
 fn wlPointerAxis(data: ?*anyopaque, p: ?*wl.struct_wl_pointer, t: u32, a: u32, v: wl.wl_fixed_t) callconv(.c) void { _ = data; _ = p; _ = t; _ = a; _ = v; }
@@ -547,6 +555,11 @@ const X11DragSource = struct {
 
     phase:           Phase = .idle,
     target:          xlib.Window = 0,
+    /// The target the pointer last moved off. Its XdndStatus/XdndFinished can
+    /// still arrive after the switch, and must not count for the new target.
+    /// (Replies aren't matched to `target` exactly: a target behind an
+    /// XdndProxy answers from its own window.)
+    left_target:     xlib.Window = 0,
     accepted:        bool = false,
     uri_list:        []u8 = &.{},
     finish_ns:       i96 = 0,
@@ -731,6 +744,7 @@ const X11DragSource = struct {
             if (self.target != 0)
                 self.sendMsg(self.target, self.atoms.XdndLeave,
                     @bitCast(self.src_win), 0, 0, 0, 0);
+            self.left_target = self.target;
             self.target   = new_target;
             self.accepted = false;
             if (new_target != 0)
@@ -782,6 +796,7 @@ const X11DragSource = struct {
         _ = xlib.XFlush(self.dnd_dpy);
         self.phase  = .idle;
         self.target = 0;
+        self.left_target = 0;
         self.freeUriList();
         self.freeDragCursors();
     }
@@ -916,6 +931,13 @@ const X11DragSource = struct {
         switch (ev.type) {
             ClientMessage => {
                 const mt = ev.xclient.message_type;
+                const from: xlib.Window = @bitCast(ev.xclient.data.l[0]);
+                if ((mt == self.atoms.XdndStatus or mt == self.atoms.XdndFinished) and
+                    from != 0 and from == self.left_target and from != self.target)
+                {
+                    std.log.debug("dnd: ignoring a late reply from 0x{x}, which the drag left", .{from});
+                    return;
+                }
                 if (mt == self.atoms.XdndStatus) {
                     const prev = self.accepted;
                     self.accepted = (ev.xclient.data.l[1] & 0x1) != 0;

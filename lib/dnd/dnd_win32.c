@@ -77,11 +77,50 @@ static MyDropSource *create_drop_source(void) {
 
 /* ── IDataObject ──────────────────────────────────────────────────────────── */
 
+/* Formats other code stores on the data object with SetData: the drag-image
+   helper keeps the ghost image here ("DragImageBits", "DragContext", ...),
+   and drop targets read it back through GetData / EnumFormatEtc. */
+#define MAX_STORED 16
+typedef struct {
+    FORMATETC fe;
+    STGMEDIUM medium; /* owned */
+} StoredFormat;
+
 typedef struct {
     IDataObjectVtbl *lpVtbl;
     LONG   ref;
     HGLOBAL hHDrop; /* CF_HDROP data */
+    StoredFormat stored[MAX_STORED];
+    int n_stored;
 } MyDataObject;
+
+static FORMATETC hdrop_format(void) {
+    FORMATETC fe = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    return fe;
+}
+
+static StoredFormat *find_stored(MyDataObject *self, const FORMATETC *f) {
+    for (int i = 0; i < self->n_stored; i++) {
+        StoredFormat *s = &self->stored[i];
+        if (s->fe.cfFormat == f->cfFormat && s->fe.dwAspect == f->dwAspect &&
+            s->fe.lindex == f->lindex)
+            return s;
+    }
+    return NULL;
+}
+
+/* A private copy of an HGLOBAL (for SetData without ownership). */
+static HGLOBAL dup_hglobal(HGLOBAL src) {
+    SIZE_T sz = GlobalSize(src);
+    HGLOBAL dup = GlobalAlloc(GMEM_MOVEABLE, sz);
+    if (!dup) return NULL;
+    void *s = GlobalLock(src);
+    void *d = GlobalLock(dup);
+    if (s && d) memcpy(d, s, sz);
+    if (d) GlobalUnlock(dup);
+    if (s) GlobalUnlock(src);
+    return dup;
+}
 
 static HRESULT STDMETHODCALLTYPE DO_QueryInterface(IDataObject *This,
     REFIID riid, void **ppv)
@@ -102,6 +141,7 @@ static ULONG STDMETHODCALLTYPE DO_Release(IDataObject *This) {
     if (n == 0) {
         MyDataObject *self = (MyDataObject *)This;
         if (self->hHDrop) GlobalFree(self->hHDrop);
+        for (int i = 0; i < self->n_stored; i++) ReleaseStgMedium(&self->stored[i].medium);
         free(self);
     }
     return (ULONG)n;
@@ -111,19 +151,23 @@ static HRESULT STDMETHODCALLTYPE DO_GetData(IDataObject *This,
     FORMATETC *pFormatetc, STGMEDIUM *pMedium)
 {
     MyDataObject *self = (MyDataObject *)This;
-    if (pFormatetc->cfFormat != CF_HDROP ||
-        !(pFormatetc->tymed & TYMED_HGLOBAL))
-        return DV_E_FORMATETC;
+    if (pFormatetc->cfFormat != CF_HDROP) {
+        /* A stored format: hand out the same medium, kept alive by a
+           reference to this object (ReleaseStgMedium then releases that
+           reference instead of freeing our copy). */
+        StoredFormat *s = find_stored(self, pFormatetc);
+        if (!s) return DV_E_FORMATETC;
+        if (!(pFormatetc->tymed & s->medium.tymed)) return DV_E_TYMED;
+        *pMedium = s->medium;
+        pMedium->pUnkForRelease = (IUnknown *)This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    if (!(pFormatetc->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
 
     /* Duplicate our HGLOBAL so the caller can free it independently. */
-    SIZE_T sz = GlobalSize(self->hHDrop);
-    HGLOBAL dup = GlobalAlloc(GMEM_MOVEABLE, sz);
+    HGLOBAL dup = dup_hglobal(self->hHDrop);
     if (!dup) return E_OUTOFMEMORY;
-    void *src = GlobalLock(self->hHDrop);
-    void *dst = GlobalLock(dup);
-    memcpy(dst, src, sz);
-    GlobalUnlock(dup);
-    GlobalUnlock(self->hHDrop);
 
     pMedium->tymed          = TYMED_HGLOBAL;
     pMedium->hGlobal        = dup;
@@ -136,16 +180,58 @@ static HRESULT STDMETHODCALLTYPE DO_GetDataHere(IDataObject *This,
 static HRESULT STDMETHODCALLTYPE DO_QueryGetData(IDataObject *This,
     FORMATETC *pFormatetc)
 {
-    (void)This;
-    return (pFormatetc->cfFormat == CF_HDROP) ? S_OK : DV_E_FORMATETC;
+    if (pFormatetc->cfFormat == CF_HDROP) return S_OK;
+    return find_stored((MyDataObject *)This, pFormatetc) ? S_OK : DV_E_FORMATETC;
 }
 static HRESULT STDMETHODCALLTYPE DO_GetCanonicalFormatEtc(IDataObject *This,
     FORMATETC *in, FORMATETC *out)
 { (void)This;(void)in; out->ptd=NULL; return E_NOTIMPL; }
+/* Store a format (the drag-image helper's ghost image, mostly). With
+   fRelease the medium becomes ours; without it we keep a copy, which only
+   HGLOBAL media support. */
 static HRESULT STDMETHODCALLTYPE DO_SetData(IDataObject *This,
-    FORMATETC *f, STGMEDIUM *m, BOOL r) { (void)This;(void)f;(void)m;(void)r; return E_NOTIMPL; }
+    FORMATETC *f, STGMEDIUM *m, BOOL fRelease)
+{
+    MyDataObject *self = (MyDataObject *)This;
+    if (!f || !m) return E_INVALIDARG;
+    if (f->cfFormat == CF_HDROP) return E_NOTIMPL; /* the files are fixed */
+
+    STGMEDIUM owned = *m;
+    if (!fRelease) {
+        if (m->tymed != TYMED_HGLOBAL) return E_NOTIMPL;
+        owned.hGlobal = dup_hglobal(m->hGlobal);
+        if (!owned.hGlobal) return E_OUTOFMEMORY;
+        owned.pUnkForRelease = NULL;
+    }
+
+    StoredFormat *s = find_stored(self, f);
+    if (s) {
+        ReleaseStgMedium(&s->medium);
+    } else {
+        if (self->n_stored == MAX_STORED) {
+            if (!fRelease) ReleaseStgMedium(&owned);
+            return E_OUTOFMEMORY;
+        }
+        s = &self->stored[self->n_stored++];
+    }
+    s->fe = *f;
+    s->fe.ptd = NULL; /* device targets aren't kept */
+    s->medium = owned;
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE DO_EnumFormatEtc(IDataObject *This,
-    DWORD d, IEnumFORMATETC **pp) { (void)This;(void)d;(void)pp; return E_NOTIMPL; }
+    DWORD dir, IEnumFORMATETC **pp)
+{
+    MyDataObject *self = (MyDataObject *)This;
+    if (!pp) return E_INVALIDARG;
+    *pp = NULL;
+    if (dir != DATADIR_GET) return E_NOTIMPL;
+    FORMATETC all[MAX_STORED + 1];
+    all[0] = hdrop_format();
+    for (int i = 0; i < self->n_stored; i++) all[i + 1] = self->stored[i].fe;
+    return SHCreateStdEnumFmtEtc((UINT)(self->n_stored + 1), all, pp);
+}
 static HRESULT STDMETHODCALLTYPE DO_DAdvise(IDataObject *This,
     FORMATETC *f, DWORD a, IAdviseSink *s, DWORD *c)
 { (void)This;(void)f;(void)a;(void)s;(void)c; return OLE_E_ADVISENOTSUPPORTED; }
@@ -202,6 +288,7 @@ static MyDataObject *create_data_object(const wchar_t **paths, int count) {
     if (!p) return NULL;
     p->lpVtbl = &g_do_vtbl;
     p->ref    = 1;
+    p->n_stored = 0;
     p->hHDrop = build_hdrop(paths, count);
     if (!p->hHDrop) { free(p); return NULL; }
     return p;
@@ -250,10 +337,13 @@ static void try_set_ghost(IDataObject *data_obj,
         sdi.ptOffset.y = h / 2;
         sdi.hbmpDragImage = hbm;
         sdi.crColorKey    = CLR_NONE;
-        helper->lpVtbl->InitializeFromBitmap(helper, &sdi, data_obj);
+        /* On success the helper owns the bitmap (it stores it on the data
+           object through SetData): only delete it on failure. */
+        if (SUCCEEDED(helper->lpVtbl->InitializeFromBitmap(helper, &sdi, data_obj)))
+            hbm = NULL;
         helper->lpVtbl->Release(helper);
     }
-    DeleteObject(hbm);
+    if (hbm) DeleteObject(hbm);
 }
 
 /* ── Drag thread ──────────────────────────────────────────────────────────── */

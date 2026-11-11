@@ -72,6 +72,21 @@ pub fn readTag(allocator: std.mem.Allocator, path: [:0]const u8, key: [:0]const 
 
 pub const Frame = struct { pixels: []u8, width: u32, height: u32 };
 
+/// A w x h RGBA8 buffer: `reuse` if it is that size, else a new allocation
+/// (and `reuse` is freed).
+pub fn frameBuffer(allocator: std.mem.Allocator, reuse: ?[]u8, w: c_int, h: c_int) ![]u8 {
+    if (w <= 0 or h <= 0) {
+        if (reuse) |b| allocator.free(b);
+        return error.BadFrameSize;
+    }
+    const len = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    if (reuse) |b| {
+        if (b.len == len) return b;
+        allocator.free(b);
+    }
+    return allocator.alloc(u8, len);
+}
+
 pub const DecodedFrame = struct { pixels: []u8, width: u32, height: u32, pts_ms: i64 };
 
 /// Stateful decoder session for playback. Not thread-safe; use from one thread.
@@ -93,23 +108,23 @@ pub const Decoder = struct {
         return c.diffkeep_decoder_fps(self.handle);
     }
 
-    /// Decode the next frame (allocator-owned pixels), or null at end-of-stream.
-    pub fn next(self: Decoder, allocator: std.mem.Allocator) !?DecodedFrame {
-        var buf: ?*anyopaque = null;
+    /// Decode the next frame, or null at end-of-stream. The pixels go into
+    /// `reuse` when it is the right size, saving an allocation per frame;
+    /// otherwise into a new allocation. `reuse` is consumed either way (kept
+    /// in the frame, or freed).
+    pub fn next(self: Decoder, allocator: std.mem.Allocator, reuse: ?[]u8) !?DecodedFrame {
         var w: c_int = 0;
         var h: c_int = 0;
         var pts: i64 = 0;
-        const r = c.diffkeep_decoder_next(self.handle, &buf, &w, &h, &pts);
-        if (r == 0) return null;
-        if (r < 0) return error.VideoDecodeFailed;
-        defer c.diffkeep_video_free(buf);
-        const len: usize = @intCast(w * h * 4);
-        return .{
-            .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .pts_ms = pts,
-        };
+        const r = c.diffkeep_decoder_next(self.handle, &w, &h, &pts);
+        if (r <= 0) {
+            if (reuse) |b| allocator.free(b);
+            return if (r == 0) null else error.VideoDecodeFailed;
+        }
+        const pixels = try frameBuffer(allocator, reuse, w, h);
+        errdefer allocator.free(pixels);
+        if (c.diffkeep_decoder_read(self.handle, pixels.ptr, pixels.len) != 0) return error.VideoDecodeFailed;
+        return .{ .pixels = pixels, .width = @intCast(w), .height = @intCast(h), .pts_ms = pts };
     }
 
     /// Seek to ~ts_ms (keyframe at or before).

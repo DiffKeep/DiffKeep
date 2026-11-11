@@ -1498,6 +1498,11 @@ test "style: ellipsize measures the text rather than counting characters" {
             try std.testing.expect(font.textSize(cut).w <= 80);
             // The cut never lands inside a UTF-8 sequence.
             try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+            // And it keeps as much as fits: one more character would not.
+            const kept = cut.len - "\u{2026}".len;
+            var more: [256]u8 = undefined;
+            const longer = try std.fmt.bufPrint(&more, "{s}\u{2026}", .{long[0 .. kept + 1]});
+            try std.testing.expect(font.textSize(longer).w > 80);
 
             // An ideograph is twice a Latin letter's width, so a character
             // budget would cut this at half the room it has. Measured, it keeps
@@ -3411,4 +3416,367 @@ test "view_query: sortAppended gives the same order as sorting everything" {
             }
         }
     }
+}
+
+test "video: decoding fills a reused buffer when it is the right size" {
+    const dir = "/tmp/diffkeep_test_video_reuse";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/v.mp4", .data = tagged_mp4 });
+
+    var dec = try dk.video.Decoder.open(dir ++ "/v.mp4", 0);
+    defer dec.close();
+    const first = (try dec.next(alloc, null)).?;
+    try std.testing.expectEqual(@as(usize, 640 * 360 * 4), first.pixels.len);
+    try std.testing.expect(first.pixels[0] > 200 and first.pixels[1] < 60); // red
+
+    // The right size: decoded in place.
+    const second = (try dec.next(alloc, first.pixels)).?;
+    try std.testing.expectEqual(first.pixels.ptr, second.pixels.ptr);
+    try std.testing.expect(second.pixels[0] > 200 and second.pixels[1] < 60);
+    // End of stream consumes (frees) the buffer it was given.
+    try std.testing.expect((try dec.next(alloc, second.pixels)) == null);
+
+    // A wrong-size buffer is replaced (and freed: the testing allocator checks).
+    dec.seek(0);
+    const wrong = try alloc.alloc(u8, 16);
+    const third = (try dec.next(alloc, wrong)).?;
+    defer alloc.free(third.pixels);
+    try std.testing.expectEqual(@as(usize, 640 * 360 * 4), third.pixels.len);
+}
+
+test "video player: shown frames' buffers go back to the decoder" {
+    var p: dk.video_player.VideoPlayer = .{
+        .gpa = alloc, .io = io, .source = undefined,
+        .frame_duration_ns = 40 * std.time.ns_per_ms, .frame_duration_ms = 40, .duration_ms = 5000,
+    };
+    defer p.freeQueued();
+    p.playing = false;
+    p.pending_step = 1;
+    p.pushFrame(try testFrame(0), p.seek_gen);
+    const shown = p.tick(0).?;
+    p.recycle(shown.pixels);
+    // A scrub drops queued frames into the spares too, rather than freeing them.
+    p.pushFrame(try testFrame(40), p.seek_gen);
+    p.requestSeek(3000);
+    try std.testing.expect(p.tick(0) == null);
+    var spares: usize = 0;
+    for (p.spare) |b| {
+        if (b != null) spares += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), spares);
+}
+
+/// 64x48, 6 frames (3 red, 3 blue) at 100 ms: decoded whole into memory.
+const anim_small_gif = @embedFile("fixtures/anim_small.gif");
+/// 2400x2400, 5 green frames: over the in-memory budget, so decoded per frame.
+const anim_big_gif = @embedFile("fixtures/anim_big.gif");
+
+test "anim: both decode modes fill reused buffers and seek back" {
+    const dir = "/tmp/diffkeep_test_anim_decode";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const Case = struct { name: [:0]const u8, data: []const u8, frames: usize, w: u32, last_rgb: [3]u8 };
+    const cases = [_]Case{
+        .{ .name = dir ++ "/small.gif", .data = anim_small_gif, .frames = 6, .w = 64, .last_rgb = .{ 0, 0, 255 } },
+        .{ .name = dir ++ "/big.gif", .data = anim_big_gif, .frames = 5, .w = 2400, .last_rgb = .{ 0, 144, 0 } }, // the GIF palette's green
+    };
+    for (cases) |c| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = c.name, .data = c.data });
+        var dec = try dk.vips.AnimDecoder.open(c.name, 0);
+        defer dec.close();
+
+        var buf: ?[]u8 = null;
+        defer if (buf) |b| alloc.free(b);
+        var n: usize = 0;
+        var last_pts: i64 = -1;
+        var last_rgb: [3]u8 = undefined;
+        while (true) {
+            const reuse = buf;
+            buf = null;
+            const f = (try dec.next(alloc, reuse)) orelse break;
+            if (reuse) |r| try std.testing.expectEqual(r.ptr, f.pixels.ptr);
+            buf = f.pixels;
+            try std.testing.expectEqual(c.w, f.width);
+            try std.testing.expect(f.pts_ms > last_pts);
+            last_pts = f.pts_ms;
+            last_rgb = f.pixels[0..3].*;
+            n += 1;
+        }
+        try std.testing.expectEqual(c.frames, n);
+        // GIF palettes are approximate.
+        for (last_rgb, c.last_rgb) |got, want|
+            try std.testing.expect(@abs(@as(i32, got) - want) < 16);
+
+        dec.seek(0);
+        const reuse = buf;
+        buf = null;
+        const first = (try dec.next(alloc, reuse)).?;
+        buf = first.pixels;
+        try std.testing.expectEqual(@as(i64, 0), first.pts_ms);
+    }
+}
+
+fn commitThumb(grid: *dk.GridState, id: u64, len: usize) !void {
+    const bytes = try alloc.alloc(u8, len);
+    @memset(bytes, 0);
+    grid.thumbs.pending_mutex.lockUncancelable(io);
+    defer grid.thumbs.pending_mutex.unlock(io);
+    try grid.thumbs.pending.put(id, bytes);
+}
+
+test "thumbnails: the cache stays under its byte cap, dropping the least recently shown" {
+    const path = "/tmp/diffkeep_test_thumb_cap.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    const t = &grid.thumbs;
+    t.max_bytes = 4000;
+
+    // Frame 1: four 1000-byte thumbnails; exactly at the cap, nothing goes.
+    for (1..5) |id| try commitThumb(&grid, id, 1000);
+    t.commitPending();
+    try std.testing.expectEqual(@as(usize, 4000), t.total_bytes);
+    t.committed.getPtr(2).?.tex_key = 0xAB; // id 2 was drawn
+
+    // Frames 2-3: the grid keeps showing 1 and 3 (prefetch counts too).
+    for (0..2) |_| {
+        t.commitPending();
+        _ = t.touch(1);
+        _ = t.touch(3);
+    }
+    // Frame 4: a new one tips it over. 2 and 4 (unseen since frame 1) go;
+    // the new one (just arrived) and the shown ones stay.
+    try commitThumb(&grid, 5, 1000);
+    t.commitPending();
+    try std.testing.expect(t.committed.contains(1) and t.committed.contains(3) and t.committed.contains(5));
+    try std.testing.expect(!t.committed.contains(2) and !t.committed.contains(4));
+    try std.testing.expectEqual(@as(usize, 3000), t.total_bytes);
+    // The drawn one's texture key comes back for the grid to invalidate.
+    try std.testing.expectEqualSlices(u64, &.{0xAB}, t.releasedKeys());
+    t.clearReleasedKeys();
+
+    // Replacing or invalidating an entry keeps the count right.
+    try commitThumb(&grid, 1, 500);
+    t.commitPending();
+    t.invalidate(3);
+    try std.testing.expectEqual(@as(usize, 1500), t.total_bytes);
+}
+
+test "grid: a freed thumbnail's texture is dropped before the next draw" {
+    const path = "/tmp/diffkeep_test_thumb_texture.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+    const id = try makeImage(&db, lib, "/lib/a.png");
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    try grid.reloadImages();
+    grid.awaitReload();
+
+    var px: [4 * 4 * 4]u8 = @splat(200);
+    const jpeg = try dk.vips.rgbaToJpeg(alloc, &px, 4, 4, 4);
+    grid.thumbs.pending_mutex.lockUncancelable(io);
+    try grid.thumbs.pending.put(id, jpeg);
+    grid.thumbs.pending_mutex.unlock(io);
+    grid.thumbs.commitPending();
+
+    g_grid_test_ptr = &grid;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.style.install();
+    try dvui.testing.settle(gridFrame);
+
+    const key = grid.thumbs.committed.get(id).?.tex_key;
+    try std.testing.expect(key != 0);
+    try std.testing.expect(dvui.currentWindow().texture_cache.get(key) != null);
+
+    // Freed (reparse, removal, eviction): the address may come back holding
+    // another image, so its texture must go before anything is drawn.
+    // (dvui would also drop it at the end of the frame, as nothing draws it:
+    // check within the frame, right after the grid rendered.)
+    grid.thumbs.invalidate(id);
+    g_texture_key = key;
+    g_texture_gone = false;
+    _ = try dvui.testing.step(gridFrameCheckTexture);
+    try std.testing.expect(g_texture_gone);
+    try std.testing.expectEqual(@as(usize, 0), grid.thumbs.releasedKeys().len);
+}
+
+var g_texture_key: u64 = 0;
+var g_texture_gone = false;
+
+fn gridFrameCheckTexture() anyerror!dvui.App.Result {
+    g_grid_test_ptr.render();
+    g_texture_gone = dvui.currentWindow().texture_cache.get(g_texture_key) == null;
+    return .ok;
+}
+
+var g_long_code: []const u8 = "";
+var g_long_laid: usize = 0;
+var g_long_height: f32 = 0;
+
+fn longCodeFrame() anyerror!dvui.App.Result {
+    var box = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 300, .h = 200 }, .max_size_content = .{ .w = 300, .h = 200 } });
+    defer box.deinit();
+    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+    defer scroll.deinit();
+    g_long_laid = dk.detail_panel.drawLongCode(g_long_code, 0);
+    g_long_height = scroll.si.virtual_size.h;
+    return .ok;
+}
+
+test "detail panel: long raw metadata lays out only the blocks on screen" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..3000) |i| try text.print(alloc, "  \"line_{d}\": \"some workflow value\",\n", .{i});
+    g_long_code = text.items;
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.style.install();
+
+    // First frame: nothing measured yet, so every block is laid out.
+    _ = try dvui.testing.step(longCodeFrame);
+    try std.testing.expectEqual(@as(usize, 3000 / 40), g_long_laid);
+    _ = try dvui.testing.step(longCodeFrame);
+    _ = try dvui.testing.step(longCodeFrame);
+    const full_height = g_long_height;
+    // Then only what is in the 200 px viewport (a block or two), and the
+    // content keeps its full height so the scrollbar doesn't jump.
+    _ = try dvui.testing.step(longCodeFrame);
+    try std.testing.expect(g_long_laid >= 1 and g_long_laid <= 3);
+    try std.testing.expect(full_height > 3000 * 5);
+    try std.testing.expectEqual(full_height, g_long_height);
+}
+
+fn embedItem(id: u64) !dk.scan.EmbedInput {
+    return .{
+        .image_id = id,
+        .path = try alloc.dupeSentinel(u8, "/lib/a.png", 0),
+        .prompt_text = null,
+        .want_image = true,
+        .allocator = alloc,
+    };
+}
+
+fn fillEmbedQueue(q: *dk.scan.EmbedQueue, first: u64, n: u64) void {
+    for (first..first + n) |id| q.push(io, embedItem(id) catch unreachable);
+}
+
+test "scan: the embed queue is FIFO and makes producers wait when full" {
+    var done: std.atomic.Value(u32) = .init(0);
+    var total: std.atomic.Value(u32) = .init(0);
+    var q: dk.scan.EmbedQueue = .{ .allocator = alloc, .embed_done = &done, .embed_total = &total, .consumers = 1 };
+    defer q.deinit(io);
+    const cap = dk.scan.EmbedQueue.capacity;
+
+    // A producer pushing one more than fits waits for the consumer.
+    const t = try std.Thread.spawn(.{}, fillEmbedQueue, .{ &q, 0, cap + 1 });
+    while (total.load(.acquire) < cap) std.Thread.yield() catch {};
+    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, cap), total.load(.acquire));
+
+    // Popping makes room; items come out in the order they went in.
+    for (0..cap + 1) |want| {
+        var it = q.pop(io).?;
+        defer it.deinit();
+        try std.testing.expectEqual(@as(u64, want), it.image_id);
+    }
+    t.join();
+
+    // With no consumer left (stopped), pushes are dropped, never waited on.
+    q.consumerExit(io);
+    fillEmbedQueue(&q, 0, cap + 10);
+    try std.testing.expect(q.tryPop(io) == null);
+}
+
+test "video player: nextDueNs says when tick will next have a frame" {
+    var p: dk.video_player.VideoPlayer = .{
+        .gpa = alloc, .io = io, .source = undefined,
+        .frame_duration_ns = 100 * std.time.ns_per_ms, .frame_duration_ms = 100, .duration_ms = 2100,
+    };
+    defer p.freeQueued();
+    const ms = std.time.ns_per_ms;
+
+    // Nothing queued: the decoder's push wakes the app, no timer needed.
+    try std.testing.expect(p.nextDueNs(0) == null);
+    for ([_]i64{ 0, 2000 }) |pts| p.pushFrame(try testFrame(pts), p.seek_gen);
+    // Not started: the first frame is due now.
+    try std.testing.expectEqual(@as(?i128, 5), p.nextDueNs(5));
+    const f0 = p.tick(0);
+    defer freeFrame(f0);
+    // The next is due at its own timestamp, and tick agrees.
+    try std.testing.expectEqual(@as(?i128, 2000 * ms), p.nextDueNs(10 * ms));
+    try std.testing.expect(p.tick(1999 * ms) == null);
+    const f1 = p.tick(2000 * ms);
+    defer freeFrame(f1);
+    try std.testing.expect(f1 != null);
+
+    // Paused: no timer (resuming redraws anyway).
+    p.pushFrame(try testFrame(2100), p.seek_gen);
+    p.togglePlay();
+    try std.testing.expect(p.nextDueNs(2000 * ms) == null);
+}
+
+var g_wake_due_ns: i128 = 0;
+
+fn wakeFrame() anyerror!dvui.App.Result {
+    dk.style.wakeAt(dvui.parentGet().extendId(@src(), 0), 1_000_000, g_wake_due_ns);
+    return .ok;
+}
+
+test "style: wakeAt wakes the loop for a frame due later or already due" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    _ = try dvui.testing.settle(struct {
+        fn f() anyerror!dvui.App.Result {
+            return .ok;
+        }
+    }.f);
+
+    // Due in 40 ms: the loop sleeps about that long.
+    g_wake_due_ns = 1_000_000 + 40 * std.time.ns_per_ms;
+    const later = (try dvui.testing.step(wakeFrame)).?;
+    try std.testing.expect(later > 30_000 and later <= 40_000);
+    // Already due (dvui ignores a 0 µs timer, which froze playback): no wait.
+    g_wake_due_ns = 1_000_000;
+    try std.testing.expectEqual(@as(?u32, 0), try dvui.testing.step(wakeFrame));
+}
+
+/// 64x48, 5 frames at 10 fps, whose timestamps start at 1.5 s (as cut clips
+/// and some cameras' files do).
+const offset_mp4 = @embedFile("fixtures/offset.mp4");
+
+test "video: timestamps count from the start of the clip, and seeks agree" {
+    const dir = "/tmp/diffkeep_test_video_offset";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/v.mp4", .data = offset_mp4 });
+
+    var dec = try dk.video.Decoder.open(dir ++ "/v.mp4", 0);
+    defer dec.close();
+    var pts: [5]i64 = undefined;
+    for (&pts) |*p| {
+        const f = (try dec.next(alloc, null)).?;
+        defer alloc.free(f.pixels);
+        p.* = f.pts_ms;
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 0, 100, 200, 300, 400 }, &pts);
+
+    // A seek to 300 ms lands on the frame at 300 ms of the clip.
+    dec.seek(300);
+    var got: i64 = -1;
+    while (try dec.next(alloc, null)) |f| {
+        defer alloc.free(f.pixels);
+        if (f.pts_ms >= 300) {
+            got = f.pts_ms;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 300), got);
 }

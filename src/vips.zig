@@ -22,43 +22,23 @@ fn checkRgba(len: usize, w: c_int, h: c_int) !void {
     if (len != @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) return error.BadPixelLayout;
 }
 
-/// Decode a full-resolution image to packed RGBA8 pixels.
-/// The returned slice is gpa-owned; caller frees with allocator.free().
-pub fn loadImageRgba(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
-    var buf: ?*anyopaque = null;
-    var len: usize = 0;
-    var w: c_int = 0;
-    var h: c_int = 0;
-
-    if (c.diffkeep_load_image_rgba(path.ptr, &buf, &len, &w, &h) != 0)
-        return error.VipsLoadFailed;
-    defer c.diffkeep_vips_free(buf);
-    try checkRgba(len, w, h);
-
-    return allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]);
-}
-
-/// Same as loadImageRgba but also returns the image dimensions.
+/// Decode a full-resolution image to packed RGBA8 pixels, straight into an
+/// `allocator` buffer (no second full-size copy). Caller frees `pixels`.
 pub fn loadImageRgbaWithDims(
     allocator: std.mem.Allocator,
     path: [:0]const u8,
 ) !struct { pixels: []u8, width: u32, height: u32 } {
-    var buf: ?*anyopaque = null;
-    var len: usize = 0;
+    var handle: ?*anyopaque = null;
     var w: c_int = 0;
     var h: c_int = 0;
+    if (c.diffkeep_image_open_rgba(path.ptr, &handle, &w, &h) != 0) return error.VipsLoadFailed;
+    defer c.diffkeep_image_close(handle);
+    if (w <= 0 or h <= 0) return error.BadPixelLayout;
 
-    if (c.diffkeep_load_image_rgba(path.ptr, &buf, &len, &w, &h) != 0)
-        return error.VipsLoadFailed;
-    defer c.diffkeep_vips_free(buf);
-    try checkRgba(len, w, h);
-
-    const pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]);
-    return .{
-        .pixels = pixels,
-        .width = @intCast(w),
-        .height = @intCast(h),
-    };
+    const pixels = try allocator.alloc(u8, @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4);
+    errdefer allocator.free(pixels);
+    if (c.diffkeep_image_read_rgba(handle, pixels.ptr, pixels.len) != 0) return error.VipsLoadFailed;
+    return .{ .pixels = pixels, .width = @intCast(w), .height = @intCast(h) };
 }
 
 pub fn jpegBytesToRgba(
@@ -136,20 +116,27 @@ pub const AnimDecoder = struct {
         return @intCast(@max(0, c.diffkeep_anim_frame_count(self.handle)));
     }
 
-    /// Decode the next page (allocator-owned pixels), or null at end-of-stream.
-    pub fn next(self: AnimDecoder, allocator: std.mem.Allocator) !?DecodedFrame {
-        var buf: ?*anyopaque = null;
+    /// Decode the next page, or null at end-of-stream. Like
+    /// `video.Decoder.next`: the pixels go into `reuse` when it is the right
+    /// size, and `reuse` is consumed either way.
+    pub fn next(self: AnimDecoder, allocator: std.mem.Allocator, reuse: ?[]u8) !?DecodedFrame {
         var w: c_int = 0;
         var h: c_int = 0;
         var pts: c_long = 0;
-        const r = c.diffkeep_anim_next(self.handle, &buf, &w, &h, &pts);
-        if (r == 0) return null;
-        if (r < 0) return error.AnimDecodeFailed;
-        defer c.diffkeep_vips_free(buf);
-        if (w <= 0 or h <= 0) return error.AnimDecodeFailed;
+        const r = c.diffkeep_anim_next(self.handle, &w, &h, &pts);
+        if (r <= 0 or w <= 0 or h <= 0) {
+            if (reuse) |b| allocator.free(b);
+            return if (r == 0) null else error.AnimDecodeFailed;
+        }
         const len = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+        const pixels = if (reuse != null and reuse.?.len == len) reuse.? else blk: {
+            if (reuse) |b| allocator.free(b);
+            break :blk try allocator.alloc(u8, len);
+        };
+        errdefer allocator.free(pixels);
+        if (c.diffkeep_anim_read(self.handle, pixels.ptr, pixels.len) != 0) return error.AnimDecodeFailed;
         return .{
-            .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
+            .pixels = pixels,
             .width = @intCast(w),
             .height = @intCast(h),
             .pts_ms = @intCast(pts),

@@ -121,10 +121,10 @@ pub const PlayerPool = struct {
         }
     }
 
-    /// After the rows: evict players whose cell scrolled off. Returns whether
-    /// any survivor is still playing (keep the render loop spinning).
-    pub fn endFrame(self: *PlayerPool) bool {
-        return self.evictStaleCellPlayers();
+    /// After the rows: evict players whose cell scrolled off. Returns when the
+    /// soonest survivor's next frame is due (see `VideoPlayer.nextDueNs`).
+    pub fn endFrame(self: *PlayerPool, now_ns: i128) ?i128 {
+        return self.evictStaleCellPlayers(now_ns);
     }
 
     /// Advance the (already-open) player for a visible cell and return it so its
@@ -136,7 +136,7 @@ pub const PlayerPool = struct {
         if (cp.player.tick(now_ns)) |frame| {
             if (cp.pixels) |old| {
                 dvui.textureInvalidateCache(cp.tex_hash);
-                self.allocator.free(old);
+                cp.player.recycle(old);
             }
             cp.pixels = frame.pixels;
             cp.width = frame.width;
@@ -207,8 +207,8 @@ pub const PlayerPool = struct {
     /// Evict players whose cell hasn't been visible for `player_evict_grace_frames`.
     /// Also returns true if any surviving player is still playing (so the render
     /// loop keeps spinning to advance playback).
-    fn evictStaleCellPlayers(self: *PlayerPool) bool {
-        var any_playing = false;
+    fn evictStaleCellPlayers(self: *PlayerPool, now_ns: i128) ?i128 {
+        var next_due: ?i128 = null;
         // Collect stale keys first — removing during iteration can invalidate the
         // iterator, and (with no cap) any number may go stale in one frame. Only
         // destroy after collecting, so a player is never freed while its map entry
@@ -222,15 +222,15 @@ pub const PlayerPool = struct {
                 // If the append fails (OOM), leave the entry: it stays alive and is
                 // retried next frame — never destroyed-but-orphaned.
                 stale.append(self.allocator, kv.key_ptr.*) catch {};
-            } else if (cp.player.isPlaying()) {
-                any_playing = true;
+            } else if (cp.player.nextDueNs(now_ns)) |due| {
+                next_due = if (next_due) |d| @min(d, due) else due;
             }
         }
         for (stale.items) |id| {
             if (self.live.getPtr(id)) |cp| self.destroyCellPlayer(cp, true);
             _ = self.live.remove(id);
         }
-        return any_playing;
+        return next_due;
     }
 
     /// Tear down all grid players (autoplay turned off, view reloaded, or deinit).

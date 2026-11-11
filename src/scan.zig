@@ -150,63 +150,85 @@ pub const EmbedInput = struct {
     }
 };
 
-/// Thread-safe FIFO queue of EmbedInputs. CPU tasks push; a dedicated embed
-/// consumer goroutine pops and calls the embedder, letting CPU work and GPU
-/// inference overlap instead of running strictly serially.
-const EmbedQueue = struct {
+/// Thread-safe bounded FIFO of EmbedInputs. CPU tasks push; embed consumers
+/// pop and call the embedder, so CPU work and inference overlap. When full,
+/// `push` waits for the consumers: without that, a slower embedder (CPU) let
+/// the scan queue a prompt and path for every file in the library.
+pub const EmbedQueue = struct {
     mutex:       std.Io.Mutex                 = .init,
-    cond:        std.Io.Condition             = .init,
-    items:       std.ArrayList(EmbedInput)    = .empty,
+    not_empty:   std.Io.Condition             = .init,
+    not_full:    std.Io.Condition             = .init,
+    items:       std.Deque(EmbedInput)        = .empty,
     done:        bool                         = false,
+    /// Consumers still running. Once there are none (stopped, or none could
+    /// start) `push` drops items instead of waiting for room forever.
+    consumers:   usize                        = 0,
     allocator:   std.mem.Allocator,
     embed_done:  *std.atomic.Value(u32),
     embed_total: *std.atomic.Value(u32),
 
-    fn deinit(q: *EmbedQueue, io: std.Io) void {
+    /// Enough for every GPU consumer to take a full batch with as many waiting.
+    pub const capacity = 8 * EMBED_BATCH_SIZE;
+
+    pub fn deinit(q: *EmbedQueue, io: std.Io) void {
         q.mutex.lockUncancelable(io);
-        for (q.items.items) |*item| item.deinit();
+        while (q.items.popFront()) |item| {
+            var it = item;
+            it.deinit();
+        }
         q.items.deinit(q.allocator);
         q.mutex.unlock(io);
     }
 
-    fn push(q: *EmbedQueue, io: std.Io, item: EmbedInput) void {
+    pub fn push(q: *EmbedQueue, io: std.Io, item: EmbedInput) void {
+        var it = item;
         q.mutex.lockUncancelable(io);
-        q.items.append(q.allocator, item) catch {
-            q.mutex.unlock(io);
-            var it = item;
-            it.deinit();
-            return;
-        };
+        defer q.mutex.unlock(io);
+        while (q.items.len >= capacity and q.consumers > 0)
+            q.not_full.waitUncancelable(io, &q.mutex);
+        if (q.consumers == 0) return it.deinit();
+        q.items.pushBack(q.allocator, it) catch return it.deinit();
         _ = q.embed_total.fetchAdd(1, .acq_rel);
-        q.cond.signal(io);
+        q.not_empty.signal(io);
+    }
+
+    pub fn finish(q: *EmbedQueue, io: std.Io) void {
+        q.mutex.lockUncancelable(io);
+        q.done = true;
+        log.debug("embed queue: finish called, broadcasting (items remaining: {d})", .{q.items.len});
+        q.not_empty.broadcast(io);
         q.mutex.unlock(io);
     }
 
-    fn finish(q: *EmbedQueue, io: std.Io) void {
+    /// A consumer is exiting; wake producers waiting for room it won't make.
+    pub fn consumerExit(q: *EmbedQueue, io: std.Io) void {
         q.mutex.lockUncancelable(io);
-        q.done = true;
-        log.debug("embed queue: finish called, broadcasting (items remaining: {d})", .{q.items.items.len});
-        q.cond.broadcast(io);
+        q.consumers -= 1;
+        q.not_full.broadcast(io);
         q.mutex.unlock(io);
     }
 
     /// Blocks until an item is available. Returns null when done and empty.
-    fn pop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
+    pub fn pop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
-        while (q.items.items.len == 0 and !q.done)
-            q.cond.waitUncancelable(io, &q.mutex);
-        if (q.items.items.len > 0) return q.items.pop();
-        return null;
+        while (q.items.len == 0 and !q.done)
+            q.not_empty.waitUncancelable(io, &q.mutex);
+        return q.takeLocked(io);
     }
 
     /// Non-blocking pop: returns an item if one is queued right now, else null
     /// (never waits). Used to grow a batch from whatever is already available.
-    fn tryPop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
+    pub fn tryPop(q: *EmbedQueue, io: std.Io) ?EmbedInput {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
-        if (q.items.items.len > 0) return q.items.pop();
-        return null;
+        return q.takeLocked(io);
+    }
+
+    fn takeLocked(q: *EmbedQueue, io: std.Io) ?EmbedInput {
+        const item = q.items.popFront() orelse return null;
+        q.not_full.signal(io);
+        return item;
     }
 };
 
@@ -369,6 +391,8 @@ pub const LibraryScanner = struct {
             // keep the GPU fed (~3 decode streams while one holds the GPU is plenty
             // even for slow decodes). On CPU one consumer already uses every core.
             const n_consumers: usize = if (emb.hasGpu()) 4 else 1;
+            // Counted before they start: one could exit (stop) at once.
+            embed_queue.consumers = n_consumers;
             var spawned: usize = 0;
             for (0..n_consumers) |_| {
                 embed_group.concurrent(io, embedConsumer, .{EmbedConsumerCtx{
@@ -380,6 +404,7 @@ pub const LibraryScanner = struct {
                     .io        = io,
                 }}) catch |err| {
                     log.warn("spawn embed consumer: {}", .{err});
+                    embed_queue.consumerExit(io);
                     continue;
                 };
                 spawned += 1;
@@ -596,6 +621,7 @@ const EmbedConsumerCtx = struct {
 /// stays on the CPU and a bulk scan batches onto the GPU (see embedder.zig).
 fn embedConsumer(ctx: EmbedConsumerCtx) void {
     log.debug("embed consumer: started", .{});
+    defer ctx.queue.consumerExit(ctx.io);
     var n: u32 = 0;
     var buf: [EMBED_BATCH_SIZE]EmbedInput = undefined;
     while (!ctx.stop.load(.acquire)) {

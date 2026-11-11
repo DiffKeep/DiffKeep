@@ -47,6 +47,25 @@ static void fit_dims(int sw, int sh, int max_dim, int *dw, int *dh) {
     *dh = h < 2 ? 2 : (h & ~1);
 }
 
+/* The container's start time in ms (0 if unknown). Clips can start at a
+   non-zero timestamp; video and audio both count from it, so they stay in
+   sync, position 0 is the first frame, and seeks use the same clock. */
+static int64_t start_ms(const AVFormatContext *fmt) {
+    return fmt->start_time == AV_NOPTS_VALUE ? 0 : fmt->start_time / 1000;
+}
+
+static int64_t pts_to_ms(const AVFormatContext *fmt, int stream, int64_t pts) {
+    if (pts == AV_NOPTS_VALUE) return 0;
+    const AVRational tb = fmt->streams[stream]->time_base;
+    return (int64_t)(pts * av_q2d(tb) * 1000.0) - start_ms(fmt);
+}
+
+static int seek_ms(AVFormatContext *fmt, int stream, int64_t ts_ms) {
+    const AVRational tb = fmt->streams[stream]->time_base;
+    int64_t ts = (int64_t)((double)(ts_ms + start_ms(fmt)) / 1000.0 / av_q2d(tb));
+    return av_seek_frame(fmt, stream, ts, AVSEEK_FLAG_BACKWARD);
+}
+
 static int open_input(const char *filename, AVFormatContext **fmt) {
     *fmt = NULL;
     if (avformat_open_input(fmt, filename, NULL, NULL) != 0) return -1;
@@ -194,6 +213,9 @@ struct DiffkeepDecoder {
     int sws_w, sws_h;
     int sws_fmt;
     int max_dim; /* downscale long edge to this if > 0; 0 = native */
+    uint8_t *dst[4];     /* swscale output, reused across frames */
+    int dst_linesize[4];
+    int dst_w, dst_h;
 };
 
 DiffkeepDecoder *diffkeep_decoder_open(const char *filename, int max_dim) {
@@ -233,9 +255,9 @@ double diffkeep_decoder_fps(DiffkeepDecoder *d) {
     return av_q2d(r);
 }
 
-int diffkeep_decoder_next(DiffkeepDecoder *d, void **buf, int *width, int *height, int64_t *pts_ms) {
-    *buf = NULL;
+int diffkeep_decoder_next(DiffkeepDecoder *d, int *width, int *height, int64_t *pts_ms) {
     if (!d) return -1;
+    av_frame_unref(d->frame); /* a frame _next prepared but nobody read */
 
     int have = 0;
     while (!have) {
@@ -258,9 +280,19 @@ int diffkeep_decoder_next(DiffkeepDecoder *d, void **buf, int *width, int *heigh
     const int w = d->frame->width;
     const int h = d->frame->height;
     if (w <= 0 || h <= 0) { av_frame_unref(d->frame); return -1; }
+    fit_dims(w, h, d->max_dim, width, height);
 
+    *pts_ms = pts_to_ms(d->fmt, d->vidx, d->frame->best_effort_timestamp);
+    return 1;
+}
+
+int diffkeep_decoder_read(DiffkeepDecoder *d, void *out, size_t len) {
+    if (!d || !d->frame->data[0]) return -1;
+    const int w = d->frame->width;
+    const int h = d->frame->height;
     int dw, dh;
     fit_dims(w, h, d->max_dim, &dw, &dh);
+    if (len != (size_t)dw * (size_t)dh * 4) { av_frame_unref(d->frame); return -1; }
 
     if (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != d->frame->format) {
         if (d->sws) sws_freeContext(d->sws);
@@ -270,43 +302,30 @@ int diffkeep_decoder_next(DiffkeepDecoder *d, void **buf, int *width, int *heigh
     }
     if (!d->sws) { av_frame_unref(d->frame); return -1; }
 
-    uint8_t *dst_data[4] = { NULL, NULL, NULL, NULL };
-    int dst_linesize[4] = { 0, 0, 0, 0 };
-    if (av_image_alloc(dst_data, dst_linesize, dw, dh, AV_PIX_FMT_RGBA, 32) < 0) {
-        av_frame_unref(d->frame);
-        return -1;
+    /* swscale writes into a SIMD-aligned, padded buffer (it may write past a
+       tight w*4 row), kept across frames; then tight rows go to `out`. */
+    if (!d->dst[0] || d->dst_w != dw || d->dst_h != dh) {
+        av_freep(&d->dst[0]);
+        if (av_image_alloc(d->dst, d->dst_linesize, dw, dh, AV_PIX_FMT_RGBA, 32) < 0) {
+            d->dst[0] = NULL;
+            av_frame_unref(d->frame);
+            return -1;
+        }
+        d->dst_w = dw; d->dst_h = dh;
     }
-    sws_scale(d->sws, (const uint8_t * const *)d->frame->data, d->frame->linesize, 0, h, dst_data, dst_linesize);
-
-    uint8_t *out = (uint8_t *)malloc((size_t)dw * (size_t)dh * 4);
-    if (!out) {
-        av_freep(&dst_data[0]);
-        av_frame_unref(d->frame);
-        return -1;
-    }
+    sws_scale(d->sws, (const uint8_t * const *)d->frame->data, d->frame->linesize, 0, h, d->dst, d->dst_linesize);
     for (int y = 0; y < dh; y++) {
-        memcpy(out + (size_t)y * (size_t)dw * 4,
-               dst_data[0] + (size_t)y * (size_t)dst_linesize[0],
+        memcpy((uint8_t *)out + (size_t)y * (size_t)dw * 4,
+               d->dst[0] + (size_t)y * (size_t)d->dst_linesize[0],
                (size_t)dw * 4);
     }
-    av_freep(&dst_data[0]);
-
-    int64_t pts = d->frame->best_effort_timestamp;
-    if (pts == AV_NOPTS_VALUE) pts = 0;
-    const AVRational tb = d->fmt->streams[d->vidx]->time_base;
-    *pts_ms = (int64_t)(pts * av_q2d(tb) * 1000.0);
-    *buf = out;
-    *width = dw;
-    *height = dh;
     av_frame_unref(d->frame);
-    return 1;
+    return 0;
 }
 
 int diffkeep_decoder_seek(DiffkeepDecoder *d, int64_t ts_ms) {
     if (!d || d->vidx < 0) return -1;
-    const AVRational tb = d->fmt->streams[d->vidx]->time_base;
-    int64_t ts = (int64_t)((double)ts_ms / 1000.0 / av_q2d(tb));
-    if (av_seek_frame(d->fmt, d->vidx, ts, AVSEEK_FLAG_BACKWARD) < 0) return -1;
+    if (seek_ms(d->fmt, d->vidx, ts_ms) < 0) return -1;
     avcodec_flush_buffers(d->ctx);
     return 0;
 }
@@ -314,6 +333,7 @@ int diffkeep_decoder_seek(DiffkeepDecoder *d, int64_t ts_ms) {
 void diffkeep_decoder_close(DiffkeepDecoder *d) {
     if (!d) return;
     if (d->sws) sws_freeContext(d->sws);
+    av_freep(&d->dst[0]);
     if (d->frame) av_frame_free(&d->frame);
     if (d->pkt) av_packet_free(&d->pkt);
     if (d->ctx) avcodec_free_context(&d->ctx);
@@ -406,10 +426,7 @@ int diffkeep_audio_next(DiffkeepAudioDecoder *d, void **buf, int *nbytes, int64_
                                 (const uint8_t **)d->frame->extended_data, d->frame->nb_samples);
     if (got < 0) { free(out); av_frame_unref(d->frame); return -1; }
 
-    int64_t pts = d->frame->best_effort_timestamp;
-    if (pts == AV_NOPTS_VALUE) pts = 0;
-    const AVRational tb = d->fmt->streams[d->aidx]->time_base;
-    *pts_ms = (int64_t)(pts * av_q2d(tb) * 1000.0);
+    *pts_ms = pts_to_ms(d->fmt, d->aidx, d->frame->best_effort_timestamp);
     *nbytes = got * 2 * (int)sizeof(float);
     *buf = out;
     av_frame_unref(d->frame);
@@ -418,9 +435,7 @@ int diffkeep_audio_next(DiffkeepAudioDecoder *d, void **buf, int *nbytes, int64_
 
 int diffkeep_audio_seek(DiffkeepAudioDecoder *d, int64_t ts_ms) {
     if (!d || d->aidx < 0) return -1;
-    const AVRational tb = d->fmt->streams[d->aidx]->time_base;
-    int64_t ts = (int64_t)((double)ts_ms / 1000.0 / av_q2d(tb));
-    if (av_seek_frame(d->fmt, d->aidx, ts, AVSEEK_FLAG_BACKWARD) < 0) return -1;
+    if (seek_ms(d->fmt, d->aidx, ts_ms) < 0) return -1;
     avcodec_flush_buffers(d->ctx);
     return 0;
 }

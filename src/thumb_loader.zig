@@ -15,14 +15,22 @@ const media = @import("media.zig");
 const log = std.log.scoped(.thumb_loader);
 
 pub const max_workers = 8;
-const evict_interval_s: i64 = 5;
-const ttl_s: i64 = 45;
+/// Default cap on cached JPEG bytes. A screenful plus the prefetch zone is a
+/// few hundred thumbnails (~10-20 MB); past the cap the least recently shown
+/// go first.
+pub const default_max_bytes: usize = 64 * 1024 * 1024;
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
-const CacheEntry = struct {
+pub const CacheEntry = struct {
     bytes: []u8,
-    last_seen_s: i64,
+    /// `ThumbLoader.frame` when the grid last showed or prefetched it.
+    last_seen: u64,
+    /// The dvui texture-cache key the grid drew it under (0 = not drawn yet).
+    /// Textures are keyed by the bytes' address, so when the bytes are freed
+    /// the key is handed back (`takeReleasedKeys`) for the grid to invalidate
+    /// before that address can show another image.
+    tex_key: u64 = 0,
     width: f32,  // natural JPEG pixel width
     height: f32, // natural JPEG pixel height
 };
@@ -74,7 +82,13 @@ pub const ThumbLoader = struct {
     pending: std.AutoHashMap(u64, []u8),
     pending_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
-    last_eviction_s: i64 = 0,
+    /// Bumped by each `commitPending` (once per frame): the LRU clock.
+    frame: u64 = 0,
+    /// Sum of `committed` bytes, kept under `max_bytes`.
+    total_bytes: usize = 0,
+    max_bytes: usize = default_max_bytes,
+    /// Texture keys of freed entries (see `CacheEntry.tex_key`). Main thread.
+    released_keys: std.ArrayList(u64) = .empty,
 
     // Load queues — protected by queue_mutex
     // high = visible range, low = prefetch zone
@@ -110,7 +124,6 @@ pub const ThumbLoader = struct {
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, thumb_px: c_int, wakeup_fn: ?*const fn () void) !ThumbLoader {
         const loader_db = try db.getConnection();
-        const now_ns = std.Io.Clock.real.now(io).nanoseconds;
         return .{
             .io = io,
             .allocator = allocator,
@@ -124,7 +137,6 @@ pub const ThumbLoader = struct {
             .load_failed = std.AutoHashMap(u64, void).init(allocator),
             .loader_db = loader_db,
             .thumbnails_in_db = .init(thumbnails_in_db),
-            .last_eviction_s = @intCast(@divTrunc(now_ns, std.time.ns_per_s)),
         };
     }
 
@@ -149,6 +161,7 @@ pub const ThumbLoader = struct {
         var ci = self.committed.iterator();
         while (ci.next()) |kv| self.allocator.free(kv.value_ptr.bytes);
         self.committed.deinit();
+        self.released_keys.deinit(self.allocator);
 
         var pi = self.pending.iterator();
         while (pi.next()) |kv| self.allocator.free(kv.value_ptr.*);
@@ -179,9 +192,9 @@ pub const ThumbLoader = struct {
     }
 
     /// Main thread, each frame: move finished thumbnails into the cache, and
-    /// evict ones not seen for a while.
+    /// evict the least recently seen ones once it is over `max_bytes`.
     pub fn commitPending(self: *ThumbLoader) void {
-        const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        self.frame += 1;
         {
             self.pending_mutex.lockUncancelable(self.io);
             defer self.pending_mutex.unlock(self.io);
@@ -190,37 +203,67 @@ pub const ThumbLoader = struct {
                 const dims = jpegDimensions(kv.value_ptr.*);
                 const entry = CacheEntry{
                     .bytes = kv.value_ptr.*,
-                    .last_seen_s = now_s,
+                    .last_seen = self.frame,
                     .width = dims.w,
                     .height = dims.h,
                 };
-                if (self.committed.fetchPut(kv.key_ptr.*, entry) catch null) |old| {
-                    self.allocator.free(old.value.bytes);
-                }
+                const old = self.committed.fetchPut(kv.key_ptr.*, entry) catch {
+                    self.allocator.free(entry.bytes);
+                    continue;
+                };
+                self.total_bytes += entry.bytes.len;
+                if (old) |o| self.release(o.value);
             }
             self.pending.clearRetainingCapacity();
         }
-
-        // Periodic eviction (~every 5 seconds)
-        if (now_s - self.last_eviction_s >= evict_interval_s) {
-            self.last_eviction_s = now_s;
-            self.evictStale(now_s - ttl_s);
-        }
+        if (self.total_bytes > self.max_bytes) self.evictLeastRecent();
     }
 
-    fn evictStale(self: *ThumbLoader, cutoff_s: i64) void {
-        var stale: std.ArrayList(u64) = .empty;
-        defer stale.deinit(self.allocator);
+    /// Mark `id`'s cached thumbnail as in use (on screen or prefetched), so
+    /// eviction keeps it. Returns the entry, or null if it isn't cached.
+    pub fn touch(self: *ThumbLoader, id: u64) ?*CacheEntry {
+        const ce = self.committed.getPtr(id) orelse return null;
+        ce.last_seen = self.frame;
+        return ce;
+    }
+
+    /// Texture keys of thumbnails freed since `clearReleasedKeys`; the grid
+    /// invalidates them before drawing, then clears them.
+    pub fn releasedKeys(self: *const ThumbLoader) []const u64 {
+        return self.released_keys.items;
+    }
+
+    pub fn clearReleasedKeys(self: *ThumbLoader) void {
+        self.released_keys.clearRetainingCapacity();
+    }
+
+    /// Free an entry that has left `committed`.
+    fn release(self: *ThumbLoader, e: CacheEntry) void {
+        self.total_bytes -= e.bytes.len;
+        if (e.tex_key != 0) self.released_keys.append(self.allocator, e.tex_key) catch {};
+        self.allocator.free(e.bytes);
+    }
+
+    /// Evict down to 3/4 of `max_bytes` (so this doesn't run every frame),
+    /// oldest first, never what the grid used last frame.
+    fn evictLeastRecent(self: *ThumbLoader) void {
+        const Old = struct { id: u64, seen: u64 };
+        var olds: std.ArrayList(Old) = .empty;
+        defer olds.deinit(self.allocator);
         var it = self.committed.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.last_seen_s < cutoff_s) {
-                stale.append(self.allocator, kv.key_ptr.*) catch continue;
-            }
+            if (kv.value_ptr.last_seen + 1 >= self.frame) continue;
+            olds.append(self.allocator, .{ .id = kv.key_ptr.*, .seen = kv.value_ptr.last_seen }) catch return;
         }
-        for (stale.items) |id| {
-            if (self.committed.fetchRemove(id)) |kv| {
-                self.allocator.free(kv.value.bytes);
+        std.mem.sort(Old, olds.items, {}, struct {
+            fn lt(_: void, a: Old, b: Old) bool {
+                return a.seen < b.seen;
             }
+        }.lt);
+        const target = self.max_bytes / 4 * 3;
+        for (olds.items) |o| {
+            if (self.total_bytes <= target) break;
+            if (self.committed.fetchRemove(o.id)) |kv| self.release(kv.value);
         }
     }
 
@@ -230,7 +273,7 @@ pub const ThumbLoader = struct {
     /// next insert, so a lingering cache entry would show the old thumbnail under
     /// the new image.
     pub fn invalidate(self: *ThumbLoader, id: u64) void {
-        if (self.committed.fetchRemove(id)) |kv| self.allocator.free(kv.value.bytes);
+        if (self.committed.fetchRemove(id)) |kv| self.release(kv.value);
         {
             // Drop a stale, not-yet-drained worker result so commitPending
             // doesn't re-commit it; an in-flight load regenerates from disk.

@@ -57,10 +57,12 @@ DiffkeepDecoder *diffkeep_decoder_open(const char *filename, int max_dim);
 /* Average frames-per-second of the video stream (0 if unknown). */
 double diffkeep_decoder_fps(DiffkeepDecoder *d);
 
-/* Decode the next frame to packed RGBA8. Returns 1 and sets *buf (malloc'd
-   width*height*4, free with diffkeep_video_free), *width, *height, *pts_ms on a
-   frame; 0 at end-of-stream; -1 on error. */
-int diffkeep_decoder_next(DiffkeepDecoder *d, void **buf, int *width, int *height, int64_t *pts_ms);
+/* Decode the next frame: returns 1 and sets its output size *width x
+   *height and *pts_ms, 0 at end-of-stream, -1 on error. Then
+   diffkeep_decoder_read converts it to packed RGBA8 in the caller's buffer
+   (len = width*height*4). */
+int diffkeep_decoder_next(DiffkeepDecoder *d, int *width, int *height, int64_t *pts_ms);
+int diffkeep_decoder_read(DiffkeepDecoder *d, void *out, size_t len);
 
 /* Seek to ~ts_ms (to the keyframe at or before it) and flush. 0 on success. */
 int diffkeep_decoder_seek(DiffkeepDecoder *d, int64_t ts_ms);

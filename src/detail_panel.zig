@@ -398,18 +398,67 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
                     .padding = .all(8),
                 });
                 defer well.deinit();
-                var tl = dvui.textLayout(@src(), .{}, .{
-                    .id_extra = ci,
-                    .expand = .horizontal,
-                    .background = false,
-                    .padding = .{},
-                });
-                fonts.addStyled(tl, rc.display_text, .{ .code = true }, .{
-                    .font = style.F.code,
-                    .color_text = .{ .color = style.C.text_dim },
-                });
-                tl.deinit();
+                _ = drawLongCode(rc.display_text, ci);
             }
         }
     }
+}
+
+/// Lines per separately laid-out block of `drawLongCode`.
+const code_block_lines = 40;
+
+/// Draw `text` (pretty-printed metadata: often thousands of lines) as code,
+/// laying out only the blocks of lines on screen. One text layout of all of
+/// it was re-measured every frame while expanded. A block out of view keeps
+/// the height it measured at this width; until it has one, it is laid out.
+/// Returns how many blocks were laid out (tests).
+pub fn drawLongCode(text: []const u8, id_extra: usize) usize {
+    var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = id_extra, .expand = .horizontal });
+    defer col.deinit();
+    const w = col.data().contentRect().w;
+    const clip = dvui.clipGet();
+
+    var laid_out: usize = 0;
+    var start: usize = 0;
+    var block: usize = 0;
+    while (start < text.len) : (block += 1) {
+        var end = start;
+        for (0..code_block_lines) |_| {
+            end = if (std.mem.indexOfScalarPos(u8, text, end, '\n')) |nl| nl + 1 else text.len;
+            if (end == text.len) break;
+        }
+        // The block's text without its final newline (the next block starts a line).
+        const chunk = std.mem.trimEnd(u8, text[start..end], "\n");
+        start = end;
+
+        const src = @src();
+        const id = dvui.parentGet().extendId(src, block);
+        const known_h: ?f32 = if (dvui.dataGet(null, id, "w", f32) == w) dvui.dataGet(null, id, "h", f32) else null;
+        var b = dvui.box(src, .{ .dir = .vertical }, .{
+            .id_extra = block,
+            .expand = .horizontal,
+            .min_size_content = .{ .h = known_h orelse 0 },
+        });
+        defer b.deinit();
+        // Laid out at this width last frame: its height now is the text's.
+        if (dvui.dataGet(null, id, "laid_w", f32) == w) {
+            dvui.dataSet(null, id, "h", b.data().contentRect().h);
+            dvui.dataSet(null, id, "w", w);
+        }
+        if (known_h != null and b.data().rectScale().r.intersect(clip).empty()) continue;
+
+        var tl = dvui.textLayout(@src(), .{}, .{
+            .expand = .horizontal,
+            .background = false,
+            .padding = .{},
+        });
+        fonts.addStyled(tl, chunk, .{ .code = true }, .{
+            .font = style.F.code,
+            .color_text = .{ .color = style.C.text_dim },
+        });
+        tl.deinit();
+        dvui.dataSet(null, id, "laid_w", w);
+        laid_out += 1;
+    }
+    return laid_out;
 }

@@ -34,7 +34,7 @@ zig build test
 zig build video_probe -- file.mp4         # probe a media file's streams/metadata/first frame
 zig build test_tp_batch -- ...            # TensorPencil single vs batch embed throughput
 zig build bench_embed -Doptimize=ReleaseFast -- --corpus FILE  # encoder quality/speed A/B
-zig build bench_scan -Doptimize=ReleaseFast -- DIR [--runs N]    # full-scan time/RSS (no embeddings), throwaway DB
+zig build bench_scan -Doptimize=ReleaseFast -- DIR [--runs N] [--text-model D] [--visual-model D]  # full-scan time/RSS, throwaway DB
 
 # Pass --config / -c <dir> to use <dir>/DiffKeep.cfg. The DB stays at the XDG data dir
 # unless that config sets data_path (the DB file path) — set it for throwaway runs.
@@ -53,7 +53,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/app_state.zig` | `AppState` — everything the main window holds (config, DB, grid, library manager, embedder and its loader, watcher, file ops, counts, panels, dialogs, search, filters) and its per-frame logic (`frame`: apply background results, act on grid requests, search debounce, watcher flush, render). No SDL: what needs it comes in through `Hooks`, so tests run whole frames headless. |
 | `src/image_grid.zig` | `GridState` — the grid widget: the image list, selection, keyboard navigation, view reloads (`bg.Latest`) and rendering. |
 | `src/view_query.zig` | What a view shows and how it loads, with no UI: view/search/sort types, `ImageEntry`, `ViewQuery`, `loadView`, FTS sanitising, relevance and sort order. Services and tests use it without the widget. |
-| `src/thumb_loader.zig` | `ThumbLoader` — the grid's thumbnail cache and loader threads (visible cells first; queue rebuilt each frame). A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`). |
+| `src/thumb_loader.zig` | `ThumbLoader` — the grid's thumbnail cache (least recently shown evicted past 64 MB; freed entries hand their texture key back for the grid to invalidate) and loader threads (visible cells first; queue rebuilt each frame). A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`). |
 | `src/grid_players.zig` | `PlayerPool` — grid autoplay: live players for on-screen animated/video cells, opened by a small thread pool. |
 | `src/library_manager.zig` | `LibraryManager` — queues background `io` concurrent scans per library, proxies add/remove to the DB. |
 | `src/scan.zig` | `LibraryScanner` — walks a directory tree, detects new/changed/removed images (mtime-first, hash on change), generates thumbnails via libvips, and optionally runs text/image embeddings. |

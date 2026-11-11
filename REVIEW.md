@@ -307,20 +307,26 @@ Measured with the new `zig build bench_scan` (1,500 PNGs plus a few videos, 8 co
 - A video is opened once per scan instead of three times, and its poster frame is scaled during conversion rather than copied at full size. Tested with a small tagged MP4 fixture (`tests/fixtures/tagged.mp4`).
 - New grid images during a scan are merged into the sorted list (O(n + k log k)) instead of re-sorting the whole grid, and the "already shown" check no longer hashes the whole grid. Tested against a full stable sort for every mode; not timed.
 
-### Not done (deliberately left; say if you want any)
+### Remaining items (2026-11-11)
 
-- **Efficiency:**
-  - fewer frame copies;
-  - thumbnail TTL/cap;
-  - `ellipsize`;
-  - raw-JSON relayout;
-  - embed queue backpressure;
-  - viewer refresh at full vsync.
-- **Platform:**
-  - X11 XdndStatus/Finished target matching;
-  - `XDefineCursor` on foreign windows;
-  - Wayland drag stuck on a bad serial;
-  - Windows `EnumFormatEtc`/`SetData`;
-  - video `start_time` offsets.
-- **Other:** GPU weight eviction at embedder deinit.
-- **Unverified at runtime:** none of this was exercised in the running GUI (only `zig build` and the test suites). The Windows and macOS code was only compile-checked.
+- **Video frames:** decoders write straight into a Zig buffer in two steps (`next` reports the size, `read` fills it). Each frame is one scale plus one copy instead of three copies and two allocations. Shown frames go back to the player (`recycle`) for the decoder to refill. Still images decode straight into the viewer's buffer, so the second full-size copy is gone. Tested with MP4 and GIF fixtures, in both animation modes (held in memory and decoded per frame).
+- **Thumbnail cache:**
+  - It is capped at 64 MB and evicts the least recently shown first, with no time-based expiry. Prefetched rows count as shown, so they aren't reloaded every 45 s any more.
+  - Textures are keyed by pointer instead of hashing every visible JPEG each frame. Freed entries hand their key back, and the grid invalidates it before drawing.
+  - Tested, including a check inside a frame that fails without the invalidation.
+- **`ellipsize`:** one dvui measuring pass (`textSizeEx` with `max_width`) instead of measuring every prefix. Tested: the result is the longest prefix that fits.
+- **Raw metadata:** laid out in blocks of 40 lines, and only the blocks on screen are laid out. Blocks out of view keep the height measured at the current width. Tested: a 3,000-line text lays out 1–3 blocks per frame and keeps its height.
+- **Embed queue:** a bounded FIFO (256 items). File tasks wait when it is full, and items are dropped if no consumer is left. Tested. A real embedding scan (CUDA, 1,511 files) embedded 1504 of 1504 in 154 s, against 157 s before.
+- **Playback redraws:**
+  - Players report when the next frame is due (`nextDueNs`), and the grid and viewer set a dvui timer instead of redrawing every frame.
+  - dvui ignores a 0 µs timer, which froze autoplay in a real-app check. A frame that is already due is now a redraw (`style.wakeAt`), with a test that fails without it.
+  - CPU with 11 autoplaying clips was unchanged (~33%: decoding dominates).
+- **Embedder deinit:** every encoder evicts its device weights through the GPU handle, with the CUDA context bound and under the mutex. Can't be observed today, because the handle's own deinit frees the device memory anyway. CUDA and Vulkan scans shut down cleanly.
+- **Video timestamps** count from the container's start time (video and audio both), and seeks add it back. Tested with a clip that starts at 1.5 s.
+- **Wayland:** a button release during a drag means the compositor refused `start_drag`, so the drag resets instead of staying stuck. Compiled only; no Wayland session here.
+- **X11:** a late XdndStatus or XdndFinished from the window the drag just left is ignored. Replies aren't matched to the target exactly, because XdndProxy targets answer from another window. Compiled only.
+- **Windows:**
+  - The data object stores formats given to `SetData` and returns them from `GetData`/`EnumFormatEtc` (`SHCreateStdEnumFmtEtc`), which is how the drag-image helper's ghost reaches drop targets.
+  - The ghost bitmap is no longer deleted after the helper took ownership of it.
+  - Cross-compiled for x86_64-windows with `-Wall -Wextra` only; not linked or run.
+- **Not done:** `XDefineCursor` on other apps' windows. The fix (change the active grab's cursor on SDL's connection) depends on how SDL3 holds the pointer grab, and needs a manual drag onto real apps to verify.

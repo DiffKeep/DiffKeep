@@ -32,6 +32,18 @@ fail:
     return -1;
 }
 
+/* Write `img` (w x h, 4-band uchar) into the caller's buffer `out` of `len`
+   bytes, with no intermediate copy. */
+static int write_into(VipsImage *img, void *out, size_t len) {
+    int w = vips_image_get_width(img), h = vips_image_get_height(img);
+    if (vips_image_get_bands(img) != 4 || len != (size_t)w * (size_t)h * 4) return -1;
+    VipsImage *mem = vips_image_new_from_memory(out, len, w, h, 4, VIPS_FORMAT_UCHAR);
+    if (!mem) return -1;
+    int rc = vips_image_write(img, mem);
+    g_object_unref(mem);
+    return rc;
+}
+
 int diffkeep_vips_init(const char *name) {
     int rc = vips_init(name);
     if (rc == 0) {
@@ -231,6 +243,7 @@ struct DiffkeepAnimDecoder {
     long *pts_ms;      /* pts_ms[k] = start time of page k (cumulative delay) */
     long duration_ms;  /* total = sum of all per-frame delays */
     int cur;           /* index of the next page diffkeep_anim_next emits */
+    VipsImage *page;   /* stream mode: the page _next prepared for _read */
 };
 
 /* Scale (sw,sh) to fit max_dim on the long edge (never upscales). */
@@ -332,6 +345,7 @@ DiffkeepAnimDecoder *diffkeep_anim_open(const char *filename, int max_dim) {
 void diffkeep_anim_close(DiffkeepAnimDecoder *d) {
     if (!d) return;
     if (d->pixels) g_free(d->pixels);
+    if (d->page) g_object_unref(d->page);
     if (d->roll) g_object_unref(d->roll);
     g_free(d->pts_ms);
     g_free(d->filename);
@@ -345,8 +359,9 @@ double diffkeep_anim_fps(const DiffkeepAnimDecoder *d) {
     return (double)d->n_pages * 1000.0 / (double)d->duration_ms;
 }
 
-/* Stream mode: decode the current page from the live roll (with optional resize). */
-static int anim_next_stream(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms) {
+/* Stream mode: build the current page from the live roll (with optional
+   resize). Lazy: decoded by diffkeep_anim_read. */
+static int anim_prepare_stream(DiffkeepAnimDecoder *d) {
     /* A failed reopen on a backward seek leaves no roll to read. */
     if (!d->roll) return -1;
     VipsImage *page = NULL;
@@ -366,35 +381,42 @@ static int anim_next_stream(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, 
     }
 
     if (to_rgba8(&page) != 0) return -1;
+    d->page = page;
+    return 0;
+}
 
-    size_t len = 0;
-    void *pixels = vips_image_write_to_memory(page, &len);
-    if (!pixels) { g_object_unref(page); return -1; }
-    *buf = pixels;
-    *w = vips_image_get_width(page);
-    *h = vips_image_get_height(page);
+int diffkeep_anim_next(DiffkeepAnimDecoder *d, int *w, int *h, long *pts_ms) {
+    if (!d || d->cur >= d->n_pages) return 0; /* EOF */
+    if (d->page) { g_object_unref(d->page); d->page = NULL; }
+
+    if (d->pixels) {
+        *w = d->width;
+        *h = d->page_height;
+    } else {
+        if (anim_prepare_stream(d) != 0) return -1;
+        *w = vips_image_get_width(d->page);
+        *h = vips_image_get_height(d->page);
+    }
     *pts_ms = d->pts_ms[d->cur];
-    g_object_unref(page);
-    d->cur++;
     return 1;
 }
 
-int diffkeep_anim_next(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms) {
-    if (!d || d->cur >= d->n_pages) return 0; /* EOF */
-
+int diffkeep_anim_read(DiffkeepAnimDecoder *d, void *out, size_t len) {
+    if (!d || d->cur >= d->n_pages) return -1;
+    int rc = 0;
     if (d->pixels) {
-        /* Cached: hand back a copy of the pre-decoded frame (cheap). */
+        /* Cached: copy the pre-decoded frame. */
         size_t fb = (size_t)d->width * (size_t)d->page_height * 4;
-        void *out = g_malloc(fb);
+        if (len != fb) return -1;
         memcpy(out, d->pixels + (size_t)d->cur * fb, fb);
-        *buf = out;
-        *w = d->width;
-        *h = d->page_height;
-        *pts_ms = d->pts_ms[d->cur];
-        d->cur++;
-        return 1;
+    } else {
+        if (!d->page) return -1;
+        rc = write_into(d->page, out, len);
+        g_object_unref(d->page);
+        d->page = NULL;
     }
-    return anim_next_stream(d, buf, w, h, pts_ms);
+    if (rc == 0) d->cur++;
+    return rc;
 }
 
 int diffkeep_anim_seek(DiffkeepAnimDecoder *d, long ts_ms) {
@@ -459,6 +481,35 @@ int diffkeep_jpeg_bytes_to_rgba(
     return 0;
 }
 
+int diffkeep_image_open_rgba(const char *filename, void **handle, int *width, int *height) {
+    /* vips_thumbnail with a huge target and VIPS_SIZE_DOWN returns the image
+       at its original resolution converted to sRGB(A) uint8 — the same path
+       used by the thumbnail worker, which is known to work from threads.
+       Lazy: nothing is decoded until diffkeep_image_read_rgba. */
+    VipsImage *image = NULL;
+    *handle = NULL;
+    if (vips_thumbnail(filename, &image, 65535,
+            "height", 65535,
+            "size", VIPS_SIZE_DOWN,
+            "no_rotate", TRUE,
+            NULL) != 0)
+        return -1;
+    /* dvui wants 4-band RGBA8; vips_thumbnail keeps greyscale as 1-2 bands. */
+    if (to_rgba8(&image) != 0) return -1;
+    *width  = vips_image_get_width(image);
+    *height = vips_image_get_height(image);
+    *handle = image;
+    return 0;
+}
+
+int diffkeep_image_read_rgba(void *handle, void *out, size_t len) {
+    return write_into((VipsImage *)handle, out, len);
+}
+
+void diffkeep_image_close(void *handle) {
+    if (handle) g_object_unref((VipsImage *)handle);
+}
+
 int diffkeep_load_image_rgba(
     const char *filename,
     void **buf,
@@ -466,32 +517,13 @@ int diffkeep_load_image_rgba(
     int *width,
     int *height
 ) {
-    /* vips_thumbnail with a huge target and VIPS_SIZE_DOWN returns the image
-       at its original resolution converted to sRGB(A) uint8 — the same path
-       used by the thumbnail worker, which is known to work from threads. */
-    VipsImage *image = NULL;
-    if (vips_thumbnail(filename, &image, 65535,
-            "height", 65535,
-            "size", VIPS_SIZE_DOWN,
-            "no_rotate", TRUE,
-            NULL) != 0)
-        return -1;
-
-    /* dvui wants 4-band RGBA8; vips_thumbnail keeps greyscale as 1-2 bands. */
-    if (to_rgba8(&image) != 0) return -1;
-
+    void *image = NULL;
+    if (diffkeep_image_open_rgba(filename, &image, width, height) != 0) return -1;
     size_t out_len = 0;
-    void *pixels = vips_image_write_to_memory(image, &out_len);
-    if (!pixels) {
-        g_object_unref(image);
-        return -1;
-    }
-
-    *width  = vips_image_get_width(image);
-    *height = vips_image_get_height(image);
-    *buf    = pixels;
-    *len    = out_len;
-
-    g_object_unref(image);
+    void *pixels = vips_image_write_to_memory((VipsImage *)image, &out_len);
+    g_object_unref((VipsImage *)image);
+    if (!pixels) return -1;
+    *buf = pixels;
+    *len = out_len;
     return 0;
 }

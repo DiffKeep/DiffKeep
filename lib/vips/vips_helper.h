@@ -32,6 +32,14 @@ int diffkeep_rgba_to_jpeg(
     size_t *len
 );
 
+/* Open a full-resolution image as RGBA8 without decoding it: sets *handle and
+   its size. diffkeep_image_read_rgba decodes it into the caller's buffer
+   (len = width*height*4); diffkeep_image_close releases the handle. 0 on
+   success. */
+int diffkeep_image_open_rgba(const char *filename, void **handle, int *width, int *height);
+int diffkeep_image_read_rgba(void *handle, void *out, size_t len);
+void diffkeep_image_close(void *handle);
+
 /* Load a full-resolution image as a packed RGBA8 buffer.
    Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
 int diffkeep_load_image_rgba(
@@ -85,10 +93,12 @@ long diffkeep_anim_duration_ms(const DiffkeepAnimDecoder *d);
    variable per-frame delays; this is the average. */
 double diffkeep_anim_fps(const DiffkeepAnimDecoder *d);
 
-/* Decode the next page to packed RGBA8. Returns 1 and fills *buf (glib-allocated,
-   free with diffkeep_vips_free), *w, *h, *pts_ms (presentation time of this
-   frame). Returns 0 at end-of-stream, -1 on error. */
-int diffkeep_anim_next(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms);
+/* Prepare the next page: returns 1 and sets its size *w x *h and *pts_ms
+   (presentation time), 0 at end-of-stream, -1 on error. Then
+   diffkeep_anim_read writes it as packed RGBA8 into the caller's buffer
+   (len = w*h*4) and advances to the following page. */
+int diffkeep_anim_next(DiffkeepAnimDecoder *d, int *w, int *h, long *pts_ms);
+int diffkeep_anim_read(DiffkeepAnimDecoder *d, void *out, size_t len);
 
 /* Reposition so the next diffkeep_anim_next() returns the page at/before ts_ms.
    Seeking backward reopens the image (forward-only decode). */

@@ -593,7 +593,7 @@ pub const ViewerState = struct {
         if (player.tick(video_player_mod.VideoPlayer.nowNs(self.io))) |frame| {
             if (self.image_pixels) |old| {
                 dvui.textureInvalidateCache(self.image_texture_hash);
-                self.gpa.free(old);
+                player.recycle(old); // same allocator; the decoder refills it
             }
             self.image_pixels = frame.pixels;
             self.image_width = frame.width;
@@ -605,8 +605,9 @@ pub const ViewerState = struct {
             } };
             self.image_texture_hash = src.hash();
         }
-        // Keep the render loop spinning so playback advances without input.
-        if (player.isPlaying()) dvui.refresh(null, @src(), null);
+        // Wake for the next frame so playback advances without input.
+        const now_ns = video_player_mod.VideoPlayer.nowNs(self.io);
+        if (player.nextDueNs(now_ns)) |due| style.wakeAt(dvui.parentGet().extendId(@src(), 0), now_ns, due);
     }
 
     fn startPlayerOpen(self: *ViewerState, cur: *const image_grid_mod.ImageEntry) !void {

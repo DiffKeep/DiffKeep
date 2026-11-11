@@ -622,6 +622,11 @@ pub const GridState = struct {
     }
 
     pub fn render(self: *GridState) void {
+        // Textures of freed thumbnails, before anything is drawn this frame:
+        // their addresses may already hold another image's bytes.
+        for (self.thumbs.releasedKeys()) |key| dvui.textureInvalidateCache(key);
+        self.thumbs.clearReleasedKeys();
+
         const n = self.images.items.len;
         const ts = self.thumbSize();
         const cell_w = ts + gap;
@@ -856,17 +861,15 @@ pub const GridState = struct {
         // separately and finish on their own.
         self.thumbs.clearQueued();
 
-        // Touch last_seen for visible items; queue loads for prefetch zone
-        const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+        // Keep the visible and prefetch rows' thumbnails cached; queue loads
+        // for the ones missing.
         for (pf_first..pf_last) |row| {
             const is_visible = row >= first_row and row < last_row;
             for (0..cols) |col| {
                 const idx = row * cols + col;
                 if (idx >= n) break;
                 const entry = &self.images.items[idx];
-                if (self.thumbs.committed.getPtr(entry.id)) |ce| {
-                    if (is_visible) ce.last_seen_s = now_s;
-                } else {
+                if (self.thumbs.touch(entry.id) == null) {
                     const path = self.diskPath(entry);
                     defer if (path.ptr != entry.path.ptr) self.allocator.free(path);
                     self.thumbs.request(entry.id, path, is_visible);
@@ -909,10 +912,11 @@ pub const GridState = struct {
             }
         }
 
-        // Evict players whose cell scrolled off; keep the loop spinning while any
-        // survivor is still playing so playback advances without further input.
+        // Evict players whose cell scrolled off, and wake for the next frame
+        // any survivor has due so playback advances without further input.
         if (self.autoplay) {
-            if (self.players.endFrame()) dvui.refresh(null, @src(), null);
+            const now_ns = video_player_mod.VideoPlayer.nowNs(self.io);
+            if (self.players.endFrame(now_ns)) |due| style.wakeAt(dvui.parentGet().extendId(@src(), 0), now_ns, due);
         }
 
         // Bottom spacer (same max_size_content override as the top spacer).
@@ -1071,7 +1075,7 @@ pub const GridState = struct {
                 }
             }
 
-            if (!drew_live) if (self.thumbs.committed.get(entry.id)) |ce| {
+            if (!drew_live) if (self.thumbs.committed.getPtr(entry.id)) |ce| {
                 // Scale to fit ts×ts while preserving aspect ratio, then center with margin.
                 // Using explicit margin avoids DVUI layout bugs caused by gravity_y=0.5
                 // triggering child_positioned mode in the vertical BoxWidget.
@@ -1080,13 +1084,15 @@ pub const GridState = struct {
                 const rh = ce.height * scale;
                 const mx = (ts - rw) / 2.0;
                 const my = (ts - rh) / 2.0;
+                // Keyed by the bytes' address: hashing every visible JPEG each
+                // frame (.bytes) was megabytes of hashing per frame. The
+                // address can be reused for another image once these bytes are
+                // freed, so the loader hands the key back then and the grid
+                // invalidates it before drawing (start of `render`).
+                const source: dvui.ImageSource = .{ .imageFile = .{ .bytes = ce.bytes, .invalidation = .ptr } };
+                if (ce.tex_key == 0) ce.tex_key = source.hash();
                 _ = dvui.image(@src(), .{
-                    // Key dvui's texture cache on the JPEG *content*, not the byte
-                    // pointer. After a thumbnail is freed (delete / reparse) the
-                    // allocator can hand the same address to a different image's
-                    // bytes; pointer-keyed caching (.ptr, the default) would then
-                    // show the stale texture for the new image.
-                    .source = .{ .imageFile = .{ .bytes = ce.bytes, .invalidation = .bytes } },
+                    .source = source,
                 }, .{
                     .id_extra = idx,
                     .min_size_content = .{ .w = rw, .h = rh },

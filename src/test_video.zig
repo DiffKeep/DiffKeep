@@ -50,8 +50,13 @@ pub fn main(init: std.process.Init) !void {
         var count: usize = 0;
         var last_pts: i64 = -1;
         var fdim: struct { w: u32, h: u32 } = .{ .w = 0, .h = 0 };
-        while (try dec.next(allocator)) |fr| {
-            defer allocator.free(fr.pixels);
+        var buf: ?[]u8 = null; // one buffer reused for every frame
+        defer if (buf) |b| allocator.free(b);
+        while (true) {
+            const reuse = buf;
+            buf = null; // `next` consumes it, even on error
+            const fr = (try dec.next(allocator, reuse)) orelse break;
+            buf = fr.pixels;
             count += 1;
             last_pts = fr.pts_ms;
             fdim = .{ .w = fr.width, .h = fr.height };
@@ -59,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("decoded {d} frames, last pts={d}ms, frame {d}x{d} (max_dim={d})", .{ count, last_pts, fdim.w, fdim.h, max_dim });
 
         dec.seek(0);
-        if (try dec.next(allocator)) |fr| {
+        if (try dec.next(allocator, null)) |fr| {
             defer allocator.free(fr.pixels);
             std.log.info("after seek(0): first frame pts={d}ms", .{fr.pts_ms});
         }
@@ -99,8 +104,13 @@ pub fn main(init: std.process.Init) !void {
         var a_last: i64 = -1;
         var adim: struct { w: u32, h: u32 } = .{ .w = 0, .h = 0 };
         const t0 = std.Io.Clock.real.now(init.io).nanoseconds;
-        while (try adec.next(allocator)) |fr| {
-            defer allocator.free(fr.pixels);
+        var abuf: ?[]u8 = null;
+        defer if (abuf) |b| allocator.free(b);
+        while (true) {
+            const reuse = abuf;
+            abuf = null;
+            const fr = (try adec.next(allocator, reuse)) orelse break;
+            abuf = fr.pixels;
             acount += 1;
             a_last = fr.pts_ms;
             adim = .{ .w = fr.width, .h = fr.height };
@@ -109,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         const per_ms = if (acount > 0) @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(acount)) / 1_000_000.0 else 0;
         std.log.info("anim decoded {d} frames, last pts={d}ms, frame {d}x{d} (max_dim={d}) — {d:.2}ms/frame, {d:.1}ms total", .{ acount, a_last, adim.w, adim.h, max_dim, per_ms, @as(f64, @floatFromInt(ns)) / 1_000_000.0 });
         adec.seek(0);
-        if (try adec.next(allocator)) |fr| {
+        if (try adec.next(allocator, null)) |fr| {
             defer allocator.free(fr.pixels);
             std.log.info("anim after seek(0): first frame pts={d}ms", .{fr.pts_ms});
         }
