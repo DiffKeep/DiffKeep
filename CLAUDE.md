@@ -57,8 +57,10 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/db.zig` | `VectorDb` — thin SQLite wrapper. Schema is append-only migration list. Embeds sqlite-vec for KNN vector search (768-dim float32). Supports soft-delete (trash) with 30-day auto-purge. `getConnection()` hands out per-thread handles sharing one pool. |
 | `src/embedder.zig` | `Embedder` — all embeddings via TensorPencil: EmbeddingGemma 300M (prompts), SigLIP2 visual (images) and SigLIP2 text (visual queries). Batches route to CUDA/Vulkan at or above `embed_gpu_threshold`, single items to CPU. |
 | `src/image_ops.zig` | Trash / delete / restore and bulk ops (empty trash, dedupe), all on background threads; `fileOpsPoll` / `bulkPoll` apply results each frame. |
-| `src/config.zig` | `Config` struct loaded/saved as JSON in the XDG config dir. |
+| `src/config.zig` | `Config` struct loaded/saved as JSON in the XDG config dir (saved via temp file + rename; an unparseable file loads as defaults, kept as `.bak`). |
+| `src/counts.zig` | `CountsLoader` — sidebar/toolbar counts (total, trash, duplicates, favorites, per library) loaded in the background; `app.zig` `refreshCounts()` requests, `applyCounts()` shows. |
 | `src/i18n.zig` | Compile-time string table (English only so far). |
+| `src/app_icons.zig` | Vendored TVG icons. The `icons` package's heroicons/solid set is broken (stored as hollow strokes), so the favorite star lives in `src/icons/` instead. Don't use `icons.tvg.heroicons.solid.*`. |
 | `src/models.zig` | Shared data structs (`Library`, `Image`). |
 | `src/parse/comfy.zig` | Parses ComfyUI workflow JSON embedded in PNG metadata (`tEXt` chunks). |
 | `src/image/png-data.zig` | Low-level PNG chunk reader for extracting raw metadata bytes. |
@@ -81,13 +83,16 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 The render loop runs on the main thread and does no file or DB IO beyond small point queries. Background work, each waking the render loop via a custom SDL event (`g_wakeup_event_type`):
 1. `LibraryManager` dispatches `std.Io` concurrent tasks for library scans. Each scan produces thumbnail bytes and embeddings, then calls `ImageNotifier` to push new IDs.
 2. `GridState` worker threads load thumbnails from disk/DB. A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`).
-3. `GridState.reloadImages` loads a view (list + favorites + media types) as a background task; `update()` swaps in the newest result. Tests call `awaitReload()`.
-4. `SearchState` (`search.zig`) embeds queries and runs searches as background tasks, through the same `image_grid.loadView`.
-5. `image_ops` runs file operations on its own worker threads.
+3. `GridState.reloadImages` loads a view (list + favorites + media types) as a background task on the grid's own connection (`view_db`); `update()` swaps in the newest result. Tests call `awaitReload()`.
+4. `SearchState` (`search.zig`) embeds queries and runs searches as background tasks, through the same `image_grid.loadView`. A query embedding is delivered under a mutex tagged with its generation; only the latest is applied.
+5. `image_ops` runs every file operation — single-image trash/delete/restore and the bulk empty-trash / dedupe — as jobs on one worker thread, so they never race each other.
+6. `LibraryManager.flushFileEvents` removes rows for watcher-reported deletions in one background transaction; `removeLibrary` stops the library's scan and deletes its rows and trashed files in the background. Both report removed ids through `drainRemovedIds`.
+7. `counts.zig` (`CountsLoader`) and the detail panel (`DetailState`) load in the background; the viewer decodes images, and opens video/animation players, on background threads.
+8. The embedder is freed only after `app.zig:releaseEmbedder` has awaited every user of it (`SearchState.awaitEmbed`, `LibraryManager.quiesce`).
 
 ### Database schema
 
-Append-only migration list in `db.zig:migrations`. Tables: `libraries`, `images` (full PNG parse metadata + optional BLOB thumbnail), `image_embeddings` (vec0, 768-dim), `positive_prompt_embeddings` (vec0, 768-dim). Soft-delete via `trashed_at`/`trash_name`/`file_size_bytes` columns. vec0 tables take no foreign keys: trigger `images_embeddings_ad` (v12) deletes an image's embeddings with its row, since ids are recycled. Rows whose file was deleted outside the app are removed by the scan, the fs watcher, or the grid loader on a failed thumbnail load (`GridState.noteLoadFailure`; only when the file's directory still exists).
+Append-only migration list in `db.zig:migrations`. Tables: `libraries`, `images` (full PNG parse metadata + optional BLOB thumbnail), `image_embeddings` (vec0, 768-dim), `positive_prompt_embeddings` (vec0, 768-dim). Soft-delete via `trashed_at`/`trash_name`/`trash_file_size` columns. A (library, path) has at most one live row (partial unique index `idx_images_live_path`, v14; trashed rows are exempt, so a new file may reuse a trashed image's path). Destructive row operations (`trashImage`, `restoreImage`, `deleteImage`) and embedding stores match the id AND the path the caller saw, since ids are recycled and a grid/viewer entry can outlive its row; they return whether a row matched. Library paths are stored without a trailing separator, and overlapping libraries are refused. Folder filters use the range `path >= 'f/' AND path < 'f0'`, never `LIKE`. vec0 tables take no foreign keys: trigger `images_embeddings_ad` (v12) deletes an image's embeddings with its row, since ids are recycled. Rows whose file was deleted outside the app are removed by the scan, the fs watcher, or the grid loader on a failed thumbnail load (`GridState.noteLoadFailure`; only when the file's directory still exists).
 
 ### Search architecture
 

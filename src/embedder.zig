@@ -343,7 +343,9 @@ fn loadImageAsTensor(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
 
     const pixels: [*]const u8 = @ptrCast(buf.?);
     const n_pixels = SIGLIP_IMAGE_SIZE * SIGLIP_IMAGE_SIZE;
-    std.debug.assert(len == n_pixels * 3);
+    // A real check, not an assert: ReleaseFast would compile that out and
+    // read past a buffer of any other layout.
+    if (len != n_pixels * 3) return error.BadPixelLayout;
 
     const tensor = try allocator.alloc(f32, 3 * n_pixels);
     for (0..n_pixels) |p| {

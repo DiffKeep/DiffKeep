@@ -79,87 +79,96 @@ const siglip2_hf_base = "https://huggingface.co/timm/ViT-B-16-SigLIP2/resolve/ma
 const siglip2_dir_name = "ViT-B-16-SigLIP2-timm";
 const siglip2_dl_files = [_][]const u8{ "open_clip_model.safetensors", "tokenizer.json" };
 
-const DownloadCtx = struct {
+/// One model download, run by a detached thread. The thread touches nothing
+/// but this struct (thread-safe C heap, never the app allocator or UI
+/// buffers), so it may outlive the settings screen, or even app shutdown while
+/// curl runs; the main thread reads the result once `done` is set and then
+/// frees it (`take`).
+const Download = struct {
+    const a = std.heap.c_allocator;
+
     io: std.Io,
-    allocator: std.mem.Allocator,
-    target_dir: []const u8,           // owned; freed by task
-    hf_base: []const u8,              // static constant
-    files: []const []const u8,        // static constant
-    running: *std.atomic.Value(bool),
-    success: *std.atomic.Value(bool),
-    path_buf: *[4096:0]u8,
+    target_dir: []u8, // owned
+    hf_base: []const u8, // static
+    files: []const []const u8, // static
     wakeup_fn: ?*const fn () void,
-};
+    ok: bool = false, // valid once `done`
+    done: std.atomic.Value(bool) = .init(false),
 
-fn downloadTask(ctx: DownloadCtx) void {
-    defer ctx.allocator.free(ctx.target_dir);
-    defer ctx.running.store(false, .release);
-
-    for (ctx.files) |rel_path| {
-        const out_path = ctx.allocator.print("{s}/{s}", .{ ctx.target_dir, rel_path }) catch return;
-        defer ctx.allocator.free(out_path);
-        const url = ctx.allocator.print("{s}/{s}", .{ ctx.hf_base, rel_path }) catch return;
-        defer ctx.allocator.free(url);
-
-        const result = std.process.run(ctx.allocator, ctx.io, .{
-            .argv = &.{ "curl", "-L", "-f", "-s", "-S", "--create-dirs", "-o", out_path, url },
-        }) catch |err| {
-            log.warn("curl spawn failed for {s}: {}", .{ url, err });
-            return;
+    fn start(io: std.Io, data_dir: []const u8, model_dir_name: []const u8, hf_base: []const u8, files: []const []const u8, wakeup_fn: ?*const fn () void) ?*Download {
+        const target_dir = std.mem.concat(a, u8, &.{ data_dir, "/models/", model_dir_name }) catch return null;
+        const d = a.create(Download) catch {
+            a.free(target_dir);
+            return null;
         };
-        ctx.allocator.free(result.stdout);
-        ctx.allocator.free(result.stderr);
-
-        if (result.term != .exited or result.term.exited != 0) {
-            log.warn("curl failed (exit {}) for {s}", .{ result.term, url });
-            return;
-        }
+        d.* = .{
+            .io = io,
+            .target_dir = target_dir,
+            .hf_base = hf_base,
+            .files = files,
+            .wakeup_fn = wakeup_fn,
+        };
+        const t = std.Thread.spawn(.{}, run, .{d}) catch |err| {
+            log.warn("spawn download thread: {}", .{err});
+            a.free(d.target_dir);
+            a.destroy(d);
+            return null;
+        };
+        t.detach();
+        return d;
     }
 
-    const len = @min(ctx.target_dir.len, ctx.path_buf.len - 1);
-    @memcpy(ctx.path_buf[0..len], ctx.target_dir[0..len]);
-    ctx.path_buf[len] = 0;
-    ctx.success.store(true, .release);
-    if (ctx.wakeup_fn) |wake| wake();
-}
+    /// Main thread, after `done`: the downloaded model dir (owned by the
+    /// caller's `gpa`), or null on failure. Frees the job.
+    fn take(d: *Download, gpa: std.mem.Allocator) ?[]u8 {
+        defer {
+            a.free(d.target_dir);
+            a.destroy(d);
+        }
+        if (!d.ok) return null;
+        return gpa.dupe(u8, d.target_dir) catch null;
+    }
 
-fn spawnDownload(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    model_dir_name: []const u8,
-    hf_base: []const u8,
-    files: []const []const u8,
-    running: *std.atomic.Value(bool),
-    success: *std.atomic.Value(bool),
-    path_buf: *[4096:0]u8,
-    wakeup_fn: ?*const fn () void,
-) void {
-    if (running.load(.acquire)) return;
-    success.store(false, .release);
+    fn run(d: *Download) void {
+        d.ok = d.fetchAll();
+        const wake = d.wakeup_fn; // `d` may be freed once `done` is set
+        d.done.store(true, .release);
+        if (wake) |w| w();
+    }
 
-    const target_dir = allocator.print("{s}/models/{s}", .{ data_dir, model_dir_name }) catch return;
-    running.store(true, .release);
+    fn fetchAll(d: *Download) bool {
+        for (d.files) |rel_path| {
+            const out_path = std.mem.concat(a, u8, &.{ d.target_dir, "/", rel_path }) catch return false;
+            defer a.free(out_path);
+            // Download beside the target and rename into place, so an
+            // interrupted download never leaves a truncated model file.
+            const part = std.mem.concat(a, u8, &.{ out_path, ".part" }) catch return false;
+            defer a.free(part);
+            const url = std.mem.concat(a, u8, &.{ d.hf_base, "/", rel_path }) catch return false;
+            defer a.free(url);
 
-    const ctx = DownloadCtx{
-        .io = io,
-        .allocator = allocator,
-        .target_dir = target_dir,
-        .hf_base = hf_base,
-        .files = files,
-        .running = running,
-        .success = success,
-        .path_buf = path_buf,
-        .wakeup_fn = wakeup_fn,
-    };
-    const thread = std.Thread.spawn(.{}, downloadTask, .{ctx}) catch |err| {
-        log.warn("spawn download thread: {}", .{err});
-        allocator.free(target_dir);
-        running.store(false, .release);
-        return;
-    };
-    thread.detach();
-}
+            const result = std.process.run(a, d.io, .{
+                .argv = &.{ "curl", "-L", "-f", "-s", "-S", "--create-dirs", "-o", part, url },
+            }) catch |err| {
+                log.warn("curl spawn failed for {s}: {}", .{ url, err });
+                return false;
+            };
+            a.free(result.stdout);
+            a.free(result.stderr);
+            if (result.term != .exited or result.term.exited != 0) {
+                log.warn("curl failed (exit {}) for {s}", .{ result.term, url });
+                std.Io.Dir.cwd().deleteFile(d.io, part) catch {};
+                return false;
+            }
+            const cwd = std.Io.Dir.cwd();
+            std.Io.Dir.rename(cwd, part, cwd, out_path, d.io) catch |err| {
+                log.warn("install {s}: {}", .{ rel_path, err });
+                return false;
+            };
+        }
+        return true;
+    }
+};
 
 pub const ScanSnapshot = struct {
     thumbnails_in_db: bool = false,
@@ -184,11 +193,12 @@ pub const SettingsModalState = struct {
     data_path_snapshot:   [4096:0]u8 = std.mem.zeroes([4096:0]u8),
     /// Set to true by onClosed() or applyCompletedDownloads() when model paths changed; cleared by app.zig.
     model_paths_changed: bool = false,
+    /// "Empty trash" was clicked; app.zig asks for confirmation (it deletes
+    /// files for good), like the toolbar's trash-view button does.
+    empty_trash_requested: bool = false,
 
-    gemma_dl_running: std.atomic.Value(bool) = .init(false),
-    gemma_dl_success: std.atomic.Value(bool) = .init(false),
-    siglip2_dl_running: std.atomic.Value(bool) = .init(false),
-    siglip2_dl_success: std.atomic.Value(bool) = .init(false),
+    gemma_dl: ?*Download = null,
+    siglip2_dl: ?*Download = null,
 
     pub fn initFromConfig(self: *SettingsModalState, cfg: *const config_mod.Config) void {
         if (cfg.text_model_dir) |p| {
@@ -206,11 +216,6 @@ pub const SettingsModalState = struct {
             @memcpy(self.data_path_buf[0..len], p[0..len]);
             self.data_path_buf[len] = 0;
         }
-    }
-
-    pub fn awaitDownloads(self: *SettingsModalState, io: std.Io) void {
-        _ = self;
-        _ = io;
     }
 
     pub fn render(
@@ -290,20 +295,12 @@ pub const SettingsModalState = struct {
                 {
                     var dl_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 4 } });
                     defer dl_row.deinit();
-                    if (self.gemma_dl_running.load(.acquire)) {
+                    if (self.gemma_dl != null) {
                         runningLine(@src(), i18n.t(.settings_download_running));
                     } else {
                         if (dvui.button(@src(), i18n.t(.settings_download_text_model), .{}, small_button)) {
                             if (dvui.App.main_init) |init| {
-                                if (data_dir) |dd| {
-                                    spawnDownload(
-                                        init.io, init.gpa, dd,
-                                        gemma_dir_name, gemma_hf_base,
-                                        &gemma_dl_files,
-                                        &self.gemma_dl_running, &self.gemma_dl_success,
-                                        &self.text_model_dir_buf, wakeup_fn,
-                                    );
-                                }
+                                if (data_dir) |dd| self.gemma_dl = Download.start(init.io, dd, gemma_dir_name, gemma_hf_base, &gemma_dl_files, wakeup_fn);
                             }
                         }
                     }
@@ -320,20 +317,12 @@ pub const SettingsModalState = struct {
                 {
                     var dl_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .h = 4 } });
                     defer dl_row.deinit();
-                    if (self.siglip2_dl_running.load(.acquire)) {
+                    if (self.siglip2_dl != null) {
                         runningLine(@src(), i18n.t(.settings_download_running));
                     } else {
                         if (dvui.button(@src(), i18n.t(.settings_download_siglip2), .{}, small_button)) {
                             if (dvui.App.main_init) |init| {
-                                if (data_dir) |dd| {
-                                    spawnDownload(
-                                        init.io, init.gpa, dd,
-                                        siglip2_dir_name, siglip2_hf_base,
-                                        &siglip2_dl_files,
-                                        &self.siglip2_dl_running, &self.siglip2_dl_success,
-                                        &self.visual_model_dir_buf, wakeup_fn,
-                                    );
-                                }
+                                if (data_dir) |dd| self.siglip2_dl = Download.start(init.io, dd, siglip2_dir_name, siglip2_hf_base, &siglip2_dl_files, wakeup_fn);
                             }
                         }
                     }
@@ -395,9 +384,7 @@ pub const SettingsModalState = struct {
                         // Emptying the trash deletes the files for good.
                         if (dvui.button(@src(), i18n.t(.settings_empty_trash), .{},
                             small_button.override(.{ .gravity_y = 0.5, .style = .err }))) {
-                            // Runs in the background; image_ops.bulkPoll refreshes
-                            // the counts and reloads the view when it finishes.
-                            if (dvui.App.main_init) |init| image_ops.startEmptyTrash(init.io);
+                            self.empty_trash_requested = true;
                         }
                     }
                 }
@@ -517,29 +504,28 @@ pub const SettingsModalState = struct {
         }
     }
 
+    /// Main thread, each frame: apply finished model downloads. The path goes
+    /// into the settings field; when the screen is closed it is applied to the
+    /// config right away (onClosed handles it when open).
     pub fn applyCompletedDownloads(self: *SettingsModalState, cfg: *config_mod.Config, data_dir: ?[]const u8) void {
         _ = data_dir;
-        if (self.gemma_dl_success.load(.acquire)) {
-            self.gemma_dl_success.store(false, .release);
-            if (!self.open) {
-                if (dvui.App.main_init) |init| {
-                    if (cfg.text_model_dir) |p| init.gpa.free(p);
-                    const s = std.mem.sliceTo(&self.text_model_dir_buf, 0);
-                    cfg.text_model_dir = if (s.len > 0) init.gpa.dupe(u8, s) catch null else null;
+        const init = dvui.App.main_init orelse return;
+        inline for (.{ .{ "gemma_dl", "text_model_dir_buf", "text_model_dir" }, .{ "siglip2_dl", "visual_model_dir_buf", "visual_model_dir" } }) |f| {
+            if (@field(self, f[0])) |d| if (d.done.load(.acquire)) {
+                @field(self, f[0]) = null;
+                if (d.take(init.gpa)) |dir| {
+                    defer init.gpa.free(dir);
+                    const buf = &@field(self, f[1]);
+                    const len = @min(dir.len, buf.len - 1);
+                    @memcpy(buf[0..len], dir[0..len]);
+                    buf[len] = 0;
+                    if (!self.open) {
+                        if (@field(cfg, f[2])) |p| init.gpa.free(p);
+                        @field(cfg, f[2]) = init.gpa.dupe(u8, buf[0..len]) catch null;
+                        self.model_paths_changed = true;
+                    }
                 }
-                self.model_paths_changed = true;
-            }
-        }
-        if (self.siglip2_dl_success.load(.acquire)) {
-            self.siglip2_dl_success.store(false, .release);
-            if (!self.open) {
-                if (dvui.App.main_init) |init| {
-                    if (cfg.visual_model_dir) |p| init.gpa.free(p);
-                    const s = std.mem.sliceTo(&self.visual_model_dir_buf, 0);
-                    cfg.visual_model_dir = if (s.len > 0) init.gpa.dupe(u8, s) catch null else null;
-                }
-                self.model_paths_changed = true;
-            }
+            };
         }
     }
 

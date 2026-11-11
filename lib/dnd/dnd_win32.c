@@ -258,13 +258,51 @@ static void try_set_ghost(IDataObject *data_obj,
 
 /* ── Drag thread ──────────────────────────────────────────────────────────── */
 
+/* Owned by the drag thread: deep copies of the caller's paths and ghost
+   pixels, which the caller frees as soon as dnd_win32_start_drag returns. */
 typedef struct {
     const wchar_t **paths;
     int             path_count;
-    const void     *ghost_rgba;
+    void           *ghost_rgba;
     int             ghost_w;
     int             ghost_h;
 } DragArgs;
+
+static void free_drag_args(DragArgs *args) {
+    if (!args) return;
+    if (args->paths) {
+        for (int i = 0; i < args->path_count; i++) free((void *)args->paths[i]);
+        free((void *)args->paths);
+    }
+    free(args->ghost_rgba);
+    free(args);
+}
+
+static DragArgs *copy_drag_args(const wchar_t **paths, int path_count,
+                                const void *ghost_rgba, int ghost_w, int ghost_h) {
+    DragArgs *args = (DragArgs *)calloc(1, sizeof(*args));
+    if (!args) return NULL;
+    args->paths = (const wchar_t **)calloc((size_t)path_count, sizeof(wchar_t *));
+    if (!args->paths) { free(args); return NULL; }
+    for (int i = 0; i < path_count; i++) {
+        size_t n = wcslen(paths[i]) + 1;
+        wchar_t *copy = (wchar_t *)malloc(n * sizeof(wchar_t));
+        if (!copy) { free_drag_args(args); return NULL; }
+        memcpy(copy, paths[i], n * sizeof(wchar_t));
+        args->paths[i] = copy;
+        args->path_count = i + 1;
+    }
+    if (ghost_rgba && ghost_w > 0 && ghost_h > 0) {
+        size_t bytes = (size_t)ghost_w * (size_t)ghost_h * 4;
+        args->ghost_rgba = malloc(bytes);
+        if (args->ghost_rgba) {
+            memcpy(args->ghost_rgba, ghost_rgba, bytes);
+            args->ghost_w = ghost_w;
+            args->ghost_h = ghost_h;
+        }
+    }
+    return args;
+}
 
 static volatile LONG g_dragging = 0; /* atomic bool */
 static HANDLE        g_drag_thread = NULL;
@@ -286,7 +324,7 @@ static DWORD WINAPI drag_thread_proc(LPVOID param) {
     if (data_obj) data_obj->lpVtbl->Release((IDataObject *)data_obj);
     if (drop_src) drop_src->lpVtbl->Release((IDropSource *)drop_src);
 
-    free(args);
+    free_drag_args(args);
     OleUninitialize();
     InterlockedExchange(&g_dragging, 0);
     return 0;
@@ -299,6 +337,11 @@ BOOL dnd_win32_init(void) {
 }
 
 void dnd_win32_deinit(void) {
+    if (g_drag_thread) {
+        WaitForSingleObject(g_drag_thread, INFINITE);
+        CloseHandle(g_drag_thread);
+        g_drag_thread = NULL;
+    }
     OleUninitialize();
 }
 
@@ -308,18 +351,13 @@ BOOL dnd_win32_start_drag(
 {
     if (InterlockedCompareExchange(&g_dragging, 1, 0) != 0) return FALSE;
 
-    DragArgs *args = (DragArgs *)malloc(sizeof(*args));
+    DragArgs *args = copy_drag_args(paths, path_count, ghost_rgba, ghost_w, ghost_h);
     if (!args) { InterlockedExchange(&g_dragging, 0); return FALSE; }
-    args->paths      = paths;
-    args->path_count = path_count;
-    args->ghost_rgba = ghost_rgba;
-    args->ghost_w    = ghost_w;
-    args->ghost_h    = ghost_h;
 
     if (g_drag_thread) { CloseHandle(g_drag_thread); g_drag_thread = NULL; }
     g_drag_thread = CreateThread(NULL, 0, drag_thread_proc, args, 0, NULL);
     if (!g_drag_thread) {
-        free(args);
+        free_drag_args(args);
         InterlockedExchange(&g_dragging, 0);
         return FALSE;
     }

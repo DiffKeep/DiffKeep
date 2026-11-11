@@ -1,7 +1,6 @@
 const std = @import("std");
 const embedder_mod = @import("embedder.zig");
 const image_grid_mod = @import("image_grid.zig");
-const db_mod = @import("db.zig");
 
 const log = std.log.scoped(.search);
 
@@ -9,24 +8,16 @@ const log = std.log.scoped(.search);
 
 const EmbedTaskCtx = struct {
     allocator: std.mem.Allocator,
-    query: []const u8,        // owned; freed by task
+    query: []const u8, // owned; freed by task
     mode: image_grid_mod.SearchMode,
     embedder: *embedder_mod.Embedder,
     generation: u64,
-    current_gen: *std.atomic.Value(u64),
-    result: *image_grid_mod.QueryEmbeddings,
-    result_gen: *u64,
-    done: *std.atomic.Value(bool),
-    wakeup_fn: ?*const fn () void,
+    state: *SearchState,
 };
 
 fn embedTask(ctx: EmbedTaskCtx) void {
     defer ctx.allocator.free(ctx.query);
-    log.info("embed task start: gen={d} mode={s} query=\"{s}\"", .{ ctx.generation, @tagName(ctx.mode), ctx.query });
-    if (ctx.current_gen.load(.acquire) != ctx.generation) {
-        log.info("embed task gen={d} stale on entry, exiting", .{ctx.generation});
-        return;
-    }
+    if (ctx.state.embed_generation.load(.acquire) != ctx.generation) return; // superseded
 
     // Each vector space needs a query embedding from its own encoder;
     // combined mode needs both.
@@ -43,21 +34,9 @@ fn embedTask(ctx: EmbedTaskCtx) void {
             break :blk null;
         };
     }
-
-    if (ctx.current_gen.load(.acquire) != ctx.generation) {
-        log.info("embed task gen={d} stale after embedding, discarding", .{ctx.generation});
-        embeddings.free(ctx.allocator);
-        return;
+    if (ctx.state.deliverEmbedding(ctx.generation, embeddings)) {
+        if (ctx.state.wakeup_fn) |w| w();
     }
-    log.info("embed task gen={d} complete: prompt={s} visual={s}", .{
-        ctx.generation,
-        if (embeddings.prompt != null) "present" else "null",
-        if (embeddings.visual != null) "present" else "null",
-    });
-    ctx.result.* = embeddings;
-    ctx.result_gen.* = ctx.generation;
-    ctx.done.store(true, .release);
-    if (ctx.wakeup_fn) |w| w();
 }
 
 // ── SearchState ───────────────────────────────────────────────────────────────
@@ -78,14 +57,18 @@ pub const SearchState = struct {
     // Set by mode-button clicks to bypass the debounce timer entirely.
     force_search: bool = false,
 
-    // Async embedding generation
+    // Async query embedding. Only the task of the latest generation may
+    // deliver; delivery and the generation bump both happen under
+    // `result_mutex`, so a superseded task can never store (or race the main
+    // thread freeing) a result.
     embed_group: std.Io.Group = .init,
-    embed_done: std.atomic.Value(bool) = .init(false),
     embed_generation: std.atomic.Value(u64) = .init(0),
-    embed_in_flight: usize = 0,  // tasks spawned since last full drain
-    embed_pending: bool = false,  // true while an embed task is in flight
-    pending_embeddings: image_grid_mod.QueryEmbeddings = .{},
-    pending_embeddings_gen: u64 = 0,
+    embed_pending: bool = false, // main thread: the latest generation hasn't delivered
+    result_mutex: std.Io.Mutex = .init,
+    result: ?image_grid_mod.QueryEmbeddings = null, // guarded by result_mutex
+    /// Allocator of a delivered-but-unapplied result (the spawn's allocator).
+    result_alloc: ?std.mem.Allocator = null,
+    io: ?std.Io = null,
     wakeup_fn: ?*const fn () void = null,
 
     // The grid load generation the latest search requested; the search is
@@ -94,7 +77,8 @@ pub const SearchState = struct {
 
     pub fn deinit(self: *SearchState, gpa: std.mem.Allocator) void {
         self.query_embeddings.free(gpa);
-        self.pending_embeddings.free(gpa);
+        if (self.result) |*r| r.free(gpa);
+        self.result = null;
     }
 
     pub fn isSearchLoading(self: *const SearchState, grid: ?*const image_grid_mod.GridState) bool {
@@ -103,56 +87,124 @@ pub const SearchState = struct {
         return g.applied_gen < self.search_gen;
     }
 
+    /// Wait for every query-embed task to finish (they hold the embedder).
     pub fn awaitEmbed(self: *SearchState, io: std.Io) void {
-        // std.Io.Group.await() waits for ONE task at a time (semaphore semantics).
-        // Drain exactly as many times as we spawned to avoid leaving tasks untracked.
-        while (self.embed_in_flight > 0) {
-            self.embed_group.await(io) catch {};
-            self.embed_in_flight -= 1;
-        }
+        self.embed_group.await(io) catch {};
     }
 
-    /// Called from the main thread every frame; applies a completed query
+    fn lock(self: *SearchState) void {
+        if (self.io) |io| self.result_mutex.lockUncancelable(io);
+    }
+    fn unlock(self: *SearchState) void {
+        if (self.io) |io| self.result_mutex.unlock(io);
+    }
+
+    /// Start a new query-embed generation, superseding (and freeing the
+    /// result of) any earlier one. Main thread. Returns the new generation.
+    pub fn startEmbedGeneration(self: *SearchState, io: std.Io, gpa: std.mem.Allocator) u64 {
+        self.io = io;
+        self.lock();
+        self.result_alloc = gpa;
+        defer self.unlock();
+        const gen = self.embed_generation.fetchAdd(1, .acq_rel) + 1;
+        if (self.result) |*r| r.free(gpa);
+        self.result = null;
+        self.embed_pending = true;
+        return gen;
+    }
+
+    /// Supersede any query embedding in flight without starting a new one
+    /// (the user switched to a text search or cleared the box). Main thread.
+    pub fn cancelEmbed(self: *SearchState, io: std.Io, gpa: std.mem.Allocator) void {
+        _ = self.startEmbedGeneration(io, gpa);
+        self.embed_pending = false;
+    }
+
+    /// Hand a finished query embedding to the main thread. Called by the embed
+    /// task; returns false (and frees `embeddings`) when `gen` was superseded.
+    pub fn deliverEmbedding(self: *SearchState, gen: u64, embeddings: image_grid_mod.QueryEmbeddings) bool {
+        self.lock();
+        const a = self.result_alloc.?; // set by the startEmbedGeneration that made `gen`
+        defer self.unlock();
+        var e = embeddings;
+        if (self.embed_generation.load(.acquire) != gen) {
+            e.free(a);
+            return false;
+        }
+        if (self.result) |*r| r.free(a);
+        self.result = e;
+        return true;
+    }
+
+    /// Called from the main thread every frame; applies a delivered query
     /// embedding to the grid and runs the search.
     pub fn applyEmbedIfDone(
         self: *SearchState,
         allocator: std.mem.Allocator,
         grid: *image_grid_mod.GridState,
-        db: *db_mod.VectorDb,
     ) void {
-        if (!self.embed_done.load(.acquire)) return;
-        self.embed_done.store(false, .release);
+        const taken = blk: {
+            self.lock();
+            defer self.unlock();
+            const r = self.result orelse return;
+            self.result = null;
+            break :blk r;
+        };
         self.embed_pending = false;
-        log.info("applyEmbedIfDone: pending_gen={d} current_gen={d}", .{ self.pending_embeddings_gen, self.embed_generation.load(.acquire) });
-
         self.query_embeddings.free(allocator);
-
-        if (self.pending_embeddings_gen == self.embed_generation.load(.acquire)) {
-            self.query_embeddings = self.pending_embeddings;
-            self.pending_embeddings = .{};
-        } else {
-            log.info("applyEmbedIfDone: discarding stale embeddings", .{});
-            self.pending_embeddings.free(allocator);
-        }
-
-        log.info("applyEmbedIfDone: running search, embeddings={s}", .{if (self.query_embeddings.any()) "present" else "null"});
+        self.query_embeddings = taken;
         grid.query_embeddings = self.query_embeddings;
         // The user left the library while the embedding computed: keep it for
         // when they return rather than pulling them back.
         if (grid.view_mode != .library) return;
-        self.run(grid, db);
+        self.run(grid);
     }
 
     /// Show the results of the grid's current search parameters. Searches are
     /// library-view loads, so they go through the grid's own background load
     /// and supersede (or are superseded by) any other view change.
-    pub fn run(self: *SearchState, grid: *image_grid_mod.GridState, db: *db_mod.VectorDb) void {
+    pub fn run(self: *SearchState, grid: *image_grid_mod.GridState) void {
         grid.view_mode = .library;
-        grid.reloadImages(db) catch |err| {
+        grid.reloadImages() catch |err| {
             log.warn("search load: {}", .{err});
             return;
         };
         self.search_gen = grid.load_gen.load(.acquire);
+    }
+
+    /// Run the search for the current text box and mode (debounce elapsed or a
+    /// mode button was clicked). Main thread.
+    pub fn fire(self: *SearchState, io: std.Io, gpa: std.mem.Allocator, grid: *image_grid_mod.GridState) void {
+        @memcpy(&self.prev, &self.buf);
+        const q = std.mem.sliceTo(&self.buf, 0);
+        grid.search_mode = self.mode;
+        grid.query_embeddings = .{};
+        self.query_embeddings.free(gpa);
+        switch (self.mode) {
+            .fts => {
+                self.cancelEmbed(io, gpa);
+                grid.setSearchQuery(if (q.len > 0) q else null) catch |err| {
+                    log.warn("search query: {}", .{err});
+                    return;
+                };
+                self.run(grid);
+            },
+            .semantic, .visual, .combined => {
+                grid.setSearchQuery(null) catch {};
+                if (q.len == 0) {
+                    // Empty query: show all/library images without embedding.
+                    self.cancelEmbed(io, gpa);
+                    self.run(grid);
+                    return;
+                }
+                // Keep showing the current results while the embedding is
+                // computed; applyEmbedIfDone runs the search when it lands.
+                self.spawnEmbedQuery(io, gpa, q, self.mode) catch |err| {
+                    log.warn("search embed spawn: {}", .{err});
+                    self.cancelEmbed(io, gpa);
+                };
+            },
+        }
     }
 
     /// Spawn a background task to compute a query embedding.
@@ -165,37 +217,18 @@ pub const SearchState = struct {
         mode: image_grid_mod.SearchMode,
     ) !void {
         if (mode == .fts) return;
-        const embedder = self.embedder orelse {
-            log.warn("spawnEmbedQuery: no embedder configured", .{});
-            return error.NoEmbedder;
-        };
-
-        const gen = self.embed_generation.fetchAdd(1, .acq_rel) + 1;
-        self.embed_done.store(false, .release);
-        self.embed_pending = true;
-        self.pending_embeddings.free(allocator);
+        const embedder = self.embedder orelse return error.NoEmbedder;
+        const gen = self.startEmbedGeneration(io, allocator);
 
         const query_copy = try allocator.dupe(u8, query);
         errdefer allocator.free(query_copy);
-
-        const task_ctx = EmbedTaskCtx{
+        try self.embed_group.concurrent(io, embedTask, .{EmbedTaskCtx{
             .allocator = allocator,
             .query = query_copy,
             .mode = mode,
             .embedder = embedder,
             .generation = gen,
-            .current_gen = &self.embed_generation,
-            .result = &self.pending_embeddings,
-            .result_gen = &self.pending_embeddings_gen,
-            .done = &self.embed_done,
-            .wakeup_fn = self.wakeup_fn,
-        };
-        self.embed_group.concurrent(io, embedTask, .{task_ctx}) catch |err| {
-            log.warn("embed_group.concurrent failed: {}", .{err});
-            allocator.free(query_copy);
-            return err;
-        };
-        self.embed_in_flight += 1;
-        log.info("embed task spawned: gen={d} in_flight={d}", .{ task_ctx.generation, self.embed_in_flight });
+            .state = self,
+        }});
     }
 };

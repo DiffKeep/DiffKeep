@@ -209,7 +209,7 @@ pub const FilterModalState = struct {
                     });
                     if (grid) |g| {
                         g.filters = active_filters.items;
-                        if (db) |d| g.reloadImages(d) catch {};
+                        g.reloadImages() catch {};
                     }
                 }
                 self.open = false;

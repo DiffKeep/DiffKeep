@@ -18,10 +18,10 @@ pub const BytesFmt = struct { value: f64, unit: []const u8 };
 
 pub fn fmtBytes(bytes: i64) BytesFmt {
     const b: f64 = @floatFromInt(if (bytes < 0) 0 else bytes);
-    if (b >= 1024 * 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0 * 1024.0), .unit = "GB" };
-    if (b >= 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0), .unit = "MB" };
-    if (b >= 1024) return .{ .value = b / 1024.0, .unit = "KB" };
-    return .{ .value = b, .unit = "B" };
+    if (b >= 1024 * 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0 * 1024.0), .unit = i18n.t(.unit_gb) };
+    if (b >= 1024 * 1024) return .{ .value = b / (1024.0 * 1024.0), .unit = i18n.t(.unit_mb) };
+    if (b >= 1024) return .{ .value = b / 1024.0, .unit = i18n.t(.unit_kb) };
+    return .{ .value = b, .unit = i18n.t(.unit_bytes) };
 }
 
 fn prettyJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
@@ -38,8 +38,23 @@ pub const DetailState = struct {
     id: ?u64 = null,
     detail: ?db_mod.ImageDetails = null,
     reparse_requested: bool = false,
+    /// Wakes the render loop when a background load finishes.
+    wakeup_fn: ?*const fn () void = null,
+
+    // Background load of `id`'s details. The task delivers into `loaded` under
+    // `mutex`, tagged with the generation it was started for; only the latest
+    // generation's result is shown.
+    io: ?std.Io = null,
+    group: std.Io.Group = .init,
+    mutex: std.Io.Mutex = .init,
+    gen: u64 = 0, // written under mutex
+    loaded: ?db_mod.ImageDetails = null, // guarded by mutex
+    loaded_gen: u64 = 0, // guarded by mutex
 
     pub fn deinit(self: *DetailState, allocator: std.mem.Allocator) void {
+        if (self.io) |io| self.group.await(io) catch {};
+        if (self.loaded) |*d| d.deinit(allocator);
+        self.loaded = null;
         if (self.detail) |*d| {
             d.deinit(allocator);
             self.detail = null;
@@ -47,6 +62,9 @@ pub const DetailState = struct {
         self.id = null;
     }
 
+    /// Show `focused_id`'s details. The DB row and the file's PNG chunks are
+    /// read in the background (file IO never runs on the render thread); until
+    /// they arrive the panel shows its loading state.
     pub fn update(
         self: *DetailState,
         focused_id: ?u64,
@@ -54,6 +72,8 @@ pub const DetailState = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
     ) void {
+        self.io = io;
+        self.takeLoaded(gpa);
         if (focused_id == self.id) return;
 
         if (self.detail) |*d| {
@@ -61,92 +81,49 @@ pub const DetailState = struct {
             self.detail = null;
         }
         self.id = focused_id;
-
+        self.mutex.lockUncancelable(io);
+        self.gen += 1;
+        const gen = self.gen;
+        self.mutex.unlock(io);
         const fid = focused_id orelse return;
+        self.group.concurrent(io, loadTask, .{ self, db, gpa, io, fid, gen }) catch |err|
+            std.log.scoped(.detail_panel).warn("spawn details load: {}", .{err});
+    }
 
-        if (db.getImageDetails(gpa, fid) catch null) |det| {
-            self.detail = det;
-            const img_path = self.detail.?.library_path;
+    /// Wait for the running load and show it (tests).
+    pub fn awaitLoad(self: *DetailState, gpa: std.mem.Allocator) void {
+        if (self.io) |io| self.group.await(io) catch {};
+        self.group = .init;
+        self.takeLoaded(gpa);
+    }
 
-            // File size (best-effort).
-            if (std.Io.Dir.cwd().openFile(io, img_path, .{})) |f| {
-                defer f.close(io);
-                if (f.length(io)) |sz| {
-                    self.detail.?.file_size = @intCast(sz);
-                } else |_| {}
-            } else |_| {}
+    fn takeLoaded(self: *DetailState, gpa: std.mem.Allocator) void {
+        const io = self.io orelse return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var d = self.loaded orelse return;
+        self.loaded = null;
+        if (self.loaded_gen != self.gen) return d.deinit(gpa);
+        if (self.detail) |*old| old.deinit(gpa);
+        self.detail = d;
+    }
 
-            // PNG dims + raw text chunks (best-effort).
-            var maybe_parser: ?png_mod.PngParser = png_mod.PngParser.init(gpa, io) catch null;
-            if (maybe_parser) |*parser| {
-                defer parser.deinit();
-                if (parser.parseFile(img_path)) |_| {
-                    for (parser.chunks.items) |pc| {
-                        if (std.mem.eql(u8, &pc.type, &png_mod.ChunkType.IHDR) and pc.data.len >= 8) {
-                            self.detail.?.width = std.mem.readInt(u32, pc.data[0..4], .big);
-                            self.detail.?.height = std.mem.readInt(u32, pc.data[4..8], .big);
-                            break;
-                        }
-                    }
-
-                    var raw_list: std.ArrayList(db_mod.RawChunk) = .empty;
-
-                    const text_chunks = parser.getTExtChunks() catch &[_]png_mod.Chunk{};
-                    defer gpa.free(text_chunks);
-                    for (text_chunks) |tc| {
-                        const c = parser.parseTExtChunk(tc) catch continue;
-                        const kw = c.keyword;
-                        const raw_text = c.text;
-                        const maybe_pretty = prettyJson(gpa, raw_text);
-                        const display = maybe_pretty orelse raw_text;
-                        if (maybe_pretty != null) gpa.free(raw_text);
-                        raw_list.append(gpa, .{
-                            .keyword = kw,
-                            .display_text = display,
-                            .is_json = maybe_pretty != null,
-                        }) catch {
-                            gpa.free(kw);
-                            gpa.free(display);
-                        };
-                    }
-
-                    const itxt_chunks = parser.getITxtChunks() catch &[_]png_mod.Chunk{};
-                    defer gpa.free(itxt_chunks);
-                    for (itxt_chunks) |tc| {
-                        var c = parser.parseITxtChunk(tc) catch continue;
-                        if (c.compressed) { c.deinit(gpa); continue; }
-                        const kw = c.keyword;
-                        const raw_text = c.text;
-                        gpa.free(c.language);
-                        gpa.free(c.translated_keyword);
-                        const maybe_pretty = prettyJson(gpa, raw_text);
-                        const display = maybe_pretty orelse raw_text;
-                        if (maybe_pretty != null) gpa.free(raw_text);
-                        raw_list.append(gpa, .{
-                            .keyword = kw,
-                            .display_text = display,
-                            .is_json = maybe_pretty != null,
-                        }) catch {
-                            gpa.free(kw);
-                            gpa.free(display);
-                        };
-                    }
-
-                    if (raw_list.items.len > 0) {
-                        if (raw_list.toOwnedSlice(gpa)) |sl| {
-                            self.detail.?.raw_chunks = sl;
-                            self.detail.?.raw_chunks_owned = true;
-                        } else |_| {
-                            for (raw_list.items) |*rc| {
-                                gpa.free(rc.keyword);
-                                gpa.free(rc.display_text);
-                            }
-                            raw_list.deinit(gpa);
-                        }
-                    }
-                } else |_| {}
-            }
+    fn loadTask(self: *DetailState, db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64, gen: u64) void {
+        var conn = db.getConnection() catch return;
+        defer conn.deinit();
+        var d = loadDetails(&conn, gpa, io, id) orelse return;
+        self.mutex.lockUncancelable(io);
+        // A newer selection's load may have finished first: never replace it.
+        if (gen != self.gen) {
+            self.mutex.unlock(io);
+            d.deinit(gpa);
+            return;
         }
+        if (self.loaded) |*old| old.deinit(gpa);
+        self.loaded = d;
+        self.loaded_gen = gen;
+        self.mutex.unlock(io);
+        if (self.wakeup_fn) |w| w();
     }
 
     pub fn renderPanel(self: *DetailState, panel_w: f32, filename: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
@@ -221,6 +198,78 @@ pub const DetailState = struct {
         }
     }
 };
+
+/// Everything the detail panel shows for image `id`: the DB row plus, from
+/// the file, its size and (PNG only) dimensions and raw text chunks. Does DB
+/// and file IO: call it off the main thread.
+pub fn loadDetails(db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64) ?db_mod.ImageDetails {
+    var det = (db.getImageDetails(gpa, id) catch null) orelse return null;
+    const img_path = det.library_path;
+
+    if (std.Io.Dir.cwd().statFile(io, img_path, .{})) |st| {
+        det.file_size = @intCast(st.size);
+    } else |_| {}
+
+    // Only PNGs carry chunks; don't read a large video or JPEG for nothing.
+    if (!std.ascii.endsWithIgnoreCase(img_path, ".png")) return det;
+    var parser = png_mod.PngParser.init(gpa, io) catch return det;
+    defer parser.deinit();
+    parser.parseFile(img_path) catch return det;
+
+    for (parser.chunks.items) |pc| {
+        if (std.mem.eql(u8, &pc.type, &png_mod.ChunkType.IHDR) and pc.data.len >= 8) {
+            det.width = std.mem.readInt(u32, pc.data[0..4], .big);
+            det.height = std.mem.readInt(u32, pc.data[4..8], .big);
+            break;
+        }
+    }
+
+    var raw_list: std.ArrayList(db_mod.RawChunk) = .empty;
+    const text_chunks = parser.getTExtChunks() catch &[_]png_mod.Chunk{};
+    defer gpa.free(text_chunks);
+    for (text_chunks) |tc| {
+        const c = parser.parseTExtChunk(tc) catch continue;
+        appendRawChunk(gpa, &raw_list, c.keyword, c.text);
+    }
+    const itxt_chunks = parser.getITxtChunks() catch &[_]png_mod.Chunk{};
+    defer gpa.free(itxt_chunks);
+    for (itxt_chunks) |tc| {
+        var c = parser.parseITxtChunk(tc) catch continue;
+        if (c.compressed) {
+            c.deinit(gpa);
+            continue;
+        }
+        gpa.free(c.language);
+        gpa.free(c.translated_keyword);
+        appendRawChunk(gpa, &raw_list, c.keyword, c.text);
+    }
+
+    if (raw_list.items.len > 0) {
+        if (raw_list.toOwnedSlice(gpa)) |sl| {
+            det.raw_chunks = sl;
+            det.raw_chunks_owned = true;
+        } else |_| {
+            for (raw_list.items) |*rc| {
+                gpa.free(rc.keyword);
+                gpa.free(rc.display_text);
+            }
+            raw_list.deinit(gpa);
+        }
+    }
+    return det;
+}
+
+/// Append a chunk (taking ownership of `kw` and `raw_text`), pretty-printing
+/// JSON text.
+fn appendRawChunk(gpa: std.mem.Allocator, list: *std.ArrayList(db_mod.RawChunk), kw: []u8, raw_text: []u8) void {
+    const maybe_pretty = prettyJson(gpa, raw_text);
+    const display = maybe_pretty orelse raw_text;
+    if (maybe_pretty != null) gpa.free(raw_text);
+    list.append(gpa, .{ .keyword = kw, .display_text = display, .is_json = maybe_pretty != null }) catch {
+        gpa.free(kw);
+        gpa.free(display);
+    };
+}
 
 // Shared option presets for the metadata layout.
 const meta_bold: dvui.Options = .{

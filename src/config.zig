@@ -63,6 +63,9 @@ pub const Config = struct {
 
 /// Reads the config file at `path`. Returns defaults if the file does not exist.
 /// The caller owns any heap-allocated fields in the returned Config (free with deinit).
+/// Load the config at `path`. A missing file gives the defaults. So does one
+/// that doesn't parse (truncated by a crash mid-save, edited by hand, or written
+/// by a newer build), so the app still starts; it is kept as `<path>.bak`.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
     var buf: [16384]u8 = undefined;
     const content = std.Io.Dir.cwd().readFile(io, path, &buf) catch |err| switch (err) {
@@ -70,9 +73,14 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config 
         else => return err,
     };
 
-    const parsed = try std.json.parseFromSlice(Config, allocator, content, .{
+    const parsed = std.json.parseFromSlice(Config, allocator, content, .{
         .ignore_unknown_fields = true,
-    });
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        log.warn("config {s} unreadable ({}); using defaults", .{ path, err });
+        keepBackup(io, path, content);
+        return Config{};
+    };
     defer parsed.deinit();
 
     var config = parsed.value;
@@ -140,6 +148,40 @@ test "config: round-trip preserves all fields" {
     try std.testing.expectEqual(original.thumbnails_in_db, loaded.thumbnails_in_db);
 }
 
+test "config: a damaged file falls back to defaults and is kept as .bak" {
+    const tmp = "/tmp/diffkeep_test_damaged_cfg.json";
+    const bak = tmp ++ ".bak";
+    const io = std.testing.io;
+    std.Io.Dir.cwd().deleteFile(io, bak) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, bak) catch {};
+
+    // Truncated mid-write, and a value this build doesn't know.
+    for ([_][]const u8{
+        "{\"main_window\":{\"fullscreen\":tr",
+        "{\"embed_gpu_backend\":\"metal\"}",
+    }) |content| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = content });
+        var cfg = try load(std.testing.allocator, io, tmp);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u32, 1200), cfg.main_window.width);
+        var buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(content, try std.Io.Dir.cwd().readFile(io, bak, &buf));
+    }
+}
+
+test "config: saving replaces the file whole, leaving no temp file" {
+    const tmp = "/tmp/diffkeep_test_atomic_cfg.json";
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try save(.{ .grid_autoplay = true }, io, tmp);
+    try save(.{ .grid_autoplay = false }, io, tmp);
+    var cfg = try load(std.testing.allocator, io, tmp);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, cfg.grid_autoplay);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, tmp ++ ".tmp", .{}));
+}
+
 test "config: unknown keys are ignored" {
     const tmp = "/tmp/diffkeep_test_unknown_keys.json";
     std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
@@ -154,7 +196,16 @@ test "config: unknown keys are ignored" {
     try std.testing.expectEqual(true, cfg.main_window.fullscreen);
 }
 
+fn keepBackup(io: std.Io, path: []const u8, content: []const u8) void {
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const bak = std.mem.print(&name_buf, "{s}.bak", .{path}) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bak, .data = content }) catch |err|
+        log.warn("config backup {s}: {}", .{ bak, err });
+}
+
 /// Writes the config to `path`, creating parent directories as needed.
+/// Written to a temporary file and renamed over `path`, so a crash mid-save
+/// leaves the previous config rather than a truncated one.
 pub fn save(config: Config, io: std.Io, path: []const u8) !void {
     if (std.Io.Dir.path.dirname(path)) |dir| {
         try std.Io.Dir.cwd().createDirPath(io, dir);
@@ -169,6 +220,13 @@ pub fn save(config: Config, io: std.Io, path: []const u8) !void {
         },
     };
     try js.write(config);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.buffered() });
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = try std.mem.print(&name_buf, "{s}.tmp", .{path});
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = tmp, .data = out.buffered() });
+    std.Io.Dir.rename(cwd, tmp, cwd, path, io) catch |err| {
+        cwd.deleteFile(io, tmp) catch {};
+        return err;
+    };
     log.info("config saved to {s}", .{path});
 }

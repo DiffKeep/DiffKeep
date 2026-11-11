@@ -25,6 +25,10 @@ Language:
 - `@import("builtin").os` / `.cpu` are deprecated: `builtin.target.os`, `builtin.target.cpu`.
 
 std (renames):
+- `std.Io.Group.await` waits for ALL tasks in the group (not one), after which the group
+  is empty and reusable; no need to count spawned tasks.
+- `std.os.linux` has no `Stat`/`fstatat`: use `linux.statx(dirfd, path, flags,
+  .{ .TYPE = true }, &statx_buf)` and `statx_buf.mode & linux.S.IFMT`.
 - `std.fmt.allocPrint(a, ...)` -> `a.print(...)`; `std.fmt.bufPrint` -> `std.mem.print`;
   `std.fmt.bufPrintZ(b, f, x)` -> `std.mem.printSentinel(b, f, x, 0)`;
   `a.dupeZ(u8, s)` -> `a.dupeSentinel(u8, s, 0)`.

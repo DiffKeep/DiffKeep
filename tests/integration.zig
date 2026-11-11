@@ -7,6 +7,13 @@ const io = std.testing.io;
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 
+/// Trash the row `id` in the DB only (no file move), at its current path.
+fn trashById(db: *dk.VectorDb, id: u64, trash_name: []const u8, size: i64, at: i64) !void {
+    var details = (try db.getImageDetails(alloc, id)).?;
+    defer details.deinit(alloc);
+    try std.testing.expect(try db.trashImage(id, details.library_path, trash_name, size, at));
+}
+
 fn openDb(path: []const u8) !dk.VectorDb {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     return dk.VectorDb.init(alloc, io, path);
@@ -143,7 +150,7 @@ test "db: trash and restore lifecycle" {
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
 
     // Trash it
-    try db.trashImage(img.id, "img_trash.png", 1024, 1000);
+    try trashById(&db, img.id, "img_trash.png", 1024, 1000);
     try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
 
     const trash = try db.listTrashImages(alloc);
@@ -178,7 +185,7 @@ test "db: trash and restore lifecycle" {
     try std.testing.expectEqual(@as(usize, 1), still_there.len);
 
     // Restore it
-    try db.restoreImage(img.id);
+    try std.testing.expect(try db.restoreImage(img.id, "img_trash.png", img.libraryPath));
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
     const empty_trash = try db.listTrashImages(alloc);
     defer alloc.free(empty_trash);
@@ -229,7 +236,7 @@ test "db: duplicate detection by hash" {
     try std.testing.expectEqual(dup2, dupes[1].id);
 
     // Trashing one of the pair leaves the other unique → no duplicates remain.
-    try db.trashImage(dup2, "b_trash.png", 1, 1000);
+    try trashById(&db, dup2, "b_trash.png", 1, 1000);
     try std.testing.expectEqual(@as(i64, 0), try db.getDuplicateCount());
     const after = try db.listDuplicateImages(alloc);
     defer alloc.free(after);
@@ -354,8 +361,8 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
         var image_vec: [dim]f32 = @splat(0);
         prompt_vec[k] = 1.0; // prompt axis k
         image_vec[k + 10] = 1.0; // image axis k+10 (distinct from prompt axes)
-        try db.storePromptEmbedding(img.id, &prompt_vec);
-        try db.storeImageEmbedding(img.id, &image_vec);
+        _ = try db.storePromptEmbedding(img.id, img.libraryPath, &prompt_vec);
+        _ = try db.storeImageEmbedding(img.id, img.libraryPath, &image_vec);
     }
 
     // Prompt query nearest to image b (axis 1).
@@ -414,7 +421,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     }
 
     // Trashed images must be excluded from results.
-    try db.trashImage(ids[1], "b_trash.png", 1024, 1000);
+    try trashById(&db, ids[1], "b_trash.png", 1024, 1000);
     {
         var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
@@ -445,7 +452,7 @@ test "grid: empty library shows placeholder" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     g_grid_test_ptr = &grid;
@@ -469,7 +476,7 @@ test "grid: render with images doesn't crash" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
 
@@ -499,10 +506,10 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     grid.autoplay = true;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     g_grid_test_ptr = &grid;
@@ -546,7 +553,7 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
@@ -761,7 +768,7 @@ test "grid: incomingBelongs respects the active view filters" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     // Fully unfiltered "all images" view accepts anything.
@@ -781,9 +788,9 @@ test "grid: incomingBelongs respects the active view filters" {
 
     // An active text search means membership can't be cheaply decided, so new
     // images are withheld until the query is re-run.
-    grid.search_query = "kitten";
+    try grid.setSearchQuery("kitten");
     try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
-    grid.search_query = null;
+    try grid.setSearchQuery(null);
 
     // Same for an active embedding (semantic/visual) query.
     const dummy_embedding: [4]f32 = @splat(0.0);
@@ -836,28 +843,28 @@ test "grid: reloadImages reflects the active view_mode" {
     const b = try makeHashedImage(&db, lib, "/lib/b.png", "dup"); // …with a
     const c = try makeHashedImage(&db, lib, "/lib/c.png", "uniq");
     const d = try makeHashedImage(&db, lib, "/lib/d.png", "trash-me");
-    try db.trashImage(d, "d_trash.png", 0, 1000);
+    try trashById(&db, d, "d_trash.png", 0, 1000);
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     // Library view: every non-trashed image, trashed one excluded.
     grid.view_mode = .library;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b, c });
 
     // Trash view: only the trashed image.
     grid.view_mode = .trash;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{d});
 
     // Duplicates view: only the images that share a hash.
     grid.view_mode = .duplicates;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b });
 }
@@ -870,12 +877,12 @@ test "grid: reloadImages resets the scroll position to the top" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     // Pretend the user had scrolled down, then switch view.
     grid.scroll_info.viewport.y = 500;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(f32, 0), grid.scroll_info.viewport.y);
 }
@@ -889,7 +896,7 @@ test "grid: a scanned image is only injected if it belongs to the current view" 
     // Empty DB → grid starts empty in the (default) library view.
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     grid.filter_library_path = "/lib";
     grid.filter_folder_path = "/lib/cats";
@@ -928,6 +935,49 @@ test "toolbar: the clear button empties the search query" {
     try dvui.testing.settle(clearFrame);
 
     try std.testing.expectEqual(@as(u8, 0), fix.search.buf[0]);
+}
+
+test "toolbar: sort buttons do nothing while a search is active" {
+    const path = "/tmp/diffkeep_test_toolbar_sort_disabled.db";
+    var fix = ToolbarFix{};
+    defer fix.deinit();
+    fix.db = try openDb(path);
+    defer fix.db.?.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    fix.grid = try dk.GridState.init(io, alloc, &fix.db.?, false, null);
+    defer fix.grid.?.deinit();
+    const grid = &fix.grid.?;
+    g_toolbar_fix = &fix;
+
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 1600, .h = 400 } });
+    defer t.deinit();
+    dk.style.install();
+
+    try grid.setSearchQuery("cat");
+    try dvui.testing.settle(toolbarFrame);
+    try dvui.testing.moveTo("sort-mode");
+    try dvui.testing.click(.left);
+    try dvui.testing.moveTo("search-box");
+    try dvui.testing.settle(toolbarFrame);
+    try dvui.testing.moveTo("sort-dir");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(toolbarFrame);
+    try std.testing.expectEqual(dk.image_grid.SortMode.date, grid.sort_mode);
+    try std.testing.expectEqual(dk.image_grid.SortDir.desc, grid.sort_dir);
+
+    // Cleared: the same buttons work again, from the settings left untouched.
+    // (Move off sort-dir first, so its tooltip isn't covering sort-mode.)
+    try grid.setSearchQuery(null);
+    try dvui.testing.moveTo("search-box");
+    try dvui.testing.settle(toolbarFrame);
+    try dvui.testing.moveTo("sort-mode");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(toolbarFrame);
+    try std.testing.expectEqual(dk.image_grid.SortMode.name, grid.sort_mode);
+    try dvui.testing.moveTo("sort-dir");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(toolbarFrame);
+    try std.testing.expectEqual(dk.image_grid.SortDir.asc, grid.sort_dir);
 }
 
 // ── Favorites ───────────────────────────────────────────────────────────────────
@@ -973,7 +1023,7 @@ test "db: favorite flag set/count/list lifecycle" {
     // A trashed favorite is excluded from the (non-trashed) favorite count.
     try db.setFavorite(b, true); // now b and c are favorites
     try std.testing.expectEqual(@as(i64, 2), try db.getFavoriteCount());
-    try db.trashImage(b, "b_trash.png", 0, 1000);
+    try trashById(&db, b, "b_trash.png", 0, 1000);
     try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
 }
 
@@ -992,12 +1042,12 @@ test "grid: favorites view lists only favorites; loaded entries carry the favori
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     // Library view: every entry carries the correct favorite flag.
     grid.view_mode = .library;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     for (grid.images.items) |e| {
         try std.testing.expectEqual(e.id == a or e.id == c, e.favorite);
@@ -1006,7 +1056,7 @@ test "grid: favorites view lists only favorites; loaded entries carry the favori
 
     // Favorites view: only favorited images, all flagged.
     grid.view_mode = .favorites;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, c });
     for (grid.images.items) |e| try std.testing.expect(e.favorite);
@@ -1192,10 +1242,10 @@ test "grid: a load flags animated and video entries from the DB" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     grid.view_mode = .library;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     for (grid.images.items) |e| {
@@ -1448,12 +1498,12 @@ test "db: deleting an image drops its embeddings, so a recycled id starts clean"
     defer img.deinit(alloc);
     var vec: [768]f32 = @splat(0);
     vec[0] = 1.0;
-    try db.storePromptEmbedding(img.id, &vec);
-    try db.storeImageEmbedding(img.id, &vec);
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &vec);
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &vec);
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
 
-    try db.deleteImage(img.id);
+    try std.testing.expect(try db.deleteImage(img.id, img.libraryPath));
     try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
     try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
 }
@@ -1473,7 +1523,7 @@ test "db: deleteMissingImage only removes the live row at that path" {
     // Wrong path for the id (e.g. the id was recycled): untouched.
     try std.testing.expect(!try db.deleteMissingImage(a.id, "/lib/other.png"));
     // A trashed row keeps living in the trash even though its file left the library.
-    try db.trashImage(b.id, "b_trash.png", 1, 1000);
+    try trashById(&db, b.id, "b_trash.png", 1, 1000);
     try std.testing.expect(!try db.deleteMissingImage(b.id, "/lib/b.png"));
     try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
 
@@ -1517,7 +1567,7 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
 
     grid.noteLoadFailure(gone.id, dir ++ "/gone.png");
@@ -1549,7 +1599,7 @@ fn opsRemoved(ids: *const std.AutoHashMap(u64, void)) void {
 
 /// Poll until the file-op worker has applied something (or time out).
 fn pollFileOps(grid: *dk.GridState) !void {
-    for (0..500) |_| {
+    for (0..5000) |_| {
         if (dk.image_ops.fileOpsPoll(io, alloc, grid)) return;
         try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
     }
@@ -1589,7 +1639,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     var grid = try dk.GridState.init(io, alloc, db, false, null);
     defer grid.deinit();
-    try grid.reloadImages(db);
+    try grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 2), grid.images.items.len);
 
@@ -1604,7 +1654,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     // Restore it from the trash view.
     grid.view_mode = .trash;
-    try grid.reloadImages(db);
+    try grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
     grid.selection.clearRetainingCapacity();
@@ -1616,7 +1666,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     // Permanently delete b: file and row are gone.
     grid.view_mode = .library;
-    try grid.reloadImages(db);
+    try grid.reloadImages();
     grid.awaitReload();
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(b.id, {});
@@ -1637,7 +1687,7 @@ test "grid: background reloads apply only the latest request and keep removed im
     defer a.deinit(alloc);
     var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
     defer b.deinit(alloc);
-    try db.trashImage(b.id, "b.png", 1, 1000);
+    try trashById(&db, b.id, "b.png", 1, 1000);
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
@@ -1646,9 +1696,9 @@ test "grid: background reloads apply only the latest request and keep removed im
 
     // Two requests in a row: the trash view is superseded by the library view.
     grid.view_mode = .trash;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.view_mode = .library;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     try std.testing.expect(grid.reloadPending());
     grid.awaitReload();
     try std.testing.expect(!grid.reloadPending());
@@ -1656,7 +1706,7 @@ test "grid: background reloads apply only the latest request and keep removed im
     try std.testing.expectEqual(a.id, grid.images.items[0].id);
 
     // An image removed while a load is in flight stays out of its result.
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     var ids = std.AutoHashMap(u64, void).init(alloc);
     defer ids.deinit();
     try ids.put(a.id, {});
@@ -1684,8 +1734,8 @@ test "db: vector search fills the limit past trashed nearest neighbours" {
         const t: f32 = @as(f32, @floatFromInt(k)) * 0.1;
         v[0] = @cos(t);
         v[1] = @sin(t);
-        try db.storePromptEmbedding(img.id, &v);
-        if (k < 4) try db.trashImage(img.id, "t", 1, 1000);
+        _ = try db.storePromptEmbedding(img.id, img.libraryPath, &v);
+        if (k < 4) try trashById(&db, img.id, "t", 1, 1000);
     }
     var q: [768]f32 = @splat(0);
     q[0] = 1.0;
@@ -1712,7 +1762,7 @@ test "search: a late search result or embedding can't replace a different view" 
     defer a.deinit(alloc);
     var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
     defer b.deinit(alloc);
-    try db.trashImage(b.id, "b.png", 1, 1000);
+    try trashById(&db, b.id, "b.png", 1, 1000);
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
@@ -1720,18 +1770,18 @@ test "search: a late search result or embedding can't replace a different view" 
     defer search.deinit(alloc);
 
     // A search is fired, then the user opens the trash before it lands.
-    search.run(&grid, &db);
+    search.run(&grid);
     try std.testing.expect(search.isSearchLoading(&grid));
     grid.view_mode = .trash;
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.awaitReload();
     try std.testing.expect(!search.isSearchLoading(&grid));
     try expectGridIds(&grid, &.{b.id});
 
     // An embedding finishing now doesn't pull the user back to the library.
-    search.embed_done.store(true, .release);
-    search.pending_embeddings_gen = search.embed_generation.load(.acquire);
-    search.applyEmbedIfDone(alloc, &grid, &db);
+    const gen = search.startEmbedGeneration(io, alloc);
+    try std.testing.expect(search.deliverEmbedding(gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
+    search.applyEmbedIfDone(alloc, &grid);
     try std.testing.expectEqual(dk.image_grid.ViewMode.trash, grid.view_mode);
     try std.testing.expect(!grid.reloadPending());
 }
@@ -1748,7 +1798,7 @@ test "grid: an image scanned in while a load is running survives the load" {
     // Hold the DB so the load can't finish, then let a scan report an image the
     // load's query won't contain.
     db.db_mutex.lockUncancelable(io);
-    try grid.reloadImages(&db);
+    try grid.reloadImages();
     grid.notifier.push(io, 77, "/lib/new.png", 0);
     grid.update();
     try expectGridIds(&grid, &.{77});
@@ -1771,8 +1821,8 @@ test "db: scan prefetch reports which images already have embeddings" {
     defer b.deinit(alloc);
     var v: [768]f32 = @splat(0);
     v[0] = 1.0;
-    try db.storePromptEmbedding(a.id, &v);
-    try db.storeImageEmbedding(b.id, &v);
+    _ = try db.storePromptEmbedding(a.id, a.libraryPath, &v);
+    _ = try db.storeImageEmbedding(b.id, b.libraryPath, &v);
 
     var known = try db.prefetchLibraryImages(alloc, lib_id);
     defer {
@@ -1784,4 +1834,1261 @@ test "db: scan prefetch reports which images already have embeddings" {
     const mb = known.get("/lib/b.png").?;
     try std.testing.expect(ma.has_prompt_embedding and !ma.has_image_embedding);
     try std.testing.expect(!mb.has_prompt_embedding and mb.has_image_embedding);
+}
+
+/// Sum of vertex-interpolated alpha (0..1, composited) of `tri` at point `p`.
+fn meshCoverage(tri: dvui.Triangles, p: dvui.Point.Physical) f32 {
+    var a: f32 = 0;
+    var i: usize = 0;
+    while (i < tri.indices.len) : (i += 3) {
+        const v0 = tri.vertexes[tri.indices[i]];
+        const v1 = tri.vertexes[tri.indices[i + 1]];
+        const v2 = tri.vertexes[tri.indices[i + 2]];
+        const d = (v1.pos.y - v2.pos.y) * (v0.pos.x - v2.pos.x) + (v2.pos.x - v1.pos.x) * (v0.pos.y - v2.pos.y);
+        if (@abs(d) < 1e-9) continue;
+        const l0 = ((v1.pos.y - v2.pos.y) * (p.x - v2.pos.x) + (v2.pos.x - v1.pos.x) * (p.y - v2.pos.y)) / d;
+        const l1 = ((v2.pos.y - v0.pos.y) * (p.x - v2.pos.x) + (v0.pos.x - v2.pos.x) * (p.y - v2.pos.y)) / d;
+        const l2 = 1 - l0 - l1;
+        if (l0 < 0 or l1 < 0 or l2 < 0) continue;
+        const va: f32 = l0 * @as(f32, @floatFromInt(v0.col.a)) + l1 * @as(f32, @floatFromInt(v1.col.a)) + l2 * @as(f32, @floatFromInt(v2.col.a));
+        a += va / 255.0 * (1 - a);
+    }
+    return a;
+}
+
+test "icons: favorite star is a solid fill, not a hollow outline" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var mesh = dvui.render_tvg.MeshBuilder.init(alloc);
+    defer mesh.deinit();
+    try dvui.render_tvg.appendTvg(scratch.allocator(), &mesh, dk.app_icons.star, .{ .w = 16, .h = 16 }, .{
+        .keep_aspect = true,
+        .fill_color_override = .{ .color = .white },
+    });
+    const tri = mesh.toTriangles();
+
+    // The star's middle is interior: a filled star covers it fully, the
+    // package's broken stroke-only star leaves it empty.
+    try std.testing.expect(meshCoverage(tri, .{ .x = 8, .y = 10 }) > 0.99);
+    try std.testing.expect(meshCoverage(tri, .{ .x = 0.5, .y = 15.5 }) < 0.01);
+}
+
+// ── Review regressions (2026-11): DB layer ───────────────────────────────────
+
+fn dupVec(axis: usize) [768]f32 {
+    var v: [768]f32 = @splat(0);
+    v[axis] = 1.0;
+    return v;
+}
+
+test "db: storing an embedding again replaces the old vector" {
+    const path = "/tmp/diffkeep_test_vec_replace.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer img.deinit(alloc);
+
+    // A changed or reparsed image is embedded again: the new vector must win.
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &dupVec(0));
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &dupVec(1));
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &dupVec(0));
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &dupVec(1));
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
+
+    for ([_]bool{ true, false }) |prompt| {
+        const hits = if (prompt)
+            try db.searchByPromptEmbedding(alloc, &dupVec(1), 5, 0.9)
+        else
+            try db.searchByImageEmbedding(alloc, &dupVec(1), 5, 0.9);
+        defer {
+            for (hits) |h| alloc.free(h.path);
+            alloc.free(hits);
+        }
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqual(img.id, hits[0].id);
+    }
+}
+
+test "db: a lookup that finds a row doesn't pin the connection to a stale snapshot" {
+    const path = "/tmp/diffkeep_test_stale_snapshot.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+
+    var other = try db.getConnection();
+    defer other.deinit();
+
+    // Cached-statement hits on `db`, then another connection commits.
+    var again = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer again.deinit(alloc);
+    _ = try db.storeLibrary("/lib");
+    _ = try db.getLibraryIdByPath("/lib");
+    try other.setFavorite(a.id, true);
+
+    // `db` must see that commit and be able to write after it.
+    try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
+    try db.setFavorite(a.id, false);
+    try std.testing.expectEqual(@as(i64, 0), try other.getFavoriteCount());
+}
+
+test "db: folder queries match the folder exactly, not LIKE wildcards or other case" {
+    const path = "/tmp/diffkeep_test_folder_like.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    for ([_][]const u8{
+        "/lib/img_1/a.png", "/lib/imgX1/b.png", // `_` is a LIKE wildcard
+        "/lib/cats/c.png",  "/lib/Cats/d.png", // LIKE is ASCII case-insensitive
+        "/lib/100%/e.png",  "/lib/100x/f.png", // `%` too
+    }) |p| {
+        var img = try db.findOrCreateImage(alloc, lib_id, p);
+        img.deinit(alloc);
+    }
+
+    const cases = [_]struct { folder: []const u8, want: []const u8 }{
+        .{ .folder = "/lib/img_1", .want = "/lib/img_1/a.png" },
+        .{ .folder = "/lib/cats", .want = "/lib/cats/c.png" },
+        .{ .folder = "/lib/100%", .want = "/lib/100%/e.png" },
+    };
+    for (cases) |cs| {
+        const in_folder = try db.listImagesInFolder(alloc, lib_id, cs.folder);
+        defer {
+            for (in_folder) |e| alloc.free(e.path);
+            alloc.free(in_folder);
+        }
+        try std.testing.expectEqual(@as(usize, 1), in_folder.len);
+        try std.testing.expectEqualStrings(cs.want, in_folder[0].path);
+
+        const filtered = try db.listImagesFiltered(alloc, lib_id, cs.folder, null, &.{});
+        defer {
+            for (filtered) |e| alloc.free(e.path);
+            alloc.free(filtered);
+        }
+        try std.testing.expectEqual(@as(usize, 1), filtered.len);
+        try std.testing.expectEqualStrings(cs.want, filtered[0].path);
+    }
+
+    // A nested folder's subtree must not pick up a sibling that only LIKE-matches.
+    {
+        var img = try db.findOrCreateImage(alloc, lib_id, "/lib/cats/sub/g.png");
+        img.deinit(alloc);
+        var img2 = try db.findOrCreateImage(alloc, lib_id, "/lib/Cats/sub2/h.png");
+        img2.deinit(alloc);
+    }
+    const subs = try db.listImmediateSubdirs(alloc, lib_id, "/lib/cats");
+    defer {
+        for (subs) |s| alloc.free(s.path);
+        alloc.free(subs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), subs.len);
+    try std.testing.expectEqualStrings("/lib/cats/sub", subs[0].path);
+}
+
+test "db: an empty thumbnail blob reads back without crashing" {
+    const path = "/tmp/diffkeep_test_empty_blob.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer img.deinit(alloc);
+    img.thumbnail = try alloc.dupe(u8, "");
+    try db.saveImage(&img);
+
+    var again = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), again.thumbnail.?.len);
+    const bytes = (try db.getThumbnailBytes(alloc, img.id)).?;
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "db: closing every connection closes the database cleanly (WAL removed)" {
+    const path = "/tmp/diffkeep_test_clean_close.db";
+    const wal = path ++ "-wal";
+    {
+        var db = try openDb(path);
+        defer db.deinit();
+        const lib_id = try db.storeLibrary("/lib");
+        var img = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+        img.deinit(alloc);
+        var conn = try db.getConnection();
+        conn.deinit();
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // SQLite deletes the WAL when the last connection closes; a connection that
+    // failed to close (unfinalized statements) leaves it behind.
+    const gone = blk: {
+        std.Io.Dir.cwd().access(io, wal, .{}) catch break :blk true;
+        break :blk false;
+    };
+    std.Io.Dir.cwd().deleteFile(io, wal) catch {};
+    try std.testing.expect(gone);
+}
+
+test "db: a database from a newer build is rejected, not a crash" {
+    const path = "/tmp/diffkeep_test_newer_schema.db";
+    {
+        var db = try openDb(path);
+        defer db.deinit();
+        try db.db.exec("PRAGMA user_version = 9999");
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.testing.expectError(error.SchemaTooNew, dk.VectorDb.init(alloc, io, path));
+}
+
+// ── Review regressions (2026-11): image identity ─────────────────────────────
+
+fn rawCount(db: *dk.VectorDb, sql: [:0]const u8) !i64 {
+    var stmt = try db.db.prepare(sql);
+    defer stmt.deinit();
+    _ = try stmt.step();
+    return stmt.columnInt64(0);
+}
+
+test "db: a path has at most one live row; a new file at a trashed path gets its own" {
+    const path = "/tmp/diffkeep_test_unique_path.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var old = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer old.deinit(alloc);
+
+    // The schema refuses a second live row (the scan/watcher race).
+    try std.testing.expectEqual(@as(i64, 1), try rawCount(&db,
+        "SELECT count(*) FROM sqlite_master WHERE name = 'idx_images_live_path' AND sql LIKE 'CREATE UNIQUE%'"));
+
+    // ComfyUI reuses a trashed image's name: the new file is a new image, not
+    // the trashed row coming back to life.
+    try trashById(&db, old.id, "1_a.png", 1, 1000);
+    var new = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer new.deinit(alloc);
+    try std.testing.expect(new.id != old.id);
+    try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
+    try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
+}
+
+test "db: upgrading merges duplicate live rows left by the old scan/watcher race" {
+    const path = "/tmp/diffkeep_test_dedupe_migration.db";
+    {
+        var db = try openDb(path);
+        defer db.deinit();
+        const lib_id = try db.storeLibrary("/lib");
+        var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+        a.deinit(alloc);
+        // Recreate the pre-index state: no unique index, two rows for one path.
+        try db.db.exec("DROP INDEX IF EXISTS idx_images_live_path");
+        try db.db.exec("INSERT INTO images (library_id, library_path, favorite) VALUES (1, '/lib/a.png', 1)");
+        try db.db.exec("PRAGMA user_version = 13");
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try dk.VectorDb.init(alloc, io, path);
+    defer db.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
+    // The favorite set on the dropped copy survives on the kept row.
+    try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
+}
+
+test "db: trash, restore and delete by a stale id don't touch the row now holding it" {
+    const path = "/tmp/diffkeep_test_guarded_ops.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/new.png");
+    defer img.deinit(alloc);
+
+    // A stale grid entry still believes this id is "/lib/old.png".
+    try std.testing.expect(!try db.trashImage(img.id, "/lib/old.png", "x", 1, 1000));
+    try std.testing.expect(!try db.deleteImage(img.id, "/lib/old.png"));
+    try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
+
+    try std.testing.expect(try db.trashImage(img.id, "/lib/new.png", "5_new.png", 1, 1000));
+    // Trashing twice is a no-op, and restore needs the matching trash name.
+    try std.testing.expect(!try db.trashImage(img.id, "/lib/new.png", "5_new.png", 1, 1000));
+    try std.testing.expect(!try db.restoreImage(img.id, "other.png", "/lib/new.png"));
+    try std.testing.expect(try db.restoreImage(img.id, "5_new.png", "/lib/new.png"));
+    try std.testing.expectEqual(@as(i64, 0), (try db.getTrashStats()).count);
+}
+
+test "db: an embedding finished after its image was deleted isn't stored" {
+    const path = "/tmp/diffkeep_test_orphan_embed.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    var gone = try db.findOrCreateImage(alloc, lib_id, "/lib/gone.png");
+    defer gone.deinit(alloc);
+    const gone_id = gone.id;
+    try std.testing.expect(try db.deleteImage(gone_id, "/lib/gone.png"));
+    // The id is recycled before the queued embedding lands.
+    var next = try db.findOrCreateImage(alloc, lib_id, "/lib/next.png");
+    defer next.deinit(alloc);
+    try std.testing.expectEqual(gone_id, next.id);
+
+    try std.testing.expect(!try db.storePromptEmbedding(gone_id, "/lib/gone.png", &dupVec(0)));
+    try std.testing.expect(!try db.storeImageEmbedding(gone_id, "/lib/gone.png", &dupVec(0)));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
+}
+
+test "db: redundant-duplicate removal never counts two rows for one file" {
+    const path = "/tmp/diffkeep_test_dedupe_same_path.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Two libraries that both reach /pics/sub/a.png (an overlap from before
+    // overlapping libraries were refused).
+    const outer = try db.storeLibrary("/pics");
+    const inner = try db.storeLibrary("/pics/sub");
+    for ([_]u64{ outer, inner }) |lib| {
+        var img = try db.findOrCreateImage(alloc, lib, "/pics/sub/a.png");
+        defer img.deinit(alloc);
+        img.hash = try alloc.dupe(u8, "h1");
+        try db.saveImage(&img);
+    }
+    try std.testing.expectEqual(@as(i64, 0), try db.getRedundantDuplicateCount());
+    const reds = try db.listRedundantDuplicates(alloc);
+    defer alloc.free(reds);
+    try std.testing.expectEqual(@as(usize, 0), reds.len);
+}
+
+test "library_manager: a library inside or around an existing one is refused" {
+    const dir = "/tmp/diffkeep_test_lib_overlap";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/pics/sub");
+    try cwd.createDirPath(io, dir ++ "/pictures");
+    defer cwd.deleteTree(io, dir) catch {};
+
+    var db = try openDb(dir ++ "/test.db");
+    defer db.deinit();
+
+    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    defer mgr.deinit(io);
+
+    _ = try mgr.addLibrary(io, dir ++ "/pics/");
+    // Stored without the trailing slash, so folder queries line up.
+    try std.testing.expect((try db.getLibraryIdByPath(dir ++ "/pics")) != null);
+    try std.testing.expectError(error.LibraryExists, mgr.addLibrary(io, dir ++ "/pics"));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, dir ++ "/pics/sub"));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, dir));
+    try std.testing.expectError(error.LibraryOverlaps, mgr.addLibrary(io, "/"));
+    // A sibling that merely shares a prefix is fine.
+    _ = try mgr.addLibrary(io, dir ++ "/pictures");
+}
+
+test "image_ops: restoring next to a new file at the old path keeps both" {
+    const dir = "/tmp/diffkeep_test_restore_clash";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data/trash");
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "old" });
+
+    g_ops_db = try openDb(dir ++ "/data/test.db");
+    const db = &g_ops_db.?;
+    defer db.deinit();
+    g_ops_data_dir = dir ++ "/data";
+    dk.image_ops.init(.{
+        .db = &g_ops_db,
+        .data_dir = &g_ops_data_dir,
+        .cfg = &dk.g_cfg,
+        .on_counts_changed = opsNoop,
+        .on_images_removed = opsRemoved,
+        .on_wakeup = opsNoop,
+    });
+    defer dk.image_ops.fileOpsJoin(io);
+
+    const lib_id = try db.storeLibrary(dir ++ "/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
+    defer a.deinit(alloc);
+
+    var grid = try dk.GridState.init(io, alloc, db, false, null);
+    defer grid.deinit();
+    try grid.reloadImages();
+    grid.awaitReload();
+    try grid.selection.put(a.id, {});
+    dk.image_ops.performTrash(io, alloc, &grid);
+    try pollFileOps(&grid);
+
+    // ComfyUI writes a new a.png, which the scan indexes as a new image.
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "new" });
+    var b = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
+    defer b.deinit(alloc);
+
+    grid.view_mode = .trash;
+    try grid.reloadImages();
+    grid.awaitReload();
+    grid.selection.clearRetainingCapacity();
+    try grid.selection.put(a.id, {});
+    dk.image_ops.performRestore(io, alloc, &grid);
+    try pollFileOps(&grid);
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("new", try cwd.readFile(io, dir ++ "/lib/a.png", &buf));
+    try std.testing.expectEqualStrings("old", try cwd.readFile(io, dir ++ "/lib/a (1).png", &buf));
+    try std.testing.expectEqual(@as(i64, 2), try db.getTotalImageCount());
+    var restored = (try db.getImageDetails(alloc, a.id)).?;
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings(dir ++ "/lib/a (1).png", restored.library_path);
+}
+
+test "image_ops: trashing an entry whose row is gone leaves the file alone" {
+    const dir = "/tmp/diffkeep_test_trash_stale";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data/trash");
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "a" });
+
+    g_ops_db = try openDb(dir ++ "/data/test.db");
+    const db = &g_ops_db.?;
+    defer db.deinit();
+    g_ops_data_dir = dir ++ "/data";
+    dk.image_ops.init(.{
+        .db = &g_ops_db,
+        .data_dir = &g_ops_data_dir,
+        .cfg = &dk.g_cfg,
+        .on_counts_changed = opsNoop,
+        .on_images_removed = opsRemoved,
+        .on_wakeup = opsNoop,
+    });
+    defer dk.image_ops.fileOpsJoin(io);
+
+    // A viewer still shows id 77 for a.png, but that row no longer exists.
+    dk.image_ops.performOnEntry(io, .{ .id = 77, .path = dir ++ "/lib/a.png", .filename = "a.png", .mtime = null }, .trash);
+    dk.image_ops.fileOpsJoin(io);
+    try cwd.access(io, dir ++ "/lib/a.png", .{});
+}
+
+// ── Review regressions (2026-11): search ordering ────────────────────────────
+
+test "grid: vector search results stay in relevance order, not the sort order" {
+    const path = "/tmp/diffkeep_test_relevance_order.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    // Nearest first: c, a, b — the reverse of both name and mtime order.
+    const names = [_][]const u8{ "/lib/a.png", "/lib/b.png", "/lib/c.png" };
+    const angles = [_]f32{ 0.3, 0.6, 0.0 };
+    var ids: [3]u64 = undefined;
+    for (names, angles, 0..) |n, t, k| {
+        var img = try db.findOrCreateImage(alloc, lib_id, n);
+        defer img.deinit(alloc);
+        img.mtime = @intCast(100 + k);
+        try db.saveImage(&img);
+        ids[k] = img.id;
+        var v: [768]f32 = @splat(0);
+        v[0] = @cos(t);
+        v[1] = @sin(t);
+        _ = try db.storePromptEmbedding(img.id, n, &v);
+    }
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var q: [768]f32 = @splat(0);
+    q[0] = 1.0;
+    grid.search_mode = .semantic;
+    grid.query_embeddings = .{ .prompt = &q };
+    grid.semantic_min_similarity = -1;
+    for ([_]dk.image_grid.SortMode{ .date, .name, .random }) |mode| {
+        grid.sort_mode = mode;
+        try grid.reloadImages();
+        grid.awaitReload();
+        try std.testing.expectEqual(@as(usize, 3), grid.images.items.len);
+        try std.testing.expectEqual(ids[2], grid.images.items[0].id);
+        try std.testing.expectEqual(ids[0], grid.images.items[1].id);
+        try std.testing.expectEqual(ids[1], grid.images.items[2].id);
+    }
+}
+
+test "grid: text search results stay in rank order; sort settings return after" {
+    const path = "/tmp/diffkeep_test_fts_rank_order.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    // BM25 ranks b (most "cat", shortest) first, then c, then a: different
+    // from name and date order in either direction.
+    const names = [_][]const u8{ "/lib/a.png", "/lib/b.png", "/lib/c.png" };
+    const prompts = [_][]const u8{ "cat dog bird fish horse", "cat cat cat", "cat dog" };
+    var ids: [3]u64 = undefined;
+    for (names, prompts, 0..) |n, pr, k| {
+        var img = try db.findOrCreateImage(alloc, lib_id, n);
+        defer img.deinit(alloc);
+        img.mtime = @intCast(100 + k);
+        img.positivePromptText = try alloc.dupe(u8, pr);
+        try db.saveImage(&img);
+        ids[k] = img.id;
+    }
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    grid.search_mode = .fts;
+    try grid.setSearchQuery("cat");
+    try std.testing.expect(grid.isRelevanceRanked());
+    for ([_]dk.image_grid.SortMode{ .date, .name, .random }) |mode| {
+        for ([_]dk.image_grid.SortDir{ .asc, .desc }) |dir| {
+            grid.sort_mode = mode;
+            grid.sort_dir = dir;
+            try grid.reloadImages();
+            grid.awaitReload();
+            try std.testing.expectEqual(@as(usize, 3), grid.images.items.len);
+            try std.testing.expectEqual(ids[1], grid.images.items[0].id);
+            try std.testing.expectEqual(ids[2], grid.images.items[1].id);
+            try std.testing.expectEqual(ids[0], grid.images.items[2].id);
+        }
+    }
+
+    // A query with nothing searchable left is not a search.
+    try grid.setSearchQuery(" \"* ");
+    try std.testing.expect(!grid.isRelevanceRanked());
+
+    // Clearing the search applies the sort settings again.
+    try grid.setSearchQuery(null);
+    try std.testing.expect(!grid.isRelevanceRanked());
+    grid.sort_mode = .name;
+    grid.sort_dir = .asc;
+    try grid.reloadImages();
+    grid.awaitReload();
+    try std.testing.expectEqual(ids[0], grid.images.items[0].id);
+    try std.testing.expectEqual(ids[1], grid.images.items[1].id);
+    try std.testing.expectEqual(ids[2], grid.images.items[2].id);
+}
+
+// ── Review regressions (2026-11): scanning ───────────────────────────────────
+
+/// A valid 1x1 RGB PNG with no metadata chunks.
+const plain_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90\x77\x53\xde\x00\x00\x00\x0c\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+fn waitForScans(mgr: *dk.LibraryManager) !void {
+    for (0..2000) |_| {
+        if (!mgr.isScanActive()) return;
+        try std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+    }
+    return error.ScanTimedOut;
+}
+
+fn rescanAll(mgr: *dk.LibraryManager) !void {
+    try mgr.scanAllLibraries(io);
+    try waitForScans(mgr);
+}
+
+fn setMtime(path: []const u8, secs: i64) !void {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer f.close(io);
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, secs) * std.time.ns_per_s } } });
+}
+
+const ScanFixture = struct {
+    dir: []const u8,
+    db: dk.VectorDb,
+    mgr: dk.LibraryManager,
+    lib_id: u64,
+
+    fn init(self: *ScanFixture, dir: []const u8, thumbnails_in_db: bool) !void {
+        self.dir = dir;
+        const db_path = try std.mem.concat(alloc, u8, &.{ dir, ".db" });
+        defer alloc.free(db_path);
+        self.db = try openDb(db_path);
+        self.mgr = dk.LibraryManager.init(alloc, &self.db, thumbnails_in_db, false, false, null, null);
+        self.lib_id = try self.mgr.addLibrary(io, dir);
+        try waitForScans(&self.mgr);
+    }
+
+    fn deinit(self: *ScanFixture) void {
+        self.mgr.deinit(io);
+        self.db.deinit();
+        const db_path = std.mem.concat(alloc, u8, &.{ self.dir, ".db" }) catch unreachable;
+        defer alloc.free(db_path);
+        std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
+        std.Io.Dir.cwd().deleteTree(io, self.dir) catch {};
+    }
+
+    fn row(self: *ScanFixture, name: []const u8) !dk.Image {
+        const p = try std.Io.Dir.path.join(alloc, &.{ self.dir, name });
+        defer alloc.free(p);
+        return self.db.findOrCreateImage(alloc, self.lib_id, p);
+    }
+};
+
+fn freshDir(dir: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+}
+
+test "scan: an emptied library folder (unmounted drive) keeps its images" {
+    const dir = "/tmp/diffkeep_test_scan_unmounted";
+    try freshDir(dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/a.png", .data = plain_png });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/b.png", .data = plain_png });
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(i64, 2), try fx.db.getTotalImageCount());
+
+    // The mount point is still there but empty: not evidence the files are gone.
+    try std.Io.Dir.cwd().deleteFile(io, dir ++ "/a.png");
+    try std.Io.Dir.cwd().deleteFile(io, dir ++ "/b.png");
+    try rescanAll(&fx.mgr);
+    try std.testing.expectEqual(@as(i64, 2), try fx.db.getTotalImageCount());
+}
+
+test "scan: rows the scan removes are reported so the grid drops them" {
+    const dir = "/tmp/diffkeep_test_scan_removed_ids";
+    try freshDir(dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/a.png", .data = plain_png });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/b.png", .data = plain_png });
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+
+    var a = try fx.row("a.png");
+    defer a.deinit(alloc);
+    // Deleted while the app was closed: only the next scan notices.
+    try std.Io.Dir.cwd().deleteFile(io, dir ++ "/a.png");
+    try rescanAll(&fx.mgr);
+
+    var removed: std.ArrayList(u64) = .empty;
+    defer removed.deinit(alloc);
+    fx.mgr.drainRemovedIds(io, &removed);
+    try std.testing.expectEqualSlices(u64, &.{a.id}, removed.items);
+}
+
+test "scan: an unreadable subfolder doesn't abort the scan or lose its images" {
+    const dir = "/tmp/diffkeep_test_scan_unreadable";
+    try freshDir(dir);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, dir ++ "/locked");
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/locked/l.png", .data = plain_png });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/a.png", .data = plain_png });
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(i64, 2), try fx.db.getTotalImageCount());
+
+    try cwd.setFilePermissions(io, dir ++ "/locked", .fromMode(0o000), .{});
+    defer cwd.setFilePermissions(io, dir ++ "/locked", .fromMode(0o755), .{}) catch {};
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/b.png", .data = plain_png });
+    try rescanAll(&fx.mgr);
+    // b.png indexed, l.png (unreadable, not gone) kept.
+    try std.testing.expectEqual(@as(i64, 3), try fx.db.getTotalImageCount());
+}
+
+test "scan: an image without metadata still gets its hash and thumbnail" {
+    const dir = "/tmp/diffkeep_test_scan_no_meta";
+    try freshDir(dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/plain.png", .data = plain_png });
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, true);
+    defer fx.deinit();
+
+    var img = try fx.row("plain.png");
+    defer img.deinit(alloc);
+    try std.testing.expect(img.hash != null);
+    try std.testing.expect(img.thumbnail != null);
+    try std.testing.expect(img.mtime != null);
+}
+
+test "scan: a file rewritten without metadata drops the old prompt" {
+    const dir = "/tmp/diffkeep_test_scan_lost_meta";
+    try freshDir(dir);
+    const cwd = std.Io.Dir.cwd();
+    var src_buf: [1100000]u8 = undefined;
+    const with_meta = try cwd.readFile(io, "test-artifacts/chunk-data.png", &src_buf);
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/x.png", .data = with_meta });
+    try setMtime(dir ++ "/x.png", 1_000_000);
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+    {
+        var img = try fx.row("x.png");
+        defer img.deinit(alloc);
+        try std.testing.expect(img.positivePromptText != null);
+    }
+
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/x.png", .data = plain_png });
+    try setMtime(dir ++ "/x.png", 2_000_000);
+    try rescanAll(&fx.mgr);
+    var img = try fx.row("x.png");
+    defer img.deinit(alloc);
+    try std.testing.expect(img.positivePromptText == null);
+    try std.testing.expect(img.model == null);
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(plain_png, &expected_hash, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(expected_hash, .lower), img.hash.?);
+}
+
+test "library_manager: quiesce stops running scans and resumes them afterwards" {
+    const dir = "/tmp/diffkeep_test_quiesce";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    defer cwd.deleteTree(io, dir) catch {};
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "a", "b" }) |lib| {
+        for (0..40) |k| {
+            const p = try std.mem.print(&buf, "{s}/{s}/{d}.png", .{ dir, lib, k });
+            try cwd.createDirPath(io, std.Io.Dir.path.dirname(p).?);
+            try cwd.writeFile(io, .{ .sub_path = p, .data = plain_png });
+        }
+    }
+    var db = try openDb(dir ++ ".db");
+    defer std.Io.Dir.cwd().deleteFile(io, dir ++ ".db") catch {};
+    defer db.deinit();
+    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    defer mgr.deinit(io);
+
+    _ = try mgr.addLibrary(io, dir ++ "/a");
+    _ = try mgr.addLibrary(io, dir ++ "/b");
+    // Swapping the embedder: nothing may still be scanning when this returns.
+    mgr.quiesce(io);
+    try std.testing.expect(!mgr.scanUsesEmbedder());
+    // …and the interrupted / queued scans still complete.
+    try waitForScans(&mgr);
+    try std.testing.expectEqual(@as(i64, 80), try db.getTotalImageCount());
+}
+
+// ── Review regressions (2026-11): search state ───────────────────────────────
+
+test "search: the grid keeps its own copy of the FTS query" {
+    const path = "/tmp/diffkeep_test_search_owned_query.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var search: dk.search.SearchState = .{};
+    defer search.deinit(alloc);
+
+    @memcpy(search.buf[0..3], "cat");
+    search.fire(io, alloc, &grid);
+    grid.awaitReload();
+    // The user keeps typing; a later, unrelated reload must still use "cat".
+    @memcpy(search.buf[0..3], "dog");
+    try std.testing.expectEqualStrings("cat", grid.search_query.?);
+}
+
+test "search: a superseded query embedding is dropped and doesn't end the newer one's loading" {
+    const path = "/tmp/diffkeep_test_search_stale_embed.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var search: dk.search.SearchState = .{};
+    defer search.deinit(alloc);
+
+    const old_gen = search.startEmbedGeneration(io, alloc);
+    const new_gen = search.startEmbedGeneration(io, alloc);
+    // The old task finishes after the new one started: refused (and freed).
+    try std.testing.expect(!search.deliverEmbedding(old_gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
+    search.applyEmbedIfDone(alloc, &grid);
+    try std.testing.expect(search.isSearchLoading(&grid));
+    try std.testing.expect(!grid.query_embeddings.any());
+
+    try std.testing.expect(search.deliverEmbedding(new_gen, .{ .prompt = try alloc.dupe(f32, &dupVec(1)) }));
+    search.applyEmbedIfDone(alloc, &grid);
+    try std.testing.expect(grid.query_embeddings.prompt != null);
+    try std.testing.expectEqual(@as(f32, 1.0), grid.query_embeddings.prompt.?[1]);
+    grid.awaitReload();
+    try std.testing.expect(!search.isSearchLoading(&grid));
+}
+
+test "search: clearing the box cancels a semantic query still embedding" {
+    const path = "/tmp/diffkeep_test_search_cancel_embed.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var search: dk.search.SearchState = .{};
+    defer search.deinit(alloc);
+
+    search.mode = .semantic;
+    const gen = search.startEmbedGeneration(io, alloc); // "dog" is embedding…
+    @memset(&search.buf, 0); // …and the user clears the box.
+    search.fire(io, alloc, &grid);
+    grid.awaitReload();
+    try std.testing.expect(!search.deliverEmbedding(gen, .{ .prompt = try alloc.dupe(f32, &dupVec(0)) }));
+    search.applyEmbedIfDone(alloc, &grid);
+    try std.testing.expect(!grid.query_embeddings.any());
+    try std.testing.expect(!search.isSearchLoading(&grid));
+}
+
+// ── Review regressions (2026-11): decoding ───────────────────────────────────
+
+/// 3x2 8-bit greyscale PNG (one band).
+const grey_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x03\x00\x00\x00\x02\x08\x00\x00\x00\x00\xb8\x1f\x39\xc6\x00\x00\x00\x0e\x49\x44\x41\x54\x78\x9c\x63\x60\xb0\xa9\x60\x00\x62\x00\x04\xb8\x01\x69\xed\xad\xdd\x62\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+test "vips: a greyscale image decodes to 4 bytes per pixel" {
+    const dir = "/tmp/diffkeep_test_grey_decode";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/g.png", .data = grey_png });
+    try dk.vips.init();
+
+    const img = try dk.vips.loadImageRgbaWithDims(alloc, dir ++ "/g.png");
+    defer alloc.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 3), img.width);
+    try std.testing.expectEqual(@as(u32, 2), img.height);
+    try std.testing.expectEqual(@as(usize, 3 * 2 * 4), img.pixels.len);
+    // Second pixel is grey 60: R = G = B = 60, opaque.
+    try std.testing.expectEqualSlices(u8, &.{ 60, 60, 60, 255 }, img.pixels[4..8]);
+}
+
+// ── Review regressions (2026-11): bulk file operations ───────────────────────
+
+test "image_ops: duplicate removal runs on the file-op queue and updates grid and viewers" {
+    const dir = "/tmp/diffkeep_test_bulk_dedupe";
+    const cwd = std.Io.Dir.cwd();
+    try freshDir(dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data/trash");
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "same" });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/b.png", .data = "same" });
+
+    g_ops_db = try openDb(dir ++ "/data/test.db");
+    const db = &g_ops_db.?;
+    defer db.deinit();
+    g_ops_data_dir = dir ++ "/data";
+    g_ops_removed = 0;
+    dk.image_ops.init(.{
+        .db = &g_ops_db,
+        .data_dir = &g_ops_data_dir,
+        .cfg = &dk.g_cfg,
+        .on_counts_changed = opsNoop,
+        .on_images_removed = opsRemoved,
+        .on_wakeup = opsNoop,
+    });
+    defer dk.image_ops.fileOpsJoin(io);
+
+    const lib_id = try db.storeLibrary(dir ++ "/lib");
+    var ids: [2]u64 = undefined;
+    for ([_][]const u8{ dir ++ "/lib/a.png", dir ++ "/lib/b.png" }, 0..) |p, k| {
+        var img = try db.findOrCreateImage(alloc, lib_id, p);
+        defer img.deinit(alloc);
+        img.hash = try alloc.dupe(u8, "h");
+        try db.saveImage(&img);
+        ids[k] = img.id;
+    }
+    var grid = try dk.GridState.init(io, alloc, db, false, null);
+    defer grid.deinit();
+    try grid.reloadImages();
+    grid.awaitReload();
+
+    // The user trashes b while "remove duplicates" is also asked for: both go
+    // through one queue, so b is trashed exactly once and nothing is orphaned.
+    try grid.selection.put(ids[1], {});
+    dk.image_ops.performTrash(io, alloc, &grid);
+    dk.image_ops.startRemoveRedundantDuplicates(io);
+    try pollFileOps(&grid);
+    for (0..5000) |_| {
+        _ = dk.image_ops.fileOpsPoll(io, alloc, &grid);
+        if (!dk.image_ops.bulkActive()) break;
+        try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.expect(!dk.image_ops.bulkActive());
+    try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
+    try cwd.access(io, dir ++ "/lib/a.png", .{});
+    try expectGridIds(&grid, &.{ids[0]});
+    try std.testing.expectEqual(@as(usize, 1), g_ops_removed);
+}
+
+// ── Review regressions (2026-11): fs watcher events ──────────────────────────
+
+test "library_manager: a burst of watcher events is merged per path, latest state wins" {
+    var batch: dk.library_manager.PendingFileEvents = .{};
+    defer batch.deinit(alloc);
+    for (0..1000) |k| {
+        var buf: [32]u8 = undefined;
+        const p = try std.mem.print(&buf, "/lib/{d}.png", .{k % 10});
+        try batch.add(alloc, .{ .library_id = 1, .path = try alloc.dupe(u8, p), .deleted = k >= 990 });
+    }
+    try batch.add(alloc, .{ .library_id = 1, .path = try alloc.dupe(u8, "/lib/0.png"), .deleted = false, .kind = .rescan_library });
+    try std.testing.expectEqual(@as(usize, 11), batch.events.items.len);
+    for (batch.events.items) |ev| {
+        if (ev.kind == .file) try std.testing.expect(ev.deleted);
+    }
+}
+
+test "library_manager: files deleted on disk are removed in the background and reported" {
+    const path = "/tmp/diffkeep_test_watch_deletes.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+
+    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    defer mgr.deinit(io);
+    var batch: dk.library_manager.PendingFileEvents = .{};
+    defer batch.deinit(alloc);
+    try batch.add(alloc, .{ .library_id = lib_id, .path = try alloc.dupe(u8, "/lib/a.png"), .deleted = true });
+    try batch.add(alloc, .{ .library_id = lib_id, .path = try alloc.dupe(u8, "/lib/b.png"), .deleted = true });
+    mgr.flushFileEvents(io, &batch);
+    try std.testing.expectEqual(@as(usize, 0), batch.events.items.len);
+    mgr.awaitFileTasks(io);
+
+    var removed: std.ArrayList(u64) = .empty;
+    defer removed.deinit(alloc);
+    mgr.drainRemovedIds(io, &removed);
+    std.mem.sort(u64, removed.items, {}, std.sort.asc(u64));
+    try std.testing.expectEqualSlices(u64, &.{ a.id, b.id }, removed.items);
+    try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
+}
+
+test "sidebar: an expanded library keeps its folders after the counts refresh" {
+    const path = "/tmp/diffkeep_test_sidebar_refresh.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    var img = try db.findOrCreateImage(alloc, lib_id, "/lib/cats/a.png");
+    img.deinit(alloc);
+
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    var sb = dk.sidebar.SidebarState{};
+    defer sb.deinit(alloc);
+    try sb.loadLibraries(alloc, &db);
+    sb.libraries.items[0].expanded = true;
+
+    g_sidebar = &sb;
+    g_sidebar_db = &db;
+    g_sidebar_grid = &grid;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    dk.style.install();
+
+    try dvui.testing.settle(sidebarFrame);
+    try std.testing.expectEqual(@as(usize, 1), sb.libraries.items[0].top_folders.len);
+    // A favorite toggle or file op refreshes the counts…
+    sb.applyLibraryCounts(alloc, &.{.{ .id = lib_id, .count = 1 }});
+    try dvui.testing.settle(sidebarFrame);
+    // …and the open tree still shows its folders.
+    try std.testing.expectEqual(@as(usize, 1), sb.libraries.items[0].top_folders.len);
+}
+
+test "grid: scan notifications don't pile up while another view is shown" {
+    const path = "/tmp/diffkeep_test_notifier_other_view.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    grid.view_mode = .trash;
+    try grid.reloadImages();
+    grid.awaitReload();
+
+    for (0..100) |k| grid.notifier.push(io, k + 1, "/lib/x.png", 0);
+    grid.update();
+    try std.testing.expectEqual(@as(usize, 0), grid.notifier.incoming.items.len);
+    try std.testing.expectEqual(@as(usize, 0), grid.images.items.len);
+}
+
+test "grid: a thumbnail load in flight when its id is invalidated is discarded" {
+    const path = "/tmp/diffkeep_test_thumb_inflight.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+
+    // A worker is decoding id 7's old file when the id is recycled.
+    grid.queue_mutex.lockUncancelable(io);
+    try grid.in_flight.put(7, {});
+    grid.queue_mutex.unlock(io);
+    grid.invalidateThumbnail(7);
+
+    // The old image's thumbnail must not land in the cache…
+    grid.finishLoad(7, "/lib/old.png", try alloc.dupe(u8, "old-jpeg"));
+    try std.testing.expect(grid.pending.get(7) == null);
+    // …nor may a failed old load block the new image's thumbnail.
+    grid.queue_mutex.lockUncancelable(io);
+    try grid.in_flight.put(7, {});
+    grid.queue_mutex.unlock(io);
+    grid.invalidateThumbnail(7);
+    grid.finishLoad(7, "/lib/old.png", null);
+    try std.testing.expect(!grid.load_failed.contains(7));
+
+    // A load that wasn't invalidated is kept.
+    grid.queue_mutex.lockUncancelable(io);
+    try grid.in_flight.put(8, {});
+    grid.queue_mutex.unlock(io);
+    grid.finishLoad(8, "/lib/new.png", try alloc.dupe(u8, "new-jpeg"));
+    try std.testing.expect(grid.pending.get(8) != null);
+}
+
+// ── Review regressions (2026-11): removing a library ─────────────────────────
+
+test "library_manager: removing a library stops its scan, reports its images and deletes its trash" {
+    const dir = "/tmp/diffkeep_test_remove_lib";
+    const cwd = std.Io.Dir.cwd();
+    try freshDir(dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data/trash");
+    var buf: [128]u8 = undefined;
+    for (0..60) |k| {
+        try cwd.writeFile(io, .{ .sub_path = try std.mem.print(&buf, "{s}/lib/{d}.png", .{ dir, k }), .data = plain_png });
+    }
+    var db = try openDb(dir ++ "/data/test.db");
+    defer db.deinit();
+    var mgr = dk.LibraryManager.init(alloc, &db, false, false, false, null, null);
+    defer mgr.deinit(io);
+    mgr.data_dir = dir ++ "/data";
+
+    const lib_id = try mgr.addLibrary(io, dir ++ "/lib");
+    try waitForScans(&mgr);
+    // One image is in the trash (its file moved to <data>/trash).
+    var t = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/0.png");
+    defer t.deinit(alloc);
+    try trashById(&db, t.id, "1_0.png", 1, 1000);
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/data/trash/1_0.png", .data = plain_png });
+
+    // Removed while a rescan is running.
+    try mgr.scanAllLibraries(io);
+    try mgr.removeLibrary(io, dir ++ "/lib");
+    try std.testing.expect(!mgr.isScanActive() or mgr.activeLibrary() != lib_id);
+    mgr.awaitFileTasks(io);
+    try waitForScans(&mgr);
+
+    try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
+    try std.testing.expectEqual(@as(i64, 0), (try db.getTrashStats()).count);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/data/trash/1_0.png", .{}));
+    var removed: std.ArrayList(u64) = .empty;
+    defer removed.deinit(alloc);
+    mgr.drainRemovedIds(io, &removed);
+    try std.testing.expectEqual(@as(usize, 60), removed.items.len);
+}
+
+// ── Review regressions (2026-11): viewer ─────────────────────────────────────
+
+fn viewerImages(ids: []const u64) !std.ArrayList(dk.ImageEntry) {
+    var images: std.ArrayList(dk.ImageEntry) = .empty;
+    for (ids, 0..) |id, i| {
+        const p = try alloc.print("/lib/img{d}.png", .{i});
+        try images.append(alloc, .{ .id = id, .path = p, .filename = std.Io.Dir.path.basename(p), .mtime = null });
+    }
+    return images;
+}
+
+test "viewer: wheel zoom keeps the point under the cursor still" {
+    const s: f32 = 1.5;
+    for ([_]f32{ 0.2, 1.0, 3.0 }) |z| {
+        for ([_]f32{ 1.12, 1.0 / 1.12, 4.0 }) |f| {
+            const pan: f32 = 37;
+            const u: f32 = -120; // cursor, in image units from the image centre
+            const z2 = z * f;
+            const before = (pan + u) * z * s; // screen offset of that image point
+            const pan2 = dk.image_viewer.zoomPanAbout(pan, u, z, z2);
+            const after = (pan2 + u) * z2 * s;
+            try std.testing.expectApproxEqAbs(before, after, 1e-3);
+        }
+    }
+}
+
+test "viewer: removing an earlier image doesn't restart the playing video" {
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, try viewerImages(&.{ 10, 11, 12 }), 2, null, null, io, null, null);
+    defer vs.deinit();
+    // A player is open for the current entry (index 2).
+    vs.video_player_idx = 2;
+    var ids = std.AutoHashMap(u64, void).init(alloc);
+    defer ids.deinit();
+    try ids.put(10, {});
+    vs.removeImages(&ids);
+    try std.testing.expectEqual(@as(usize, 1), vs.current_idx);
+    try std.testing.expectEqual(vs.current_idx, vs.video_player_idx);
+}
+
+test "viewer: a decode that finishes after the list changed is discarded" {
+    var vs = dk.image_viewer.ViewerState.init(alloc, 1, try viewerImages(&.{ 10, 11, 12 }), 0, null, null, io, null, null);
+    defer vs.deinit();
+    // A load for slot 0 was started (generation g) …
+    const g = vs.claimSlot(0, 1);
+    // … then the list changed and the slot was claimed again for another image.
+    vs.flushCache();
+    _ = vs.claimSlot(0, 1);
+    // The old decode lands: it must not fill the re-claimed slot.
+    try std.testing.expect(!vs.deliverDecode(0, g, .{ .pixels = try alloc.alloc(u8, 4), .width = 1, .height = 1 }));
+    // A failed decode marks its slot failed instead of spinning forever.
+    const g2 = vs.claimSlot(1, 2);
+    try std.testing.expect(vs.deliverDecode(1, g2, null));
+    try std.testing.expect(vs.cache_slots[1].failed);
+}
+
+// ── Review regressions (2026-11): counts off the render thread ───────────────
+
+test "counts: the loader computes every count on its own connection" {
+    const path = "/tmp/diffkeep_test_counts.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    for ([_][]const u8{ "/lib/a.png", "/lib/b.png", "/lib/c.png" }, 0..) |p, k| {
+        var img = try db.findOrCreateImage(alloc, lib_id, p);
+        defer img.deinit(alloc);
+        img.hash = try alloc.dupe(u8, if (k < 2) "same" else "other");
+        try db.saveImage(&img);
+        if (k == 0) try db.setFavorite(img.id, true);
+        if (k == 2) try trashById(&db, img.id, "t.png", 10, 1000);
+    }
+
+    var loader = dk.counts.CountsLoader.init(alloc, io, &db);
+    defer loader.deinit();
+    loader.request();
+    loader.request(); // coalesces with the running load
+    var got: ?dk.counts.Counts = null;
+    for (0..5000) |_| {
+        got = loader.poll();
+        if (got != null) break;
+        try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
+    }
+    var c = got orelse return error.CountsTimedOut;
+    defer c.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 2), c.total);
+    try std.testing.expectEqual(@as(i64, 1), c.trash.?.count);
+    try std.testing.expectEqual(@as(i64, 2), c.duplicates);
+    try std.testing.expectEqual(@as(i64, 1), c.favorites);
+    try std.testing.expectEqual(@as(usize, 1), c.libraries.len);
+    try std.testing.expectEqual(@as(i64, 2), c.libraries[0].count);
+}
+
+test "detail panel: details load in the background and the newest selection wins" {
+    const dir = "/tmp/diffkeep_test_detail_async";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var src_buf: [1100000]u8 = undefined;
+    const png = try std.Io.Dir.cwd().readFile(io, "test-artifacts/chunk-data.png", &src_buf);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/a.png", .data = png });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/b.png", .data = plain_png });
+
+    var db = try openDb(dir ++ "/t.db");
+    defer db.deinit();
+    const lib_id = try db.storeLibrary(dir);
+    var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, dir ++ "/b.png");
+    defer b.deinit(alloc);
+
+    var ds: dk.detail_panel.DetailState = .{};
+    defer ds.deinit(alloc);
+    // Arrowing quickly: a, then b. Only b's details may be shown.
+    ds.update(a.id, &db, alloc, io);
+    ds.update(b.id, &db, alloc, io);
+    ds.awaitLoad(alloc);
+    try std.testing.expectEqual(b.id, ds.detail.?.id);
+    try std.testing.expectEqual(@as(?u32, 1), ds.detail.?.width);
+
+    ds.update(a.id, &db, alloc, io);
+    ds.awaitLoad(alloc);
+    try std.testing.expectEqual(a.id, ds.detail.?.id);
+    try std.testing.expect(ds.detail.?.raw_chunks.len == 2);
+    try std.testing.expectEqual(@as(?i64, @intCast(png.len)), ds.detail.?.file_size);
+}
+
+fn testFrame(pts: i64) !dk.video_player.Frame {
+    return .{ .pixels = try alloc.alloc(u8, 4), .width = 1, .height = 1, .pts_ms = pts };
+}
+
+fn freeFrame(f: ?dk.video_player.Frame) void {
+    if (f) |fr| alloc.free(fr.pixels);
+}
+
+test "video player: frames play at their own timestamps, not an average rate" {
+    // A GIF that holds its first frame for 2 s, then runs 50 ms frames.
+    var p: dk.video_player.VideoPlayer = .{
+        .gpa = alloc, .io = io, .source = undefined,
+        .frame_duration_ns = 100 * std.time.ns_per_ms, .frame_duration_ms = 100, .duration_ms = 2100,
+    };
+    defer p.freeQueued();
+    for ([_]i64{ 0, 2000, 2050 }) |pts| p.pushFrame(try testFrame(pts), p.seek_gen);
+
+    const ms = std.time.ns_per_ms;
+    const f0 = p.tick(0);
+    defer freeFrame(f0);
+    try std.testing.expectEqual(@as(i64, 0), f0.?.pts_ms);
+    try std.testing.expect(p.tick(150 * ms) == null); // average fps would advance here
+    const f1 = p.tick(2000 * ms);
+    defer freeFrame(f1);
+    try std.testing.expectEqual(@as(i64, 2000), f1.?.pts_ms);
+    try std.testing.expect(p.tick(2020 * ms) == null);
+    const f2 = p.tick(2050 * ms);
+    defer freeFrame(f2);
+    try std.testing.expectEqual(@as(i64, 2050), f2.?.pts_ms);
+}
+
+test "video player: a scrub never shows a frame decoded before the seek" {
+    var p: dk.video_player.VideoPlayer = .{
+        .gpa = alloc, .io = io, .source = undefined,
+        .frame_duration_ns = 40 * std.time.ns_per_ms, .frame_duration_ms = 40, .duration_ms = 5000,
+    };
+    defer p.freeQueued();
+    p.playing = false;
+    for ([_]i64{ 0, 40, 80 }) |pts| p.pushFrame(try testFrame(pts), p.seek_gen);
+    p.requestSeek(3000);
+    // The queue still holds pre-seek frames: none may be shown for the seek.
+    try std.testing.expect(p.tick(0) == null);
+    p.pushFrame(try testFrame(3000), p.seek_gen);
+    const f = p.tick(0);
+    defer freeFrame(f);
+    try std.testing.expectEqual(@as(i64, 3000), f.?.pts_ms);
+}
+
+test "delete dialog: confirming acts on the images chosen when it opened" {
+    const path = "/tmp/diffkeep_test_delete_snapshot.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
+    defer a.deinit(alloc);
+    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
+    defer b.deinit(alloc);
+    var grid = try dk.GridState.init(io, alloc, &db, false, null);
+    defer grid.deinit();
+    try grid.reloadImages();
+    grid.awaitReload();
+
+    var dlg: dk.delete_dialog.DeleteDialogState = .{};
+    defer dlg.deinit(alloc);
+    try grid.selection.put(a.id, {});
+    dlg.snapshot(alloc, &grid);
+    // A background reload lands while the dialog is open and clears the selection.
+    grid.selection.clearRetainingCapacity();
+    try grid.selection.put(b.id, {});
+    dlg.restoreSelection(&grid);
+    try std.testing.expectEqual(@as(u32, 1), grid.selection.count());
+    try std.testing.expect(grid.selection.contains(a.id));
 }

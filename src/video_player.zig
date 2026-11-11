@@ -8,6 +8,8 @@ const platform = @import("platform.zig");
 /// carries audio. Animated images (gif/webp) decode through vips, because
 /// libav* only decodes the first frame of animated WebP. Both expose the same
 /// forward-decode + seek contract, so the player machinery is identical.
+pub const Frame = video.DecodedFrame;
+
 pub const Source = union(enum) {
     video: video.Decoder,
     anim: vips.AnimDecoder,
@@ -56,6 +58,11 @@ pub const VideoPlayer = struct {
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     not_full: std.Io.Condition = std.Io.Condition.init,
     queue: [capacity]?video.DecodedFrame = @splat(null),
+    /// The `seek_gen` each queued frame was decoded under; frames from before
+    /// the latest seek are dropped, never shown.
+    queue_gen: [capacity]u64 = @splat(0),
+    /// Bumped by every `requestSeek` (guarded by mutex).
+    seek_gen: u64 = 0,
     head: usize = 0,
     count: usize = 0,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -65,8 +72,12 @@ pub const VideoPlayer = struct {
 
     // Main-thread-only state.
     playing: bool = true,
+    /// Pacing: each frame is due at the previous one's due time plus the gap
+    /// between their timestamps (animations have per-frame delays; videos can
+    /// be variable-rate). `started` false = the next frame is due now.
     started: bool = false,
-    next_due_ns: i128 = 0,
+    last_due_ns: i128 = 0,
+    last_pts_ms: i64 = 0,
     pending_step: u32 = 0, // one-shot frame pops (frame-step / show-after-seek)
     current_pts_ms: i64 = 0,
     wakeup_fn: ?*const fn () void = null,
@@ -159,13 +170,7 @@ pub const VideoPlayer = struct {
         if (self.audio_stream) |s| platform.audioClose(s);
         if (self.audio_decoder) |a| a.close();
 
-        while (self.count > 0) {
-            const f = self.queue[self.head].?;
-            self.gpa.free(f.pixels);
-            self.queue[self.head] = null;
-            self.head = (self.head + 1) % capacity;
-            self.count -= 1;
-        }
+        self.freeQueued();
         self.source.close();
         self.gpa.destroy(self);
     }
@@ -178,6 +183,11 @@ pub const VideoPlayer = struct {
         self.playing = !self.playing;
         self.started = false; // re-sync cadence to "now" on resume
         self.setAudioPaused(!self.playing);
+    }
+
+    /// Stop playback (and audio) if it is running.
+    pub fn pause(self: *VideoPlayer) void {
+        if (self.playing) self.togglePlay();
     }
 
     fn setAudioPaused(self: *VideoPlayer, paused: bool) void {
@@ -239,6 +249,7 @@ pub const VideoPlayer = struct {
         const clamped = std.math.clamp(target_ms, 0, if (self.duration_ms > 0) self.duration_ms else target_ms);
         self.mutex.lockUncancelable(self.io);
         self.seek_target_ms = clamped;
+        self.seek_gen += 1;
         if (self.audio_stream != null) self.audio_seek_target_ms = clamped;
         self.not_full.signal(self.io); // wake the decode thread if it's queue-full
         self.mutex.unlock(self.io);
@@ -250,9 +261,11 @@ pub const VideoPlayer = struct {
     }
 
     /// Pop the frame to display now (ownership transfers to the caller), or null.
+    /// `now_ns` is a monotonic time (see `nowNs`).
     pub fn tick(self: *VideoPlayer, now_ns: i128) ?video.DecodedFrame {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.dropStaleLocked();
 
         // One-shot pop for frame-step / show-after-seek (ignores the clock).
         if (self.pending_step > 0) {
@@ -265,37 +278,62 @@ pub const VideoPlayer = struct {
         if (!self.playing) return null;
 
         // Don't start (or keep advancing) the cadence clock until a frame is
-        // actually buffered. Otherwise startup latency — opening + buffering a
-        // large streamed animation can take a couple seconds — accrues as a debt
-        // that the catch-up loop below burns off by fast-forwarding once frames
-        // arrive (the "plays fast then settles" glitch).
-        if (self.count == 0) return null;
-
-        if (!self.started) {
-            self.next_due_ns = now_ns;
-            self.started = true;
-        }
-        // If we've fallen far behind — startup gap or a mid-play decode stall —
-        // resync to now instead of racing through the buffered frames. Normal
-        // slow-render catch-up (a frame or two of debt) is well under this.
-        if (now_ns - self.next_due_ns > resync_threshold_ns) {
-            self.next_due_ns = now_ns;
-        }
-        if (now_ns < self.next_due_ns) return null;
-
-        // Advance on a wall clock (next_due += duration, NOT now + duration) so
-        // playback stays real-time. If the render loop is slower than the video's
-        // fps, several frames come due at once — pop them all and drop everything
-        // but the last, so speed is correct even at low render rates.
+        // actually buffered, so startup latency isn't burned off later by
+        // fast-forwarding.
         var result: ?video.DecodedFrame = null;
-        while (self.count > 0 and now_ns >= self.next_due_ns) {
-            const frame = self.popLocked().?;
+        while (self.count > 0) {
+            const head = self.queue[self.head].?;
+            var due = if (self.started) self.dueOf(head.pts_ms) else now_ns;
+            // Far behind (startup gap, decode stall): resync to now instead of
+            // racing through the buffered frames.
+            if (now_ns - due > resync_threshold_ns) due = now_ns;
+            if (now_ns < due) break;
+            // If the render loop is slower than the clip, several frames come
+            // due at once: keep only the last, so speed stays correct.
             if (result) |prev| self.gpa.free(prev.pixels);
-            result = frame;
-            self.next_due_ns += self.frame_duration_ns;
+            result = self.popLocked().?;
+            self.started = true;
+            self.last_due_ns = due;
+            self.last_pts_ms = head.pts_ms;
         }
         if (result) |frame| self.current_pts_ms = frame.pts_ms;
         return result;
+    }
+
+    /// When the frame with `pts_ms` is due, following the last shown frame.
+    /// Timestamps that don't advance sensibly (a loop back to the start, or a
+    /// missing/odd pts) fall back to the average frame duration.
+    fn dueOf(self: *const VideoPlayer, pts_ms: i64) i128 {
+        const delta = pts_ms - self.last_pts_ms;
+        const step: i128 = if (delta > 0 and delta < 10_000)
+            @as(i128, delta) * std.time.ns_per_ms
+        else
+            self.frame_duration_ns;
+        return self.last_due_ns + step;
+    }
+
+    /// Drop queued frames decoded before the latest seek. Caller holds mutex.
+    fn dropStaleLocked(self: *VideoPlayer) void {
+        while (self.count > 0 and self.queue_gen[self.head] != self.seek_gen) {
+            const f = self.popLocked().?;
+            self.gpa.free(f.pixels);
+        }
+    }
+
+    /// Free every queued frame (deinit, tests).
+    pub fn freeQueued(self: *VideoPlayer) void {
+        while (self.count > 0) {
+            const f = self.queue[self.head].?;
+            self.gpa.free(f.pixels);
+            self.queue[self.head] = null;
+            self.head = (self.head + 1) % capacity;
+            self.count -= 1;
+        }
+    }
+
+    /// Monotonic time for `tick`: unaffected by wall-clock changes.
+    pub fn nowNs(io: std.Io) i128 {
+        return std.Io.Clock.awake.now(io).nanoseconds;
     }
 
     /// Pop the queue head (caller holds the mutex). Signals the decode thread.
@@ -324,16 +362,23 @@ pub const VideoPlayer = struct {
         self.not_full.signal(self.io);
     }
 
-    fn pushFrame(self: *VideoPlayer, frame: video.DecodedFrame) void {
+    /// Queue a decoded frame, tagged with the `seek_gen` it was decoded under.
+    pub fn pushFrame(self: *VideoPlayer, frame: video.DecodedFrame, gen: u64) void {
         self.mutex.lockUncancelable(self.io);
+        if (self.count >= capacity) { // only possible across a seek; drop
+            self.mutex.unlock(self.io);
+            self.gpa.free(frame.pixels);
+            return;
+        }
         const tail = (self.head + self.count) % capacity;
         self.queue[tail] = frame;
+        self.queue_gen[tail] = gen;
         self.count += 1;
         self.mutex.unlock(self.io);
         if (self.wakeup_fn) |w| w();
     }
 
-    fn doSeek(self: *VideoPlayer, target_ms: i64) void {
+    fn doSeek(self: *VideoPlayer, target_ms: i64, gen: u64) void {
         self.source.seek(target_ms);
         self.flushQueue();
         // Decode forward, keeping the nearest frame below the target as a fallback,
@@ -350,10 +395,10 @@ pub const VideoPlayer = struct {
                 continue;
             }
             if (nearest) |n| self.gpa.free(n.pixels);
-            self.pushFrame(frame);
+            self.pushFrame(frame, gen);
             return;
         }
-        if (nearest) |n| self.pushFrame(n); // EOF/stop → show the closest frame we found
+        if (nearest) |n| self.pushFrame(n, gen); // EOF/stop → show the closest frame we found
     }
 
     fn decodeLoop(self: *VideoPlayer) void {
@@ -362,9 +407,10 @@ pub const VideoPlayer = struct {
             self.mutex.lockUncancelable(self.io);
             const seek = self.seek_target_ms;
             self.seek_target_ms = null;
+            const gen = self.seek_gen;
             self.mutex.unlock(self.io);
             if (seek) |target| {
-                self.doSeek(target);
+                self.doSeek(target, gen);
                 continue;
             }
 
@@ -380,7 +426,7 @@ pub const VideoPlayer = struct {
 
             const res = self.source.next(self.gpa) catch break;
             if (res) |frame| {
-                self.pushFrame(frame);
+                self.pushFrame(frame, gen);
             } else {
                 self.source.seek(0); // EOS → loop
             }
@@ -388,7 +434,7 @@ pub const VideoPlayer = struct {
     }
 
     fn sleepMs(self: *VideoPlayer, ms: u64) void {
-        std.Io.sleep(self.io, .{ .nanoseconds = @intCast(ms * 1_000_000) }, .real) catch {};
+        std.Io.sleep(self.io, .{ .nanoseconds = @intCast(ms * 1_000_000) }, .awake) catch {};
     }
 
     /// Audio feeder thread: keeps the output stream fed ~200ms ahead (so it plays

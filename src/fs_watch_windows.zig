@@ -96,8 +96,8 @@ pub const FsWatcher = struct {
         const path_copy = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_copy);
 
-        // Convert UTF-8 path to null-terminated UTF-16.
-        const path_w = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, path);
+        // NtCreateFile takes an NT object path, not a Win32 one.
+        const path_w = try ntObjectPath(self.allocator, path);
         defer self.allocator.free(path_w);
 
         // Open the directory via NtCreateFile.
@@ -223,6 +223,38 @@ pub const FsWatcher = struct {
     }
 };
 
+/// `path` (a Win32 path, UTF-8) as a NUL-terminated UTF-16 NT object path:
+/// `C:\x` -> `\??\C:\x`, `\\server\share` -> `\??\UNC\server\share`.
+/// NtCreateFile rejects plain Win32 paths (OBJECT_PATH_SYNTAX_BAD).
+fn ntObjectPath(allocator: std.mem.Allocator, path: []const u8) ![:0]u16 {
+    const unc = path.len > 2 and (path[0] == '\\' or path[0] == '/') and (path[1] == '\\' or path[1] == '/');
+    const already_nt = std.mem.startsWith(u8, path, "\\??\\");
+    const prefix: []const u8 = if (already_nt) "" else if (unc) "\\??\\UNC\\" else "\\??\\";
+    const rest = if (unc and !already_nt) path[2..] else path;
+    const joined = try std.mem.concat(allocator, u8, &.{ prefix, rest });
+    defer allocator.free(joined);
+    for (joined) |*ch| if (ch.* == '/') {
+        ch.* = '\\';
+    };
+    return std.unicode.utf8ToUtf16LeAllocZ(allocator, joined);
+}
+
+test "windows watcher: Win32 paths become NT object paths" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "C:\\pics", "\\??\\C:\\pics" },
+        .{ "C:/pics/sub", "\\??\\C:\\pics\\sub" },
+        .{ "\\\\nas\\share", "\\??\\UNC\\nas\\share" },
+    };
+    for (cases) |c| {
+        const w = try ntObjectPath(a, c[0]);
+        defer a.free(w);
+        const back = try std.unicode.utf16LeToUtf8Alloc(a, w);
+        defer a.free(back);
+        try std.testing.expectEqualStrings(c[1], back);
+    }
+}
+
 // ── Watch thread ──────────────────────────────────────────────────────────────
 
 fn libWatchThread(watch: *LibWatch) void {
@@ -258,6 +290,8 @@ fn libWatchThread(watch: *LibWatch) void {
     }
 
     const handles = [2]windows.HANDLE{ io_event, watch.stop_event };
+    // Whether a notify request is outstanding (and io_event will fire for it).
+    var io_pending = true;
 
     while (true) {
         const status = NtWaitForMultipleObjects(
@@ -287,7 +321,12 @@ fn libWatchThread(watch: *LibWatch) void {
                     .Notify,
                 )) {
                     .PENDING, .SUCCESS => {},
-                    else => break,
+                    else => {
+                        // The directory went away (or the handle broke): nothing
+                        // is outstanding, so don't wait for it below.
+                        io_pending = false;
+                        break;
+                    },
                 }
             },
             else => {
@@ -297,11 +336,13 @@ fn libWatchThread(watch: *LibWatch) void {
         }
     }
 
-    // Cancel any pending IO before exiting.
-    var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
-    _ = windows.ntdll.NtCancelIoFileEx(watch.dir_handle, &watch.iosb, &cancel_iosb);
-    // Wait for the IO to complete/cancel.
-    _ = windows.ntdll.NtWaitForSingleObject(io_event, windows.FALSE, null);
+    // Cancel the outstanding request and wait for it to finish, so the kernel
+    // is done with watch.buffer / watch.iosb before they're freed.
+    if (io_pending) {
+        var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
+        _ = windows.ntdll.NtCancelIoFileEx(watch.dir_handle, &watch.iosb, &cancel_iosb);
+        _ = windows.ntdll.NtWaitForSingleObject(io_event, windows.FALSE, null);
+    }
 
     log.info("watch thread for library {} stopped", .{watch.library_id});
 }

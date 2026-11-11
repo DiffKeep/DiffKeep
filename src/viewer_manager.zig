@@ -38,14 +38,7 @@ pub const ViewerWindow = struct {
         if (self.dnd_drag_cursor) |c| SDLBackend.c.SDL_DestroyCursor(c);
         self.state.deinit();
         self.win.deinit();
-        // Destroy the SDL renderer and window manually, then suppress SDL_Quit.
-        // SDL3 does not refcount SDL_Init/SDL_Quit — calling SDL_Quit from a
-        // viewer deinit would tear down the video subsystem while the main window
-        // is still running.  Only the main window's deferred back.deinit() should
-        // call SDL_Quit at process exit.
-        SDLBackend.c.SDL_DestroyRenderer(self.back.renderer);
-        SDLBackend.c.SDL_DestroyWindow(self.back.window);
-        self.back.we_own_window = false;
+        // Destroys the renderer and window; `sdl_quit` was cleared at creation.
         self.back.deinit();
     }
 };
@@ -161,7 +154,7 @@ pub const ViewerManager = struct {
 
         const init_w: f32 = if (cfg) |c| @floatFromInt(c.viewer_window.width) else 1200;
         const init_h: f32 = if (cfg) |c| @floatFromInt(c.viewer_window.height) else 800;
-        const back = SDLBackend.initWindow(.{
+        var back = SDLBackend.initWindow(.{
             .io = init.io,
             .size = .{ .w = init_w, .h = init_h },
             .min_size = .{ .w = 400, .h = 300 },
@@ -178,6 +171,10 @@ pub const ViewerManager = struct {
             init.gpa.destroy(vw);
             return;
         };
+        // SDL3 doesn't refcount SDL_Init/SDL_Quit: a viewer's backend must
+        // never call SDL_Quit (on close or on an error path below) while the
+        // main window is still running.
+        back.sdl_quit = false;
 
         vw.* = .{
             .back = back,

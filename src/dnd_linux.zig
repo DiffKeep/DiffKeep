@@ -181,11 +181,37 @@ fn wlDataSourceSend(
 ) callconv(.c) void {
     _ = source;
     const self: *WaylandDragSource = @ptrCast(@alignCast(data.?));
-    if (std.mem.eql(u8, std.mem.span(mime_type), "text/uri-list")) {
-        _ = std.os.linux.write(@intCast(fd), self.uri_list.ptr, self.uri_list.len);
+    // The compositor transfers fd ownership to us; it must always be closed.
+    if (!std.mem.eql(u8, std.mem.span(mime_type), "text/uri-list")) {
+        _ = std.os.linux.close(@intCast(fd));
+        return;
     }
-    // Compositor transfers fd ownership to us; we must always close it.
-    _ = std.os.linux.close(@intCast(fd));
+    // Write from a thread: the reader may be this very thread (a drop onto our
+    // own window), and a list bigger than the pipe buffer would then block
+    // forever. The thread owns a copy of the list and the fd.
+    const copy = std.heap.c_allocator.dupe(u8, self.uri_list) catch {
+        _ = std.os.linux.close(@intCast(fd));
+        return;
+    };
+    const t = std.Thread.spawn(.{}, writeAllAndClose, .{ fd, copy }) catch {
+        writeAllAndClose(fd, copy);
+        return;
+    };
+    t.detach();
+}
+
+fn writeAllAndClose(fd: i32, bytes: []u8) void {
+    defer std.heap.c_allocator.free(bytes);
+    defer _ = std.os.linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = std.os.linux.write(@intCast(fd), bytes[off..].ptr, bytes.len - off);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => off += rc,
+            .INTR, .AGAIN => continue,
+            else => return, // reader went away
+        }
+    }
 }
 
 fn wlDataSourceCancelled(
@@ -529,6 +555,8 @@ const X11DragSource = struct {
     drag_sdl_cursor: ?*SDLBackend.c.SDL_Cursor = null,
     wakeup_event_type: u32 = 0,
     watcher_stop:      std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The watcher pushed a wakeup the main thread hasn't pumped yet.
+    wake_pending:      std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     watcher_thread:    ?std.Thread = null,
 
     fn init(allocator: std.mem.Allocator, sdl_window: *SDLBackend.c.SDL_Window) ?X11DragSource {
@@ -549,6 +577,7 @@ const X11DragSource = struct {
         _ = xlib.XFlush(sdl_dpy);
 
         const dnd_dpy = xlib.XOpenDisplay(null) orelse return null;
+        XErrors.register(dnd_dpy);
         const root_win = xlib.DefaultRootWindow(dnd_dpy);
 
         const src_win = xlib.XCreateSimpleWindow(dnd_dpy, root_win, -2, -2, 1, 1, 0, 0, 0);
@@ -618,6 +647,7 @@ const X11DragSource = struct {
         self.freeDragCursors();
         _ = xlib.XDestroyWindow(self.dnd_dpy, self.src_win);
         _ = xlib.XCloseDisplay(self.dnd_dpy);
+        XErrors.unregister(self.dnd_dpy);
     }
 
     fn getSdlCursor(self: *const X11DragSource) ?*SDLBackend.c.SDL_Cursor {
@@ -648,6 +678,7 @@ const X11DragSource = struct {
     }
 
     fn pumpEvents(self: *X11DragSource) void {
+        self.wake_pending.store(false, .release);
         var event: xlib.XEvent = undefined;
         while (xlib.XCheckIfEvent(self.dnd_dpy, &event, xdndPredicate, @ptrCast(self)) != 0) {
             self.handleX11Event(&event);
@@ -988,12 +1019,58 @@ const X11DragSource = struct {
     }
 };
 
+/// X errors on our drag connections are expected: the window under the
+/// pointer (a tooltip, a menu) can vanish between our XQueryPointer and the
+/// next request, giving BadWindow. Xlib's default handler exits the process,
+/// so errors on these displays are swallowed; others go to the previous
+/// handler. Xlib handlers are process-wide. Main thread only.
+const XErrors = struct {
+    var displays: [16]?*xlib.Display = @splat(null);
+    var prev: xlib.XErrorHandler = null;
+    var installed = false;
+
+    fn register(dpy: *xlib.Display) void {
+        for (&displays) |*d| if (d.* == null) {
+            d.* = dpy;
+            break;
+        };
+        if (!installed) {
+            prev = xlib.XSetErrorHandler(handler);
+            installed = true;
+        }
+    }
+
+    fn unregister(dpy: *xlib.Display) void {
+        for (&displays) |*d| if (d.* == dpy) {
+            d.* = null;
+        };
+    }
+
+    fn handler(dpy: ?*xlib.Display, ev: [*c]xlib.XErrorEvent) callconv(.c) c_int {
+        for (displays) |d| if (d != null and d == dpy) {
+            std.log.debug("dnd: ignored X error code={d}", .{ev.*.error_code});
+            return 0;
+        };
+        if (prev) |h| return h(dpy, ev);
+        return 0;
+    }
+};
+
 fn dndWatcher(self: *X11DragSource) void {
     const fd = xlib.XConnectionNumber(self.dnd_dpy);
     var pfd = std.posix.pollfd{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
     while (!self.watcher_stop.load(.acquire)) {
+        // poll is level-triggered and only the main thread reads the socket:
+        // after one wakeup, wait for pumpEvents to take it before polling
+        // again, or this loop spins and floods SDL's event queue.
+        if (self.wake_pending.load(.acquire)) {
+            var none: [0]std.posix.pollfd = .{};
+            _ = std.posix.poll(&none, 2) catch break; // sleep 2 ms
+            continue;
+        }
         _ = std.posix.poll(@as(*[1]std.posix.pollfd, &pfd)[0..1], 50) catch break;
         if (pfd.revents & std.posix.POLL.IN != 0) {
+            self.wake_pending.store(true, .release);
             var ev = std.mem.zeroes(SDLBackend.c.SDL_Event);
             ev.type = self.wakeup_event_type;
             _ = SDLBackend.c.SDL_PushEvent(&ev);

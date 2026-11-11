@@ -25,13 +25,18 @@ pub const Chunk = struct {
 /// PNG Parser for extracting chunks
 pub const PngParser = struct {
     allocator: std.mem.Allocator,
+    /// The header and text chunks (IHDR, tEXt, iTXt, zTXt). Image data and
+    /// other chunks are skipped, not copied.
     chunks: std.ArrayList(Chunk),
     io: std.Io,
+    /// The last parse ran out of bytes before IEND (a file still being written,
+    /// or a damaged one). `chunks` holds what came before the cut.
+    truncated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !PngParser {
         return .{
             .allocator = allocator,
-            .chunks = try std.ArrayList(Chunk).initCapacity(allocator, 512),
+            .chunks = .empty,
             .io = io,
         };
     }
@@ -60,62 +65,51 @@ pub const PngParser = struct {
         try self.parseBuffer(buffer);
     }
 
-    /// Parse a PNG from a reader stream
-    pub fn parseStream(self: *PngParser, reader: anytype) !void {
-        var buffer = try std.ArrayList(u8).initCapacity(self.allocator, 512);
-        defer buffer.deinit();
-        try reader.readAllArrayList(&buffer, std.math.maxInt(usize));
-
-        try self.parseBuffer(buffer.items);
-    }
-
-    /// Parse a PNG from a buffer
+    /// Parse a PNG from a buffer. A buffer that ends before IEND is not an
+    /// error: the chunks read so far are kept and `truncated` is set.
     pub fn parseBuffer(self: *PngParser, buffer: []const u8) !void {
         // Clear any previous chunks
         for (self.chunks.items) |*chunk| chunk.deinit(self.allocator);
         self.chunks.clearRetainingCapacity();
+        self.truncated = false;
 
-        var reader: std.Io.Reader = .fixed(buffer);
-
-        // Check PNG signature
         const png_signature = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
-        var signature: [8]u8 = undefined;
-        try reader.readSliceAll(&signature);
-
-        if (!std.mem.eql(u8, &signature, &png_signature)) {
+        if (buffer.len < png_signature.len or !std.mem.eql(u8, buffer[0..8], &png_signature))
             return error.InvalidPngSignature;
-        }
 
-        // Read chunks until IEND
+        var pos: usize = png_signature.len;
         while (true) {
-            // Read chunk length (4 bytes, big endian)
-            const length = try reader.takeInt(u32, .big);
+            // length (4, big endian) + type (4) + data + CRC (4). The length is
+            // untrusted: check it against what's left before using it.
+            if (buffer.len - pos < 8) break;
+            const length = std.mem.readInt(u32, buffer[pos..][0..4], .big);
+            const chunk_type: [4]u8 = buffer[pos + 4 ..][0..4].*;
+            pos += 8;
+            if (buffer.len - pos < @as(usize, length) + 4) break;
+            const data = buffer[pos..][0..length];
+            const crc = std.mem.readInt(u32, buffer[pos + length ..][0..4], .big);
+            pos += @as(usize, length) + 4;
 
-            // Read chunk type (4 bytes)
-            var chunk_type: [4]u8 = undefined;
-            try reader.readSliceAll(&chunk_type);
+            if (std.mem.eql(u8, &chunk_type, &ChunkType.IEND)) return;
+            if (!isKeptChunk(chunk_type)) continue;
 
-            // Allocate and read chunk data
-            const data = try self.allocator.alloc(u8, length);
-            errdefer self.allocator.free(data);
-            try reader.readSliceAll(data);
-
-            // Read CRC (4 bytes)
-            const crc = try reader.takeInt(u32, .big);
-
-            // Store the chunk
+            const owned = try self.allocator.dupe(u8, data);
+            errdefer self.allocator.free(owned);
             try self.chunks.append(self.allocator, .{
                 .length = length,
                 .type = chunk_type,
-                .data = data,
+                .data = owned,
                 .crc = crc,
             });
-
-            // If this is the IEND chunk, we're done
-            if (std.mem.eql(u8, &chunk_type, &ChunkType.IEND)) {
-                break;
-            }
         }
+        self.truncated = true;
+    }
+
+    fn isKeptChunk(t: [4]u8) bool {
+        return std.mem.eql(u8, &t, &ChunkType.IHDR) or
+            std.mem.eql(u8, &t, &ChunkType.tEXt) or
+            std.mem.eql(u8, &t, &ChunkType.iTXt) or
+            std.mem.eql(u8, &t, &ChunkType.zTXt);
     }
 
     /// Get all tEXt chunks
@@ -260,24 +254,63 @@ pub const TExtContent = struct {
         allocator.free(self.text);
     }
 };
-test "parse PNG and extract tEXt chunks" {
-    const testing = std.testing;
-    const test_file_path = "test-artifacts/chunk-data.png"; // Adjust path as needed
+fn testChunk(out: *std.ArrayList(u8), kind: []const u8, data: []const u8) !void {
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(data.len), .big);
+    try out.appendSlice(std.testing.allocator, &len);
+    try out.appendSlice(std.testing.allocator, kind);
+    try out.appendSlice(std.testing.allocator, data);
+    try out.appendSlice(std.testing.allocator, &.{ 0, 0, 0, 0 }); // CRC (unchecked)
+}
 
-    var parser = try PngParser.init(testing.allocator);
+const png_sig = [_]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
+
+test "png: the sample file's two tEXt chunks parse" {
+    var parser = try PngParser.init(std.testing.allocator, std.testing.io);
     defer parser.deinit();
-
-    try parser.parseFile(test_file_path);
-
-    // Check if we have any iTXt chunks
-    const text_chunks = parser.getTExtChunks();
-    defer testing.allocator.free(text_chunks);
-    var found: i64 = 0;
-
+    try parser.parseFile("test-artifacts/chunk-data.png");
+    const text_chunks = try parser.getTExtChunks();
+    defer std.testing.allocator.free(text_chunks);
+    try std.testing.expectEqual(@as(usize, 2), text_chunks.len);
     for (text_chunks) |chunk| {
-        found += 1;
         var content = try parser.parseTExtChunk(chunk);
-        defer content.deinit(testing.allocator);
+        content.deinit(std.testing.allocator);
     }
-    try testing.expect(found == 2);
+}
+
+test "png: only metadata chunks are kept, not the image data" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, &png_sig);
+    try testChunk(&buf, "IHDR", &@as([13]u8, @splat(0)));
+    try testChunk(&buf, "tEXt", "prompt\x00{}");
+    try testChunk(&buf, "IDAT", &@as([4096]u8, @splat(0xAB)));
+    try testChunk(&buf, "IEND", "");
+
+    var parser = try PngParser.init(std.testing.allocator, std.testing.io);
+    defer parser.deinit();
+    try parser.parseBuffer(buf.items);
+    for (parser.chunks.items) |c| try std.testing.expect(!std.mem.eql(u8, &c.type, &ChunkType.IDAT));
+    try std.testing.expect(!parser.truncated);
+}
+
+test "png: a truncated file keeps the metadata before the cut, without trusting its lengths" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, &png_sig);
+    try testChunk(&buf, "tEXt", "prompt\x00{}");
+    // A chunk claiming ~4 GB in a file that ends right after its header (a file
+    // still being written, or a hostile one).
+    try buf.appendSlice(std.testing.allocator, &.{ 0xFF, 0xFF, 0xFF, 0xF0 });
+    try buf.appendSlice(std.testing.allocator, "tEXt");
+
+    // Little memory to spare: the parser must not allocate the claimed length.
+    var mem: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    var parser = try PngParser.init(fba.allocator(), std.testing.io);
+    defer parser.deinit();
+    try parser.parseBuffer(buf.items);
+    try std.testing.expect(parser.truncated);
+    const text_chunks = try parser.getTExtChunks();
+    try std.testing.expectEqual(@as(usize, 1), text_chunks.len);
 }

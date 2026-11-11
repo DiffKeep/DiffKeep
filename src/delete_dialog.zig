@@ -13,6 +13,32 @@ pub const DeleteDialogState = struct {
     count: usize = 0,
     name_buf: [512]u8 = undefined,
     name_len: usize = 0,
+    /// The images the dialog was opened for. A background reload while it is
+    /// open replaces the grid's selection, so confirm re-selects these.
+    ids: std.ArrayList(u64) = .empty,
+
+    pub fn deinit(self: *DeleteDialogState, gpa: std.mem.Allocator) void {
+        self.ids.deinit(gpa);
+    }
+
+    /// Remember the grid's selection (or focused image) as the dialog's target.
+    pub fn snapshot(self: *DeleteDialogState, gpa: std.mem.Allocator, grid: *const image_grid_mod.GridState) void {
+        self.ids.clearRetainingCapacity();
+        if (grid.selection.count() > 0) {
+            var it = grid.selection.keyIterator();
+            while (it.next()) |id| self.ids.append(gpa, id.*) catch {};
+        } else if (grid.focused_idx) |fi| {
+            if (fi < grid.images.items.len) self.ids.append(gpa, grid.images.items[fi].id) catch {};
+        }
+    }
+
+    /// Select exactly the snapshotted images that are still in the grid.
+    pub fn restoreSelection(self: *const DeleteDialogState, grid: *image_grid_mod.GridState) void {
+        grid.selection.clearRetainingCapacity();
+        for (self.ids.items) |id| {
+            if (grid.entryById(id) != null) grid.selection.put(id, {}) catch {};
+        }
+    }
 
     pub fn render(
         self: *DeleteDialogState,
@@ -71,6 +97,7 @@ pub const DeleteDialogState = struct {
                 if (permanent) self.skip_permanent_delete_confirm = true
                 else           self.skip_delete_confirm = true;
                 if (grid) |g| {
+                    self.restoreSelection(g);
                     if (dvui.App.main_init) |init| {
                         if (permanent) perform_delete(init.io, init.gpa, g)
                         else           perform_trash(init.io, init.gpa, g);
@@ -87,6 +114,7 @@ pub const DeleteDialogState = struct {
         if (confirmed) {
             self.open = false;
             if (grid) |g| {
+                self.restoreSelection(g);
                 if (dvui.App.main_init) |init| {
                     if (permanent) perform_delete(init.io, init.gpa, g)
                     else           perform_trash(init.io, init.gpa, g);

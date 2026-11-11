@@ -82,7 +82,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         }
 
         if (ctx.search.buf[0] != 0) {
-            if (dvui.buttonIcon(@src(), "search_clear", dvui.entypo.cross, .{}, .{}, .{
+            if (dvui.buttonIcon(@src(), i18n.t(.a11y_search_clear), dvui.entypo.cross, .{}, .{}, .{
                 .gravity_y = 0.5,
                 .min_size_content = .{ .w = 14, .h = 14 },
                 .padding = dvui.Rect.all(3),
@@ -186,7 +186,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
             .font = style.F.mono,
             .color_text = .{ .color = style.C.text_hi },
         });
-        if (dvui.buttonIcon(@src(), "remove_filter", dvui.entypo.cross, .{}, .{}, .{
+        if (dvui.buttonIcon(@src(), i18n.t(.a11y_remove_filter), dvui.entypo.cross, .{}, .{}, .{
             .id_extra = fi,
             .min_size_content = .{ .w = 10, .h = 10 },
             .gravity_y = 0.5,
@@ -205,7 +205,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         }
         if (ctx.grid.*) |*grid| {
             grid.filters = ctx.active_filters.items;
-            if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
+            grid.reloadImages() catch {};
         }
     }
 
@@ -260,6 +260,13 @@ pub fn renderToolbar(ctx: RenderCtx) void {
 
         _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 0 } });
 
+        // A search shows results in rank order, so the sort controls are
+        // greyed out and inert; the settings themselves are left alone, so
+        // they apply again when the search is cleared.
+        const sort_enabled = !grid.isRelevanceRanked();
+        const sort_color = if (sort_enabled) style.C.text_dim else style.C.text_ghost;
+        const relevance_tip = i18n.t(.toolbar_sort_by_relevance);
+
         {
             const sort_mode_tvg = switch (grid.sort_mode) {
                 .date   => icons.tvg.lucide.calendar,
@@ -272,7 +279,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .random => i18n.t(.toolbar_sort_randomly),
             };
             var bw: dvui.ButtonWidget = undefined;
-            bw.init(@src(), .{}, chip.override(.{ .id_extra = 5, .min_size_content = .{ .w = 16, .h = 16 } }));
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 5, .tag = "sort-mode", .min_size_content = .{ .w = 16, .h = 16 } }));
             defer bw.deinit();
             bw.processEvents();
             bw.drawBackground();
@@ -280,9 +287,9 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
-                .color_text = .{ .color = style.C.text_dim },
+                .color_text = .{ .color = sort_color },
             });
-            if (bw.clicked()) {
+            if (bw.clicked() and sort_enabled) {
                 grid.sort_mode = switch (grid.sort_mode) {
                     .date => .name,
                     .name => .random,
@@ -291,12 +298,12 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 grid.applySortOrder();
             }
             bw.drawFocus();
-            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{sort_mode_tip}, .{});
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{if (sort_enabled) sort_mode_tip else relevance_tip}, .{});
         }
 
         if (grid.sort_mode == .random) {
             var bw: dvui.ButtonWidget = undefined;
-            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .tag = "sort-dir", .min_size_content = .{ .w = 16, .h = 16 } }));
             defer bw.deinit();
             bw.processEvents();
             bw.drawBackground();
@@ -304,19 +311,19 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
-                .color_text = .{ .color = style.C.text_dim },
+                .color_text = .{ .color = sort_color },
             });
-            if (bw.clicked()) {
+            if (bw.clicked() and sort_enabled) {
                 grid.sort_seed +%= 1;
                 grid.applySortOrder();
             }
             bw.drawFocus();
-            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{i18n.t(.toolbar_reshuffle)}, .{});
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{if (sort_enabled) i18n.t(.toolbar_reshuffle) else relevance_tip}, .{});
         } else {
             const dir_tvg = if (grid.sort_dir == .asc) icons.tvg.lucide.@"arrow-up" else icons.tvg.lucide.@"arrow-down";
             const dir_tip = if (grid.sort_dir == .asc) i18n.t(.toolbar_sort_ascending) else i18n.t(.toolbar_sort_descending);
             var bw: dvui.ButtonWidget = undefined;
-            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .min_size_content = .{ .w = 16, .h = 16 } }));
+            bw.init(@src(), .{}, chip.override(.{ .id_extra = 6, .tag = "sort-dir", .min_size_content = .{ .w = 16, .h = 16 } }));
             defer bw.deinit();
             bw.processEvents();
             bw.drawBackground();
@@ -324,14 +331,14 @@ pub fn renderToolbar(ctx: RenderCtx) void {
                 .gravity_x = 0.5, .gravity_y = 0.5,
                 .min_size_content = .{ .w = 16, .h = 16 },
                 .expand = .ratio,
-                .color_text = .{ .color = style.C.text_dim },
+                .color_text = .{ .color = sort_color },
             });
-            if (bw.clicked()) {
+            if (bw.clicked() and sort_enabled) {
                 grid.sort_dir = if (grid.sort_dir == .asc) .desc else .asc;
                 grid.applySortOrder();
             }
             bw.drawFocus();
-            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{dir_tip}, .{});
+            dvui.tooltip(@src(), .{ .active_rect = bw.data().rectScale().r, .delay = 500_000 }, "{s}", .{if (sort_enabled) dir_tip else relevance_tip}, .{});
         }
     }
 }
@@ -567,8 +574,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
 
         const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
         const is_searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g else null);
-        const is_downloading = ctx.settings.gemma_dl_running.load(.acquire) or
-            ctx.settings.siglip2_dl_running.load(.acquire);
+        const is_downloading = ctx.settings.gemma_dl != null or ctx.settings.siglip2_dl != null;
 
         if (is_scanning) {
             const embed_total = if (ctx.library_manager.*) |*mgr| mgr.embedsTotal() else 0;
@@ -589,7 +595,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     }
 
     _ = dvui.spacer(@src(), .{ .expand = .horizontal });
-    if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
+    if (dvui.buttonIcon(@src(), i18n.t(.nav_settings), dvui.entypo.cog, .{}, .{}, .{
         .min_size_content = .{ .w = 14, .h = 14 },
         .gravity_y = 0.5,
         .padding = dvui.Rect.all(4),

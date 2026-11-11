@@ -1,6 +1,36 @@
 #include "vips_helper.h"
 #include <vips/vips.h>
 
+/* Convert *img in place to 4-band sRGB uchar (RGBA8), the layout every caller
+   indexes as w*h*4. vips keeps greyscale as 1 band (2 with alpha) and 16-bit
+   sources as ushort, so colourspace/cast before adding alpha. On failure *img
+   is unreffed and set to NULL. */
+static int to_rgba8(VipsImage **img) {
+    VipsImage *t = NULL;
+    if (vips_image_get_bands(*img) < 3 ||
+        vips_image_guess_interpretation(*img) != VIPS_INTERPRETATION_sRGB) {
+        if (vips_colourspace(*img, &t, VIPS_INTERPRETATION_sRGB, NULL) != 0) goto fail;
+        g_object_unref(*img);
+        *img = t;
+    }
+    if (vips_image_get_format(*img) != VIPS_FORMAT_UCHAR) {
+        if (vips_cast(*img, &t, VIPS_FORMAT_UCHAR, NULL) != 0) goto fail;
+        g_object_unref(*img);
+        *img = t;
+    }
+    if (!vips_image_hasalpha(*img)) {
+        if (vips_addalpha(*img, &t, NULL) != 0) goto fail;
+        g_object_unref(*img);
+        *img = t;
+    }
+    if (vips_image_get_bands(*img) != 4) goto fail;
+    return 0;
+fail:
+    g_object_unref(*img);
+    *img = NULL;
+    return -1;
+}
+
 int diffkeep_vips_init(const char *name) {
     int rc = vips_init(name);
     if (rc == 0) {
@@ -138,7 +168,7 @@ int diffkeep_image_to_rgb_square(
         thumb = flat;
     }
 
-    /* Ensure 3-band sRGB */
+    /* Ensure 3-band sRGB uchar */
     if (vips_image_get_bands(thumb) != 3) {
         VipsImage *rgb = NULL;
         if (vips_colourspace(thumb, &rgb, VIPS_INTERPRETATION_sRGB, NULL) != 0) {
@@ -147,6 +177,15 @@ int diffkeep_image_to_rgb_square(
         }
         g_object_unref(thumb);
         thumb = rgb;
+    }
+    if (vips_image_get_format(thumb) != VIPS_FORMAT_UCHAR) {
+        VipsImage *u8img = NULL;
+        if (vips_cast(thumb, &u8img, VIPS_FORMAT_UCHAR, NULL) != 0) {
+            g_object_unref(thumb);
+            return -1;
+        }
+        g_object_unref(thumb);
+        thumb = u8img;
     }
 
     size_t out_len = 0;
@@ -259,12 +298,7 @@ DiffkeepAnimDecoder *diffkeep_anim_open(const char *filename, int max_dim) {
         src = NULL;
     }
 
-    if (!vips_image_hasalpha(roll)) {
-        VipsImage *rgba = NULL;
-        if (vips_addalpha(roll, &rgba, NULL) != 0) { g_object_unref(roll); diffkeep_anim_close(d); return NULL; }
-        g_object_unref(roll);
-        roll = rgba;
-    }
+    if (to_rgba8(&roll) != 0) { diffkeep_anim_close(d); return NULL; }
 
     d->width = vips_image_get_width(roll);
     d->page_height = vips_image_get_page_height(roll);
@@ -305,6 +339,8 @@ double diffkeep_anim_fps(const DiffkeepAnimDecoder *d) {
 
 /* Stream mode: decode the current page from the live roll (with optional resize). */
 static int anim_next_stream(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, long *pts_ms) {
+    /* A failed reopen on a backward seek leaves no roll to read. */
+    if (!d->roll) return -1;
     VipsImage *page = NULL;
     if (vips_extract_area(d->roll, &page, 0, d->cur * d->page_height,
                           d->width, d->page_height, NULL) != 0)
@@ -321,12 +357,7 @@ static int anim_next_stream(DiffkeepAnimDecoder *d, void **buf, int *w, int *h, 
         page = thumb;
     }
 
-    if (!vips_image_hasalpha(page)) {
-        VipsImage *rgba = NULL;
-        if (vips_addalpha(page, &rgba, NULL) != 0) { g_object_unref(page); return -1; }
-        g_object_unref(page);
-        page = rgba;
-    }
+    if (to_rgba8(&page) != 0) return -1;
 
     size_t len = 0;
     void *pixels = vips_image_write_to_memory(page, &len);
@@ -403,15 +434,7 @@ int diffkeep_jpeg_bytes_to_rgba(
     }
     g_object_unref(image);
 
-    if (!vips_image_hasalpha(thumb)) {
-        VipsImage *rgba = NULL;
-        if (vips_addalpha(thumb, &rgba, NULL) != 0) {
-            g_object_unref(thumb);
-            return -1;
-        }
-        g_object_unref(thumb);
-        thumb = rgba;
-    }
+    if (to_rgba8(&thumb) != 0) return -1;
 
     size_t len = 0;
     void *pixels = vips_image_write_to_memory(thumb, &len);
@@ -446,17 +469,8 @@ int diffkeep_load_image_rgba(
             NULL) != 0)
         return -1;
 
-    /* vips_thumbnail outputs 3-band sRGB or 4-band sRGB-A.
-       Ensure we always have 4 bands for dvui. */
-    if (!vips_image_hasalpha(image)) {
-        VipsImage *rgba = NULL;
-        if (vips_addalpha(image, &rgba, NULL) != 0) {
-            g_object_unref(image);
-            return -1;
-        }
-        g_object_unref(image);
-        image = rgba;
-    }
+    /* dvui wants 4-band RGBA8; vips_thumbnail keeps greyscale as 1-2 bands. */
+    if (to_rgba8(&image) != 0) return -1;
 
     size_t out_len = 0;
     void *pixels = vips_image_write_to_memory(image, &out_len);

@@ -15,6 +15,13 @@ pub fn threadShutdown() void {
     c.diffkeep_vips_thread_shutdown();
 }
 
+/// Callers index decoded pixels as packed RGBA8; refuse anything else rather
+/// than read past the buffer.
+fn checkRgba(len: usize, w: c_int, h: c_int) !void {
+    if (w <= 0 or h <= 0) return error.BadPixelLayout;
+    if (len != @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) return error.BadPixelLayout;
+}
+
 /// Decode a full-resolution image to packed RGBA8 pixels.
 /// The returned slice is gpa-owned; caller frees with allocator.free().
 pub fn loadImageRgba(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
@@ -26,6 +33,7 @@ pub fn loadImageRgba(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
     if (c.diffkeep_load_image_rgba(path.ptr, &buf, &len, &w, &h) != 0)
         return error.VipsLoadFailed;
     defer c.diffkeep_vips_free(buf);
+    try checkRgba(len, w, h);
 
     return allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]);
 }
@@ -43,6 +51,7 @@ pub fn loadImageRgbaWithDims(
     if (c.diffkeep_load_image_rgba(path.ptr, &buf, &len, &w, &h) != 0)
         return error.VipsLoadFailed;
     defer c.diffkeep_vips_free(buf);
+    try checkRgba(len, w, h);
 
     const pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]);
     return .{
@@ -65,6 +74,7 @@ pub fn jpegBytesToRgba(
     if (c.diffkeep_jpeg_bytes_to_rgba(jpeg_data.ptr, jpeg_data.len, size, &buf, &len, &w, &h) != 0)
         return error.VipsDecodeFailed;
     defer c.diffkeep_vips_free(buf);
+    try checkRgba(len, w, h);
 
     return .{
         .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
@@ -136,7 +146,8 @@ pub const AnimDecoder = struct {
         if (r == 0) return null;
         if (r < 0) return error.AnimDecodeFailed;
         defer c.diffkeep_vips_free(buf);
-        const len: usize = @intCast(w * h * 4);
+        if (w <= 0 or h <= 0) return error.AnimDecodeFailed;
+        const len = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
         return .{
             .pixels = try allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
             .width = @intCast(w),

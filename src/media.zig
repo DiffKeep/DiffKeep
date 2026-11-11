@@ -37,6 +37,25 @@ pub fn isAnimatableImage(name: []const u8) bool {
     return hasAnyExt(name, &animatable_extensions);
 }
 
+/// The clipboard MIME type for an image file, or null for files that can't be
+/// pasted as an image (video).
+pub fn imageMimeType(name: []const u8) ?[:0]const u8 {
+    if (std.ascii.endsWithIgnoreCase(name, ".png")) return "image/png";
+    if (std.ascii.endsWithIgnoreCase(name, ".jpg") or std.ascii.endsWithIgnoreCase(name, ".jpeg")) return "image/jpeg";
+    if (std.ascii.endsWithIgnoreCase(name, ".webp")) return "image/webp";
+    if (std.ascii.endsWithIgnoreCase(name, ".gif")) return "image/gif";
+    return null;
+}
+
+test "clipboard MIME type follows the file's format" {
+    try std.testing.expectEqualStrings("image/png", imageMimeType("/a/b.PNG").?);
+    try std.testing.expectEqualStrings("image/jpeg", imageMimeType("x.jpeg").?);
+    try std.testing.expectEqualStrings("image/jpeg", imageMimeType("x.jpg").?);
+    try std.testing.expectEqualStrings("image/webp", imageMimeType("x.webp").?);
+    try std.testing.expectEqualStrings("image/gif", imageMimeType("x.gif").?);
+    try std.testing.expect(imageMimeType("x.mp4") == null);
+}
+
 test "media file classification (images, video, animatable, case-insensitive)" {
     const t = std.testing;
     try t.expect(isImageFile("a.png"));

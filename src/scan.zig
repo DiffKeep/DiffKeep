@@ -36,6 +36,71 @@ fn gatherEmbeddedSections(
     }
 }
 
+/// Collect a PNG's iTXt then tEXt chunks as parser sections (file order within
+/// each kind, so the shared selector picks the first of each; an iTXt
+/// "parameters" wins over tEXt). Strings are duped into the arena `aa`.
+/// Returns whether the PNG was truncated (ended before IEND; maybe still being
+/// written) — its sections are still gathered.
+fn gatherPngSections(
+    aa: std.mem.Allocator,
+    io: std.Io,
+    buffer: []const u8,
+    sections: *std.ArrayList(comfy_mod.ComfyParser.RawSection),
+) !bool {
+    var png_parser = try png_mod.PngParser.init(aa, io);
+    defer png_parser.deinit();
+    try png_parser.parseBuffer(buffer);
+    const truncated = png_parser.truncated;
+    {
+        const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
+        defer aa.free(itxt);
+        for (itxt) |chunk| {
+            var content = png_parser.parseITxtChunk(chunk) catch continue;
+            defer content.deinit(aa);
+            if (content.compressed) continue;
+            const kw = aa.dupe(u8, content.keyword) catch continue;
+            const tx = aa.dupe(u8, content.text) catch continue;
+            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+        }
+    }
+    const text_chunks = try png_parser.getTExtChunks();
+    defer aa.free(text_chunks);
+    for (text_chunks) |chunk| {
+        var content = png_parser.parseTExtChunk(chunk) catch continue;
+        defer content.deinit(aa);
+        const kw = aa.dupe(u8, content.keyword) catch continue;
+        const tx = aa.dupe(u8, content.text) catch continue;
+        sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+    }
+    return truncated;
+}
+
+/// Overwrite `image`'s generation metadata with `result`, clearing every field
+/// when there is none. Strings are duped with `a` (the image's allocator).
+fn applyParseResult(a: std.mem.Allocator, image: *models.Image, maybe_result: ?comfy_mod.ParseResult) void {
+    const r: comfy_mod.ParseResult = maybe_result orelse .{};
+    const dupeOpt = struct {
+        fn f(alloc: std.mem.Allocator, v: ?[]const u8) ?[]const u8 {
+            return if (v) |x| alloc.dupe(u8, x) catch null else null;
+        }
+    }.f;
+    if (image.positivePromptText) |p| a.free(p);
+    image.positivePromptText = dupeOpt(a, r.positive_prompt);
+    if (image.negativePromptText) |p| a.free(p);
+    image.negativePromptText = dupeOpt(a, r.negative_prompt);
+    if (image.model) |m| a.free(m);
+    image.model = dupeOpt(a, r.model);
+    if (image.sampler) |v| a.free(v);
+    image.sampler = dupeOpt(a, r.sampler);
+    if (image.scheduler) |v| a.free(v);
+    image.scheduler = dupeOpt(a, r.scheduler);
+    image.cfg = r.cfg;
+    image.steps = r.steps;
+    image.seed = r.seed;
+    if (image.loras) |l| a.free(l);
+    image.loras = lorasToString(a, r.loras);
+}
+
 /// Join a slice of lora names into a single newline-separated string.
 fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]const u8 {
     const items = loras orelse return null;
@@ -71,13 +136,17 @@ pub const ScanStats = struct {
 /// EmbedQueue; an embed consumer drains a mini-batch of these and runs embedBatch.
 pub const EmbedInput = struct {
     image_id: u64,
-    prompt_text:  ?[]const u8,    // owned; null = no prompt embedding needed
-    image_path_z: ?[:0]const u8,  // owned; null = no image embedding needed
+    /// owned; the image's library path, so the vector is only stored while the
+    /// row still belongs to this file (it may be deleted and its id recycled
+    /// while the item waits in the queue).
+    path: [:0]const u8,
+    prompt_text: ?[]const u8, // owned; null = no prompt embedding needed
+    want_image: bool, // embed the image at `path`
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *EmbedInput) void {
-        if (self.prompt_text)  |p| self.allocator.free(p);
-        if (self.image_path_z) |p| self.allocator.free(p);
+        self.allocator.free(self.path);
+        if (self.prompt_text) |p| self.allocator.free(p);
     }
 };
 
@@ -164,6 +233,27 @@ pub const ScanCtx = struct {
     embed_queue: ?*EmbedQueue = null,
 };
 
+/// What a directory walk saw, beyond the per-file work it queued.
+const WalkState = struct {
+    /// Supported media files found (whether processed or unchanged).
+    media_seen: usize = 0,
+    /// Subdirectories that couldn't be listed. Rows under them are kept: their
+    /// files are unreadable, not known to be gone. Paths owned.
+    skipped_dirs: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(w: *WalkState, a: std.mem.Allocator) void {
+        for (w.skipped_dirs.items) |d| a.free(d);
+        w.skipped_dirs.deinit(a);
+    }
+
+    fn underSkipped(w: *const WalkState, path: []const u8) bool {
+        for (w.skipped_dirs.items) |d| {
+            if (path.len > d.len and std.mem.startsWith(u8, path, d) and path[d.len] == '/') return true;
+        }
+        return false;
+    }
+};
+
 pub const AtomicStats = struct {
     added: std.atomic.Value(u32) = .init(0),
     updated: std.atomic.Value(u32) = .init(0),
@@ -184,6 +274,10 @@ pub const LibraryScanner = struct {
     db: *db_mod.VectorDb,
     notifier: ?*notifier_mod.ImageNotifier,
     embedder: ?*embedder_mod.Embedder = null,  // borrowed, not owned
+    /// When set, `scanLibrary` appends the ids of rows it removes (files gone
+    /// from disk) so the caller can drop them from the grid and viewers.
+    /// Allocated with `self.allocator`.
+    removed_ids: ?*std.ArrayList(u64) = null,
 
     pub fn init(_: std.mem.Allocator, db: *db_mod.VectorDb, notifier: ?*notifier_mod.ImageNotifier) LibraryScanner {
         // c_allocator (glibc malloc) is used throughout because processFile tasks
@@ -295,10 +389,12 @@ pub const LibraryScanner = struct {
 
         var group: std.Io.Group = .init;
         var in_flight: usize = 0;
+        var walk: WalkState = .{};
+        defer walk.deinit(self.allocator);
         const walk_err = self.walkDirectory(
             io, library_id, library_path, &stats, &known,
             stop, files_scanned, thumbnails_in_db, prompt_embeddings, image_embeddings,
-            &group, &in_flight, &embed_queue,
+            &group, &in_flight, &embed_queue, &walk, true,
         );
         group.await(io) catch |err| log.warn("final cpu group.await: {}", .{err});
         log.debug("scanLibrary: all cpu tasks done, signaling embed consumer", .{});
@@ -313,17 +409,25 @@ pub const LibraryScanner = struct {
 
         // Reconciliation: any entry not marked seen no longer exists on disk.
         // Skip if the scan was stopped early — unseen entries may simply not have
-        // been reached yet, not actually missing from disk.
+        // been reached yet, not actually missing from disk. Also skip when the
+        // walk found no media at all but the library has images: that is an
+        // unmounted drive (its empty mount point) or a filesystem we can't
+        // list, not the user deleting everything.
         var removed: u32 = 0;
-        if (!stop.load(.acquire)) {
+        const stopped = stop.load(.acquire);
+        const looks_unmounted = !stopped and walk.media_seen == 0 and known.count() > 0;
+        if (looks_unmounted)
+            log.warn("{s}: no media found but {d} indexed; keeping them (drive unmounted?)", .{ library_path, known.count() });
+        if (!stopped and !looks_unmounted) {
             var kit = known.iterator();
             while (kit.next()) |entry| {
-                if (!entry.value_ptr.seen) {
-                    _ = self.db.deleteImageByPath(library_id, entry.key_ptr.*) catch |err| {
-                        log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(entry.key_ptr.*), err });
-                    };
-                    removed += 1;
-                }
+                if (entry.value_ptr.seen or walk.underSkipped(entry.key_ptr.*)) continue;
+                const id = self.db.deleteImageByPath(library_id, entry.key_ptr.*) catch |err| {
+                    log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(entry.key_ptr.*), err });
+                    continue;
+                } orelse continue;
+                removed += 1;
+                if (self.removed_ids) |out| out.append(self.allocator, id) catch {};
             }
         }
 
@@ -348,35 +452,55 @@ pub const LibraryScanner = struct {
         group: *std.Io.Group,
         in_flight: *usize,
         embed_queue: *EmbedQueue,
+        walk: *WalkState,
+        is_root: bool,
     ) !void {
-        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{
+        // A subdirectory that can't be listed is skipped (and its rows kept);
+        // only the library root failing fails the scan.
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{
             .access_sub_paths = true,
             .iterate = true,
-        });
+        }) catch |err| {
+            if (is_root) return err;
+            return skipDir(self.allocator, walk, dir_path, err);
+        };
         defer dir.close(io);
 
         var iter = dir.iterate();
 
-        while (try iter.next(io)) |entry| {
+        while (true) {
+            const maybe_entry = iter.next(io) catch |err| {
+                if (is_root) return err;
+                return skipDir(self.allocator, walk, dir_path, err);
+            };
+            const entry = maybe_entry orelse break;
             // Abort the walk promptly when stopped (window close / rescan) instead
             // of iterating the rest of the tree, so scan_group.await unblocks fast.
             if (stop.load(.acquire)) return;
             const full_path = try std.Io.Dir.path.join(self.allocator, &.{ dir_path, entry.name });
 
-            if (entry.kind == .directory) {
+            // Some filesystems (NFS, FUSE, XFS without ftype) don't report entry
+            // types; stat those, or every file would be skipped.
+            const kind: std.Io.File.Kind = if (entry.kind == .unknown)
+                if (std.Io.Dir.cwd().statFile(io, full_path, .{ .follow_symlinks = false })) |st| st.kind else |_| .unknown
+            else
+                entry.kind;
+
+            if (kind == .directory) {
                 defer self.allocator.free(full_path);
                 try self.walkDirectory(
                     io, library_id, full_path, stats, known,
                     stop, files_scanned, thumbnails_in_db, prompt_embeddings, image_embeddings,
-                    group, in_flight, embed_queue,
+                    group, in_flight, embed_queue, walk, false,
                 );
                 continue;
             }
 
-            if (entry.kind != .file or !media.isSupportedMediaFile(entry.name)) {
+            if (kind != .file or !media.isSupportedMediaFile(entry.name)) {
                 self.allocator.free(full_path);
                 continue;
             }
+            walk.media_seen += 1;
 
             if (stop.load(.acquire)) {
                 self.allocator.free(full_path);
@@ -394,11 +518,12 @@ pub const LibraryScanner = struct {
             const current_mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
 
             // Skip files that are unchanged and already have all requested data.
+            // Only an image with a prompt can have a prompt embedding.
             if (meta_ptr) |m| {
                 if (m.mtime) |stored_mtime| {
                     if (stored_mtime == current_mtime
                         and (!thumbnails_in_db or m.has_thumbnail)
-                        and (!prompt_embeddings or m.has_prompt_embedding)
+                        and (!prompt_embeddings or !m.has_prompt or m.has_prompt_embedding)
                         and (!image_embeddings or m.has_image_embedding))
                     {
                         _ = stats.unchanged.fetchAdd(1, .acq_rel);
@@ -445,6 +570,15 @@ pub const LibraryScanner = struct {
         }
     }
 };
+
+fn skipDir(a: std.mem.Allocator, walk: *WalkState, dir_path: []const u8, err: anyerror) !void {
+    log.warn("skipping unreadable folder {s}: {}", .{ dir_path, err });
+    const owned = try a.dupe(u8, dir_path);
+    walk.skipped_dirs.append(a, owned) catch |e| {
+        a.free(owned);
+        return e;
+    };
+}
 
 const EmbedConsumerCtx = struct {
     queue:     *EmbedQueue,
@@ -501,6 +635,7 @@ fn embedBatch(
     if (emb.hasPromptEncoder()) {
         var texts:    [EMBED_BATCH_SIZE][]const u8 = undefined;
         var text_ids: [EMBED_BATCH_SIZE]u64        = undefined;
+        var text_paths: [EMBED_BATCH_SIZE][]const u8 = undefined;
         var nt: usize = 0;
         for (items) |*it| {
             const raw = it.prompt_text orelse continue;
@@ -518,6 +653,7 @@ fn embedBatch(
             }
             texts[nt] = cleaned;
             text_ids[nt] = it.image_id;
+            text_paths[nt] = it.path;
             nt += 1;
         }
         defer for (texts[0..nt]) |t| allocator.free(t);
@@ -529,11 +665,11 @@ fn embedBatch(
                     for (vecs) |v| allocator.free(v);
                     allocator.free(vecs);
                 }
-                for (vecs, text_ids[0..nt]) |vec, id|
-                    db.storePromptEmbedding(id, vec) catch |err| log.warn("store prompt embed: {}", .{err});
+                for (vecs, text_ids[0..nt], text_paths[0..nt]) |vec, id, path|
+                    storePrompt(db, id, path, vec);
             } else |err| {
                 log.warn("prompt embed batch failed ({}); retrying per item", .{err});
-                for (texts[0..nt], text_ids[0..nt]) |t, id| embedOnePrompt(allocator, db, emb, id, t);
+                for (texts[0..nt], text_ids[0..nt], text_paths[0..nt]) |t, id, path| embedOnePrompt(allocator, db, emb, id, path, t);
             }
         }
     }
@@ -546,8 +682,8 @@ fn embedBatch(
         var img_ids: [EMBED_BATCH_SIZE]u64          = undefined;
         var ni: usize = 0;
         for (items) |*it| {
-            const p = it.image_path_z orelse continue;
-            paths[ni] = p;
+            if (!it.want_image) continue;
+            paths[ni] = it.path;
             img_ids[ni] = it.image_id;
             ni += 1;
         }
@@ -559,12 +695,13 @@ fn embedBatch(
                 }
                 // Empty vec = that image failed to decode (skipped, not fatal to the
                 // batch); the rest still embedded on the GPU in one forward.
-                for (vecs, img_ids[0..ni]) |vec, id| {
+                for (vecs, img_ids[0..ni], 0..) |vec, id, i| {
                     if (vec.len == 0) {
-                        log.warn("image decode failed for image {d}; skipped", .{id});
+                        // Empty slots are also what a stopped batch returns.
+                        if (!stop.load(.acquire)) log.warn("image decode failed for image {d}; skipped", .{id});
                         continue;
                     }
-                    db.storeImageEmbedding(id, vec) catch |err| log.warn("store image embed: {}", .{err});
+                    storeImage(db, id, paths[i], vec);
                 }
             } else |err| {
                 log.warn("image embed batch failed ({}); retrying per item", .{err});
@@ -574,11 +711,27 @@ fn embedBatch(
     }
 }
 
+fn storePrompt(db: *db_mod.VectorDb, id: u64, path: []const u8, vec: []const f32) void {
+    const stored = db.storePromptEmbedding(id, path, vec) catch |err| {
+        log.warn("store prompt embed: {}", .{err});
+        return;
+    };
+    if (!stored) log.debug("prompt embed for {s} dropped: image removed", .{std.Io.Dir.path.basename(path)});
+}
+
+fn storeImage(db: *db_mod.VectorDb, id: u64, path: []const u8, vec: []const f32) void {
+    const stored = db.storeImageEmbedding(id, path, vec) catch |err| {
+        log.warn("store image embed: {}", .{err});
+        return;
+    };
+    if (!stored) log.debug("image embed for {s} dropped: image removed", .{std.Io.Dir.path.basename(path)});
+}
+
 /// Fallback: embed one already-cleaned prompt (routes to CPU, n=1) and store it.
-fn embedOnePrompt(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embedder_mod.Embedder, id: u64, cleaned: []const u8) void {
+fn embedOnePrompt(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embedder_mod.Embedder, id: u64, path: []const u8, cleaned: []const u8) void {
     if (emb.embedPrompt(allocator, cleaned)) |vec| {
         defer allocator.free(vec);
-        db.storePromptEmbedding(id, vec) catch |err| log.warn("store prompt embed: {}", .{err});
+        storePrompt(db, id, path, vec);
     } else |err| log.warn("prompt embed failed ({}); skipped", .{err});
 }
 
@@ -586,7 +739,7 @@ fn embedOnePrompt(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embe
 fn embedOneImage(allocator: std.mem.Allocator, db: *db_mod.VectorDb, emb: *embedder_mod.Embedder, id: u64, path: [:0]const u8) void {
     if (emb.embedImage(allocator, path)) |vec| {
         defer allocator.free(vec);
-        db.storeImageEmbedding(id, vec) catch |err| log.warn("store image embed: {}", .{err});
+        storeImage(db, id, path, vec);
     } else |err| log.warn("image embed failed ({}); skipped", .{err});
 }
 
@@ -607,9 +760,7 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
         if (cleaned.len == 0) break :prompt;
         const vec = emb.embedPrompt(ctx.allocator, cleaned) catch break :prompt;
         defer ctx.allocator.free(vec);
-        ctx.db.storePromptEmbedding(image.id, vec) catch |err| {
-            log.warn("store prompt embed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-        };
+        storePrompt(ctx.db, image.id, ctx.path, vec);
         did_work = true;
     }
     image_blk: {
@@ -620,12 +771,29 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
         defer ctx.allocator.free(path_z);
         const vec = emb.embedImage(ctx.allocator, path_z) catch break :image_blk;
         defer ctx.allocator.free(vec);
-        ctx.db.storeImageEmbedding(image.id, vec) catch |err| {
-            log.warn("store image embed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-        };
+        storeImage(ctx.db, image.id, ctx.path, vec);
         did_work = true;
     }
     return did_work;
+}
+
+/// Queue embedding work for one image. Returns false when there was nothing to
+/// embed (no prompt and no image wanted) or the item couldn't be allocated.
+fn pushEmbed(ctx: ScanCtx, q: *EmbedQueue, id: u64, prompt: ?[]const u8, want_image: bool) bool {
+    if (prompt == null and !want_image) return false;
+    const path = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return false;
+    const text = if (prompt) |p| ctx.allocator.dupe(u8, p) catch {
+        ctx.allocator.free(path);
+        return false;
+    } else null;
+    q.push(ctx.io, .{
+        .image_id = id,
+        .path = path,
+        .prompt_text = text,
+        .want_image = want_image,
+        .allocator = ctx.allocator,
+    });
+    return true;
 }
 
 /// gif/webp can be animated; persist media_type accordingly. Gated on those two
@@ -638,6 +806,24 @@ fn classifyAnimatedImage(ctx: ScanCtx, image_id: u64) void {
     defer ctx.allocator.free(path_z);
     const pages = vips.nPages(path_z) catch return;
     ctx.db.setMediaType(image_id, if (pages > 1) .animated else .image) catch {};
+}
+
+/// Blake3 of a file's bytes as lowercase hex, read in fixed-size pieces.
+fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    var off: u64 = 0;
+    while (true) {
+        const n = try file.readPositional(io, &.{&buf}, off);
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+        off += n;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 /// Process a video file: poster-frame thumbnail (always stored in the DB so the
@@ -663,43 +849,13 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
         sections.append(aa, .{ .keyword = "prompt", .text = p }) catch {};
 
     var parser = comfy_mod.ComfyParser.init(aa);
-    if (parser.parseImageMetadata(sections.items) catch null) |res| {
-        var result = res;
-        defer result.deinit(aa);
-        if (image.positivePromptText) |p| ctx.allocator.free(p);
-        image.positivePromptText = if (result.positive_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
-        if (image.negativePromptText) |p| ctx.allocator.free(p);
-        image.negativePromptText = if (result.negative_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
-        if (image.model) |m| ctx.allocator.free(m);
-        image.model = if (result.model) |m| ctx.allocator.dupe(u8, m) catch null else null;
-        if (image.sampler) |s| ctx.allocator.free(s);
-        image.sampler = if (result.sampler) |s| ctx.allocator.dupe(u8, s) catch null else null;
-        if (image.scheduler) |s| ctx.allocator.free(s);
-        image.scheduler = if (result.scheduler) |s| ctx.allocator.dupe(u8, s) catch null else null;
-        image.cfg = result.cfg;
-        image.steps = result.steps;
-        image.seed = result.seed;
-        if (image.loras) |l| ctx.allocator.free(l);
-        image.loras = lorasToString(ctx.allocator, result.loras);
-    }
+    applyParseResult(ctx.allocator, image, parser.parseImageMetadata(sections.items) catch null);
 
-    // Hash the file bytes for duplicate detection.
-    if (std.Io.Dir.cwd().openFile(ctx.io, ctx.path, .{})) |file| {
-        defer file.close(ctx.io);
-        if (file.length(ctx.io)) |size| {
-            if (aa.alloc(u8, size)) |buffer| {
-                if (file.readPositionalAll(ctx.io, buffer, 0)) |_| {
-                    var hasher = std.crypto.hash.Blake3.init(.{});
-                    hasher.update(buffer);
-                    var digest: [32]u8 = undefined;
-                    hasher.final(&digest);
-                    const hash_hex = std.fmt.bytesToHex(digest, .lower);
-                    if (image.hash) |h| ctx.allocator.free(h);
-                    image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
-                } else |_| {}
-            } else |_| {}
-        } else |_| {}
-    } else |_| {}
+    // Hash the file for duplicate detection, streamed: videos can be huge.
+    if (hashFile(ctx.io, ctx.path)) |hash_hex| {
+        if (image.hash) |h| ctx.allocator.free(h);
+        image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
+    } else |err| log.warn("hash {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     image.mtime = current_mtime;
     ctx.db.saveImage(image) catch |err| {
@@ -750,23 +906,15 @@ pub fn processFile(ctx: ScanCtx) void {
                 };
                 did_work = true;
             }
-            const needs_prompt_backfill = ctx.prompt_embeddings and !ctx.has_prompt_embedding;
+            const needs_prompt_backfill = ctx.prompt_embeddings and !ctx.has_prompt_embedding and
+                image.positivePromptText != null;
             const needs_image_backfill  = ctx.image_embeddings  and !ctx.has_image_embedding;
 
             if (ctx.embed_queue) |q| {
                 // Queue mode: push embedding inputs to the concurrent consumer.
                 if (needs_prompt_backfill or needs_image_backfill) {
-                    q.push(ctx.io, EmbedInput{
-                        .image_id     = image.id,
-                        .prompt_text  = if (needs_prompt_backfill)
-                            if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
-                            else null,
-                        .image_path_z = if (needs_image_backfill)
-                            ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch null
-                            else null,
-                        .allocator    = ctx.allocator,
-                    });
-                    did_work = true;
+                    if (pushEmbed(ctx, q, image.id, if (needs_prompt_backfill) image.positivePromptText else null, needs_image_backfill))
+                        did_work = true;
                 }
             } else {
                 // Inline mode (single-file from watcher): embed directly.
@@ -795,7 +943,7 @@ pub fn processFile(ctx: ScanCtx) void {
         return;
     }
 
-    // Classify gif/webp as static vs animated (before any metadata early-returns).
+    // Classify gif/webp as static vs animated.
     classifyAnimatedImage(ctx, image.id);
 
     // Read file into arena buffer.
@@ -804,72 +952,33 @@ pub fn processFile(ctx: ScanCtx) void {
 
     const file_size = file.length(ctx.io) catch return;
     const buffer = aa.alloc(u8, file_size) catch return;
-    _ = file.readPositionalAll(ctx.io, buffer, 0) catch return;
+    // A short read means the file shrank under us (being rewritten): leave the
+    // row as it was and let the next event or scan pick up the final file.
+    const n_read = file.readPositionalAll(ctx.io, buffer, 0) catch return;
+    if (n_read != file_size) return;
 
     // Gather metadata "sections" (keyword + text) for the shared ComfyUI/A1111
     // parser. ComfyUI PNGs carry the workflow/prompt JSON in tEXt/iTXt chunks;
     // other formats (notably ComfyUI WebP) carry the same JSON in EXIF.
     var sections: std.ArrayList(comfy_mod.ComfyParser.RawSection) = .empty;
+    // A PNG that doesn't parse may be mid-write (ComfyUI still saving it): its
+    // mtime is not stored, so the next event or scan reads it again.
+    var parse_failed = false;
     if (std.ascii.endsWithIgnoreCase(ctx.path, ".png")) {
-        var png_parser = png_mod.PngParser.init(aa, ctx.io) catch return;
-        defer png_parser.deinit();
-        png_parser.parseBuffer(buffer) catch |err| {
+        parse_failed = gatherPngSections(aa, ctx.io, buffer, &sections) catch |err| blk: {
             log.warn("parse failed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-            image.mtime = current_mtime;
-            ctx.db.saveImage(&image) catch {};
-            _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
-            return;
+            break :blk true;
         };
-
-        // Preserve file order so the shared selector can pick the first of each
-        // kind. iTXt is collected before tEXt (an iTXt "parameters" wins over tEXt).
-        {
-            const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
-            defer aa.free(itxt);
-            for (itxt) |chunk| {
-                var content = png_parser.parseITxtChunk(chunk) catch continue;
-                defer content.deinit(aa);
-                if (content.compressed) continue;
-                const kw = aa.dupe(u8, content.keyword) catch continue;
-                const tx = aa.dupe(u8, content.text) catch continue;
-                sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
-            }
-        }
-        {
-            const text_chunks = png_parser.getTExtChunks() catch return;
-            defer aa.free(text_chunks);
-            for (text_chunks) |chunk| {
-                var content = png_parser.parseTExtChunk(chunk) catch continue;
-                defer content.deinit(aa);
-                const kw = aa.dupe(u8, content.keyword) catch continue;
-                const tx = aa.dupe(u8, content.text) catch continue;
-                sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
-            }
-        }
     } else {
         gatherEmbeddedSections(aa, buffer, &sections);
     }
 
     var parser = comfy_mod.ComfyParser.init(aa);
     const maybe_result: ?comfy_mod.ParseResult = parser.parseImageMetadata(sections.items) catch null;
+    if (maybe_result == null) log.debug("no metadata: {s}", .{std.Io.Dir.path.basename(ctx.path)});
 
-    var result = maybe_result orelse {
-        log.debug("no metadata: {s}", .{std.Io.Dir.path.basename(ctx.path)});
-        // Persist mtime so this file is skipped on future scans.
-        image.mtime = current_mtime;
-        ctx.db.saveImage(&image) catch {};
-        _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
-        return;
-    };
-    defer result.deinit(aa);
-    if (result.positive_prompt == null) {
-        image.mtime = current_mtime;
-        ctx.db.saveImage(&image) catch {};
-        _ = ctx.stats.unchanged.fetchAdd(1, .acq_rel);
-        return;
-    }
-
-    // Hash the raw file bytes.
+    // Hash the raw file bytes (every image: duplicate detection needs it
+    // whether or not the image has generation metadata).
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(buffer);
     var digest: [32]u8 = undefined;
@@ -882,25 +991,12 @@ pub fn processFile(ctx: ScanCtx) void {
         };
     }
 
-    // Update image fields with parsed data.
-    if (image.positivePromptText) |p| ctx.allocator.free(p);
-    image.positivePromptText = if (result.positive_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
-    if (image.negativePromptText) |p| ctx.allocator.free(p);
-    image.negativePromptText = if (result.negative_prompt) |p| ctx.allocator.dupe(u8, p) catch null else null;
-    if (image.model) |m| ctx.allocator.free(m);
-    image.model = if (result.model) |m| ctx.allocator.dupe(u8, m) catch null else null;
-    if (image.sampler) |s| ctx.allocator.free(s);
-    image.sampler = if (result.sampler) |s| ctx.allocator.dupe(u8, s) catch null else null;
-    if (image.scheduler) |s| ctx.allocator.free(s);
-    image.scheduler = if (result.scheduler) |s| ctx.allocator.dupe(u8, s) catch null else null;
-    image.cfg = result.cfg;
-    image.steps = result.steps;
-    image.seed = result.seed;
-    if (image.loras) |l| ctx.allocator.free(l);
-    image.loras = lorasToString(ctx.allocator, result.loras);
+    // Replace the stored metadata with what this version of the file carries
+    // (none, if it was rewritten without any).
+    applyParseResult(ctx.allocator, &image, maybe_result);
     if (image.hash) |h| ctx.allocator.free(h);
     image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
-    image.mtime = current_mtime;
+    image.mtime = if (parse_failed) null else current_mtime;
 
     // DB write.
     ctx.db.saveImage(&image) catch |err| {
@@ -910,18 +1006,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     if (ctx.embed_queue) |q| {
         // Queue mode: push embedding inputs to the concurrent consumer.
-        if (ctx.prompt_embeddings or ctx.image_embeddings) {
-            q.push(ctx.io, EmbedInput{
-                .image_id     = image.id,
-                .prompt_text  = if (ctx.prompt_embeddings)
-                    if (image.positivePromptText) |p| ctx.allocator.dupe(u8, p) catch null else null
-                    else null,
-                .image_path_z = if (ctx.image_embeddings)
-                    ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch null
-                    else null,
-                .allocator    = ctx.allocator,
-            });
-        }
+        _ = pushEmbed(ctx, q, image.id, if (ctx.prompt_embeddings) image.positivePromptText else null, ctx.image_embeddings);
         if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
         else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
         log.debug("processed {s}", .{std.Io.Dir.path.basename(ctx.path)});

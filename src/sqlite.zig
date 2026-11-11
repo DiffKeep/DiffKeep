@@ -90,7 +90,6 @@ pub const ConnectionPool = struct {
 
 pub const PreparedStatement = struct {
     stmt: *c.sqlite3_stmt,
-    db: *Database,
 
     pub fn deinit(self: *PreparedStatement) void {
         _ = c.sqlite3_finalize(self.stmt);
@@ -148,7 +147,9 @@ pub const PreparedStatement = struct {
             c.SQLITE_ROW => return true,
             c.SQLITE_DONE => return false,
             else => {
-                const err_msg = c.sqlite3_errmsg(self.db.db);
+                // Ask the statement for its connection: a back-pointer to the
+                // `Database` would dangle once the struct is copied or moved.
+                const err_msg = c.sqlite3_errmsg(c.sqlite3_db_handle(self.stmt));
                 log.err("SQLite step error: {s} (code: {d})", .{ err_msg, result });
                 return Error.SQLiteError;
             },
@@ -173,15 +174,19 @@ pub const PreparedStatement = struct {
         return c.sqlite3_column_double(self.stmt, @intCast(col));
     }
 
+    /// Empty for NULL or a zero-length value (SQLite returns a null pointer for both).
     pub fn columnText(self: *PreparedStatement, col: usize) []const u8 {
         const text = c.sqlite3_column_text(self.stmt, @intCast(col));
         const len = c.sqlite3_column_bytes(self.stmt, @intCast(col));
+        if (text == null or len == 0) return &.{};
         return text[0..@intCast(len)];
     }
 
+    /// Empty for NULL or a zero-length blob (SQLite returns a null pointer for both).
     pub fn columnBlob(self: *PreparedStatement, col: usize) []const u8 {
         const blob = c.sqlite3_column_blob(self.stmt, @intCast(col));
         const len = c.sqlite3_column_bytes(self.stmt, @intCast(col));
+        if (blob == null or len == 0) return &.{};
         return @as([*]const u8, @ptrCast(blob))[0..@intCast(len)];
     }
 
@@ -196,6 +201,12 @@ const Statements = struct {
     find_image: PreparedStatement,
     insert_image: PreparedStatement,
     update_image: PreparedStatement,
+
+    fn finalize(self: *Statements) void {
+        inline for (@typeInfo(Statements).@"struct".field_names) |name| {
+            @field(self, name).deinit();
+        }
+    }
 };
 
 pub const Database = struct {
@@ -232,6 +243,7 @@ pub const Database = struct {
             .allocator = allocator,
             .statements = undefined,
         };
+        errdefer _ = c.sqlite3_close(self.db);
 
         // initialize with the needed stuff
         try self.exec(
@@ -250,44 +262,64 @@ pub const Database = struct {
         return self;
     }
 
+    /// Finalize the cached statements, then close. `sqlite3_close` refuses (and
+    /// leaks the connection) while any statement is unfinalized.
     pub fn close(self: *Database) void {
-        _ = c.sqlite3_close(self.db);
+        self.statements.finalize();
+        if (c.sqlite3_close(self.db) != c.SQLITE_OK)
+            log.err("sqlite3_close: {s}", .{c.sqlite3_errmsg(self.db)});
     }
 
     fn prepareStatements(db: *Database) !Statements {
-        return Statements {
-            .find_library = try db.prepare("SELECT id FROM libraries WHERE path = ?"),
-            .insert_library = try db.prepare("INSERT INTO libraries (path) VALUES (?)"),
-            .find_image = try db.prepare(
-                \\SELECT id, library_id, library_path, creation_date, positive_prompt_text,
-                \\       negative_prompt_text, generated_description, thumbnail, hash, mtime,
-                \\       model, sampler, scheduler, cfg, steps, seed, loras
-                \\FROM images
-                \\WHERE library_id = ? AND library_path = ?
-            ),
-            .insert_image = try db.prepare(
-                \\INSERT INTO images (library_id, library_path)
-                \\VALUES (?, ?)
-            ),
-            .update_image = try db.prepare(
-                \\UPDATE images
-                \\SET positive_prompt_text = ?,
-                \\    negative_prompt_text = ?,
-                \\    generated_description = ?,
-                \\    thumbnail = ?,
-                \\    hash = ?,
-                \\    mtime = ?,
-                \\    model = ?,
-                \\    sampler = ?,
-                \\    scheduler = ?,
-                \\    cfg = ?,
-                \\    steps = ?,
-                \\    seed = ?,
-                \\    loras = ?
-                \\WHERE id = ?
-            ),
+        var out: Statements = undefined;
+        var n: usize = 0;
+        errdefer inline for (@typeInfo(Statements).@"struct".field_names, 0..) |name, i| {
+            if (i < n) @field(out, name).deinit();
         };
+        inline for (@typeInfo(Statements).@"struct".field_names) |name| {
+            @field(out, name) = try db.prepare(@field(statement_sql, name));
+            n += 1;
+        }
+        return out;
     }
+
+    const statement_sql = .{
+        .find_library = "SELECT id FROM libraries WHERE path = ?",
+        .insert_library = "INSERT INTO libraries (path) VALUES (?)",
+        // Live rows only: a trashed row keeps its old path while a new file
+        // may now live there, and that file is a different image.
+        .find_image =
+            \\SELECT id, library_id, library_path, creation_date, positive_prompt_text,
+            \\       negative_prompt_text, generated_description, thumbnail, hash, mtime,
+            \\       model, sampler, scheduler, cfg, steps, seed, loras
+            \\FROM images
+            \\WHERE library_id = ? AND library_path = ? AND trashed_at IS NULL
+        ,
+        // DO NOTHING when another connection inserted the path first (unique
+        // index, migration v14); the caller re-runs find_image.
+        .insert_image =
+            \\INSERT INTO images (library_id, library_path)
+            \\VALUES (?, ?)
+            \\ON CONFLICT DO NOTHING
+        ,
+        .update_image =
+            \\UPDATE images
+            \\SET positive_prompt_text = ?,
+            \\    negative_prompt_text = ?,
+            \\    generated_description = ?,
+            \\    thumbnail = ?,
+            \\    hash = ?,
+            \\    mtime = ?,
+            \\    model = ?,
+            \\    sampler = ?,
+            \\    scheduler = ?,
+            \\    cfg = ?,
+            \\    steps = ?,
+            \\    seed = ?,
+            \\    loras = ?
+            \\WHERE id = ?
+        ,
+    };
 
     pub fn prepare(self: *Database, sql: []const u8) !PreparedStatement {
         var stmt: ?*c.sqlite3_stmt = null;
@@ -299,10 +331,7 @@ pub const Database = struct {
             return Error.SQLiteError;
         }
 
-        return PreparedStatement{
-            .stmt = stmt.?,
-            .db = self,
-        };
+        return PreparedStatement{ .stmt = stmt.? };
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
@@ -329,29 +358,37 @@ pub const Database = struct {
         try self.exec(sql);
     }
 
-    // Insert a vector into the table
-    pub fn insertVector(self: *Database, table_name: []const u8, id: i64, vector: []const f32) !void {
-        const sql = try self.allocator.print("INSERT OR REPLACE INTO {s}(rowid, vector) VALUES (?, ?)", .{table_name});
+    /// Insert or replace the vector for `id`, only while `images` row `id` still
+    /// has `owner_path`. Returns whether it was stored. vec0 ignores `INSERT OR
+    /// REPLACE` (an existing rowid fails with a UNIQUE error), so delete first,
+    /// inside a savepoint so a failed insert keeps the old vector.
+    pub fn insertVector(self: *Database, table_name: []const u8, id: i64, owner_path: []const u8, vector: []const f32) !bool {
+        try self.exec("SAVEPOINT insert_vector");
+        errdefer self.exec("ROLLBACK TO insert_vector; RELEASE insert_vector") catch {};
+
+        const del_sql = try self.allocator.print("DELETE FROM {s} WHERE rowid = ?", .{table_name});
+        defer self.allocator.free(del_sql);
+        var del = try self.prepare(del_sql);
+        defer del.deinit();
+        try del.bind(1, id);
+        _ = try del.step();
+
+        const sql = try self.allocator.print(
+            "INSERT INTO {s}(rowid, vector) SELECT ?1, ?2 " ++
+                "WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1 AND library_path = ?3)",
+            .{table_name},
+        );
         defer self.allocator.free(sql);
+        var ins = try self.prepare(sql);
+        defer ins.deinit();
+        try ins.bind(1, id);
+        try ins.bindBlob(2, std.mem.sliceAsBytes(vector));
+        try ins.bind(3, owner_path);
+        _ = try ins.step();
+        const stored = c.sqlite3_changes(self.db) > 0;
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        const prepare_result = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
-        if (prepare_result != c.SQLITE_OK) {
-            const err_msg = c.sqlite3_errmsg(self.db);
-            log.err("SQLite prepare error: {s}", .{err_msg});
-            return Error.SQLiteError;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_int64(stmt, 1, id);
-        _ = c.sqlite3_bind_blob(stmt, 2, @ptrCast(vector.ptr), @intCast(vector.len * @sizeOf(f32)), c.SQLITE_STATIC);
-
-        const step_result = c.sqlite3_step(stmt);
-        if (step_result != c.SQLITE_DONE) {
-            const err_msg = c.sqlite3_errmsg(self.db);
-            log.err("SQLite step error: {s}", .{err_msg});
-            return Error.SQLiteError;
-        }
+        try self.exec("RELEASE insert_vector");
+        return stored;
     }
 
     // Search for nearest vectors

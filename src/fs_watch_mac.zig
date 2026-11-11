@@ -16,7 +16,7 @@ const CFAllocatorRef = ?*const opaque {};
 const CFArrayRef = *const opaque {};
 const CFStringRef = *const opaque {};
 const CFTimeInterval = f64;
-const CFIndex = i32;
+const CFIndex = isize; // `long` on 64-bit macOS
 
 const CFStringEncoding = enum(u32) {
     invalid_id = std.math.maxInt(u32),
@@ -383,12 +383,21 @@ fn fseventsCallback(
 
     for (path_arr, flags) |raw_path, f| {
         if (f.history_done) continue;
+        // Events were coalesced or dropped: only a full scan can reconcile.
+        if (f.must_scan_sub_dirs or f.user_dropped or f.kernel_dropped) {
+            const root = allocator.dupe(u8, ctx.path) catch continue;
+            watcher.pushEvent(.{ .library_id = ctx.library_id, .path = root, .deleted = false, .kind = .rescan_library });
+            continue;
+        }
         if (!f.item_is_file) continue;
 
         const event_path = std.mem.span(raw_path);
         if (!media.isSupportedMediaFile(event_path)) continue;
 
-        const deleted = f.item_removed or f.item_renamed;
+        // FSEvents flags both ends of a rename (and coalesces flags), so the
+        // flags can't say whether the file is gone: ask the filesystem.
+        const deleted = (f.item_removed or f.item_renamed) and
+            std.c.access(raw_path, std.c.F_OK) != 0;
 
         const path_copy = allocator.dupe(u8, event_path) catch continue;
         log.info("FSEvents: file event {s} deleted={}", .{ event_path, deleted });

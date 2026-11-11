@@ -62,6 +62,9 @@ pub const FsWatcher = struct {
     inotify_fd: i32,
     wake_pipe: [2]i32,
     started: bool = false,
+    /// Set by deinit: the watcher thread exits even if the .stop command
+    /// couldn't be queued (out of memory), so deinit's join can't hang.
+    stopping: std.atomic.Value(bool) = .init(false),
 
     cmd_lock: Spinlock = .{},
     cmds: std.ArrayList(Cmd) = .empty,
@@ -99,6 +102,7 @@ pub const FsWatcher = struct {
 
     pub fn deinit(self: *FsWatcher) void {
         if (self.started) {
+            self.stopping.store(true, .release);
             self.pushCmd(.stop);
             self.thread.join();
         }
@@ -138,6 +142,9 @@ pub const FsWatcher = struct {
         self.cmds.append(self.allocator, cmd) catch {
             self.cmd_lock.unlock();
             freeCmd(self.allocator, cmd);
+            // Still wake the thread: a lost .stop is covered by `stopping`.
+            const b: [1]u8 = .{1};
+            _ = linux.write(self.wake_pipe[1], &b, 1);
             return;
         };
         self.cmd_lock.unlock();
@@ -242,7 +249,7 @@ fn watcherFn(self: *FsWatcher) void {
             self.cmds = .empty;
             self.cmd_lock.unlock();
 
-            var stop_requested = false;
+            var stop_requested = self.stopping.load(.acquire);
             for (local.items) |cmd| {
                 switch (cmd) {
                     .stop => stop_requested = true,
@@ -289,6 +296,15 @@ fn watcherFn(self: *FsWatcher) void {
                 const mask = event.mask;
                 const wd = event.wd;
                 const name = event.getName();
+
+                if (mask & linux.IN.Q_OVERFLOW != 0) {
+                    // The kernel queue overflowed (a burst of thousands of
+                    // events): some were lost, so reconcile every library.
+                    log.warn("inotify queue overflow; rescanning all libraries", .{});
+                    var it = lib_root.iterator();
+                    while (it.next()) |kv| self.pushRescan(kv.key_ptr.*, kv.value_ptr.*);
+                    continue;
+                }
 
                 if (mask & linux.IN.IGNORED != 0) {
                     // A watch we dropped ourselves.  Its bookkeeping is already
@@ -551,12 +567,15 @@ fn watchAllSubdirs(
                 const entry: *const linux.dirent64 = @ptrCast(@alignCast(&buf[offset]));
                 offset += entry.reclen;
                 const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
-                if (entry.type != linux.DT.DIR) {
-                    if (!has_media and entry.type == linux.DT.REG and
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                // Some filesystems (NFS, FUSE, XFS without ftype) report
+                // DT_UNKNOWN for everything: ask the inode instead.
+                const dtype = if (entry.type == linux.DT.UNKNOWN) direntType(fd, name) else entry.type;
+                if (dtype != linux.DT.DIR) {
+                    if (!has_media and dtype == linux.DT.REG and
                         media.isSupportedMediaFile(name)) has_media = true;
                     continue;
                 }
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
                 const sub = std.Io.Dir.path.join(allocator, &.{ current, name }) catch continue;
                 queue.append(allocator, sub) catch {
                     allocator.free(sub);
@@ -572,6 +591,27 @@ fn watchAllSubdirs(
     queue.clearRetainingCapacity();
     return has_media;
 }
+
+/// The DT_* type of `name` inside directory `dir_fd`, via statx (no
+/// symlink following, as getdents reports links themselves).
+fn direntType(dir_fd: i32, name: []const u8) u8 {
+    var name_buf: [std.fs.max_name_bytes + 1]u8 = undefined;
+    if (name.len >= name_buf.len) return linux.DT.UNKNOWN;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(dir_fd, @ptrCast(&name_buf), linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+    if (@as(isize, @bitCast(rc)) < 0) return linux.DT.UNKNOWN;
+    return switch (st.mode & linux.S.IFMT) {
+        linux.S.IFDIR => linux.DT.DIR,
+        linux.S.IFREG => linux.DT.REG,
+        else => linux.DT.UNKNOWN,
+    };
+}
+
+/// inotify_add_watch hit the per-user watch limit (ENOSPC). Warned once:
+/// past that point some folders get no live updates (scans still find them).
+var watch_limit_warned = std.atomic.Value(bool).init(false);
 
 fn watchOneDir(
     inotify_fd: i32,
@@ -592,6 +632,10 @@ fn watchOneDir(
         // (created then immediately renamed or deleted) — not worth a warning.
         if (errno == @backingInt(linux.E.NOENT)) {
             log.debug("inotify_add_watch({s}): directory no longer exists", .{path});
+        } else if (errno == @backingInt(linux.E.NOSPC)) {
+            if (!watch_limit_warned.swap(true, .acq_rel))
+                log.warn("inotify watch limit reached at {s}: some folders won't update live " ++
+                    "(raise fs.inotify.max_user_watches)", .{path});
         } else {
             log.warn("inotify_add_watch({s}) failed: errno={d}", .{ path, errno });
         }

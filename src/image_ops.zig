@@ -23,24 +23,69 @@ pub fn init(ctx: AppCtx) void {
     g_ctx = ctx;
 }
 
-pub fn moveFile(io: std.Io, allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+/// Move `src` to `dst`, never replacing an existing `dst` (error.PathAlreadyExists).
+/// Falls back to a streamed copy + delete across filesystems.
+pub fn moveFile(io: std.Io, src: []const u8, dst: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    var cross_device = false;
+    // rename() silently replaces its target. The window between this check
+    // and the rename is tiny; the copy path below is exclusive outright.
+    if (cwd.access(io, dst, .{})) |_| return error.PathAlreadyExists else |_| {}
     std.Io.Dir.rename(cwd, src, cwd, dst, io) catch |err| switch (err) {
-        error.CrossDevice => cross_device = true,
+        error.CrossDevice => {
+            try copyExclusive(io, src, dst);
+            try cwd.deleteFile(io, src);
+        },
         else => return err,
     };
-    if (!cross_device) return;
-    {
-        var src_file = try std.Io.Dir.cwd().openFile(io, src, .{});
-        defer src_file.close(io);
-        const size = try src_file.length(io);
-        const buf = try allocator.alloc(u8, size);
-        defer allocator.free(buf);
-        _ = try src_file.readPositionalAll(io, buf, 0);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = buf });
+}
+
+/// Stream `src` into a newly created `dst` (fails if it exists), keeping the
+/// modification time so the scanner doesn't see a changed file. A failed copy
+/// removes the partial `dst`.
+fn copyExclusive(io: std.Io, src: []const u8, dst: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var in = try cwd.openFile(io, src, .{});
+    defer in.close(io);
+    const stat = try in.stat(io);
+    var out = try cwd.createFile(io, dst, .{ .exclusive = true });
+    var ok = false;
+    defer {
+        out.close(io);
+        if (!ok) cwd.deleteFile(io, dst) catch {};
     }
-    try std.Io.Dir.cwd().deleteFile(io, src);
+    var buf: [64 * 1024]u8 = undefined;
+    var off: u64 = 0;
+    while (true) {
+        const n = try in.readPositional(io, &.{&buf}, off);
+        if (n == 0) break;
+        try out.writePositionalAll(io, buf[0..n], off);
+        off += n;
+    }
+    try out.setTimestamps(io, .{ .modify_timestamp = .{ .new = stat.mtime } });
+    ok = true;
+}
+
+/// First of `path`, `stem (1).ext`, `stem (2).ext`, … that is neither on disk
+/// nor held by a live row. Caller frees.
+fn freeRestorePath(io: std.Io, allocator: std.mem.Allocator, conn: *db_mod.VectorDb, path: []const u8) ![]u8 {
+    const dir = std.Io.Dir.path.dirname(path) orelse "";
+    const base = std.Io.Dir.path.basename(path);
+    const ext = std.Io.Dir.path.extension(base);
+    const stem = base[0 .. base.len - ext.len];
+    var n: usize = 0;
+    while (n < 10_000) : (n += 1) {
+        const candidate = if (n == 0)
+            try allocator.dupe(u8, path)
+        else blk: {
+            const name = try allocator.print("{s} ({d}){s}", .{ stem, n, ext });
+            defer allocator.free(name);
+            break :blk try std.Io.Dir.path.join(allocator, &.{ dir, name });
+        };
+        const on_disk = if (std.Io.Dir.cwd().access(io, candidate, .{})) |_| true else |_| false;
+        if (!on_disk and !(try conn.livePathExists(candidate))) return candidate;
+        allocator.free(candidate);
+    }
+    return error.PathAlreadyExists;
 }
 
 pub fn effectiveIds(grid: *const image_grid_mod.GridState, allocator: std.mem.Allocator) !std.AutoHashMap(u64, void) {
@@ -60,11 +105,11 @@ pub fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashM
     // A view load already running may still return these; keep them out.
     var it = ids.keyIterator();
     while (it.next()) |id| grid.noteRemoved(id.*);
-    var i: usize = 0;
-    while (i < grid.images.items.len) {
-        const e = grid.images.items[i];
+    // One compaction pass: removing k of n images costs O(n), not O(n·k).
+    const items = grid.images.items;
+    var kept: usize = 0;
+    for (items) |e| {
         if (ids.contains(e.id)) {
-            _ = grid.images.orderedRemove(i);
             _ = grid.selection.remove(e.id);
             // Drop the cached thumbnail: SQLite recycles this row's id for the
             // next inserted image, which would otherwise inherit this thumbnail.
@@ -72,13 +117,17 @@ pub fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashM
             grid.allocator.free(e.path);
             if (e.trash_name) |tn| grid.allocator.free(tn);
         } else {
-            i += 1;
+            items[kept] = e;
+            kept += 1;
         }
     }
+    grid.images.shrinkRetainingCapacity(kept);
     if (grid.focused_idx) |fi| {
         if (grid.images.items.len == 0) grid.focused_idx = null
         else if (fi >= grid.images.items.len) grid.focused_idx = grid.images.items.len - 1;
     }
+    // Indices into the old list no longer mean the same image.
+    grid.anchor_idx = null;
 }
 
 // ── File operations (trash / delete / restore) ─────────────────────────────
@@ -89,7 +138,14 @@ pub fn removeFromGrid(grid: *image_grid_mod.GridState, ids: *const std.AutoHashM
 // queue, and `fileOpsPoll` (called each frame) drops the images that actually
 // succeeded from the grid and any open viewers.
 
-pub const FileOpKind = enum { trash, delete, restore, purge_expired };
+/// `purge_expired`, `empty_trash` and `dedupe` work on the DB's own selection
+/// rather than a list of grid items. Every kind runs on the one worker, so a
+/// bulk operation can never race a single-image one over the same file.
+pub const FileOpKind = enum { trash, delete, restore, purge_expired, empty_trash, dedupe };
+
+fn isBulk(kind: FileOpKind) bool {
+    return kind == .purge_expired or kind == .empty_trash or kind == .dedupe;
+}
 
 const JobItem = struct {
     id: u64,
@@ -114,6 +170,8 @@ const FileOps = struct {
     done: std.ArrayList(u64) = .empty,
     /// A purge finished: counts (and a trash view) need a refresh.
     purged: bool = false,
+    /// Empty-trash / dedupe jobs queued or running (for the toolbar indicator).
+    user_bulk: std.atomic.Value(u32) = .init(0),
     running: bool = false,
     thread: ?std.Thread = null,
 };
@@ -220,12 +278,20 @@ fn submit(io: std.Io, job_in: Job) void {
         kept.deinit(job_alloc);
         return;
     };
-    if (job.items.len == 0 and job.kind != .purge_expired) return;
+    if (job.items.len == 0 and !isBulk(job.kind)) return;
+    // Asking for the same bulk operation again while one waits is a no-op.
+    if (isBulk(job.kind)) for (g_ops.queue.items) |q| {
+        if (q.kind == job.kind) {
+            freeJob(job);
+            return;
+        }
+    };
     g_ops.queue.append(job_alloc, job) catch {
         for (job.items) |it| _ = g_ops.pending.remove(it.id);
         freeJob(job);
         return;
     };
+    if (job.kind == .empty_trash or job.kind == .dedupe) _ = g_ops.user_bulk.fetchAdd(1, .acq_rel);
     if (g_ops.running) return;
     // The previous worker has already marked itself done; reap it.
     if (g_ops.thread) |t| t.join();
@@ -253,7 +319,8 @@ fn fileOpsWorker(io: std.Io) void {
 
         g_ops.mutex.lockUncancelable(io);
         g_ops.done.appendSlice(job_alloc, succeeded.items) catch {};
-        if (job.kind == .purge_expired) g_ops.purged = true;
+        if (job.kind == .purge_expired or job.kind == .empty_trash) g_ops.purged = true;
+        if (job.kind == .empty_trash or job.kind == .dedupe) _ = g_ops.user_bulk.fetchSub(1, .acq_rel);
         // Failed items stay in the grid; let them be retried.
         for (job.items) |it| {
             if (std.mem.findScalar(u64, succeeded.items, it.id) == null) _ = g_ops.pending.remove(it.id);
@@ -288,35 +355,30 @@ fn runJob(io: std.Io, job: Job, succeeded: *std.ArrayList(u64)) void {
             else
                 job_alloc.dupe(u8, it.path) catch continue;
             defer job_alloc.free(file_path);
-            std.Io.Dir.cwd().deleteFile(io, file_path) catch |err| switch (err) {
-                error.FileNotFound => {}, // already gone: still drop the row
-                else => {
-                    log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(file_path), err });
-                    continue;
-                },
-            };
-            conn.deleteImage(it.id) catch |err| {
+            // Row first, matched on the path we saw: a stale entry (row gone or
+            // id recycled) must not delete anything.
+            const matched = conn.deleteImage(it.id, it.path) catch |err| {
                 log.warn("deleteImage {d}: {}", .{ it.id, err });
                 continue;
+            };
+            if (!matched) {
+                log.warn("delete {s}: image no longer in the library", .{std.Io.Dir.path.basename(it.path)});
+                continue;
+            }
+            std.Io.Dir.cwd().deleteFile(io, file_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                // The row is gone; a library file left behind is re-indexed by the next scan.
+                else => log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(file_path), err }),
             };
             succeeded.append(job_alloc, it.id) catch {};
         },
         .restore => for (job.items) |it| {
-            const tn = it.trash_name orelse continue;
-            const src = std.Io.Dir.path.join(job_alloc, &.{ data_dir, "trash", tn }) catch continue;
-            defer job_alloc.free(src);
-            moveFile(io, job_alloc, src, it.path) catch |err| {
-                log.warn("restore {s}: {}", .{ std.Io.Dir.path.basename(it.path), err });
-                continue;
-            };
-            conn.restoreImage(it.id) catch |err| {
-                log.warn("restoreImage {d}: {}", .{ it.id, err });
-                continue;
-            };
-            succeeded.append(job_alloc, it.id) catch {};
+            if (restoreOne(io, &conn, data_dir, it)) succeeded.append(job_alloc, it.id) catch {};
         },
-        .purge_expired => {
-            const names = conn.purgeExpiredTrash(job_alloc, job.cutoff) catch return;
+        .purge_expired, .empty_trash => {
+            // empty_trash: every trashed row, whatever its age.
+            const cutoff = if (job.kind == .empty_trash) std.math.maxInt(i64) else job.cutoff;
+            const names = conn.purgeExpiredTrash(job_alloc, cutoff) catch return;
             defer {
                 for (names) |n| job_alloc.free(n);
                 job_alloc.free(names);
@@ -324,11 +386,56 @@ fn runJob(io: std.Io, job: Job, succeeded: *std.ArrayList(u64)) void {
             for (names) |trash_name| {
                 const p = std.Io.Dir.path.join(job_alloc, &.{ data_dir, "trash", trash_name }) catch continue;
                 defer job_alloc.free(p);
-                std.Io.Dir.cwd().deleteFile(io, p) catch {};
+                std.Io.Dir.cwd().deleteFile(io, p) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => log.warn("purge {s}: {}", .{ trash_name, err }),
+                };
             }
-            if (names.len > 0) log.info("purged {d} expired trash items", .{names.len});
+            if (names.len > 0) log.info("{s}: {d} trash items deleted", .{ @tagName(job.kind), names.len });
+        },
+        .dedupe => {
+            // Every redundant copy (a separate file with the same hash as a
+            // kept one) goes to the trash, so this is recoverable.
+            const reds = conn.listRedundantDuplicates(job_alloc) catch return;
+            defer {
+                for (reds) |r| job_alloc.free(r.path);
+                job_alloc.free(reds);
+            }
+            const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+            for (reds) |r| {
+                if (trashOne(io, &conn, data_dir, r.id, r.path, now_s))
+                    succeeded.append(job_alloc, r.id) catch {};
+            }
+            log.info("dedupe: {d} copies moved to the trash", .{succeeded.items.len});
         },
     }
+}
+
+/// Move a trashed image back into its library. When its old path is now taken
+/// (ComfyUI reused the name), it comes back beside it as `name (1).ext`.
+fn restoreOne(io: std.Io, conn: *db_mod.VectorDb, data_dir: []const u8, it: JobItem) bool {
+    const tn = it.trash_name orelse return false;
+    const src = std.Io.Dir.path.join(job_alloc, &.{ data_dir, "trash", tn }) catch return false;
+    defer job_alloc.free(src);
+    const dst = freeRestorePath(io, job_alloc, conn, it.path) catch |err| {
+        log.warn("restore {s}: {}", .{ std.Io.Dir.path.basename(it.path), err });
+        return false;
+    };
+    defer job_alloc.free(dst);
+    moveFile(io, src, dst) catch |err| {
+        log.warn("restore {s}: {}", .{ std.Io.Dir.path.basename(it.path), err });
+        return false;
+    };
+    const matched = conn.restoreImage(it.id, tn, dst) catch |err| blk: {
+        log.warn("restoreImage {d}: {}", .{ it.id, err });
+        break :blk false;
+    };
+    if (!matched) {
+        // The row changed under us: put the file back where it was.
+        moveFile(io, dst, src) catch |err| log.warn("restore rollback {s}: {}", .{ tn, err });
+        return false;
+    }
+    return true;
 }
 
 /// Move one library image into the trash. The row is marked trashed BEFORE the
@@ -348,13 +455,19 @@ fn trashOne(io: std.Io, conn: *db_mod.VectorDb, data_dir: []const u8, id: u64, p
     const dst = std.Io.Dir.path.join(job_alloc, &.{ data_dir, "trash", trash_name }) catch return false;
     defer job_alloc.free(dst);
 
-    conn.trashImage(id, trash_name, file_size, now_s) catch |err| {
+    // Matched on the path too: a stale entry (row gone, or its id recycled for
+    // another image) must not move a file the DB no longer tracks.
+    const matched = conn.trashImage(id, path, trash_name, file_size, now_s) catch |err| {
         log.warn("trashImage {d}: {}", .{ id, err });
         return false;
     };
-    moveFile(io, job_alloc, path, dst) catch |err| {
+    if (!matched) {
+        log.warn("trash {s}: image no longer in the library", .{basename});
+        return false;
+    }
+    moveFile(io, path, dst) catch |err| {
         log.warn("trash {s}: {}", .{ basename, err });
-        conn.restoreImage(id) catch |rerr| log.warn("restoreImage {d}: {}", .{ id, rerr });
+        _ = conn.restoreImage(id, trash_name, path) catch |rerr| log.warn("restoreImage {d}: {}", .{ id, rerr });
         return false;
     };
     return true;
@@ -392,7 +505,7 @@ pub fn fileOpsPoll(io: std.Io, allocator: std.mem.Allocator, grid: ?*image_grid_
             maybeReloadDuplicates(g);
         }
         if (purged and g.view_mode == .trash) {
-            if (ctx.db.*) |*db| g.reloadImages(db) catch {};
+            g.reloadImages() catch {};
         }
     }
     if (ids.count() > 0) ctx.on_images_removed(&ids);
@@ -420,129 +533,30 @@ pub fn fileOpsJoin(io: std.Io) void {
 /// remaining duplicate; reload so those now-unique images drop out immediately.
 fn maybeReloadDuplicates(grid: *image_grid_mod.GridState) void {
     if (grid.view_mode != .duplicates) return;
-    const ctx = g_ctx orelse return;
-    if (ctx.db.*) |*db| {
-        // This is an in-place refresh of the same view (not a view change), so
-        // keep the user's scroll position rather than snapping back to the top.
-        grid.reloadImagesEx(db, .{ .keep_scroll = true }) catch {};
-    }
+    // This is an in-place refresh of the same view (not a view change), so
+    // keep the user's scroll position rather than snapping back to the top.
+    grid.reloadImagesEx(.{ .keep_scroll = true }) catch {};
 }
 
-// ── Background bulk operations ──────────────────────────────────────────────
+// ── Bulk operations ─────────────────────────────────────────────────────────
 //
 // "Empty trash" and "remove all but one duplicate" can touch thousands of files
-// and DB rows. Doing that on the render thread would freeze the UI, so they run
-// on a dedicated thread; the main loop polls `bulkPoll` each frame and refreshes
-// the grid + counts once the worker finishes. Only one bulk op runs at a time.
+// and rows. They are jobs on the file-op worker like any other, so they never
+// block the render thread and never run concurrently with a single-image trash
+// or delete of the same file. `fileOpsPoll` applies their results.
 
-const BulkKind = enum { empty_trash, dedupe };
-
-const Bulk = struct {
-    thread: ?std.Thread = null,
-    kind: BulkKind = .empty_trash,
-    done: std.atomic.Value(bool) = .init(false),
-    count: std.atomic.Value(u32) = .init(0),
-};
-var g_bulk: Bulk = .{};
-
+/// Whether an empty-trash or dedupe job is queued or running.
 pub fn bulkActive() bool {
-    return g_bulk.thread != null;
+    return g_ops.user_bulk.load(.acquire) > 0;
 }
 
-/// Move every redundant duplicate copy (all but the lowest-id one of each hash
-/// group) to the trash, on a background thread. Safe: only copies that still have
-/// a surviving sibling are moved, and they go to the trash (recoverable).
+/// Move every redundant duplicate copy to the trash (recoverable). Only copies
+/// whose content survives in another file are moved.
 pub fn startRemoveRedundantDuplicates(io: std.Io) void {
-    startBulk(io, .dedupe);
+    submit(io, .{ .kind = .dedupe, .items = &.{} });
 }
 
-/// Permanently delete every trashed image (DB row + file) on a background thread.
+/// Permanently delete every trashed image (DB row + file).
 pub fn startEmptyTrash(io: std.Io) void {
-    startBulk(io, .empty_trash);
-}
-
-/// Wait for a running bulk op to finish. Call at shutdown, before the DB it
-/// holds a connection from is torn down.
-pub fn bulkJoin() void {
-    if (g_bulk.thread) |t| {
-        t.join();
-        g_bulk.thread = null;
-    }
-}
-
-fn startBulk(io: std.Io, kind: BulkKind) void {
-    if (g_bulk.thread != null) return; // already running
-    g_bulk.kind = kind;
-    g_bulk.done.store(false, .release);
-    g_bulk.count.store(0, .release);
-    g_bulk.thread = std.Thread.spawn(.{}, bulkWorker, .{io}) catch |err| blk: {
-        log.warn("spawn bulk op: {}", .{err});
-        break :blk null;
-    };
-}
-
-fn bulkWorker(io: std.Io) void {
-    // c_allocator: this runs off the main thread, so it must not touch a
-    // non-thread-safe app allocator.
-    const alloc = std.heap.c_allocator;
-    defer {
-        g_bulk.done.store(true, .release);
-        if (g_ctx) |ctx| ctx.on_wakeup();
-    }
-
-    const ctx = g_ctx orelse return;
-    const data_dir = ctx.data_dir.* orelse return;
-    const db_ptr = if (ctx.db.*) |*d| d else return;
-    var conn = db_ptr.getConnection() catch |err| {
-        log.warn("bulk op db connection: {}", .{err});
-        return;
-    };
-    defer conn.deinit();
-
-    switch (g_bulk.kind) {
-        .empty_trash => {
-            // purgeExpiredTrash with a max cutoff deletes every trashed row and
-            // returns their trash file names so we can unlink the files.
-            const names = conn.purgeExpiredTrash(alloc, std.math.maxInt(i64)) catch return;
-            defer {
-                for (names) |n| alloc.free(n);
-                alloc.free(names);
-            }
-            for (names) |trash_name| {
-                const p = std.Io.Dir.path.join(alloc, &.{ data_dir, "trash", trash_name }) catch continue;
-                defer alloc.free(p);
-                std.Io.Dir.cwd().deleteFile(io, p) catch |err|
-                    log.warn("empty trash unlink {s}: {}", .{ trash_name, err });
-            }
-            g_bulk.count.store(@intCast(names.len), .release);
-        },
-        .dedupe => {
-            const reds = conn.listRedundantDuplicates(alloc) catch return;
-            defer {
-                for (reds) |r| alloc.free(r.path);
-                alloc.free(reds);
-            }
-            const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
-            var moved: u32 = 0;
-            for (reds) |r| {
-                if (trashOne(io, &conn, data_dir, r.id, r.path, now_s)) moved += 1;
-            }
-            g_bulk.count.store(moved, .release);
-        },
-    }
-}
-
-/// Call once per frame. When a background bulk op has finished, joins the worker,
-/// refreshes counts, and reloads the current view. Returns true if it just
-/// completed (so the caller can e.g. log the count).
-pub fn bulkPoll(grid: *image_grid_mod.GridState) bool {
-    const t = g_bulk.thread orelse return false;
-    if (!g_bulk.done.load(.acquire)) return false;
-    t.join();
-    g_bulk.thread = null;
-    const ctx = g_ctx orelse return true;
-    if (ctx.db.*) |*db| grid.reloadImages(db) catch {};
-    ctx.on_counts_changed();
-    log.info("bulk {s}: {d} images", .{ @tagName(g_bulk.kind), g_bulk.count.load(.acquire) });
-    return true;
+    submit(io, .{ .kind = .empty_trash, .items = &.{} });
 }

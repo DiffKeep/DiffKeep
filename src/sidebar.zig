@@ -2,9 +2,12 @@ const std = @import("std");
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const i18n = @import("i18n.zig");
+const log = std.log.scoped(.sidebar);
 const icons = @import("icons");
+const app_icons = @import("app_icons.zig");
 const platform = @import("platform.zig");
 const library_manager_mod = @import("library_manager.zig");
+const counts_mod = @import("counts.zig");
 const image_grid_mod = @import("image_grid.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
@@ -81,12 +84,32 @@ pub fn freeFolderNodes(allocator: std.mem.Allocator, nodes: []FolderNode) void {
     if (nodes.len > 0) allocator.free(nodes);
 }
 
+fn loadTopFolders(gpa: std.mem.Allocator, db: *db_mod.VectorDb, lib: *LibraryState) void {
+    lib.top_loaded = true;
+    const subs = db.listImmediateSubdirs(gpa, lib.id, lib.path) catch return;
+    defer gpa.free(subs);
+    const nodes = gpa.alloc(FolderNode, subs.len) catch {
+        for (subs) |s| gpa.free(s.path);
+        return;
+    };
+    for (subs, nodes) |s, *n| n.* = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
+    lib.top_folders = nodes;
+}
+
 pub const SidebarState = struct {
-    library_dialog_open: bool = false,
+    // The folder dialog's callback may run on another thread (SDL documents
+    // this), so it publishes its result through atomics: the buffer is written
+    // before `pending_library_len` is stored (release) and read after it is
+    // loaded (acquire).
+    library_dialog_open: std.atomic.Value(bool) = .init(false),
     pending_library_buf: [4096]u8 = undefined,
-    pending_library_len: usize = 0,
+    pending_library_len: std.atomic.Value(usize) = .init(0),
+    /// Wakes the render loop when the folder dialog resolves.
+    wakeup_fn: ?*const fn () void = null,
     libraries: std.ArrayList(LibraryState) = .empty,
     confirm_remove_idx: ?usize = null,
+    /// Why the last i18n.t(.a11y_add_library) was refused; shown until the next attempt.
+    add_error: ?[:0]const u8 = null,
     filter_library_id: ?u64 = null,
     filter_folder: ?[]const u8 = null, // heap-allocated, owned
 
@@ -113,9 +136,13 @@ pub const SidebarState = struct {
         } else |_| {}
     }
 
-    pub fn refreshLibraryCounts(self: *SidebarState, db: *db_mod.VectorDb, gpa: std.mem.Allocator) void {
+    /// Show freshly loaded per-library counts (from counts.zig). Folder trees
+    /// are dropped too, so an open one reloads with current counts.
+    pub fn applyLibraryCounts(self: *SidebarState, gpa: std.mem.Allocator, counts: []const counts_mod.LibraryCount) void {
         for (self.libraries.items) |*lib| {
-            lib.image_count = db.getLibraryImageCount(lib.id) catch 0;
+            for (counts) |c| {
+                if (c.id == lib.id) lib.image_count = c.count;
+            }
             if (lib.top_loaded) {
                 freeFolderNodes(gpa, lib.top_folders);
                 lib.top_folders = &.{};
@@ -129,21 +156,24 @@ pub const SidebarState = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         library_manager: ?*library_manager_mod.LibraryManager,
-        db: ?*db_mod.VectorDb,
     ) !void {
-        if (self.pending_library_len == 0) return;
-        const path = self.pending_library_buf[0..self.pending_library_len];
-        self.pending_library_len = 0;
-        const duped = try gpa.dupe(u8, path);
-        const lib_id: u64 = if (library_manager) |mgr|
-            mgr.addLibrary(io, duped) catch 0
-        else if (db) |d|
-            d.storeLibrary(duped) catch 0
-        else
-            0;
+        const len = self.pending_library_len.load(.acquire);
+        if (len == 0) return;
+        const path = self.pending_library_buf[0..len];
+        defer self.pending_library_len.store(0, .release);
+        self.add_error = null;
+        const mgr = library_manager orelse return;
+        const lib_id = mgr.addLibrary(io, path) catch |err| {
+            self.add_error = switch (err) {
+                error.LibraryExists => i18n.t(.library_add_exists),
+                error.LibraryOverlaps => i18n.t(.library_add_overlaps),
+                else => i18n.t(.library_add_failed),
+            };
+            return;
+        };
         try self.libraries.append(gpa, .{
             .id = lib_id,
-            .path = duped,
+            .path = try gpa.dupe(u8, library_manager_mod.normalizeLibraryPath(path)),
             .image_count = 0,
         });
     }
@@ -152,11 +182,12 @@ pub const SidebarState = struct {
     /// seam (real native dialog in production, never called in headless tests).
     fn onFolderPicked(userdata: ?*anyopaque, path: ?[]const u8) void {
         const self: *SidebarState = @ptrCast(@alignCast(userdata orelse return));
-        self.library_dialog_open = false;
+        defer self.library_dialog_open.store(false, .release);
+        defer if (self.wakeup_fn) |wake| wake();
         const p = path orelse return;
         const len = @min(p.len, self.pending_library_buf.len);
         @memcpy(self.pending_library_buf[0..len], p[0..len]);
-        self.pending_library_len = len;
+        self.pending_library_len.store(len, .release);
     }
 
     fn renderFolderNode(
@@ -220,7 +251,7 @@ pub const SidebarState = struct {
                     g.filter_folder_path = self.filter_folder;
                     g.filter_library_path = lib.path;
                     g.view_mode = .library;
-                    if (db) |d| g.reloadImages(d) catch {};
+                    g.reloadImages() catch {};
                 }
             }
 
@@ -315,7 +346,7 @@ pub const SidebarState = struct {
                         g.filter_folder_path = null;
                         g.filter_library_path = null;
                         g.view_mode = .library;
-                        if (db) |d| g.reloadImages(d) catch {};
+                        g.reloadImages() catch {};
                     }
                 }
                 style.sectionHead(@src(), i18n.t(.nav_library), .{
@@ -325,7 +356,7 @@ pub const SidebarState = struct {
                 });
                 _ = dvui.spacer(@src(), .{ .expand = .horizontal });
             }
-            if (dvui.buttonIcon(@src(), "add library", dvui.entypo.plus, .{}, .{}, .{
+            if (dvui.buttonIcon(@src(), i18n.t(.a11y_add_library), dvui.entypo.plus, .{}, .{}, .{
                 .min_size_content = .{ .w = 12, .h = 12 },
                 .gravity_y = 0.5,
                 .padding = dvui.Rect.all(3),
@@ -333,13 +364,19 @@ pub const SidebarState = struct {
                 .corners = style.R.chip,
                 .color_text = .{ .color = style.C.text_dim },
             })) {
-                if (!self.library_dialog_open) {
-                    self.library_dialog_open = true;
+                if (!self.library_dialog_open.load(.acquire)) {
+                    self.library_dialog_open.store(true, .release);
                     platform.openFolderDialog(self, SidebarState.onFolderPicked);
                 }
             }
         }
 
+        if (self.add_error) |msg| {
+            dvui.label(@src(), "{s}", .{msg}, .{
+                .padding = .all(8),
+                .color_text = .{ .color = style.C.text_dim },
+            });
+        }
         if (self.libraries.items.len == 0) {
             dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
                 .padding = .all(8),
@@ -370,7 +407,7 @@ pub const SidebarState = struct {
                     dvui.dataSet(null, row_id, "_hov", row_hov);
 
                     const expand_tvg = if (lib.expanded) icons.tvg.lucide.@"chevron-down" else icons.tvg.lucide.@"chevron-right";
-                    if (dvui.buttonIcon(@src(), "expand", expand_tvg, .{}, .{}, .{
+                    if (dvui.buttonIcon(@src(), i18n.t(.a11y_expand_library), expand_tvg, .{}, .{}, .{
                         .id_extra = idx,
                         .min_size_content = .{ .w = 14, .h = 14 },
                         .gravity_y = 0.5,
@@ -380,23 +417,11 @@ pub const SidebarState = struct {
                         .color_text = .{ .color = style.C.text_ghost },
                     })) {
                         lib.expanded = !lib.expanded;
-                        if (lib.expanded and !lib.top_loaded) {
-                            if (db) |d| {
-                                if (d.listImmediateSubdirs(gpa, lib.id, lib.path)) |subs| {
-                                    if (gpa.alloc(FolderNode, subs.len)) |new_nodes| {
-                                        for (subs, 0..) |s, i| {
-                                            new_nodes[i] = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
-                                        }
-                                        gpa.free(subs);
-                                        lib.top_folders = new_nodes;
-                                    } else |_| {
-                                        for (subs) |s| gpa.free(s.path);
-                                        gpa.free(subs);
-                                    }
-                                } else |_| {}
-                                lib.top_loaded = true;
-                            }
-                        }
+                    }
+                    // (Re)load whenever an open library has no folder list: on
+                    // expand, and after applyLibraryCounts dropped a stale one.
+                    if (lib.expanded and !lib.top_loaded) {
+                        if (db) |d| loadTopFolders(gpa, d, lib);
                     }
 
                     {
@@ -415,7 +440,7 @@ pub const SidebarState = struct {
                                 g.filter_folder_path = null;
                                 g.filter_library_path = lib.path;
                                 g.view_mode = .library;
-                                if (db) |d| g.reloadImages(d) catch {};
+                                g.reloadImages() catch {};
                             }
                         }
                         // A library is a root, so its name gets the 500-weight
@@ -444,7 +469,7 @@ pub const SidebarState = struct {
                         });
                         defer slot.deinit();
                         if (row_hov) {
-                            if (dvui.buttonIcon(@src(), "remove library", dvui.entypo.minus, .{}, .{}, .{
+                            if (dvui.buttonIcon(@src(), i18n.t(.a11y_remove_library), dvui.entypo.minus, .{}, .{}, .{
                                 .id_extra = idx,
                                 .min_size_content = .{ .w = 10, .h = 10 },
                                 .gravity_x = 0.5,
@@ -488,7 +513,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .trash) {
                         g.view_mode = .trash;
-                        if (db) |d| g.reloadImages(d) catch {};
+                        g.reloadImages() catch {};
                     }
                 }
             }
@@ -522,7 +547,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .duplicates) {
                         g.view_mode = .duplicates;
-                        if (db) |d| g.reloadImages(d) catch {};
+                        g.reloadImages() catch {};
                     }
                 }
             }
@@ -554,13 +579,13 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .favorites) {
                         g.view_mode = .favorites;
-                        if (db) |d| g.reloadImages(d) catch {};
+                        g.reloadImages() catch {};
                     }
                 }
             }
             // The only gold thing in the sidebar, and it matches the star on
             // the cells this view collects.
-            dvui.icon(@src(), "favorites", icons.tvg.heroicons.solid.star, .{}, .{
+            dvui.icon(@src(), "favorites", app_icons.star, .{}, .{
                 .min_size_content = .{ .w = 13, .h = 13 },
                 .gravity_y = 0.5,
                 .margin = .{ .w = 6 },
@@ -618,9 +643,10 @@ pub const SidebarState = struct {
                         var removed = self.libraries.orderedRemove(idx);
                         const removed_id = removed.id;
                         if (library_manager) |mgr| {
-                            mgr.removeLibrary(removed.path) catch {};
+                            if (dvui.App.main_init) |init| mgr.removeLibrary(init.io, removed.path) catch |err|
+                                log.warn("remove library: {}", .{err});
                         } else if (db) |d| {
-                            _ = d.removeLibrary(removed.path) catch {};
+                            d.removeLibrary(removed.path) catch |err| log.warn("remove library: {}", .{err});
                         }
                         removed.deinit(gpa);
                         if (self.filter_library_id == removed_id) {
@@ -634,7 +660,7 @@ pub const SidebarState = struct {
                             }
                         }
                         if (grid) |g| {
-                            if (db) |d| g.reloadImages(d) catch {};
+                            g.reloadImages() catch {};
                         }
                         needs_count_refresh = true;
                     }

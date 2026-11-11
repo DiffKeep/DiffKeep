@@ -8,6 +8,7 @@ const config_mod = @import("config.zig");
 const platform = @import("platform.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const app_icons = @import("app_icons.zig");
 const vips_mod = @import("vips");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
@@ -18,11 +19,40 @@ const cache_size: usize = cache_radius * 2 + 1; // 5 slots
 // One slot in the prefetch cache.
 const CacheSlot = struct {
     image_idx: usize = 0,
+    /// Which claim of the slot a load belongs to: a load whose generation no
+    /// longer matches (the list changed, or the slot was reused) is dropped.
+    gen: u64 = 0,
     active: bool = false, // slot is allocated for this image_idx
     ready: bool = false,  // pixels have been decoded
+    failed: bool = false, // the decode failed (shown as an error, not retried)
     pixels: ?[]u8 = null,
     width: u32 = 0,
     height: u32 = 0,
+};
+
+/// A background decode thread and the flag it sets on exit, so the main
+/// thread can join (reap) it without blocking.
+const LoadWorker = struct {
+    thread: std.Thread,
+    done: *std.atomic.Value(bool),
+};
+
+/// New `pan` after zooming from `z` to `z2` with the cursor `u` image units from
+/// the image centre, so the image point under the cursor stays put. (The
+/// image's screen offset is `pan * zoom * scale`.)
+pub fn zoomPanAbout(pan: f32, u: f32, z: f32, z2: f32) f32 {
+    return (pan + u) * z / z2 - u;
+}
+
+pub const DecodedImage = struct { pixels: []u8, width: u32, height: u32 };
+
+/// A media player being opened on a background thread: opening probes the
+/// file and, for an animation small enough to cache, decodes every frame.
+const PlayerOpen = struct {
+    thread: std.Thread,
+    idx: usize,
+    done: std.atomic.Value(bool) = .init(false),
+    result: ?*video_player_mod.VideoPlayer = null, // written before `done`
 };
 
 pub const ViewerState = struct {
@@ -40,14 +70,22 @@ pub const ViewerState = struct {
     // Video playback (active only while the current entry is a video).
     video_player: ?*video_player_mod.VideoPlayer = null,
     video_player_idx: usize = 0,
+    /// The player for some entry being opened in the background.
+    player_open: ?*PlayerOpen = null,
 
     // Prefetch cache.  cache_mutex protects both cache_slots and cache_threads.
     // Thread handles are managed only by the main thread.
     cache_slots: [cache_size]CacheSlot,
-    cache_threads: [cache_size]?std.Thread,
+    cache_threads: [cache_size]?LoadWorker,
     cache_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    // Handles for evicted threads (can't join immediately); joined at deinit.
-    orphan_threads: std.ArrayList(std.Thread) = .empty,
+    /// Last slot generation handed out (guarded by cache_mutex).
+    cache_gen: u64 = 0,
+    // Evicted threads still decoding; reaped by `reapOrphans` once done.
+    orphan_threads: std.ArrayList(LoadWorker) = .empty,
+    /// The current static image failed to decode: show an error, not a spinner.
+    image_failed: bool = false,
+    /// The current entry's player failed to open: don't retry every frame.
+    video_failed: bool = false,
     // Number of load threads that have not yet exited.  Lets the close path defer
     // joining until the (uncancellable) decodes have finished, so it never blocks.
     inflight: std.atomic.Value(u32) = .init(0),
@@ -132,9 +170,7 @@ pub const ViewerState = struct {
             state.info_w = c.viewer_info_w;
             state.info_w_open = c.viewer_info_w;
         }
-        if (db != null and images.items.len > 0) {
-            state.detail_state.update(images.items[start_idx].id, db.?, allocator, io);
-        }
+        state.detail_state.wakeup_fn = wakeup_fn;
         // Load threads are spawned on the first render() call, once self is stable.
         return state;
     }
@@ -144,6 +180,9 @@ pub const ViewerState = struct {
     /// completion in the background; `deinit` joins them later once `inflight`
     /// reaches 0, so neither this call nor the join blocks the UI.
     pub fn beginClose(self: *ViewerState) void {
+        // Stop playback (and its audio) now: the hidden window lingers until
+        // its decodes finish.
+        if (self.video_player) |p| p.pause();
         self.cache_mutex.lockUncancelable(self.io);
         defer self.cache_mutex.unlock(self.io);
         for (&self.cache_slots) |*slot| {
@@ -161,22 +200,16 @@ pub const ViewerState = struct {
     pub fn deinit(self: *ViewerState) void {
         // Stop the video decode thread first (joins it).
         self.teardownVideo();
+        if (self.player_open) |po| {
+            po.thread.join();
+            if (po.result) |p| p.deinit();
+            self.gpa.destroy(po);
+            self.player_open = null;
+        }
         // Mark all slots inactive so in-flight threads will discard their results.
         // Collect thread handles while holding the lock, then join without it.
-        var threads: [cache_size]?std.Thread = undefined;
-        {
-            self.cache_mutex.lockUncancelable(self.io);
-            for (&self.cache_slots, 0..) |*slot, i| {
-                if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
-                slot.active = false;
-                slot.ready = false;
-                threads[i] = self.cache_threads[i];
-                self.cache_threads[i] = null;
-            }
-            self.cache_mutex.unlock(self.io);
-        }
-        for (threads) |maybe_t| { if (maybe_t) |t| t.join(); }
-        for (self.orphan_threads.items) |t| t.join();
+        self.flushCache();
+        for (self.orphan_threads.items) |w| joinWorker(self.gpa, w);
         self.orphan_threads.deinit(self.gpa);
 
         if (self.image_pixels) |p| self.gpa.free(p);
@@ -215,15 +248,65 @@ pub const ViewerState = struct {
             } };
             self.image_texture_hash = src.hash();
 
-            // Thread has finished; join it now (it has already exited or will
-            // momentarily after releasing the lock it holds here).
-            if (self.cache_threads[i]) |t| {
-                self.cache_mutex.unlock(self.io);
-                t.join();
-                self.cache_mutex.lockUncancelable(self.io);
+            // Its thread is finishing; reap it once it has exited.
+            if (self.cache_threads[i]) |w| {
+                self.orphan_threads.append(self.gpa, w) catch {};
                 self.cache_threads[i] = null;
             }
             return;
+        }
+        // A failed decode of the current image: show the error state.
+        for (&self.cache_slots) |*slot| {
+            if (slot.active and slot.failed and slot.image_idx == self.current_idx) self.image_failed = true;
+        }
+    }
+
+    /// Mark slot `slot_i` as loading `image_idx` and return the generation its
+    /// load must present. Caller must not hold cache_mutex.
+    pub fn claimSlot(self: *ViewerState, slot_i: usize, image_idx: usize) u64 {
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        return self.claimSlotLocked(slot_i, image_idx);
+    }
+
+    fn claimSlotLocked(self: *ViewerState, slot_i: usize, image_idx: usize) u64 {
+        self.cache_gen += 1;
+        self.cache_slots[slot_i] = .{ .active = true, .image_idx = image_idx, .gen = self.cache_gen };
+        return self.cache_gen;
+    }
+
+    /// Load thread side: store a finished decode (`result` null = it failed)
+    /// in its slot, if the slot still belongs to that load. Returns whether it
+    /// was stored; a stale result is freed.
+    pub fn deliverDecode(self: *ViewerState, slot_i: usize, gen: u64, result: ?DecodedImage) bool {
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        const slot = &self.cache_slots[slot_i];
+        if (!slot.active or slot.gen != gen) {
+            if (result) |r| self.gpa.free(r.pixels);
+            return false;
+        }
+        const r = result orelse {
+            slot.failed = true;
+            return true;
+        };
+        if (slot.pixels) |old| self.gpa.free(old);
+        slot.pixels = r.pixels;
+        slot.width = r.width;
+        slot.height = r.height;
+        slot.ready = true;
+        return true;
+    }
+
+    /// Join evicted load threads that have exited. Never blocks.
+    fn reapOrphans(self: *ViewerState) void {
+        var i: usize = 0;
+        while (i < self.orphan_threads.items.len) {
+            const w = self.orphan_threads.items[i];
+            if (w.done.load(.acquire)) {
+                joinWorker(self.gpa, w);
+                _ = self.orphan_threads.swapRemove(i);
+            } else i += 1;
         }
     }
 
@@ -239,9 +322,10 @@ pub const ViewerState = struct {
         const lo = idx -| cache_radius;
         const hi = @min(idx + cache_radius, n - 1);
 
-        const LoadTask = struct { slot_i: usize, image_idx: usize, path: [:0]u8 };
+        const LoadTask = struct { slot_i: usize, gen: u64, path: [:0]u8 };
         var tasks: [cache_size]LoadTask = undefined;
         var task_count: usize = 0;
+        var evicted: [cache_size]?LoadWorker = @splat(null);
 
         {
             self.cache_mutex.lockUncancelable(self.io);
@@ -254,11 +338,8 @@ pub const ViewerState = struct {
                     if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
                     slot.active = false;
                     slot.ready = false;
-                    if (self.cache_threads[i]) |t| {
-                        // Can't join here (we hold the mutex); park for deinit.
-                        self.orphan_threads.append(self.gpa, t) catch t.join();
-                        self.cache_threads[i] = null;
-                    }
+                    evicted[i] = self.cache_threads[i];
+                    self.cache_threads[i] = null;
                 }
             }
 
@@ -283,34 +364,47 @@ pub const ViewerState = struct {
                 const si = free_i orelse continue;
 
                 const path_copy = self.diskPathZ(&self.images.items[wi]) catch continue;
-                self.cache_slots[si] = .{ .active = true, .image_idx = wi };
                 if (task_count < cache_size) {
-                    tasks[task_count] = .{ .slot_i = si, .image_idx = wi, .path = path_copy };
+                    tasks[task_count] = .{ .slot_i = si, .gen = self.claimSlotLocked(si, wi), .path = path_copy };
                     task_count += 1;
                 } else {
                     self.gpa.free(path_copy);
-                    self.cache_slots[si].active = false;
                 }
             }
         }
 
-        // Spawn threads outside the lock.
+        // Park evicted threads (outside the lock); reapOrphans joins them later.
+        for (evicted) |maybe_w| if (maybe_w) |w| self.parkWorker(w);
+
+        // Spawn threads outside the lock. At most `cache_size` decodes run at
+        // once beyond the evicted ones still finishing.
         for (tasks[0..task_count]) |task| {
+            const done = self.gpa.create(std.atomic.Value(bool)) catch {
+                self.gpa.free(task.path);
+                _ = self.deliverDecode(task.slot_i, task.gen, null);
+                continue;
+            };
+            done.* = .init(false);
             _ = self.inflight.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{}, loadCacheThread, .{
-                self.gpa, self.io, self, task.slot_i, task.image_idx, task.path,
+                self.gpa, self, task.slot_i, task.gen, task.path, done,
             }) catch {
                 _ = self.inflight.fetchSub(1, .acq_rel);
                 self.gpa.free(task.path);
-                self.cache_mutex.lockUncancelable(self.io);
-                self.cache_slots[task.slot_i].active = false;
-                self.cache_mutex.unlock(self.io);
+                self.gpa.destroy(done);
+                _ = self.deliverDecode(task.slot_i, task.gen, null);
                 continue;
             };
             self.cache_mutex.lockUncancelable(self.io);
-            self.cache_threads[task.slot_i] = t;
+            self.cache_threads[task.slot_i] = .{ .thread = t, .done = done };
             self.cache_mutex.unlock(self.io);
         }
+    }
+
+    /// Keep an evicted load thread for reaping; join it now only if it can't
+    /// be tracked (out of memory).
+    fn parkWorker(self: *ViewerState, w: LoadWorker) void {
+        self.orphan_threads.append(self.gpa, w) catch joinWorker(self.gpa, w);
     }
 
     pub fn navigateTo(self: *ViewerState, idx: usize) void {
@@ -326,12 +420,14 @@ pub const ViewerState = struct {
         }
         self.image_width = 0;
         self.image_height = 0;
+        self.image_failed = false;
+        self.video_failed = false;
         self.pan_x = 0;
         self.pan_y = 0;
         self.zoom_mode = .fit;
-        if (self.db) |db| {
-            self.detail_state.update(self.images.items[self.current_idx].id, db, self.gpa, self.io);
-        }
+        // A prefetched neighbour is ready now: draw it this frame, not on the
+        // next input event.
+        if (dvui.current_window != null) dvui.refresh(null, @src(), null);
         // drainCache() + updateCache() in the next render() handle the actual load.
     }
 
@@ -376,7 +472,13 @@ pub const ViewerState = struct {
                 if (e.trash_name) |tn| self.gpa.free(tn);
                 _ = self.images.orderedRemove(i);
                 any_removed = true;
-                if (i == self.current_idx) removed_current = true else if (i < self.current_idx) self.current_idx -|= 1;
+                if (i == self.current_idx) {
+                    removed_current = true;
+                } else if (i < self.current_idx) {
+                    self.current_idx -|= 1;
+                    // The open player follows its entry, or it would restart.
+                    if (self.video_player_idx > 0) self.video_player_idx -= 1;
+                }
             } else i += 1;
         }
         if (self.images.items.len == 0) { self.open = false; return; }
@@ -391,26 +493,24 @@ pub const ViewerState = struct {
 
     // Mark all cache slots inactive and park their threads as orphans.
     // Called when the images list is mutated (indices shift).
-    fn flushCache(self: *ViewerState) void {
-        var threads: [cache_size]?std.Thread = undefined;
+    pub fn flushCache(self: *ViewerState) void {
+        var threads: [cache_size]?LoadWorker = undefined;
         {
             self.cache_mutex.lockUncancelable(self.io);
             for (&self.cache_slots, 0..) |*slot, i| {
                 if (slot.pixels) |p| { self.gpa.free(p); slot.pixels = null; }
-                slot.active = false;
-                slot.ready = false;
+                slot.* = .{};
                 threads[i] = self.cache_threads[i];
                 self.cache_threads[i] = null;
             }
             self.cache_mutex.unlock(self.io);
         }
-        for (threads) |maybe_t| {
-            if (maybe_t) |t| self.orphan_threads.append(self.gpa, t) catch t.join();
-        }
+        for (threads) |maybe_w| if (maybe_w) |w| self.parkWorker(w);
     }
 
     pub fn render(self: *ViewerState) void {
         self.captureWindowState();
+        self.reapOrphans();
         // Videos and animated images play through the media player; static
         // images use the prefetch cache.
         if (self.currentIsPlayable()) {
@@ -420,7 +520,8 @@ pub const ViewerState = struct {
             self.drainCache();
             self.updateCache();
         }
-        self.handleKeyEvents();
+        // Shortcuts act on the image, not behind the delete confirmation.
+        if (!self.delete_confirm_open) self.handleKeyEvents();
         if (self.delete_confirm_open) self.renderDeleteConfirmDialog();
 
         var outer = dvui.box(@src(), .{}, .{
@@ -465,17 +566,31 @@ pub const ViewerState = struct {
     fn updateVideo(self: *ViewerState) void {
         const cur = self.currentImage() orelse return;
 
-        if (self.video_player == null or self.video_player_idx != self.current_idx) {
+        // Adopt a player that finished opening, if it's still for this entry.
+        if (self.player_open) |po| if (po.done.load(.acquire)) {
+            po.thread.join();
+            const opened = po.result;
+            const for_current = po.idx == self.current_idx and self.video_player == null;
+            self.gpa.destroy(po);
+            self.player_open = null;
+            if (for_current) {
+                self.video_player = opened;
+                self.video_player_idx = self.current_idx;
+                // A failure is shown, not retried every frame.
+                self.video_failed = opened == null;
+            } else if (opened) |p| p.deinit();
+        };
+        const want_player = self.video_player == null or self.video_player_idx != self.current_idx;
+        if (want_player and !self.video_failed and self.player_open == null) {
             self.teardownVideo();
-            const path_z = self.diskPathZ(cur) catch return;
-            defer self.gpa.free(path_z);
-            self.video_player = video_player_mod.VideoPlayer.init(self.gpa, self.io, path_z, .{ .wakeup_fn = self.wakeup_fn }) catch null;
-            self.video_player_idx = self.current_idx;
+            self.startPlayerOpen(cur) catch |err| {
+                std.log.scoped(.viewer).warn("open player: {}", .{err});
+                self.video_failed = true;
+            };
         }
 
         const player = self.video_player orelse return;
-        const now: i128 = std.Io.Clock.real.now(self.io).nanoseconds;
-        if (player.tick(now)) |frame| {
+        if (player.tick(video_player_mod.VideoPlayer.nowNs(self.io))) |frame| {
             if (self.image_pixels) |old| {
                 dvui.textureInvalidateCache(self.image_texture_hash);
                 self.gpa.free(old);
@@ -492,6 +607,18 @@ pub const ViewerState = struct {
         }
         // Keep the render loop spinning so playback advances without input.
         if (player.isPlaying()) dvui.refresh(null, @src(), null);
+    }
+
+    fn startPlayerOpen(self: *ViewerState, cur: *const image_grid_mod.ImageEntry) !void {
+        const path_z = try self.diskPathZ(cur);
+        errdefer self.gpa.free(path_z);
+        const po = try self.gpa.create(PlayerOpen);
+        errdefer self.gpa.destroy(po);
+        po.* = .{ .thread = undefined, .idx = self.current_idx };
+        _ = self.inflight.fetchAdd(1, .acq_rel);
+        errdefer _ = self.inflight.fetchSub(1, .acq_rel);
+        po.thread = try std.Thread.spawn(.{}, openPlayerThread, .{ self, po, path_z });
+        self.player_open = po;
     }
 
     fn handleKeyEvents(self: *ViewerState) void {
@@ -873,7 +1000,7 @@ pub const ViewerState = struct {
             style.C.star
         else
             style.tint(style.C.text_hi, 90);
-        dvui.icon(@src(), label, icons.tvg.heroicons.solid.star, .{}, iconChildOpts(&bw, opts).override(.{ .color_text = .{ .color = star_color } }));
+        dvui.icon(@src(), label, app_icons.star, .{}, iconChildOpts(&bw, opts).override(.{ .color_text = .{ .color = star_color } }));
         const click = bw.clicked();
         bw.drawFocus();
         btnTooltip(&bw, label);
@@ -991,6 +1118,12 @@ pub const ViewerState = struct {
                 .{},
             ) catch {};
             dvui.clipSet(prev_clip);
+        } else if (self.image_failed or (self.video_failed and self.currentIsPlayable())) {
+            dvui.label(@src(), "{s}", .{i18n.t(.viewer_load_failed)}, .{
+                .gravity_x = 0.5,
+                .gravity_y = 0.5,
+                .color_text = .{ .color = style.C.text_dim },
+            });
         } else if (self.images.items.len > 0) {
             dvui.spinner(@src(), .{
                 .gravity_x = 0.5,
@@ -1017,8 +1150,8 @@ pub const ViewerState = struct {
                     const cursor_img_y = (me.p.y - cy) / (self.zoom * s);
                     const factor: f32 = if (dy > 0) 1.12 else (1.0 / 1.12);
                     const new_zoom = std.math.clamp(self.zoom * factor, 0.05, 32.0);
-                    self.pan_x += cursor_img_x * (self.zoom - new_zoom);
-                    self.pan_y += cursor_img_y * (self.zoom - new_zoom);
+                    self.pan_x = zoomPanAbout(self.pan_x, cursor_img_x, self.zoom, new_zoom);
+                    self.pan_y = zoomPanAbout(self.pan_y, cursor_img_y, self.zoom, new_zoom);
                     self.zoom = new_zoom;
                     self.zoom_mode = .custom;
                 },
@@ -1102,6 +1235,9 @@ pub const ViewerState = struct {
         const filename: []const u8 = if (self.images.items.len > 0)
             self.images.items[self.current_idx].filename
         else "";
+        // Details load (in the background) only while the pane is open.
+        if (self.db) |db| if (self.currentImage()) |cur|
+            self.detail_state.update(cur.id, db, self.gpa, self.io);
         self.detail_state.renderPanel(self.info_w, filename, self.gpa, self.io);
     }
 
@@ -1131,40 +1267,42 @@ pub const ViewerState = struct {
     }
 };
 
+fn openPlayerThread(state: *ViewerState, po: *PlayerOpen, path_z: [:0]u8) void {
+    defer _ = state.inflight.fetchSub(1, .acq_rel);
+    defer state.gpa.free(path_z);
+    po.result = video_player_mod.VideoPlayer.init(state.gpa, state.io, path_z, .{ .wakeup_fn = state.wakeup_fn }) catch |err| blk: {
+        std.log.scoped(.viewer).warn("open {s}: {}", .{ std.Io.Dir.path.basename(path_z), err });
+        break :blk null;
+    };
+    po.done.store(true, .release);
+    if (state.wakeup_fn) |w| w();
+}
+
+fn joinWorker(gpa: std.mem.Allocator, w: LoadWorker) void {
+    w.thread.join();
+    gpa.destroy(w.done);
+}
+
 fn loadCacheThread(
     gpa: std.mem.Allocator,
-    io: std.Io,
     state: *ViewerState,
     slot_i: usize,
-    image_idx: usize,
+    gen: u64,
     path: [:0]u8,
+    done: *std.atomic.Value(bool),
 ) void {
+    defer done.store(true, .release);
     defer _ = state.inflight.fetchSub(1, .acq_rel);
     defer gpa.free(path);
     defer vips_mod.threadShutdown();
 
-    const result = vips_mod.loadImageRgbaWithDims(gpa, path) catch return;
-
-    var should_wakeup = false;
-    {
-        state.cache_mutex.lockUncancelable(io);
-        defer state.cache_mutex.unlock(io);
-
-        const slot = &state.cache_slots[slot_i];
-        if (!slot.active or slot.image_idx != image_idx) {
-            // Slot was evicted or reused while we were loading; discard result.
-            gpa.free(result.pixels);
-        } else {
-            if (slot.pixels) |old| gpa.free(old);
-            slot.pixels = result.pixels;
-            slot.width = result.width;
-            slot.height = result.height;
-            slot.ready = true;
-            should_wakeup = true;
-        }
-    }
-
-    if (should_wakeup) {
+    const result: ?DecodedImage = if (vips_mod.loadImageRgbaWithDims(gpa, path)) |r|
+        .{ .pixels = r.pixels, .width = r.width, .height = r.height }
+    else |err| blk: {
+        std.log.scoped(.viewer).warn("decode {s}: {}", .{ std.Io.Dir.path.basename(path), err });
+        break :blk null;
+    };
+    if (state.deliverDecode(slot_i, gen, result)) {
         if (state.wakeup_fn) |wakeup| wakeup();
     }
 }

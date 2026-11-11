@@ -5,6 +5,7 @@ const vips = @import("vips");
 const notifier_mod = @import("notifier.zig");
 const i18n = @import("i18n.zig");
 const icons = @import("icons");
+const app_icons = @import("app_icons.zig");
 const media = @import("media.zig");
 const video_player_mod = @import("video_player.zig");
 const style = @import("style.zig");
@@ -263,6 +264,15 @@ fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_
     return db.listAllImages(a);
 }
 
+/// Whether `raw` has anything left to search after `sanitizeFtsQuery`.
+fn hasFtsTerms(raw: ?[]const u8) bool {
+    for (raw orelse return false) |c| switch (c) {
+        '(', ')', '"', '*', '^', ' ', '\t', '\n', '\r' => {},
+        else => return true,
+    };
+    return false;
+}
+
 /// Strip FTS5 syntax characters that cause parse errors in user-typed queries.
 /// Returns null when nothing searchable is left. Caller owns the result.
 pub fn sanitizeFtsQuery(a: std.mem.Allocator, raw: []const u8) !?[]u8 {
@@ -279,7 +289,6 @@ pub fn sanitizeFtsQuery(a: std.mem.Allocator, raw: []const u8) !?[]u8 {
 
 const LoadCtx = struct {
     grid: *GridState,
-    db: *db_mod.VectorDb,
     query: ViewQuery, // owned
     generation: u64,
 };
@@ -289,7 +298,7 @@ fn loadTask(ctx: LoadCtx) void {
     defer q.deinit(ctx.grid.allocator);
     const g = ctx.grid;
     if (g.load_gen.load(.acquire) != ctx.generation) return;
-    const loaded: ?LoadedView = loadView(ctx.db, g.allocator, q) catch |err| blk: {
+    const loaded: ?LoadedView = loadView(&g.view_db, g.allocator, q) catch |err| blk: {
         log.warn("view load failed: {}", .{err});
         break :blk null;
     };
@@ -357,6 +366,9 @@ pub const GridState = struct {
     // `queued` so the per-frame queue rebuild (which drops stale queued requests)
     // doesn't re-request something already in flight and load it twice.
     in_flight: std.AutoHashMap(u64, void),
+    /// In-flight loads whose id was invalidated meanwhile (the id now names
+    /// another image): their result is dropped. Guarded by queue_mutex.
+    stale_in_flight: std.AutoHashMap(u64, void),
     // Ids whose thumbnail couldn't be produced: not re-requested until
     // invalidateThumbnail (refresh / recycled id). Guarded by queue_mutex.
     load_failed: std.AutoHashMap(u64, void),
@@ -369,7 +381,12 @@ pub const GridState = struct {
     // Dedicated DB connection shared by all loader workers, serialized via mutex
     loader_db: db_mod.VectorDb,
     loader_db_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    thumbnails_in_db: bool,
+    /// Connection for background view loads, so a long list / FTS / KNN query
+    /// never holds the main connection's mutex while the UI needs it. Its own
+    /// `db_mutex` serializes overlapping loads.
+    view_db: db_mod.VectorDb,
+    /// Read by the loader workers; the settings screen may change it.
+    thumbnails_in_db: std.atomic.Value(bool),
 
     // Worker thread pool
     workers: [max_workers]std.Thread = undefined,
@@ -432,7 +449,7 @@ pub const GridState = struct {
     copy_prompt_requested: bool = false,
     copy_prompt_id: u64 = 0,
     copy_image_requested: bool = false,
-    copy_image_path: []const u8 = "",
+    copy_image_id: u64 = 0,
     reparse_requested: bool = false,
     reparse_id: u64 = 0,
     // Favorite toggle — set when a grid star is clicked, consumed by app.zig.
@@ -454,7 +471,7 @@ pub const GridState = struct {
     // Root path of the selected library (borrowed from the sidebar, not owned).
     // Used to decide whether a newly scanned image belongs in the current view.
     filter_library_path: ?[]const u8 = null,
-    // FTS5 search query — points into app.zig's g_search_buf; not owned
+    /// FTS5 search query. Owned; set with `setSearchQuery`.
     search_query: ?[]const u8 = null,
     // Active metadata filters — slice into app.zig's g_active_filters; not owned
     filters: []const db_mod.ActiveFilter = &.{},
@@ -470,6 +487,10 @@ pub const GridState = struct {
     data_dir: ?[]const u8 = null,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, db: *db_mod.VectorDb, thumbnails_in_db: bool, wakeup_fn: ?*const fn () void) !GridState {
+        var loader_db = try db.getConnection();
+        errdefer loader_db.deinit();
+        var view_db = try db.getConnection();
+        errdefer view_db.deinit();
         var state = GridState{
             .io = io,
             .allocator = allocator,
@@ -477,12 +498,14 @@ pub const GridState = struct {
             .pending = std.AutoHashMap(u64, []u8).init(allocator),
             .queued = std.AutoHashMap(u64, void).init(allocator),
             .in_flight = std.AutoHashMap(u64, void).init(allocator),
+            .stale_in_flight = std.AutoHashMap(u64, void).init(allocator),
             .load_failed = std.AutoHashMap(u64, void).init(allocator),
             .load_dropped = std.AutoHashMap(u64, void).init(allocator),
             .refreshed = std.AutoHashMap(u64, void).init(allocator),
             .selection = std.AutoHashMap(u64, void).init(allocator),
-            .loader_db = try db.getConnection(),
-            .thumbnails_in_db = thumbnails_in_db,
+            .loader_db = loader_db,
+            .view_db = view_db,
+            .thumbnails_in_db = .init(thumbnails_in_db),
             .wakeup_fn = wakeup_fn,
             .grid_players = std.AutoHashMap(u64, CellPlayer).init(allocator),
             .player_in_flight = std.AutoHashMap(u64, void).init(allocator),
@@ -515,8 +538,22 @@ pub const GridState = struct {
         }
     }
 
+    /// The entry with `id`, if it's in the current list.
+    pub fn entryById(self: *const GridState, id: u64) ?*const ImageEntry {
+        for (self.images.items) |*e| if (e.id == id) return e;
+        return null;
+    }
+
+    /// Set the FTS query (copied; the grid owns it). Null clears it.
+    pub fn setSearchQuery(self: *GridState, q: ?[]const u8) !void {
+        const copy = if (q) |t| try self.allocator.dupe(u8, t) else null;
+        if (self.search_query) |old| self.allocator.free(old);
+        self.search_query = copy;
+    }
+
     pub fn deinit(self: *GridState) void {
         self.load_group.await(self.io) catch {};
+        if (self.search_query) |q| self.allocator.free(q);
         if (self.load_result) |v| v.deinit(self.allocator);
         self.load_dropped.deinit();
         for (self.load_added.items) |e| self.allocator.free(e.path);
@@ -561,11 +598,13 @@ pub const GridState = struct {
         self.low_queue.deinit(self.allocator);
         self.queued.deinit();
         self.in_flight.deinit();
+        self.stale_in_flight.deinit();
         self.load_failed.deinit();
         self.missing_ids.deinit(self.allocator);
         self.refreshed.deinit();
 
         self.loader_db.deinit();
+        self.view_db.deinit();
         self.notifier.deinit();
         self.selection.deinit();
         self.drag_requested_ids.deinit(self.allocator);
@@ -604,17 +643,16 @@ pub const GridState = struct {
     /// Reload the image list for the current view in the background. The old
     /// list stays on screen until update() swaps the result in; a newer
     /// request supersedes an older one still loading.
-    pub fn reloadImages(self: *GridState, db: *db_mod.VectorDb) !void {
-        return self.reloadImagesEx(db, .{});
+    pub fn reloadImages(self: *GridState) !void {
+        return self.reloadImagesEx(.{});
     }
 
-    pub fn reloadImagesEx(self: *GridState, db: *db_mod.VectorDb, opts: ReloadOptions) !void {
+    pub fn reloadImagesEx(self: *GridState, opts: ReloadOptions) !void {
         const query = try self.currentQuery().dupe(self.allocator);
         const gen = self.load_gen.fetchAdd(1, .acq_rel) + 1;
         self.load_keep_scroll = opts.keep_scroll;
         self.load_group.concurrent(self.io, loadTask, .{LoadCtx{
             .grid = self,
-            .db = db,
             .query = query,
             .generation = gen,
         }}) catch |err| {
@@ -962,9 +1000,17 @@ pub const GridState = struct {
         // 0. Swap in a finished background view load.
         _ = self.applyReloadIfDone();
 
-        // 1. Drain new images from scan threads (library view only)
-        if (self.view_mode == .library) {
-            self.notifier.drain(self.io, self.allocator, &self.incoming);
+        // 1. Drain new images from scan threads. Only the library view adds
+        // them; the other views (and the library view's next load) read the
+        // DB. Elsewhere just drop each id's stale cached thumbnail — the id may
+        // be one SQLite recycled — so the queue can't grow during a long scan.
+        self.notifier.drain(self.io, self.allocator, &self.incoming);
+        if (self.view_mode != .library) {
+            for (self.incoming.items) |e| {
+                self.invalidateThumbnail(e.id);
+                self.allocator.free(e.path);
+            }
+            self.incoming.clearRetainingCapacity();
         }
         const before_count = self.images.items.len;
         if (self.incoming.items.len > 0) {
@@ -1080,7 +1126,34 @@ pub const GridState = struct {
             defer self.queue_mutex.unlock(self.io);
             _ = self.queued.remove(id);
             _ = self.load_failed.remove(id);
+            // A worker still decoding the id's previous file: drop its result.
+            if (self.in_flight.contains(id)) self.stale_in_flight.put(id, {}) catch {};
         }
+    }
+
+    /// Worker side: hand over a finished load (`bytes` null = it failed),
+    /// unless `invalidateThumbnail` made it stale meanwhile.
+    pub fn finishLoad(self: *GridState, id: u64, path: []const u8, bytes: ?[]u8) void {
+        self.queue_mutex.lockUncancelable(self.io);
+        const stale = self.stale_in_flight.remove(id);
+        if (stale) {
+            self.queue_mutex.unlock(self.io);
+            if (bytes) |b| self.allocator.free(b);
+            return;
+        }
+        const b = bytes orelse {
+            self.queue_mutex.unlock(self.io);
+            self.noteLoadFailure(id, path);
+            return;
+        };
+        // Still under queue_mutex, so an invalidate can't slip in between the
+        // stale check and the store (it would then remove the stored result).
+        self.pending_mutex.lockUncancelable(self.io);
+        if (self.pending.fetchRemove(id)) |old| self.allocator.free(old.value);
+        self.pending.put(id, b) catch self.allocator.free(b);
+        self.pending_mutex.unlock(self.io);
+        self.queue_mutex.unlock(self.io);
+        if (self.wakeup_fn) |wakeup| wakeup();
     }
 
     /// Worker side: no thumbnail could be produced for `id`. A file deleted
@@ -1150,10 +1223,27 @@ pub const GridState = struct {
         self.scroll_to_focused = true;
     }
 
+    /// Whether the current view is a search, whose DB order is the ranking
+    /// (BM25 for text, nearest first or RRF score for vectors). The sort
+    /// settings don't apply then, and take effect again once it is cleared.
+    /// Mirrors `queryEntries`.
+    pub fn isRelevanceRanked(self: *const GridState) bool {
+        if (self.view_mode != .library) return false;
+        const e = self.query_embeddings;
+        const vector = switch (self.search_mode) {
+            .fts => false,
+            .semantic => e.prompt != null,
+            .visual => e.visual != null,
+            .combined => e.prompt != null or e.visual != null,
+        };
+        return vector or hasFtsTerms(self.search_query);
+    }
+
     pub fn applySortOrder(self: *GridState) void {
         // Duplicates view keeps the DB order (grouped by hash) so duplicate sets
-        // stay contiguous; user-facing sort controls don't apply there.
-        if (self.view_mode == .duplicates) return;
+        // stay contiguous, and a vector search keeps its relevance ranking;
+        // user-facing sort controls don't apply there.
+        if (self.view_mode == .duplicates or self.isRelevanceRanked()) return;
 
         // Remember focused image ID so we can restore focused_idx after reorder.
         const focused_id: ?u64 = if (self.focused_idx) |fi| self.images.items[fi].id else null;
@@ -1613,7 +1703,9 @@ pub const GridState = struct {
                 {
                     fm.close();
                     self.copy_image_requested = true;
-                    self.copy_image_path = entry.path;
+                    // By id: the entry (and its path) may be gone by the time
+                    // app.zig handles the request next frame.
+                    self.copy_image_id = entry.id;
                 }
                 if (self.view_mode != .trash) { // library or duplicates
                     if (dvui.menuItemLabel(@src(), i18n.t(.context_reparse), .{},
@@ -1670,7 +1762,7 @@ pub const GridState = struct {
             // (opened off-thread) and fall back to the poster until it's ready.
             var drew_live = false;
             if (self.autoplay and isPlayable(&entry)) {
-                const now_ns = std.Io.Clock.real.now(self.io).nanoseconds;
+                const now_ns = video_player_mod.VideoPlayer.nowNs(self.io);
                 if (self.drawCellPlayer(entry.id, now_ns)) |cp| {
                     if (cp.pixels) |px| {
                         const fw: f32 = @floatFromInt(cp.width);
@@ -1747,7 +1839,7 @@ pub const GridState = struct {
                     style.tint(style.C.star, if (bw.hovered() or bw.pressed()) 255 else 150)
                 else
                     style.tint(style.C.text_hi, if (bw.pressed()) 255 else if (bw.hovered()) 215 else 120);
-                dvui.icon(@src(), "favorite", icons.tvg.heroicons.solid.star, .{}, .{
+                dvui.icon(@src(), "favorite", app_icons.star, .{}, .{
                     .id_extra = idx,
                     .gravity_x = 0.5,
                     .gravity_y = 0.5,
@@ -1941,6 +2033,7 @@ fn workerFn(state: *GridState) void {
         defer {
             state.queue_mutex.lockUncancelable(state.io);
             _ = state.in_flight.remove(req.id);
+            _ = state.stale_in_flight.remove(req.id);
             state.queue_mutex.unlock(state.io);
         }
         defer state.allocator.free(req.path);
@@ -1949,7 +2042,7 @@ fn workerFn(state: *GridState) void {
         // always read the stored blob. Otherwise use the DB only when configured.
         const is_video = isVideoPath(req.path);
         var bytes: ?[]u8 = null;
-        if (state.thumbnails_in_db or is_video) {
+        if (state.thumbnails_in_db.load(.acquire) or is_video) {
             state.loader_db_mutex.lockUncancelable(state.io);
             bytes = state.loader_db.getThumbnailBytes(state.allocator, req.id) catch null;
             state.loader_db_mutex.unlock(state.io);
@@ -1965,17 +2058,7 @@ fn workerFn(state: *GridState) void {
             };
         }
 
-        const b = bytes orelse {
-            state.noteLoadFailure(req.id, req.path);
-            continue;
-        };
-
-        state.pending_mutex.lockUncancelable(state.io);
-        if (state.pending.fetchRemove(req.id)) |old| state.allocator.free(old.value);
-        state.pending.put(req.id, b) catch state.allocator.free(b);
-        state.pending_mutex.unlock(state.io);
-
-        if (state.wakeup_fn) |wakeup| wakeup();
+        state.finishLoad(req.id, req.path, bytes);
     }
     vips.threadShutdown();
 }

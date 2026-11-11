@@ -8,6 +8,7 @@ const SDLBackend = @import("backend");
 const platform = @import("platform.zig");
 const window_state = @import("window_state.zig");
 const config_mod = @import("config.zig");
+const media = @import("media.zig");
 
 pub const vtable: platform.Vtable = .{
     .copy_image_file = copyImageFile,
@@ -25,25 +26,44 @@ pub const vtable: platform.Vtable = .{
 
 // ── Image clipboard ─────────────────────────────────────────────────────────
 //
-// SDL holds the data pointer until the clipboard is replaced, so the bytes are
-// served lazily via a callback and freed by the cleanup callback.
+// SDL calls the data callback only when another app pastes, so copying does no
+// file IO: the bytes are read on the first request and freed by the cleanup
+// callback when the clipboard is replaced.
 
 const ClipboardImageData = struct {
     gpa: std.mem.Allocator,
-    bytes: []u8,
+    io: std.Io,
+    path: []u8,
+    bytes: ?[]u8 = null,
 };
 
 fn clipboardImageCallback(userdata: ?*anyopaque, mime_type: [*c]const u8, size: [*c]usize) callconv(.c) ?*const anyopaque {
     _ = mime_type;
     const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
-    size.* = d.bytes.len;
-    return d.bytes.ptr;
+    if (d.bytes == null) d.bytes = readWholeFile(d.gpa, d.io, d.path) catch null;
+    const bytes = d.bytes orelse {
+        size.* = 0;
+        return null;
+    };
+    size.* = bytes.len;
+    return bytes.ptr;
 }
 
 fn clipboardImageCleanup(userdata: ?*anyopaque) callconv(.c) void {
     const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
-    d.gpa.free(d.bytes);
+    if (d.bytes) |b| d.gpa.free(b);
+    d.gpa.free(d.path);
     d.gpa.destroy(d);
+}
+
+fn readWholeFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const len: usize = @intCast(try file.length(io));
+    const bytes = try gpa.alloc(u8, len);
+    errdefer gpa.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != len) return error.ShortRead;
+    return bytes;
 }
 
 fn copyImageFile(path: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
@@ -51,16 +71,16 @@ fn copyImageFile(path: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
 }
 
 fn copyImageFileImpl(path: []const u8, gpa: std.mem.Allocator, io: std.Io) !void {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const len: usize = @intCast(try file.length(io));
-    const bytes = try gpa.alloc(u8, len);
-    errdefer gpa.free(bytes);
-    _ = try file.readPositionalAll(io, bytes, 0);
+    // Advertise the file's real format; a video can't be pasted as an image.
+    const mime_z = media.imageMimeType(path) orelse return;
     const d = try gpa.create(ClipboardImageData);
-    d.* = .{ .gpa = gpa, .bytes = bytes };
-    var mime: [*c]const u8 = "image/png";
-    _ = SDLBackend.c.SDL_SetClipboardData(clipboardImageCallback, clipboardImageCleanup, d, &mime, 1);
+    errdefer gpa.destroy(d);
+    d.* = .{ .gpa = gpa, .io = io, .path = try gpa.dupe(u8, path) };
+    var mime: [*c]const u8 = mime_z.ptr;
+    if (!SDLBackend.c.SDL_SetClipboardData(clipboardImageCallback, clipboardImageCleanup, d, &mime, 1)) {
+        gpa.free(d.path);
+        return error.ClipboardFailed;
+    }
 }
 
 // ── Folder picker ───────────────────────────────────────────────────────────

@@ -31,6 +31,8 @@ pub const ImageMeta = struct {
     id: u64,
     mtime: ?i64,
     has_thumbnail: bool,
+    /// The row has a positive prompt (only those can get a prompt embedding).
+    has_prompt: bool = false,
     has_prompt_embedding: bool,
     has_image_embedding: bool,
     seen: bool = false,
@@ -98,7 +100,7 @@ pub const SearchResult = struct {
 };
 
 // Each entry is applied in order; never edit existing entries, only append.
-const migrations = [_][]const u8{
+const migrations = [_][:0]const u8{
     // v1: libraries table
     \\CREATE TABLE libraries (
     \\  id INTEGER PRIMARY KEY,
@@ -188,7 +190,33 @@ const migrations = [_][]const u8{
     \\DELETE FROM positive_prompt_embeddings WHERE rowid IN
     \\  (SELECT id FROM images WHERE positive_prompt_text LIKE '%<%');
     ,
+    // v14: one live row per (library, path). The scan and the fs watcher could
+    // both miss a new file and insert it twice; "remove redundant duplicates"
+    // then trashed the file itself. Merge existing copies into the lowest id
+    // (keeping a favorite set on any of them), then make the index unique.
+    // Trashed rows are exempt: a new file may reuse a trashed image's path.
+    \\UPDATE images SET favorite = 1
+    \\WHERE trashed_at IS NULL AND favorite = 0 AND EXISTS (
+    \\  SELECT 1 FROM images d WHERE d.trashed_at IS NULL AND d.favorite = 1
+    \\    AND d.library_id = images.library_id AND d.library_path = images.library_path);
+    \\DELETE FROM images WHERE trashed_at IS NULL AND EXISTS (
+    \\  SELECT 1 FROM images k WHERE k.trashed_at IS NULL AND k.id < images.id
+    \\    AND k.library_id = images.library_id AND k.library_path = images.library_path);
+    \\CREATE UNIQUE INDEX idx_images_live_path ON images (library_id, library_path)
+    \\  WHERE trashed_at IS NULL;
+    ,
 };
+
+/// Bounds of the half-open range [`folder/`, `folder0`) holding exactly the
+/// paths under `folder` ('0' is the byte after '/'). Unlike `LIKE 'folder/%'`
+/// it is case-sensitive, has no `_`/`%` wildcards, and can use the path index.
+/// Caller frees both.
+fn folderRange(allocator: std.mem.Allocator, folder: []const u8) !struct { lo: []u8, hi: []u8 } {
+    const lo = try allocator.print("{s}/", .{folder});
+    errdefer allocator.free(lo);
+    const hi = try allocator.print("{s}0", .{folder});
+    return .{ .lo = lo, .hi = hi };
+}
 
 // setupSchema runs all pending migrations and bootstraps any remaining tables
 // on a dedicated raw connection so that pool connections (which call
@@ -211,34 +239,45 @@ fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
         return error.VecExtensionFailed;
     }
 
-    _ = c.sqlite3_exec(db, "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;", null, null, null);
+    const exec = struct {
+        fn run(conn: *c.sqlite3, sql: [*:0]const u8) !void {
+            var msg: [*c]u8 = null;
+            if (c.sqlite3_exec(conn, sql, null, null, &msg) != c.SQLITE_OK) {
+                log.err("schema: {s}: {s}", .{ sql, if (msg != null) msg else c.sqlite3_errmsg(conn) });
+                if (msg != null) c.sqlite3_free(msg);
+                return error.MigrationFailed;
+            }
+        }
+    }.run;
+
+    // Wait for another instance's lock instead of failing on the first BEGIN.
+    try exec(db, "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
 
     // Determine current schema version
     var ver_stmt: ?*c.sqlite3_stmt = null;
-    _ = c.sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &ver_stmt, null);
-    _ = c.sqlite3_step(ver_stmt);
+    if (c.sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &ver_stmt, null) != c.SQLITE_OK)
+        return error.MigrationFailed;
+    const stepped = c.sqlite3_step(ver_stmt);
     const version: usize = @intCast(c.sqlite3_column_int64(ver_stmt, 0));
     _ = c.sqlite3_finalize(ver_stmt);
+    if (stepped != c.SQLITE_ROW) return error.MigrationFailed;
+    // An older build opening a newer DB: refuse rather than misread it.
+    if (version > migrations.len) return error.SchemaTooNew;
 
-    // Apply any pending migrations
+    // Apply any pending migrations, each in its own transaction with its version bump.
     for (migrations[version..], version..) |sql, idx| {
-        _ = c.sqlite3_exec(db, "BEGIN", null, null, null);
-        err_msg = null;
-        if (c.sqlite3_exec(db, sql.ptr, null, null, &err_msg) != c.SQLITE_OK) {
-            if (err_msg != null) {
-                log.err("migration {d} failed: {s}", .{ idx + 1, err_msg });
-                c.sqlite3_free(err_msg);
-            }
-            _ = c.sqlite3_exec(db, "ROLLBACK", null, null, null);
+        try exec(db, "BEGIN IMMEDIATE");
+        errdefer exec(db, "ROLLBACK") catch {};
+        exec(db, sql.ptr) catch {
+            log.err("migration {d} failed", .{idx + 1});
             return error.MigrationFailed;
-        }
+        };
         var buf: [64]u8 = undefined;
         const pragma = try std.mem.printSentinel(&buf, "PRAGMA user_version = {d}", .{idx + 1}, 0);
-        _ = c.sqlite3_exec(db, pragma.ptr, null, null, null);
-        _ = c.sqlite3_exec(db, "COMMIT", null, null, null);
+        try exec(db, pragma.ptr);
+        try exec(db, "COMMIT");
         log.info("applied migration {d}", .{idx + 1});
     }
-
 }
 
 pub const FilterColumn = enum {
@@ -305,10 +344,14 @@ pub const VectorDb = struct {
         self.* = undefined;
     }
 
-    pub fn storeImageEmbedding(self: *VectorDb, id: u64, embedding: []const f32) !void {
+    /// Store (or replace) the image embedding of row `id`, but only while that
+    /// row still holds `path`: an embedding finished after its image was deleted
+    /// would otherwise land on whichever image SQLite gives the recycled id.
+    /// Returns whether it was stored.
+    pub fn storeImageEmbedding(self: *VectorDb, id: u64, path: []const u8, embedding: []const f32) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        try self.db.insertVector("image_embeddings", @as(i64, @intCast(id)), embedding);
+        return self.db.insertVector("image_embeddings", @as(i64, @intCast(id)), path, embedding);
     }
 
     pub fn findSimilarImages(self: *VectorDb, query_embedding: []const f32, limit: usize) !std.ArrayList(sqlite.VecResult) {
@@ -324,6 +367,7 @@ pub const VectorDb = struct {
         {
             var stmt = self.db.statements.find_library;
             try stmt.reset();
+            defer stmt.reset() catch {};
 
             try stmt.bind(1, library_path);
 
@@ -337,6 +381,7 @@ pub const VectorDb = struct {
         {
             var stmt = self.db.statements.insert_library;
             try stmt.reset();
+            defer stmt.reset() catch {};
 
             try stmt.bind(1, library_path);
             _ = try stmt.step();
@@ -346,11 +391,11 @@ pub const VectorDb = struct {
         return @intCast(self.db.getLastInsertRowID());
     }
 
-    /// Store a prompt embedding in the database
-    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, embedding: []const f32) !void {
+    /// Prompt-embedding counterpart of `storeImageEmbedding` (same `path` guard).
+    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, path: []const u8, embedding: []const f32) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        try self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), embedding);
+        return self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), path, embedding);
     }
 
     /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 768-dim.
@@ -506,52 +551,37 @@ pub const VectorDb = struct {
         return out;
     }
 
+    /// The live (non-trashed) row at `image_path`, creating it if there is none.
     /// Caller owns all Image string fields; free with image.deinit(allocator).
     pub fn findOrCreateImage(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, image_path: []const u8) !models.Image {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        {
-            var stmt = self.db.statements.find_image;
-            try stmt.reset();
-            try stmt.bind(1, library_id);
-            try stmt.bind(2, image_path);
-            if (try stmt.step()) {
-                log.debug("found existing image id={d} {s}", .{ stmt.columnInt64(0), image_path });
-                return models.Image{
-                    .id = @intCast(stmt.columnInt64(0)),
-                    .libraryId = @intCast(stmt.columnInt64(1)),
-                    .libraryPath = try allocator.dupe(u8, stmt.columnText(2)),
-                    .creationDate = try allocator.dupe(u8, stmt.columnText(3)),
-                    .positivePromptText = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
-                    .negativePromptText = if (stmt.columnIsNull(5)) null else try allocator.dupe(u8, stmt.columnText(5)),
-                    .generatedDescription = if (stmt.columnIsNull(6)) null else try allocator.dupe(u8, stmt.columnText(6)),
-                    .thumbnail = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnBlob(7)),
-                    .hash = if (stmt.columnIsNull(8)) null else try allocator.dupe(u8, stmt.columnText(8)),
-                    .mtime = if (stmt.columnIsNull(9)) null else stmt.columnInt64(9),
-                    .model = if (stmt.columnIsNull(10)) null else try allocator.dupe(u8, stmt.columnText(10)),
-                    .sampler = if (stmt.columnIsNull(11)) null else try allocator.dupe(u8, stmt.columnText(11)),
-                    .scheduler = if (stmt.columnIsNull(12)) null else try allocator.dupe(u8, stmt.columnText(12)),
-                    .cfg = if (stmt.columnIsNull(13)) null else stmt.columnDouble(13),
-                    .steps = if (stmt.columnIsNull(14)) null else stmt.columnInt64(14),
-                    .seed = if (stmt.columnIsNull(15)) null else stmt.columnInt64(15),
-                    .loras = if (stmt.columnIsNull(16)) null else try allocator.dupe(u8, stmt.columnText(16)),
-                };
-            }
-        }
+
+        if (try self.findLiveImage(allocator, library_id, image_path)) |img| return img;
 
         {
             var stmt = self.db.statements.insert_image;
             try stmt.reset();
+            defer stmt.reset() catch {};
             try stmt.bind(1, library_id);
             try stmt.bind(2, image_path);
             _ = try stmt.step();
-            log.debug("created new image {s}", .{image_path});
         }
+        // Another connection (the fs watcher racing a scan) inserted the path
+        // between our find and insert: the unique index made ours a no-op.
+        if (sqlite.c.sqlite3_changes(self.db.db) == 0) {
+            if (try self.findLiveImage(allocator, library_id, image_path)) |img| return img;
+            return error.ImageRowVanished;
+        }
+        log.debug("created new image {s}", .{image_path});
 
+        const id: u64 = @intCast(self.db.getLastInsertRowID());
+        const path_copy = try allocator.dupe(u8, image_path);
+        errdefer allocator.free(path_copy);
         return models.Image{
-            .id = @intCast(self.db.getLastInsertRowID()),
+            .id = id,
             .libraryId = library_id,
-            .libraryPath = try allocator.dupe(u8, image_path),
+            .libraryPath = path_copy,
             .creationDate = try self.getCurrentTimestamp(allocator),
             .positivePromptText = null,
             .negativePromptText = null,
@@ -562,11 +592,59 @@ pub const VectorDb = struct {
         };
     }
 
+    /// find_image lookup; caller holds db_mutex.
+    fn findLiveImage(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, image_path: []const u8) !?models.Image {
+        var stmt = self.db.statements.find_image;
+        try stmt.reset();
+        // A cached statement left mid-result keeps the connection's read
+        // transaction (and its stale WAL snapshot) open; always reset it.
+        defer stmt.reset() catch {};
+        try stmt.bind(1, library_id);
+        try stmt.bind(2, image_path);
+        if (!try stmt.step()) return null;
+
+        const dupeOpt = struct {
+            fn f(a: std.mem.Allocator, st: *sqlite.PreparedStatement, col: usize) !?[]u8 {
+                return if (st.columnIsNull(col)) null else try a.dupe(u8, st.columnText(col));
+            }
+        }.f;
+
+        var img = models.Image{
+            .id = @intCast(stmt.columnInt64(0)),
+            .libraryId = @intCast(stmt.columnInt64(1)),
+            .libraryPath = try allocator.dupe(u8, stmt.columnText(2)),
+            .creationDate = &.{},
+            .positivePromptText = null,
+            .negativePromptText = null,
+            .generatedDescription = null,
+            .thumbnail = null,
+            .hash = null,
+            .mtime = if (stmt.columnIsNull(9)) null else stmt.columnInt64(9),
+            .cfg = if (stmt.columnIsNull(13)) null else stmt.columnDouble(13),
+            .steps = if (stmt.columnIsNull(14)) null else stmt.columnInt64(14),
+            .seed = if (stmt.columnIsNull(15)) null else stmt.columnInt64(15),
+        };
+        errdefer img.deinit(allocator);
+        img.creationDate = try allocator.dupe(u8, stmt.columnText(3));
+        img.positivePromptText = try dupeOpt(allocator, &stmt, 4);
+        img.negativePromptText = try dupeOpt(allocator, &stmt, 5);
+        img.generatedDescription = try dupeOpt(allocator, &stmt, 6);
+        img.thumbnail = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnBlob(7));
+        img.hash = try dupeOpt(allocator, &stmt, 8);
+        img.model = try dupeOpt(allocator, &stmt, 10);
+        img.sampler = try dupeOpt(allocator, &stmt, 11);
+        img.scheduler = try dupeOpt(allocator, &stmt, 12);
+        img.loras = try dupeOpt(allocator, &stmt, 16);
+        log.debug("found existing image id={d} {s}", .{ img.id, image_path });
+        return img;
+    }
+
     pub fn saveImage(self: *VectorDb, image: *const models.Image) !void {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         var stmt = self.db.statements.update_image;
         try stmt.reset();
+        defer stmt.reset() catch {};
 
         if (image.positivePromptText) |text| try stmt.bind(1, text) else try stmt.bindNull(1);
         if (image.negativePromptText) |text| try stmt.bind(2, text) else try stmt.bindNull(2);
@@ -591,6 +669,7 @@ pub const VectorDb = struct {
         defer self.db_mutex.unlock(self.io);
         var stmt = self.db.statements.find_library;
         try stmt.reset();
+        defer stmt.reset() catch {};
         try stmt.bind(1, path);
         if (try stmt.step()) return @intCast(stmt.columnInt64(0));
         return null;
@@ -603,6 +682,59 @@ pub const VectorDb = struct {
         defer stmt.deinit();
         try stmt.bind(1, path);
         _ = try stmt.step();
+    }
+
+    pub const RemovedLibrary = struct {
+        /// Every image row the library had (live and trashed).
+        ids: []u64,
+        /// Trash file names of its trashed images, to delete from disk.
+        trash_names: [][]const u8,
+
+        pub fn deinit(r: RemovedLibrary, a: std.mem.Allocator) void {
+            a.free(r.ids);
+            for (r.trash_names) |n| a.free(n);
+            a.free(r.trash_names);
+        }
+    };
+
+    /// Delete library `library_id` and (by cascade) all its images, in one
+    /// transaction, returning what the caller must clean up outside the DB.
+    pub fn removeLibraryById(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64) !RemovedLibrary {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        try self.db.exec("BEGIN IMMEDIATE");
+        errdefer self.db.exec("ROLLBACK") catch {};
+
+        var ids: std.ArrayList(u64) = .empty;
+        errdefer ids.deinit(allocator);
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (names.items) |n| allocator.free(n);
+            names.deinit(allocator);
+        }
+        {
+            var stmt = try self.db.prepare("SELECT id, trash_name FROM images WHERE library_id = ?");
+            defer stmt.deinit();
+            try stmt.bind(1, library_id);
+            while (try stmt.step()) {
+                try ids.append(allocator, @intCast(stmt.columnInt64(0)));
+                if (!stmt.columnIsNull(1)) {
+                    const n = try allocator.dupe(u8, stmt.columnText(1));
+                    errdefer allocator.free(n);
+                    try names.append(allocator, n);
+                }
+            }
+        }
+        {
+            var stmt = try self.db.prepare("DELETE FROM libraries WHERE id = ?");
+            defer stmt.deinit();
+            try stmt.bind(1, library_id);
+            _ = try stmt.step();
+        }
+        try self.db.exec("COMMIT");
+        const id_slice = try ids.toOwnedSlice(allocator);
+        errdefer allocator.free(id_slice);
+        return .{ .ids = id_slice, .trash_names = try names.toOwnedSlice(allocator) };
     }
 
     pub fn listLibraries(self: *VectorDb, allocator: std.mem.Allocator) ![]LibraryInfo {
@@ -654,15 +786,17 @@ pub const VectorDb = struct {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
 
-        const pattern = try allocator.print("{s}/%", .{parent_path});
-        defer allocator.free(pattern);
+        const range = try folderRange(allocator, parent_path);
+        defer allocator.free(range.lo);
+        defer allocator.free(range.hi);
 
         var stmt = try self.db.prepare(
-            "SELECT library_path FROM images WHERE library_id = ? AND library_path LIKE ? AND trashed_at IS NULL",
+            "SELECT library_path FROM images WHERE library_id = ? AND library_path >= ? AND library_path < ? AND trashed_at IS NULL",
         );
         defer stmt.deinit();
         try stmt.bind(1, library_id);
-        try stmt.bind(2, @as([]const u8, pattern));
+        try stmt.bind(2, @as([]const u8, range.lo));
+        try stmt.bind(3, @as([]const u8, range.hi));
 
         const Agg = struct { count: i64, has_children: bool };
         var map: std.StringHashMap(Agg) = .init(allocator);
@@ -807,14 +941,16 @@ pub const VectorDb = struct {
     pub fn listImagesInFolder(self: *VectorDb, allocator: std.mem.Allocator, library_id: u64, folder_path: []const u8) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        const pattern: []u8 = try allocator.print("{s}/%", .{folder_path});
-        defer allocator.free(pattern);
+        const range = try folderRange(allocator, folder_path);
+        defer allocator.free(range.lo);
+        defer allocator.free(range.hi);
         var stmt = try self.db.prepare(
-            "SELECT id, library_path, mtime FROM images WHERE library_id = ? AND library_path LIKE ? AND trashed_at IS NULL ORDER BY id",
+            "SELECT id, library_path, mtime FROM images WHERE library_id = ? AND library_path >= ? AND library_path < ? AND trashed_at IS NULL ORDER BY id",
         );
         defer stmt.deinit();
         try stmt.bind(1, library_id);
-        try stmt.bind(2, @as([]const u8, pattern));
+        try stmt.bind(2, @as([]const u8, range.lo));
+        try stmt.bind(3, @as([]const u8, range.hi));
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
             for (list.items) |e| allocator.free(e.path);
@@ -868,7 +1004,7 @@ pub const VectorDb = struct {
         // upgrade that renames them.
         var stmt = try self.db.prepare(
             \\SELECT i.id, i.library_path, i.mtime,
-            \\       (i.thumbnail IS NOT NULL),
+            \\       (i.thumbnail IS NOT NULL), (i.positive_prompt_text IS NOT NULL),
             \\       EXISTS (SELECT 1 FROM positive_prompt_embeddings_rowids r WHERE r.rowid = i.id),
             \\       EXISTS (SELECT 1 FROM image_embeddings_rowids r WHERE r.rowid = i.id)
             \\FROM images i
@@ -882,9 +1018,15 @@ pub const VectorDb = struct {
             errdefer allocator.free(path);
             const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
             const has_thumbnail = stmt.columnInt64(3) != 0;
-            const has_prompt_embedding = stmt.columnInt64(4) != 0;
-            const has_image_embedding = stmt.columnInt64(5) != 0;
-            try map.put(path, .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail, .has_prompt_embedding = has_prompt_embedding, .has_image_embedding = has_image_embedding });
+            const has_prompt = stmt.columnInt64(4) != 0;
+            const has_prompt_embedding = stmt.columnInt64(5) != 0;
+            const has_image_embedding = stmt.columnInt64(6) != 0;
+            const gop = try map.getOrPut(path);
+            if (gop.found_existing) {
+                allocator.free(path);
+                continue;
+            }
+            gop.value_ptr.* = .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail, .has_prompt = has_prompt, .has_prompt_embedding = has_prompt_embedding, .has_image_embedding = has_image_embedding };
         }
         return map;
     }
@@ -1043,7 +1185,7 @@ pub const VectorDb = struct {
         }
         try sql.appendSlice(allocator, " WHERE images.trashed_at IS NULL");
         if (library_id != null) try sql.appendSlice(allocator, " AND images.library_id = ?");
-        if (folder_path != null) try sql.appendSlice(allocator, " AND images.library_path LIKE ?");
+        if (folder_path != null) try sql.appendSlice(allocator, " AND images.library_path >= ? AND images.library_path < ?");
         for (filters) |f| {
             if (f.column == .format) {
                 // Virtual column: match the file extension of library_path.
@@ -1080,10 +1222,12 @@ pub const VectorDb = struct {
             param += 1;
         }
         if (folder_path) |fp| {
-            const pattern = try allocator.print("{s}/%", .{fp});
-            defer allocator.free(pattern);
-            try stmt.bind(param, @as([]const u8, pattern));
-            param += 1;
+            const range = try folderRange(allocator, fp);
+            defer allocator.free(range.lo);
+            defer allocator.free(range.hi);
+            try stmt.bind(param, @as([]const u8, range.lo));
+            try stmt.bind(param + 1, @as([]const u8, range.hi));
+            param += 2;
         }
         for (filters) |f| {
             if (f.column == .format) {
@@ -1212,31 +1356,56 @@ pub const VectorDb = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// Move an image to the trash: record trashed_at, trash_name, and file_size.
-    pub fn trashImage(self: *VectorDb, id: u64, trash_name: []const u8, file_size: i64, trashed_at: i64) !void {
+    // The destructive row operations below match `id` AND the path (or trash
+    // name) the caller saw: a grid or viewer entry can outlive its row, and
+    // SQLite recycles ids, so an id alone may now name a different image.
+    // Each returns whether a row matched.
+
+    /// Mark the live row `id` at `path` as trashed.
+    pub fn trashImage(self: *VectorDb, id: u64, path: []const u8, trash_name: []const u8, file_size: i64, trashed_at: i64) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare(
-            "UPDATE images SET trashed_at = ?, trash_name = ?, trash_file_size = ? WHERE id = ?",
+            "UPDATE images SET trashed_at = ?, trash_name = ?, trash_file_size = ? " ++
+                "WHERE id = ? AND library_path = ? AND trashed_at IS NULL",
         );
         defer stmt.deinit();
         try stmt.bind(1, trashed_at);
         try stmt.bind(2, trash_name);
         try stmt.bind(3, file_size);
         try stmt.bind(4, id);
+        try stmt.bind(5, path);
         _ = try stmt.step();
+        return sqlite.c.sqlite3_changes(self.db.db) > 0;
     }
 
-    /// Restore a trashed image: clear trashed_at, trash_name, trash_file_size.
-    pub fn restoreImage(self: *VectorDb, id: u64) !void {
+    /// Bring the trashed row `id` (still named `trash_name`) back as a live
+    /// image at `path`, which may differ from its old path when that is taken.
+    pub fn restoreImage(self: *VectorDb, id: u64, trash_name: []const u8, path: []const u8) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         var stmt = try self.db.prepare(
-            "UPDATE images SET trashed_at = NULL, trash_name = NULL, trash_file_size = NULL WHERE id = ?",
+            "UPDATE images SET trashed_at = NULL, trash_name = NULL, trash_file_size = NULL, library_path = ? " ++
+                "WHERE id = ? AND trash_name = ? AND trashed_at IS NOT NULL",
         );
         defer stmt.deinit();
-        try stmt.bind(1, id);
+        try stmt.bind(1, path);
+        try stmt.bind(2, id);
+        try stmt.bind(3, trash_name);
         _ = try stmt.step();
+        return sqlite.c.sqlite3_changes(self.db.db) > 0;
+    }
+
+    /// Whether a live row (in any library) already holds `path`.
+    pub fn livePathExists(self: *VectorDb, path: []const u8) !bool {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(
+            "SELECT 1 FROM images WHERE library_path = ? AND trashed_at IS NULL",
+        );
+        defer stmt.deinit();
+        try stmt.bind(1, path);
+        return try stmt.step();
     }
 
     /// Media classification stored per image (column `media_type`).
@@ -1350,14 +1519,16 @@ pub const VectorDb = struct {
         return sqlite.c.sqlite3_changes(self.db.db) > 0;
     }
 
-    /// Permanently delete an image row from the DB.
-    pub fn deleteImage(self: *VectorDb, id: u64) !void {
+    /// Permanently delete row `id` (live or trashed) if it still has `path`.
+    pub fn deleteImage(self: *VectorDb, id: u64, path: []const u8) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare("DELETE FROM images WHERE id = ?");
+        var stmt = try self.db.prepare("DELETE FROM images WHERE id = ? AND library_path = ?");
         defer stmt.deinit();
         try stmt.bind(1, id);
+        try stmt.bind(2, path);
         _ = try stmt.step();
+        return sqlite.c.sqlite3_changes(self.db.db) > 0;
     }
 
     /// Returns all trashed images ordered by trashed_at descending.
@@ -1437,18 +1608,17 @@ pub const VectorDb = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    // The "redundant" duplicates are every copy EXCEPT the lowest-id one of each
-    // hash group — exactly the rows to remove to leave one of each. The
-    // `id NOT IN (MIN(id) per hash)` form is the safety guarantee: a row is only
-    // selected when another row with the same hash (a lower id) is kept, so this
-    // can never remove the last/only copy of any file, and never touches a hash
-    // that isn't duplicated (its single row IS the min).
+    // The "redundant" duplicates are the copies to remove to leave one of each
+    // hash. The safety guarantee: a row is only selected when a lower-id live
+    // row with the same hash lives at a DIFFERENT path, i.e. a separate file is
+    // kept. Two rows for one file (overlapping libraries from before those were
+    // refused) are not duplicates — trashing one would trash the only copy.
     const redundant_dupes_predicate =
         \\trashed_at IS NULL AND hash IS NOT NULL
-        \\AND id NOT IN (
-        \\  SELECT MIN(id) FROM images
-        \\  WHERE trashed_at IS NULL AND hash IS NOT NULL
-        \\  GROUP BY hash
+        \\AND EXISTS (
+        \\  SELECT 1 FROM images k
+        \\  WHERE k.hash = images.hash AND k.trashed_at IS NULL
+        \\    AND k.id < images.id AND k.library_path != images.library_path
         \\)
     ;
 

@@ -606,6 +606,15 @@ pub const ComfyParser = struct {
 
     // Follow a link value [node_id_str, slot] through the prompt chunk graph to find text.
     fn followPromptToText(self: *ComfyParser, nodes: std.json.ObjectMap, val: std.json.Value, depth: u8) !?[]const u8 {
+        // Each node has many inputs to try, so a cyclic (or just densely
+        // linked) graph explodes exponentially unless every node is expanded
+        // at most once. A node that yielded nothing once yields nothing again.
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+        return self.followPromptToTextVisit(nodes, val, depth, &visited);
+    }
+
+    fn followPromptToTextVisit(self: *ComfyParser, nodes: std.json.ObjectMap, val: std.json.Value, depth: u8, visited: *std.StringHashMap(void)) !?[]const u8 {
         if (depth > 20) return null;
 
         // Literal string value
@@ -621,6 +630,7 @@ pub const ComfyParser = struct {
             .string => |s| s,
             else => return null,
         };
+        if ((try visited.getOrPut(node_id)).found_existing) return null;
         const node = nodes.get(node_id) orelse return null;
         if (node != .object) return null;
         const ct_val = node.object.get("class_type") orelse return null;
@@ -630,12 +640,23 @@ pub const ComfyParser = struct {
         if (inputs != .object) return null;
         const inp = inputs.object;
 
+        // Flux encoders have no "text": t5xxl is the full prompt, clip_l a
+        // (usually identical or shorter) copy for CLIP.
+        if (std.mem.eql(u8, ct, "CLIPTextEncodeFlux")) {
+            for ([_][]const u8{ "t5xxl", "clip_l", "text" }) |name| {
+                if (inp.get(name)) |v| {
+                    if (try self.followPromptToTextVisit(nodes, v, depth + 1, visited)) |text| return text;
+                }
+            }
+            return null;
+        }
+
         // Direct text encoders
         if (std.mem.find(u8, ct, "CLIPTextEncode") != null or
             std.mem.find(u8, ct, "T5TextEncode") != null)
         {
             if (inp.get("text")) |text_val| {
-                return self.followPromptToText(nodes, text_val, depth + 1);
+                return self.followPromptToTextVisit(nodes, text_val, depth + 1, visited);
             }
             return null;
         }
@@ -643,7 +664,6 @@ pub const ComfyParser = struct {
         // Static text nodes
         if (std.mem.eql(u8, ct, "Text Multiline") or
             std.mem.eql(u8, ct, "TextMultiline") or
-            std.mem.eql(u8, ct, "CLIPTextEncodeFlux") or
             std.mem.eql(u8, ct, "String Literal") or
             std.mem.eql(u8, ct, "StringLiteral"))
         {
@@ -659,7 +679,7 @@ pub const ComfyParser = struct {
         for ([_][]const u8{ "input", "conditioning", "positive" }) |pt| {
             if (inp.get(pt)) |pt_val| {
                 if (pt_val == .array) {
-                    if (try self.followPromptToText(nodes, pt_val, depth + 1)) |text| return text;
+                    if (try self.followPromptToTextVisit(nodes, pt_val, depth + 1, visited)) |text| return text;
                 }
             }
         }
@@ -671,7 +691,7 @@ pub const ComfyParser = struct {
                     return try self.allocator.dupe(u8, name_val.string);
                 }
                 if (name_val == .array) {
-                    if (try self.followPromptToText(nodes, name_val, depth + 1)) |text| return text;
+                    if (try self.followPromptToTextVisit(nodes, name_val, depth + 1, visited)) |text| return text;
                 }
             }
         }
@@ -854,23 +874,25 @@ pub const ComfyParser = struct {
             }
         }
 
+        // Each source is tried in turn; one that fails to parse (ComfyUI can
+        // write NaN, which isn't JSON) must not hide the ones after it.
         var result: ?ParseResult = null;
-        if (a1111) |t| result = try self.parseA1111Parameters(t);
+        if (a1111) |t| result = self.parseA1111Parameters(t) catch |e| try skipSource(e);
         if (result == null) {
-            if (workflow) |t| result = try self.parseWorkflow(t);
+            if (workflow) |t| result = self.parseWorkflow(t) catch |e| try skipSource(e);
         }
         if (result == null) {
-            if (prompt) |t| result = try self.parsePromptChunk(t);
+            if (prompt) |t| result = self.parsePromptChunk(t) catch |e| try skipSource(e);
         }
         if (result == null) {
-            if (prompt) |t| result = try self.parsePlainPromptString(t);
+            if (prompt) |t| result = self.parsePlainPromptString(t) catch |e| try skipSource(e);
         }
 
         // A literal positive prompt stored in a second "prompt" chunk takes
         // priority for positive_prompt, while preserving richer metadata parsed
         // from the other sources.
         if (plain_prompt) |t| {
-            if (try self.parsePlainPromptString(t)) |plain_res| {
+            if (self.parsePlainPromptString(t) catch |e| try skipSource(e)) |plain_res| {
                 var plain = plain_res;
                 if (plain.positive_prompt) |p| {
                     if (result) |*r| {
@@ -889,6 +911,13 @@ pub const ComfyParser = struct {
         return result;
     }
 };
+
+/// A metadata source that failed to parse is skipped, except when we ran out
+/// of memory, which no other source can fix.
+fn skipSource(err: anyerror) error{OutOfMemory}!?ParseResult {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    return null;
+}
 
 // Parse "Steps: N, Sampler: X, CFG scale: F, Seed: N, ..." key-value line.
 // Values containing commas must be inside {} or [] brackets (e.g. Hashes: {...}).
@@ -1184,4 +1213,48 @@ test "comfy: returns null when no usable section is present" {
     };
     var parser = ComfyParser.init(std.testing.allocator);
     try std.testing.expect((try parser.parseImageMetadata(&sections)) == null);
+}
+
+test "comfy: a self-referencing prompt graph finishes instead of exploding" {
+    // Every input of node 2 links back to node 2: a naive depth-limited
+    // traversal tries ~11^20 paths.
+    const json =
+        \\{
+        \\  "1": {"class_type": "KSampler", "inputs": {"positive": ["2", 0], "negative": ["2", 0]}},
+        \\  "2": {"class_type": "Loop", "inputs": {
+        \\    "input": ["2", 0], "conditioning": ["2", 0], "positive": ["2", 0],
+        \\    "text": ["2", 0], "text_a": ["2", 0], "text_b": ["2", 0], "text_c": ["2", 0],
+        \\    "prompt": ["2", 0], "prefix": ["2", 0], "postfix": ["2", 0], "string": ["2", 0]
+        \\  }}
+        \\}
+    ;
+    var parser = ComfyParser.init(std.testing.allocator);
+    try std.testing.expect((try parser.parsePromptChunk(json)) == null);
+}
+
+test "comfy: a broken workflow section doesn't hide a usable prompt section" {
+    // ComfyUI's Python JSON can contain NaN, which std.json rejects.
+    const sections = [_]ComfyParser.RawSection{
+        .{ .keyword = "workflow", .text = "{\"nodes\": [{\"id\": 1, \"widgets_values\": [NaN]}]}" },
+        .{ .keyword = "prompt", .text = prompt_json_string },
+    };
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parseImageMetadata(&sections)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("BETA positive from prompt", result.positive_prompt.?);
+}
+
+test "comfy: Flux prompt encoders yield their T5 text" {
+    const json =
+        \\{
+        \\  "3": {"class_type": "KSampler", "inputs": {"positive": ["5", 0], "negative": ["7", 0]}},
+        \\  "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["6", 0], "guidance": 3.5}},
+        \\  "6": {"class_type": "CLIPTextEncodeFlux", "inputs": {"clip_l": "a cat", "t5xxl": "a fluffy orange cat", "guidance": 3.5}},
+        \\  "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry"}}
+        \\}
+    ;
+    var parser = ComfyParser.init(std.testing.allocator);
+    var result = (try parser.parsePromptChunk(json)).?;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a fluffy orange cat", result.positive_prompt.?);
 }
