@@ -19,22 +19,11 @@ extern "ntdll" fn NtWaitForMultipleObjects(
 ) callconv(.winapi) windows.NTSTATUS;
 
 const Spinlock = @import("spinlock.zig").Spinlock;
+const common = @import("fs_watch_common.zig");
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-pub const DirtyEvent = struct {
-    library_id: u64,
-    /// Heap-allocated absolute path.  Caller must free after processing.
-    /// The changed file for `.file`, the library root for `.rescan_library`.
-    path: []u8,
-    deleted: bool,
-    /// TODO: this backend never reports `.rescan_library` yet, so a directory
-    /// renamed or moved within a library still leaves stale paths in the DB
-    /// until the next startup scan.  See fs_watch_linux.zig:handleDirEvent.
-    kind: Kind = .file,
-
-    pub const Kind = enum { file, rescan_library };
-};
+pub const DirtyEvent = common.DirtyEvent;
 
 // ── Per-library watch state ───────────────────────────────────────────────────
 
@@ -55,16 +44,15 @@ const LibWatch = struct {
 
 pub const FsWatcher = struct {
     allocator: std.mem.Allocator,
-    dirty_lock: Spinlock = .{},
-    dirty_events: std.ArrayList(DirtyEvent) = .empty,
-    on_dirty: ?*const fn () void = null,
+    /// Events for the app; set `events.on_dirty` to be woken on each one.
+    events: common.EventQueue,
     watches_lock: Spinlock = .{},
     watches: std.ArrayList(*LibWatch) = .empty,
     started: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !FsWatcher {
         log.info("initialized (NtNotifyChangeDirectoryFileEx)", .{});
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .events = .init(allocator) };
     }
 
     pub fn start(self: *FsWatcher) !void {
@@ -85,8 +73,7 @@ pub const FsWatcher = struct {
         }
         @constCast(&watches).deinit(self.allocator);
 
-        for (self.dirty_events.items) |ev| self.allocator.free(ev.path);
-        self.dirty_events.deinit(self.allocator);
+        self.events.deinit();
     }
 
     pub fn addLibrary(self: *FsWatcher, library_id: u64, path: []const u8) !void {
@@ -112,7 +99,7 @@ pub const FsWatcher = struct {
             .Length = @sizeOf(windows.OBJECT.ATTRIBUTES),
             .RootDirectory = null,
             .ObjectName = @constCast(&uni),
-            .Attributes = 0,
+            .Attributes = .{}, // case-insensitive, like the rest of Windows
             .SecurityDescriptor = null,
             .SecurityQualityOfService = null,
         };
@@ -152,7 +139,7 @@ pub const FsWatcher = struct {
             .{ .MAXIMUM_ALLOWED = true },
             null,
             .Notification,
-            windows.FALSE,
+            .FALSE,
         )) {
             .SUCCESS => {},
             else => |rc| return windows.unexpectedStatus(rc),
@@ -204,22 +191,7 @@ pub const FsWatcher = struct {
     /// Drain all pending file events.  The caller owns each DirtyEvent.path
     /// slice and must free it after processing.
     pub fn drainEvents(self: *FsWatcher) std.ArrayList(DirtyEvent) {
-        self.dirty_lock.lock();
-        const list = self.dirty_events;
-        self.dirty_events = .empty;
-        self.dirty_lock.unlock();
-        return list;
-    }
-
-    fn pushEvent(self: *FsWatcher, ev: DirtyEvent) void {
-        self.dirty_lock.lock();
-        self.dirty_events.append(self.allocator, ev) catch {
-            self.dirty_lock.unlock();
-            self.allocator.free(ev.path);
-            return;
-        };
-        self.dirty_lock.unlock();
-        if (self.on_dirty) |cb| cb();
+        return self.events.drain();
     }
 };
 
@@ -265,7 +237,7 @@ fn libWatchThread(watch: *LibWatch) void {
         .{ .MAXIMUM_ALLOWED = true },
         null,
         .Synchronization,
-        windows.FALSE,
+        .FALSE,
     )) {
         .SUCCESS => {},
         else => return,
@@ -282,7 +254,7 @@ fn libWatchThread(watch: *LibWatch) void {
         &watch.buffer,
         watch.buffer.len,
         .{ .FILE_NAME = true, .LAST_WRITE = true },
-        windows.TRUE,
+        .TRUE,
         .Notify,
     )) {
         .PENDING, .SUCCESS => {},
@@ -298,7 +270,7 @@ fn libWatchThread(watch: *LibWatch) void {
             2,
             &handles,
             .Any,
-            windows.FALSE,
+            .FALSE,
             null,
         );
 
@@ -317,7 +289,7 @@ fn libWatchThread(watch: *LibWatch) void {
                     &watch.buffer,
                     watch.buffer.len,
                     .{ .FILE_NAME = true, .LAST_WRITE = true },
-                    windows.TRUE,
+                    .TRUE,
                     .Notify,
                 )) {
                     .PENDING, .SUCCESS => {},
@@ -341,7 +313,7 @@ fn libWatchThread(watch: *LibWatch) void {
     if (io_pending) {
         var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
         _ = windows.ntdll.NtCancelIoFileEx(watch.dir_handle, &watch.iosb, &cancel_iosb);
-        _ = windows.ntdll.NtWaitForSingleObject(io_event, windows.FALSE, null);
+        _ = windows.ntdll.NtWaitForSingleObject(io_event, .FALSE, null);
     }
 
     log.info("watch thread for library {} stopped", .{watch.library_id});
@@ -349,7 +321,7 @@ fn libWatchThread(watch: *LibWatch) void {
 
 fn processWinNotify(watch: *LibWatch) void {
     const allocator = watch.watcher.allocator;
-    const byte_count = watch.iosb.u.Information;
+    const byte_count = watch.iosb.Information;
     if (byte_count == 0) return;
 
     var offset: usize = 0;
@@ -381,7 +353,7 @@ fn processWinNotify(watch: *LibWatch) void {
             };
 
             log.info("win notify: {s} deleted={}", .{ full_path, deleted });
-            watch.watcher.pushEvent(.{
+            watch.watcher.events.push(.{
                 .library_id = watch.library_id,
                 .path = full_path,
                 .deleted = deleted,

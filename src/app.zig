@@ -294,7 +294,7 @@ fn appInit(win: *dvui.Window) !void {
                 };
                 // Wake dvui's event loop whenever the watcher pushes a new file event,
                 // so frame() is called even when the user isn't moving the mouse.
-                if (g_fs_watcher != null) g_fs_watcher.?.on_dirty = wakeupFrame;
+                if (g_fs_watcher != null) g_fs_watcher.?.events.on_dirty = wakeupFrame;
             }
 
             // Assign to global BEFORE calling scanAllLibraries so that enqueue()'s

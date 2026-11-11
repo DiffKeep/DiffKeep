@@ -123,23 +123,11 @@ const ResolvedSymbols = struct {
     CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
 };
 
-const Spinlock = @import("spinlock.zig").Spinlock;
+const common = @import("fs_watch_common.zig");
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-pub const DirtyEvent = struct {
-    library_id: u64,
-    /// Heap-allocated absolute path.  Caller must free after processing.
-    /// The changed file for `.file`, the library root for `.rescan_library`.
-    path: []u8,
-    deleted: bool,
-    /// TODO: this backend never reports `.rescan_library` yet, so a directory
-    /// renamed or moved within a library still leaves stale paths in the DB
-    /// until the next startup scan.  See fs_watch_linux.zig:handleDirEvent.
-    kind: Kind = .file,
-
-    pub const Kind = enum { file, rescan_library };
-};
+pub const DirtyEvent = common.DirtyEvent;
 
 // ── Internal context types ────────────────────────────────────────────────────
 
@@ -173,9 +161,8 @@ const RemoveCtx = struct {
 
 pub const FsWatcher = struct {
     allocator: std.mem.Allocator,
-    dirty_lock: Spinlock = .{},
-    dirty_events: std.ArrayList(DirtyEvent) = .empty,
-    on_dirty: ?*const fn () void = null,
+    /// Events for the app; set `events.on_dirty` to be woken on each one.
+    events: common.EventQueue,
     core_services: std.DynLib,
     rs: ResolvedSymbols,
     dispatch_queue: dispatch.queue_t,
@@ -205,6 +192,7 @@ pub const FsWatcher = struct {
             .rs = rs,
             .dispatch_queue = q,
             .streams = std.AutoHashMap(u64, StreamEntry).init(allocator),
+            .events = .init(allocator),
         };
     }
 
@@ -219,8 +207,7 @@ pub const FsWatcher = struct {
         // Release the queue itself.
         self.dispatch_queue.as_object().release();
         self.core_services.close();
-        for (self.dirty_events.items) |ev| self.allocator.free(ev.path);
-        self.dirty_events.deinit(self.allocator);
+        self.events.deinit();
         self.streams.deinit();
     }
 
@@ -241,22 +228,7 @@ pub const FsWatcher = struct {
     /// Drain all pending file events.  The caller owns each DirtyEvent.path
     /// slice and must free it after processing.
     pub fn drainEvents(self: *FsWatcher) std.ArrayList(DirtyEvent) {
-        self.dirty_lock.lock();
-        const list = self.dirty_events;
-        self.dirty_events = .empty;
-        self.dirty_lock.unlock();
-        return list;
-    }
-
-    fn pushEvent(self: *FsWatcher, ev: DirtyEvent) void {
-        self.dirty_lock.lock();
-        self.dirty_events.append(self.allocator, ev) catch {
-            self.dirty_lock.unlock();
-            self.allocator.free(ev.path);
-            return;
-        };
-        self.dirty_lock.unlock();
-        if (self.on_dirty) |cb| cb();
+        return self.events.drain();
     }
 };
 
@@ -385,8 +357,7 @@ fn fseventsCallback(
         if (f.history_done) continue;
         // Events were coalesced or dropped: only a full scan can reconcile.
         if (f.must_scan_sub_dirs or f.user_dropped or f.kernel_dropped) {
-            const root = allocator.dupe(u8, ctx.path) catch continue;
-            watcher.pushEvent(.{ .library_id = ctx.library_id, .path = root, .deleted = false, .kind = .rescan_library });
+            watcher.events.pushRescan(ctx.library_id, ctx.path);
             continue;
         }
         if (!f.item_is_file) continue;
@@ -401,7 +372,7 @@ fn fseventsCallback(
 
         const path_copy = allocator.dupe(u8, event_path) catch continue;
         log.info("FSEvents: file event {s} deleted={}", .{ event_path, deleted });
-        watcher.pushEvent(.{
+        watcher.events.push(.{
             .library_id = ctx.library_id,
             .path = path_copy,
             .deleted = deleted,

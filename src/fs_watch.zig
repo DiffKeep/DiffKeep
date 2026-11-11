@@ -11,6 +11,9 @@ const impl = switch (builtin.target.os.tag) {
 pub const DirtyEvent = impl.DirtyEvent;
 pub const FsWatcher = impl.FsWatcher;
 
+// References every backend method too, so `zig test -target <os>
+// -fno-emit-bin src/fs_watch.zig` type-checks the other platforms' backends.
 test {
     std.testing.refAllDecls(impl);
+    std.testing.refAllDecls(FsWatcher);
 }

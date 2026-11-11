@@ -243,3 +243,21 @@ var set = std.EnumSet(E).initEmpty();
 // New (0.17.0)
 var set: std.EnumSet(E) = .empty;
 ```
+
+## `std.os.windows`: `BOOL`/`BOOLEAN` are enums; `OBJECT.ATTRIBUTES` flags; `IO_STATUS_BLOCK.Information`
+
+```zig
+// Old
+windows.ntdll.NtCreateEvent(&h, access, null, .Notification, windows.FALSE);
+const attrs = windows.OBJECT.ATTRIBUTES{ ..., .Attributes = 0, ... };
+const n = iosb.u.Information;
+
+// New (0.17.0)
+windows.ntdll.NtCreateEvent(&h, access, null, .Notification, .FALSE); // BOOLEAN = Bool(BYTE)
+const attrs = windows.OBJECT.ATTRIBUTES{ ..., .Attributes = .{}, ... }; // packed Flags; default is CASE_INSENSITIVE
+const n = iosb.Information; // no longer inside the `u` union
+```
+
+Platform code is only type-checked when something references it: check the
+watcher backends with `zig test -target x86_64-windows-gnu -fno-emit-bin src/fs_watch.zig`
+(and `aarch64-macos`), whose test block references every `FsWatcher` method.

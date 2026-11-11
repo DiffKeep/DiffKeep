@@ -64,6 +64,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/folder_loader.zig` | `FolderLoader` — the sidebar's folder lists (`listImmediateSubdirs`) loaded on one background worker; `SidebarState.applyFolderResults` merges them into the tree, keeping its open folders. |
 | `src/i18n.zig` | Compile-time string table (English only so far). |
 | `src/app_icons.zig` | Vendored TVG icons. The `icons` package's heroicons/solid set is broken (stored as hollow strokes), so the favorite star lives in `src/icons/` instead. Don't use `icons.tvg.heroicons.solid.*`. |
+| `src/fs_watch.zig` | File watcher: picks the backend (`fs_watch_linux.zig` inotify, `fs_watch_mac.zig` FSEvents, `fs_watch_windows.zig`); `fs_watch_common.zig` holds the shared `DirtyEvent` and `EventQueue`. Other-platform backends only type-check when referenced: `zig test -target x86_64-windows-gnu -fno-emit-bin src/fs_watch.zig` (and `aarch64-macos`). |
 | `src/models.zig` | Shared data structs (`Library`, `Image`). |
 | `src/parse/comfy.zig` | Parses ComfyUI workflow JSON embedded in PNG metadata (`tEXt` chunks). |
 | `src/image/png-data.zig` | Low-level PNG chunk reader for extracting raw metadata bytes. |

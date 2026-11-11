@@ -1,13 +1,7 @@
 const std = @import("std");
+const common = @import("fs_watch_common.zig");
 
-pub const DirtyEvent = struct {
-    library_id: u64,
-    path: []u8,
-    deleted: bool,
-    kind: Kind = .file,
-
-    pub const Kind = enum { file, rescan_library };
-};
+pub const DirtyEvent = common.DirtyEvent;
 
 pub const FsWatcher = struct {
     allocator: std.mem.Allocator,

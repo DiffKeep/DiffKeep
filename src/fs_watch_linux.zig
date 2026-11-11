@@ -26,6 +26,7 @@ const WATCH_MASK: u32 = MASK_MODIFY | MASK_DELETE | linux.IN.CREATE |
     linux.IN.DELETE_SELF | linux.IN.MOVE_SELF;
 
 const Spinlock = @import("spinlock.zig").Spinlock;
+const common = @import("fs_watch_common.zig");
 
 // ── Command channel (main → watcher thread) ──────────────────────────────────
 
@@ -37,23 +38,7 @@ const Cmd = union(enum) {
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-pub const DirtyEvent = struct {
-    library_id: u64,
-    /// Heap-allocated absolute path.  Caller must free after processing.
-    /// The changed file for `.file`, the library root for `.rescan_library`.
-    path: []u8,
-    deleted: bool,
-    kind: Kind = .file,
-
-    pub const Kind = enum {
-        /// One file changed or disappeared.
-        file,
-        /// A directory moved into, out of, or within the library.  inotify says
-        /// nothing about the files such a directory contains, so the library has
-        /// to be reconciled by a scan.
-        rescan_library,
-    };
-};
+pub const DirtyEvent = common.DirtyEvent;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -69,9 +54,8 @@ pub const FsWatcher = struct {
     cmd_lock: Spinlock = .{},
     cmds: std.ArrayList(Cmd) = .empty,
 
-    dirty_lock: Spinlock = .{},
-    dirty_events: std.ArrayList(DirtyEvent) = .empty,
-    on_dirty: ?*const fn () void = null,
+    /// Events for the app; set `events.on_dirty` to be woken on each one.
+    events: common.EventQueue,
 
     thread: std.Thread = undefined,
 
@@ -90,6 +74,7 @@ pub const FsWatcher = struct {
             .allocator = allocator,
             .inotify_fd = inotify_fd,
             .wake_pipe = wp,
+            .events = .init(allocator),
         };
     }
 
@@ -111,8 +96,7 @@ pub const FsWatcher = struct {
         _ = linux.close(self.inotify_fd);
         for (self.cmds.items) |cmd| freeCmd(self.allocator, cmd);
         self.cmds.deinit(self.allocator);
-        for (self.dirty_events.items) |ev| self.allocator.free(ev.path);
-        self.dirty_events.deinit(self.allocator);
+        self.events.deinit();
     }
 
     pub fn addLibrary(self: *FsWatcher, library_id: u64, path: []const u8) !void {
@@ -130,11 +114,7 @@ pub const FsWatcher = struct {
     /// Drain all pending file events.  The caller owns each DirtyEvent.path
     /// slice and must free it after processing.
     pub fn drainEvents(self: *FsWatcher) std.ArrayList(DirtyEvent) {
-        self.dirty_lock.lock();
-        const list = self.dirty_events;
-        self.dirty_events = .empty;
-        self.dirty_lock.unlock();
-        return list;
+        return self.events.drain();
     }
 
     fn pushCmd(self: *FsWatcher, cmd: Cmd) void {
@@ -150,30 +130,6 @@ pub const FsWatcher = struct {
         self.cmd_lock.unlock();
         const byte: [1]u8 = .{1};
         _ = linux.write(self.wake_pipe[1], &byte, 1);
-    }
-
-    /// Ask the app to reconcile a whole library with a scan.  Deduplicated by
-    /// path on the app side, so a burst of directory moves costs one scan.
-    fn pushRescan(self: *FsWatcher, library_id: u64, library_path: []const u8) void {
-        const path = self.allocator.dupe(u8, library_path) catch return;
-        log.info("rescan requested for library {} ({s})", .{ library_id, library_path });
-        self.pushEvent(.{
-            .library_id = library_id,
-            .path = path,
-            .deleted = false,
-            .kind = .rescan_library,
-        });
-    }
-
-    fn pushEvent(self: *FsWatcher, ev: DirtyEvent) void {
-        self.dirty_lock.lock();
-        self.dirty_events.append(self.allocator, ev) catch {
-            self.dirty_lock.unlock();
-            self.allocator.free(ev.path);
-            return;
-        };
-        self.dirty_lock.unlock();
-        if (self.on_dirty) |cb| cb();
     }
 };
 
@@ -302,7 +258,7 @@ fn watcherFn(self: *FsWatcher) void {
                     // events): some were lost, so reconcile every library.
                     log.warn("inotify queue overflow; rescanning all libraries", .{});
                     var it = lib_root.iterator();
-                    while (it.next()) |kv| self.pushRescan(kv.key_ptr.*, kv.value_ptr.*);
+                    while (it.next()) |kv| self.events.pushRescan(kv.key_ptr.*, kv.value_ptr.*);
                     continue;
                 }
 
@@ -341,7 +297,7 @@ fn watcherFn(self: *FsWatcher) void {
                 const full_path = std.Io.Dir.path.join(allocator, &.{ parent, filename }) catch continue;
 
                 log.info("file event: {s} deleted={}", .{ full_path, deleted });
-                self.pushEvent(.{ .library_id = lib_id, .path = full_path, .deleted = deleted });
+                self.events.push(.{ .library_id = lib_id, .path = full_path, .deleted = deleted });
             }
         }
 
@@ -403,12 +359,12 @@ fn handleDirEvent(
             // per-file event, and if it came from elsewhere in this library the
             // stored paths of those files are now wrong.
             resolvePendingMove(pending_moves, event.cookie, allocator);
-            self.pushRescan(lib_id, root);
+            self.events.pushRescan(lib_id, root);
         } else if (has_media) {
             // Created, and already holds media: those files landed in the gap
             // between the directory appearing and the watch being set up, so
             // nothing will report them.
-            self.pushRescan(lib_id, root);
+            self.events.pushRescan(lib_id, root);
         }
         return;
     }
@@ -422,7 +378,7 @@ fn handleDirEvent(
         sub_owned = false;
         // Files under the old path are gone from where the DB expects them,
         // whether the directory left the library or just moved within it.
-        self.pushRescan(lib_id, root);
+        self.events.pushRescan(lib_id, root);
     }
     // IN_DELETE of a directory needs nothing: its contents each raised their own
     // delete event, and its watch is dropped by the IN_IGNORED that follows.
