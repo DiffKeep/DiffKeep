@@ -41,13 +41,11 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     exe.root_module.strip = optimize != .debug;
-    exe.root_module.addAnonymousImport("git_version", .{ .root_source_file = git_version });
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
     exe.root_module.addImport("known-folders", known_folders);
 
     const icons_dep = b.dependency("icons", .{ .target = target, .optimize = optimize });
-    exe.root_module.addImport("icons", icons_dep.module("icons"));
     exe.root_module.link_libcpp = true;
     const os = target.result.os.tag;
     if (os == .linux) {
@@ -165,16 +163,10 @@ pub fn build(b: *std.Build) !void {
         .root_module = sqlite_c_module,
     });
 
-    exe.root_module.linkLibrary(sqlite_lib);
-    exe.root_module.addIncludePath(b.path("lib/sqlite"));
-    exe.root_module.addIncludePath(b.path("lib/sqlite-vec"));
-
     const sqlite_module_zig = b.addModule("sqlite", .{
         .root_source_file = b.path("src/sqlite.zig"),
         .imports = &.{.{ .name = "sqlite_c", .module = sqlite_c.mod }},
     });
-
-    exe.root_module.addImport("sqlite", sqlite_module_zig);
 
     // *** vips ***
     const vips_helper_mod = b.createModule(.{
@@ -198,10 +190,6 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/vips.zig"),
         .imports = &.{.{ .name = "vips_c", .module = vips_c.mod }},
     });
-
-    exe.root_module.linkLibrary(vips_helper_lib);
-    exe.root_module.addIncludePath(b.path("lib/vips"));
-    exe.root_module.addImport("vips", vips_module);
 
     // *** video (libav*) ***
     // System-linked like vips; pkg-config (default for linkSystemLibrary) supplies
@@ -229,9 +217,19 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{.{ .name = "video_c", .module = video_c.mod }},
     });
 
-    exe.root_module.linkLibrary(video_helper_lib);
-    exe.root_module.addIncludePath(b.path("lib/video"));
-    exe.root_module.addImport("video", video_module);
+    // Everything the app's own modules need, shared with the integration tests
+    // so the two builds can't drift apart.
+    const core: Core = .{
+        .sqlite_lib = sqlite_lib,
+        .sqlite = sqlite_module_zig,
+        .vips_lib = vips_helper_lib,
+        .vips = vips_module,
+        .video_lib = video_helper_lib,
+        .video = video_module,
+        .icons = icons_dep.module("icons"),
+        .git_version = git_version,
+    };
+    try wireCore(b, exe, exe.root_module, core);
 
     // Dev tool: probe a media file's streams/metadata/first-frame.
     const video_probe_exe = b.addExecutable(.{
@@ -256,113 +254,6 @@ pub fn build(b: *std.Build) !void {
     run_video_probe.addPassthruArgs();
     const video_probe_step = b.step("video_probe", "Probe a media file via libav* (dimensions, metadata tags, first frame)");
     video_probe_step.dependOn(&run_video_probe.step);
-
-    // TensorPencil — all embeddings (EmbeddingGemma text + SigLIP2 image/text)
-    try addTensorPencil(b, exe, exe.root_module);
-
-    // Dev/research tools (not part of the GUI, useful for data pipeline work)
-
-    const parse_threads_exe = b.addExecutable(.{
-        .name = "test_parse_threads",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_parse_all_in_dir_threads.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    try addLlama(b, parse_threads_exe);
-    try addMtmd(b, parse_threads_exe);
-    b.installArtifact(parse_threads_exe);
-    const run_parse_threads = b.addRunArtifact(parse_threads_exe);
-    run_parse_threads.step.dependOn(b.getInstallStep());
-    run_parse_threads.addPassthruArgs();
-    const parse_threads_step = b.step("parse_threads", "Concurrently parse PNG metadata across a directory tree");
-    parse_threads_step.dependOn(&run_parse_threads.step);
-
-    const test_embed_exe = b.addExecutable(.{
-        .name = "test_embed",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_embed.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    try addLlama(b, test_embed_exe);
-    b.installArtifact(test_embed_exe);
-    const run_test_embed = b.addRunArtifact(test_embed_exe);
-    run_test_embed.step.dependOn(b.getInstallStep());
-    run_test_embed.addPassthruArgs();
-    const test_embed_step = b.step("test_embed", "Test embedding generation with a GGUF model");
-    test_embed_step.dependOn(&run_test_embed.step);
-
-    const search_quality_exe = b.addExecutable(.{
-        .name = "test_search_quality",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_search_quality.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    try addLlama(b, search_quality_exe);
-    b.installArtifact(search_quality_exe);
-    const run_search_quality = b.addRunArtifact(search_quality_exe);
-    run_search_quality.step.dependOn(b.getInstallStep());
-    run_search_quality.addPassthruArgs();
-    const search_quality_step = b.step("test_search_quality", "Evaluate embedding search quality with short queries");
-    search_quality_step.dependOn(&run_search_quality.step);
-
-    const vl_embed_exe = b.addExecutable(.{
-        .name = "test_vl_embed",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_vl_embed.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    try addLlama(b, vl_embed_exe);
-    try addMtmd(b, vl_embed_exe);
-    b.installArtifact(vl_embed_exe);
-    const run_vl_embed = b.addRunArtifact(vl_embed_exe);
-    run_vl_embed.step.dependOn(b.getInstallStep());
-    run_vl_embed.addPassthruArgs();
-    const vl_embed_step = b.step("test_vl_embed", "Test VL image embedding with Qwen3-VL");
-    vl_embed_step.dependOn(&run_vl_embed.step);
-
-    const cross_modal_exe = b.addExecutable(.{
-        .name = "test_cross_modal_search",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_cross_modal_search.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    try addLlama(b, cross_modal_exe);
-    try addMtmd(b, cross_modal_exe);
-    b.installArtifact(cross_modal_exe);
-    const run_cross_modal = b.addRunArtifact(cross_modal_exe);
-    run_cross_modal.step.dependOn(b.getInstallStep());
-    run_cross_modal.addPassthruArgs();
-    const cross_modal_step = b.step("test_cross_modal", "Test text→image cross-modal search quality");
-    cross_modal_step.dependOn(&run_cross_modal.step);
-
-    const text_search_exe = b.addExecutable(.{
-        .name = "test_text_search",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/test_text_search.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    try addLlama(b, text_search_exe);
-    b.installArtifact(text_search_exe);
-    const run_text_search = b.addRunArtifact(text_search_exe);
-    run_text_search.step.dependOn(b.getInstallStep());
-    run_text_search.addPassthruArgs();
-    const text_search_step = b.step("test_text_search", "Test text retrieval quality across embedding models");
-    text_search_step.dependOn(&run_text_search.step);
 
     // Dev tool: batch throughput bench for the TensorPencil encoders
     const tp_batch_exe = b.addExecutable(.{
@@ -425,14 +316,6 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/diffkeep.zig"),
     });
     diffkeep_test_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
-    diffkeep_test_module.addImport("sqlite", sqlite_module_zig);
-    diffkeep_test_module.addImport("vips", vips_module);
-    diffkeep_test_module.addIncludePath(b.path("lib/vips"));
-    diffkeep_test_module.addImport("video", video_module);
-    diffkeep_test_module.addIncludePath(b.path("lib/video"));
-    diffkeep_test_module.addAnonymousImport("git_version", .{ .root_source_file = git_version });
-    // icons is pure TVG data (no backend dependency); UI modules need it to compile.
-    diffkeep_test_module.addImport("icons", icons_dep.module("icons"));
 
     const integration_module = b.createModule(.{
         .target = target,
@@ -447,119 +330,47 @@ pub fn build(b: *std.Build) !void {
         .root_module = integration_module,
     });
     integration_tests.root_module.link_libcpp = true;
-    integration_tests.root_module.linkLibrary(sqlite_lib);
-    integration_tests.root_module.addIncludePath(b.path("lib/sqlite"));
-    integration_tests.root_module.addIncludePath(b.path("lib/sqlite-vec"));
-    integration_tests.root_module.linkLibrary(vips_helper_lib);
-    integration_tests.root_module.addIncludePath(b.path("lib/vips"));
-    integration_tests.root_module.linkSystemLibrary("vips", .{});
-    integration_tests.root_module.linkLibrary(video_helper_lib);
-    integration_tests.root_module.addIncludePath(b.path("lib/video"));
-    for (av_libs) |lib| integration_tests.root_module.linkSystemLibrary(lib, .{});
-    try addTensorPencil(b, integration_tests, diffkeep_test_module);
+    try wireCore(b, integration_tests, diffkeep_test_module, core);
 
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }
 
-fn addLlama(b: *std.Build, exe: anytype) !void {
-    try addLlamaEx(b, exe, exe.root_module);
-}
+/// The C libraries and Zig modules behind the app's own code (src/diffkeep.zig
+/// and src/app.zig). dvui is not here: the app and the tests use different
+/// backends.
+const Core = struct {
+    sqlite_lib: *std.Build.Step.Compile,
+    sqlite: *std.Build.Module,
+    vips_lib: *std.Build.Step.Compile,
+    vips: *std.Build.Module,
+    video_lib: *std.Build.Step.Compile,
+    video: *std.Build.Module,
+    icons: *std.Build.Module,
+    git_version: std.Build.LazyPath,
+};
 
-/// Like addLlama but adds the llama_cpp Zig import to `import_mod` instead of
-/// exe.root_module. Used for the integration test build where the import must
-/// land on diffkeep_test_module (not the test runner's root module).
-fn addLlamaEx(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !void {
-    const target = exe.root_module.resolved_target.?;
-    const dep = b.dependency("llama_cpp", .{});
-
-    const llama_cpp: Translator = .init(b.dependency("translate_c", .{}), .{
-        .name = "llama_cpp",
-        .c_source_file = dep.path("include/llama.h"),
-        .target = target,
-        .optimize = .fast,
-    });
-
-    llama_cpp.addIncludePath(dep.path("include"));
-    llama_cpp.addIncludePath(dep.path("ggml/include"));
-
-    const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
-    const bin_path = bin.path(".");
-
-    exe.root_module.addLibraryPath(bin_path);
-    exe.root_module.linkSystemLibrary("llama", .{});
-    exe.root_module.linkSystemLibrary("ggml", .{});
-
-    const libs_to_install = [_][]const u8{
-        "libllama.so",
-        "libggml.so",
-        "libggml-base.so",
-        "libggml-cpu-x64.so",
-        "libggml-rpc.so",
-        "libllama-common.so",
-    };
-    inline for (libs_to_install) |lib| {
-        const step = b.addInstallBinFile(bin_path.path(b, lib), lib);
-        b.getInstallStep().dependOn(&step.step);
+/// Link `core`'s C libraries into `compile` and add its imports (plus
+/// TensorPencil) to `import_mod`, the module rooted at the app's code
+/// (`compile.root_module` for the app; the diffkeep library module for the
+/// integration tests).
+fn wireCore(b: *std.Build, compile: *std.Build.Step.Compile, import_mod: *std.Build.Module, core: Core) !void {
+    const root = compile.root_module;
+    root.linkLibrary(core.sqlite_lib);
+    root.linkLibrary(core.vips_lib);
+    root.linkLibrary(core.video_lib);
+    for ([_]*std.Build.Module{ root, import_mod }) |m| {
+        m.addIncludePath(b.path("lib/sqlite"));
+        m.addIncludePath(b.path("lib/sqlite-vec"));
+        m.addIncludePath(b.path("lib/vips"));
+        m.addIncludePath(b.path("lib/video"));
     }
-
-    const os = target.result.os.tag;
-    if (os == .linux) {
-        const gpu_plugins = .{
-            .{ "llama_cpp_linux_vulkan", "libggml-vulkan.so" },
-            .{ "llama_cpp_linux_rocm",   "libggml-hip.so"   },
-            .{ "llama_cpp_linux_sycl",   "libggml-sycl.so"  },
-        };
-        inline for (gpu_plugins) |plugin| {
-            const pkg_name = plugin[0];
-            const so_name  = plugin[1];
-            if (b.lazyDependency(pkg_name, .{})) |gpu_dep| {
-                const step = b.addInstallBinFile(gpu_dep.path(".").path(b, so_name), so_name);
-                b.getInstallStep().dependOn(&step.step);
-            }
-        }
-    }
-
-    import_mod.addImport("llama_cpp", llama_cpp.mod);
-}
-
-fn addMtmd(b: *std.Build, exe: anytype) !void {
-    const target = exe.root_module.resolved_target.?;
-    const bin = b.dependency(b.fmt("llama_cpp_{s}", .{@tagName(target.result.os.tag)}), .{});
-    const bin_path = bin.path(".");
-
-    const mtmd_wrapper_mod = b.createModule(.{
-        .target = target,
-        .optimize = .fast,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-    mtmd_wrapper_mod.addCSourceFile(.{
-        .file = b.path("lib/mtmd/mtmd_wrapper.cpp"),
-        .flags = &.{ "-std=c++17", "-fno-exceptions" },
-    });
-    mtmd_wrapper_mod.addCSourceFile(.{
-        .file = b.path("lib/mtmd/reranker_wrapper.cpp"),
-        .flags = &.{ "-std=c++17", "-fno-exceptions" },
-    });
-    mtmd_wrapper_mod.addIncludePath(b.path("lib/mtmd"));
-
-    const mtmd_lib = b.addLibrary(.{
-        .name = "mtmd_wrapper",
-        .root_module = mtmd_wrapper_mod,
-    });
-
-    exe.root_module.linkLibrary(mtmd_lib);
-    exe.root_module.addIncludePath(b.path("lib/mtmd"));
-    exe.root_module.addLibraryPath(bin_path);
-    exe.root_module.linkSystemLibrary("mtmd", .{});
-
-    const step = b.addInstallBinFile(bin_path.path(b, "libmtmd.so"), "libmtmd.so");
-    b.getInstallStep().dependOn(&step.step);
-
-    const mtmd_zig = b.createModule(.{
-        .root_source_file = b.path("src/mtmd.zig"),
-    });
-    exe.root_module.addImport("mtmd", mtmd_zig);
+    import_mod.addImport("sqlite", core.sqlite);
+    import_mod.addImport("vips", core.vips);
+    import_mod.addImport("video", core.video);
+    import_mod.addImport("icons", core.icons);
+    import_mod.addAnonymousImport("git_version", .{ .root_source_file = core.git_version });
+    // TensorPencil: all embeddings (EmbeddingGemma text + SigLIP2 image/text).
+    try addTensorPencil(b, compile, import_mod);
 }
 
 /// Add the TensorPencil native-Zig inference library. `import_mod` receives the

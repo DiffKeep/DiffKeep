@@ -30,12 +30,10 @@ zig build
 # Run unit tests (src/test.zig)
 zig build test
 
-# Dev/research tools (data pipeline, not part of the GUI)
-zig build parse_threads -- /path/to/dir   # concurrent PNG metadata parsing
-zig build test_embed -- model.gguf        # test text embedding generation
-zig build test_vl_embed -- model.gguf img.png  # test VL image embedding
-zig build test_cross_modal -- model.gguf  # evaluate text→image search quality
-zig build test_search_quality             # evaluate embedding search quality
+# Dev tools (not part of the GUI)
+zig build video_probe -- file.mp4         # probe a media file's streams/metadata/first frame
+zig build test_tp_batch -- ...            # TensorPencil single vs batch embed throughput
+zig build bench_embed -Doptimize=ReleaseFast -- --corpus FILE  # encoder quality/speed A/B
 
 # Pass --config / -c <dir> to use <dir>/DiffKeep.cfg. The DB stays at the XDG data dir
 # unless that config sets data_path (the DB file path) — set it for throwaway runs.
@@ -66,7 +64,6 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/parse/comfy.zig` | Parses ComfyUI workflow JSON embedded in PNG metadata (`tEXt` chunks). |
 | `src/image/png-data.zig` | Low-level PNG chunk reader for extracting raw metadata bytes. |
 | `src/vips.zig` | Thin Zig wrapper around libvips (via `lib/vips/vips_helper.c`) for thumbnail generation. |
-| `src/llama.zig` / `src/mtmd.zig` | llama.cpp wrappers used only by the older research tools (`test_embed`, `test_vl_embed`, …), not by the app. |
 | `src/sqlite.zig` | Low-level Zig bindings for the bundled SQLite + sqlite-vec C libraries. |
 | `src/notifier.zig` | `ImageNotifier` — channel used by the scan/load worker threads to push new image IDs to `GridState` without blocking. |
 
@@ -75,7 +72,6 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 - **dvui** — immediate-mode GUI framework, SDL3 backend
 - **TensorPencil** (`../TensorPencil`, path dependency) — native-Zig embedding encoders
 - **translate-c** — C header translation (replaces `@cImport` in Zig 0.17)
-- **llama.cpp b9048** — research tools only
 - **known-folders** — XDG/platform data/config path resolution
 - **sqlite + sqlite-vec** — bundled in `lib/` as C source files
 

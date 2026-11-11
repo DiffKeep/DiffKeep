@@ -25,44 +25,13 @@
             .url = "git+https://github.com/david-vanderson/dvui#5903456e099e746849b7304b0ef15ec0eeafa7aa",
             .hash = "dvui-0.6.0-dev-AQFJmdZEBAFhXY4GyApa8_JVK_lcmUxwUCbTQPceLHjj",
         },
-        .llama_cpp = .{
-            .url = "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9048.tar.gz",
-            .hash = "N-V-__8AABJr7QjlB5fAyP4Pp5P97tqAFrc8THsBD8YnsNee",
-        },
-        .llama_cpp_macos = .{
-            .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-macos-arm64.tar.gz",
-            .hash = "N-V-__8AAC4FngH7d5PYlpEm1HQ9t9netMnweSY4eb1Npxdl",
-        },
-        .llama_cpp_windows = .{
-            .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-win-cpu-x64.zip",
-            .hash = "N-V-__8AADj24gL6bz8_LCDBX5ajDq9TlwZjLiYtcZT9OD6y",
-        },
-        .llama_cpp_linux = .{
-            .optional = true,
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-x64.tar.gz",
-            .hash = "N-V-__8AAHatcwLEIVRuflEdmWeiMTDCc8LITSOe6LZ1WZHd",
-        },
         .known_folders = .{
             .url = "git+https://github.com/ziglibs/known-folders#6da0d0c41b78b9ed2d34fa364fcb81b5ebece6c4",
             .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
         },
-        .llama_cpp_linux_vulkan = .{
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-vulkan-x64.tar.gz",
-            .hash = "N-V-__8AAO49FQa9-gn72-mboQ2U4PCLLM4T0rhZKdVWhQQZ",
-        },
-        .llama_cpp_linux_rocm = .{
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-rocm-7.2-x64.tar.gz",
-            .hash = "N-V-__8AAA6AxCR54pKzYq-CjTj95cmDHDK5r3fTsXxi-sEx",
-        },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
             .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
-        },
-        .llama_cpp_linux_sycl = .{
-            .url = "https://github.com/ggml-org/llama.cpp/releases/download/b9048/llama-b9048-bin-ubuntu-sycl-fp16-x64.tar.gz",
-            .hash = "N-V-__8AAL5tbgiKr4fpDFg2QFNqlHAoqkaQ0qnw3wNtVbzy",
         },
     },
     .paths = .{
