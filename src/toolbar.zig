@@ -210,7 +210,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
         }
         if (ctx.grid.*) |*grid| {
             grid.filters = ctx.active_filters.items;
-            grid.reloadImages() catch {};
+            grid.reloadImages();
         }
     }
 

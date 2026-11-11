@@ -251,7 +251,7 @@ fn maybeReloadDuplicates(grid: *image_grid_mod.GridState) void {
     if (grid.view_mode != .duplicates) return;
     // This is an in-place refresh of the same view (not a view change), so
     // keep the user's scroll position rather than snapping back to the top.
-    grid.reloadImagesEx(.{ .keep_scroll = true }) catch {};
+    grid.reloadImagesEx(.{ .keep_scroll = true });
 }
 
 /// The file-operation worker: trash, delete and restore (from the grid or a
@@ -269,6 +269,9 @@ pub const FileOps = struct {
     done: std.ArrayList(u64) = .empty,
     /// A purge finished: counts (and a trash view) need a refresh.
     purged: bool = false,
+    /// Ids that succeeded couldn't be recorded (out of memory): the grid
+    /// reloads from the DB instead.
+    lost: bool = false,
     /// Empty-trash / dedupe jobs queued or running (for the toolbar indicator).
     user_bulk: std.atomic.Value(u32) = .init(0),
 
@@ -318,17 +321,25 @@ pub const FileOps = struct {
     }
 
     fn enqueueFromGrid(self: *FileOps, allocator: std.mem.Allocator, grid: *image_grid_mod.GridState, kind: FileOpKind) void {
-        var ids = effectiveIds(grid, allocator) catch return;
+        var ids = effectiveIds(grid, allocator) catch |err| return log.warn("{s}: {}", .{ @tagName(kind), err });
         defer ids.deinit();
         var items: std.ArrayList(JobItem) = .empty;
+        // All or nothing: acting on part of what was picked would trash or
+        // delete a different set than the user chose.
         for (grid.images.items) |entry| {
             if (!ids.contains(entry.id)) continue;
             // Restore applies only to trashed entries.
             if (kind == .restore and entry.trash_name == null) continue;
-            const item = snapshot(entry) catch continue;
-            items.append(job_alloc, item) catch {
+            const item = snapshot(entry) catch |err| {
+                for (items.items) |it| freeItem(it);
+                items.deinit(job_alloc);
+                return log.warn("{s}: {}", .{ @tagName(kind), err });
+            };
+            items.append(job_alloc, item) catch |err| {
                 freeItem(item);
-                continue;
+                for (items.items) |it| freeItem(it);
+                items.deinit(job_alloc);
+                return log.warn("{s}: {}", .{ @tagName(kind), err });
             };
         }
         const owned = items.toOwnedSlice(job_alloc) catch {
@@ -392,7 +403,11 @@ pub const FileOps = struct {
             self.runJob(io, job, &succeeded);
 
             self.mutex.lockUncancelable(io);
-            self.done.appendSlice(job_alloc, succeeded.items) catch {};
+            self.done.appendSlice(job_alloc, succeeded.items) catch |err| {
+                log.warn("file op results: {}", .{err});
+                self.lost = true;
+                for (succeeded.items) |id| _ = self.pending.remove(id);
+            };
             if (job.kind == .purge_expired or job.kind == .empty_trash) self.purged = true;
             if (job.kind == .empty_trash or job.kind == .dedupe) _ = self.user_bulk.fetchSub(1, .acq_rel);
             // Failed items stay in the grid; let them be retried.
@@ -415,12 +430,18 @@ pub const FileOps = struct {
         };
         defer conn.deinit();
 
+        // Every item that succeeds must be recorded, or its row stays in the
+        // grid with its file gone: make the room before touching any file.
+        succeeded.ensureTotalCapacity(job_alloc, job.items.len) catch |err| {
+            log.warn("file op: {}", .{err});
+            return;
+        };
         switch (job.kind) {
             .trash => {
                 const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
                 for (job.items) |it| {
                     if (trashOne(io, &conn, data_dir, it.id, it.path, now_s))
-                        succeeded.append(job_alloc, it.id) catch {};
+                        succeeded.appendAssumeCapacity(it.id);
                 }
             },
             .delete => for (job.items) |it| {
@@ -444,10 +465,10 @@ pub const FileOps = struct {
                     // The row is gone; a library file left behind is re-indexed by the next scan.
                     else => log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(file_path), err }),
                 };
-                succeeded.append(job_alloc, it.id) catch {};
+                succeeded.appendAssumeCapacity(it.id);
             },
             .restore => for (job.items) |it| {
-                if (restoreOne(io, &conn, data_dir, it)) succeeded.append(job_alloc, it.id) catch {};
+                if (restoreOne(io, &conn, data_dir, it)) succeeded.appendAssumeCapacity(it.id);
             },
             .purge_expired, .empty_trash => {
                 // empty_trash: every trashed row, whatever its age.
@@ -475,10 +496,14 @@ pub const FileOps = struct {
                     for (reds) |r| job_alloc.free(r.path);
                     job_alloc.free(reds);
                 }
+                succeeded.ensureTotalCapacity(job_alloc, reds.len) catch |err| {
+                    log.warn("dedupe: {}", .{err});
+                    return;
+                };
                 const now_s: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
                 for (reds) |r| {
                     if (trashOne(io, &conn, data_dir, r.id, r.path, now_s))
-                        succeeded.append(job_alloc, r.id) catch {};
+                        succeeded.appendAssumeCapacity(r.id);
                 }
                 log.info("dedupe: {d} copies moved to the trash", .{succeeded.items.len});
             },
@@ -493,18 +518,25 @@ pub const FileOps = struct {
         var ids = std.AutoHashMap(u64, void).init(allocator);
         defer ids.deinit();
         var purged = false;
+        var lost = false;
         {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            for (self.done.items) |id| {
-                ids.put(id, {}) catch {};
-                _ = self.pending.remove(id);
+            if (ids.ensureTotalCapacity(@intCast(self.done.items.len))) {
+                for (self.done.items) |id| ids.putAssumeCapacity(id, {});
+            } else |err| {
+                log.warn("file op results: {}", .{err});
+                self.lost = true;
             }
+            for (self.done.items) |id| _ = self.pending.remove(id);
             self.done.clearRetainingCapacity();
             purged = self.purged;
             self.purged = false;
+            lost = self.lost;
+            self.lost = false;
         }
-        if (ids.count() == 0 and !purged) return false;
+        if (ids.count() == 0 and !purged and !lost) return false;
+        if (lost) if (grid) |g| g.reloadImagesEx(.{ .keep_scroll = true });
 
         if (grid) |g| {
             if (ids.count() > 0) {
@@ -518,7 +550,7 @@ pub const FileOps = struct {
                 maybeReloadDuplicates(g);
             }
             if (purged and g.view_mode == .trash) {
-                g.reloadImages() catch {};
+                g.reloadImages();
             }
         }
         if (ids.count() > 0) ctx.on_images_removed(ctx.context, &ids);

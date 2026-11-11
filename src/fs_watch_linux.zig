@@ -117,6 +117,11 @@ pub const FsWatcher = struct {
         return self.events.drain();
     }
 
+    /// Whether events were dropped since the last call (see `EventQueue.takeLost`).
+    pub fn takeLost(self: *FsWatcher) bool {
+        return self.events.takeLost();
+    }
+
     fn pushCmd(self: *FsWatcher, cmd: Cmd) void {
         self.cmd_lock.lock();
         self.cmds.append(self.allocator, cmd) catch {
@@ -294,7 +299,10 @@ fn watcherFn(self: *FsWatcher) void {
                 const parent = wd_path.get(wd) orelse continue;
                 const lib_id = wd_lib.get(wd) orelse continue;
 
-                const full_path = std.Io.Dir.path.join(allocator, &.{ parent, filename }) catch continue;
+                const full_path = std.Io.Dir.path.join(allocator, &.{ parent, filename }) catch {
+                    self.events.markLost();
+                    continue;
+                };
 
                 log.info("file event: {s} deleted={}", .{ full_path, deleted });
                 self.events.push(.{ .library_id = lib_id, .path = full_path, .deleted = deleted });
@@ -442,12 +450,14 @@ fn removeSubtreeWatches(
         const p = entry.value_ptr.*;
         if (!std.mem.startsWith(u8, p, root)) continue;
         if (p.len != root.len and p[root.len] != std.Io.Dir.path.sep) continue;
-        doomed.append(allocator, entry.key_ptr.*) catch {};
+        // Out of memory, the watch is kept (a leak, not a wrong result).
+        doomed.append(allocator, entry.key_ptr.*) catch |err| log.warn("unwatch: {}", .{err});
     }
 
     for (doomed.items) |wd| {
         _ = linux.inotify_rm_watch(inotify_fd, wd);
-        self_ignored.append(allocator, wd) catch {};
+        // Unrecorded, its IN_IGNORED reads as an outside removal: one extra rescan.
+        self_ignored.append(allocator, wd) catch |err| log.warn("unwatch: {}", .{err});
         forgetWatch(wd, wd_lib, wd_path, lib_wds, allocator);
     }
 }
@@ -639,9 +649,10 @@ fn attachWd(
     wd: i32,
     allocator: std.mem.Allocator,
 ) void {
-    const gop = lib_wds.getOrPut(library_id) catch return;
+    // Out of memory, removing the library leaves this watch behind (a leak).
+    const gop = lib_wds.getOrPut(library_id) catch |err| return log.warn("attach watch: {}", .{err});
     if (!gop.found_existing) gop.value_ptr.* = .empty;
-    gop.value_ptr.append(allocator, wd) catch {};
+    gop.value_ptr.append(allocator, wd) catch |err| log.warn("attach watch: {}", .{err});
 }
 
 fn detachWd(lib_wds: *std.AutoHashMap(u64, std.ArrayList(i32)), library_id: u64, wd: i32) void {
@@ -680,7 +691,8 @@ fn removeWatches(
     var wds = entry.value;
     for (wds.items) |wd| {
         _ = linux.inotify_rm_watch(inotify_fd, wd);
-        self_ignored.append(allocator, wd) catch {};
+        // Unrecorded, its IN_IGNORED reads as an outside removal: one extra rescan.
+        self_ignored.append(allocator, wd) catch |err| log.warn("unwatch: {}", .{err});
         _ = wd_lib.remove(wd);
         if (wd_path.fetchRemove(wd)) |kv| allocator.free(kv.value);
     }

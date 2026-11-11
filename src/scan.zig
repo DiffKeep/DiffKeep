@@ -21,7 +21,7 @@ fn gatherEmbeddedSections(
     aa: std.mem.Allocator,
     buffer: []const u8,
     sections: *std.ArrayList(comfy_mod.ComfyParser.RawSection),
-) void {
+) error{OutOfMemory}!void {
     const markers = [_]struct { marker: []const u8, keyword: []const u8 }{
         .{ .marker = "workflow:{", .keyword = "workflow" },
         .{ .marker = "prompt:{", .keyword = "prompt" },
@@ -30,9 +30,7 @@ fn gatherEmbeddedSections(
         const at = std.mem.find(u8, buffer, m.marker) orelse continue;
         // The marker ends with '{', so the JSON object begins at that brace.
         const json = comfy_mod.extractJsonObject(buffer[at + m.marker.len - 1 ..]) orelse continue;
-        const kw = aa.dupe(u8, m.keyword) catch continue;
-        const tx = aa.dupe(u8, json) catch continue;
-        sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+        try sections.append(aa, .{ .keyword = try aa.dupe(u8, m.keyword), .text = try aa.dupe(u8, json) });
     }
 }
 
@@ -52,62 +50,64 @@ fn gatherPngSections(
     try png_parser.parseBuffer(buffer);
     const truncated = png_parser.truncated;
     {
-        const itxt = png_parser.getITxtChunks() catch &[_]png_mod.Chunk{};
+        const itxt = try png_parser.getITxtChunks();
         defer aa.free(itxt);
         for (itxt) |chunk| {
-            var content = png_parser.parseITxtChunk(chunk) catch continue;
+            // A malformed chunk is skipped; running out of memory is not.
+            var content = png_parser.parseITxtChunk(chunk) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             defer content.deinit(aa);
             if (content.compressed) continue;
-            const kw = aa.dupe(u8, content.keyword) catch continue;
-            const tx = aa.dupe(u8, content.text) catch continue;
-            sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+            try sections.append(aa, .{ .keyword = try aa.dupe(u8, content.keyword), .text = try aa.dupe(u8, content.text) });
         }
     }
     const text_chunks = try png_parser.getTExtChunks();
     defer aa.free(text_chunks);
     for (text_chunks) |chunk| {
-        var content = png_parser.parseTExtChunk(chunk) catch continue;
+        var content = png_parser.parseTExtChunk(chunk) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
         defer content.deinit(aa);
-        const kw = aa.dupe(u8, content.keyword) catch continue;
-        const tx = aa.dupe(u8, content.text) catch continue;
-        sections.append(aa, .{ .keyword = kw, .text = tx }) catch {};
+        try sections.append(aa, .{ .keyword = try aa.dupe(u8, content.keyword), .text = try aa.dupe(u8, content.text) });
     }
     return truncated;
 }
 
 /// Overwrite `image`'s generation metadata with `result`, clearing every field
-/// when there is none. Strings are duped with `a` (the image's allocator).
-fn applyParseResult(a: std.mem.Allocator, image: *models.Image, maybe_result: ?comfy_mod.ParseResult) void {
+/// when there is none. Strings are duped with `a` (the image's allocator). On
+/// error the image is left half updated (but safe to free): don't save it.
+fn applyParseResult(a: std.mem.Allocator, image: *models.Image, maybe_result: ?comfy_mod.ParseResult) error{OutOfMemory}!void {
     const r: comfy_mod.ParseResult = maybe_result orelse .{};
-    const dupeOpt = struct {
-        fn f(alloc: std.mem.Allocator, v: ?[]const u8) ?[]const u8 {
-            return if (v) |x| alloc.dupe(u8, x) catch null else null;
+    const set = struct {
+        fn f(alloc: std.mem.Allocator, field: *?[]const u8, v: ?[]const u8) !void {
+            if (field.*) |old| alloc.free(old);
+            field.* = null;
+            if (v) |x| field.* = try alloc.dupe(u8, x);
         }
     }.f;
-    if (image.positivePromptText) |p| a.free(p);
-    image.positivePromptText = dupeOpt(a, r.positive_prompt);
-    if (image.negativePromptText) |p| a.free(p);
-    image.negativePromptText = dupeOpt(a, r.negative_prompt);
-    if (image.model) |m| a.free(m);
-    image.model = dupeOpt(a, r.model);
-    if (image.sampler) |v| a.free(v);
-    image.sampler = dupeOpt(a, r.sampler);
-    if (image.scheduler) |v| a.free(v);
-    image.scheduler = dupeOpt(a, r.scheduler);
+    try set(a, &image.positivePromptText, r.positive_prompt);
+    try set(a, &image.negativePromptText, r.negative_prompt);
+    try set(a, &image.model, r.model);
+    try set(a, &image.sampler, r.sampler);
+    try set(a, &image.scheduler, r.scheduler);
     image.cfg = r.cfg;
     image.steps = r.steps;
     image.seed = r.seed;
     if (image.loras) |l| a.free(l);
-    image.loras = lorasToString(a, r.loras);
+    image.loras = null;
+    image.loras = try lorasToString(a, r.loras);
 }
 
 /// Join a slice of lora names into a single newline-separated string.
-fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) ?[]const u8 {
+fn lorasToString(allocator: std.mem.Allocator, loras: ?[]const []const u8) !?[]const u8 {
     const items = loras orelse return null;
     if (items.len == 0) return null;
     var total: usize = 0;
     for (items) |l| total += l.len + 1;
-    const buf = allocator.alloc(u8, total - 1) catch return null;
+    const buf = try allocator.alloc(u8, total - 1);
     var pos: usize = 0;
     for (items, 0..) |l, i| {
         @memcpy(buf[pos .. pos + l.len], l);
@@ -324,7 +324,7 @@ pub const LibraryScanner = struct {
     ) void {
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
         const mtime: i64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
-        const path_owned = self.allocator.dupe(u8, path) catch return;
+        const path_owned = self.allocator.dupe(u8, path) catch return oom(path);
         var dummy_stats: AtomicStats = .{};
         var dummy_count: std.atomic.Value(u32) = .init(0);
         processFile(.{
@@ -443,7 +443,16 @@ pub const LibraryScanner = struct {
         const looks_unmounted = !stopped and walk.media_seen == 0 and known.count() > 0;
         if (looks_unmounted)
             log.warn("{s}: no media found but {d} indexed; keeping them (drive unmounted?)", .{ library_path, known.count() });
-        if (!stopped and !looks_unmounted) {
+        // Every removed row must be reported, or it stays in the grid: make
+        // the room first. Without it the rows stay until the next scan.
+        const room_ok = if (self.removed_ids) |out| blk: {
+            out.ensureUnusedCapacity(self.allocator, known.count()) catch |err| {
+                log.warn("{s}: reconcile skipped: {}", .{ library_path, err });
+                break :blk false;
+            };
+            break :blk true;
+        } else true;
+        if (!stopped and !looks_unmounted and room_ok) {
             var kit = known.iterator();
             while (kit.next()) |entry| {
                 if (entry.value_ptr.seen or walk.underSkipped(entry.key_ptr.*)) continue;
@@ -452,7 +461,7 @@ pub const LibraryScanner = struct {
                     continue;
                 } orelse continue;
                 removed += 1;
-                if (self.removed_ids) |out| out.append(self.allocator, id) catch {};
+                if (self.removed_ids) |out| out.appendAssumeCapacity(id);
             }
         }
 
@@ -672,7 +681,11 @@ fn embedBatch(
         for (items) |*it| {
             const raw = it.prompt_text orelse continue;
             // Strip ComfyUI/A1111 markup so the embedder sees natural language.
-            const cleaned = prompt_clean.cleanPrompt(allocator, raw) catch continue;
+            // Out of memory it isn't embedded; the next scan queues it again.
+            const cleaned = prompt_clean.cleanPrompt(allocator, raw) catch |err| {
+                log.warn("prompt for {d}: {}", .{ it.image_id, err });
+                continue;
+            };
             if (cleaned.len == 0) {
                 allocator.free(cleaned);
                 continue;
@@ -853,7 +866,13 @@ fn classifyAnimatedImage(ctx: ScanCtx, image_id: u64) void {
     const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return;
     defer ctx.allocator.free(path_z);
     const pages = vips.nPages(path_z) catch return;
-    ctx.db.setMediaType(image_id, if (pages > 1) .animated else .image) catch {};
+    ctx.db.setMediaType(image_id, if (pages > 1) .animated else .image) catch |err|
+        log.warn("media type {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
+}
+
+/// Log a file left unsaved for lack of memory (the next scan retries it).
+fn oom(path: []const u8) void {
+    log.warn("{s}: out of memory, not saved (the next scan retries it)", .{std.Io.Dir.path.basename(path)});
 }
 
 /// Blake3 of a file's bytes as lowercase hex, read in fixed-size pieces.
@@ -881,7 +900,7 @@ fn hashFile(io: std.Io, path: []const u8) ![64]u8 {
 const video_thumb_px = 320;
 
 fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.mem.Allocator, is_new: bool) void {
-    const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return;
+    const path_z = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return oom(ctx.path);
     defer ctx.allocator.free(path_z);
 
     // One open of the file for the poster frame (already scaled to thumbnail
@@ -894,17 +913,20 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
                 image.thumbnail = jpeg;
             } else |err| log.warn("video thumb encode {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
         } else log.warn("video decode {s}: no first frame", .{std.Io.Dir.path.basename(ctx.path)});
-        if (data.workflow) |w| sections.append(aa, .{ .keyword = "workflow", .text = w }) catch {};
-        if (data.prompt) |p| sections.append(aa, .{ .keyword = "prompt", .text = p }) catch {};
+        // Out of memory, the row isn't saved: the next scan reads it again.
+        if (data.workflow) |w| sections.append(aa, .{ .keyword = "workflow", .text = w }) catch return oom(ctx.path);
+        if (data.prompt) |p| sections.append(aa, .{ .keyword = "prompt", .text = p }) catch return oom(ctx.path);
     } else |err| log.warn("video open {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     var parser = comfy_mod.ComfyParser.init(aa);
-    applyParseResult(ctx.allocator, image, parser.parseImageMetadata(sections.items) catch null);
+    const result = parser.parseImageMetadata(sections.items) catch return oom(ctx.path);
+    applyParseResult(ctx.allocator, image, result) catch return oom(ctx.path);
 
     // Hash the file for duplicate detection, streamed: videos can be huge.
     if (hashFile(ctx.io, ctx.path)) |hash_hex| {
         if (image.hash) |h| ctx.allocator.free(h);
-        image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
+        image.hash = null;
+        image.hash = ctx.allocator.dupe(u8, &hash_hex) catch return oom(ctx.path);
     } else |err| log.warn("hash {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     image.mtime = current_mtime;
@@ -1001,7 +1023,7 @@ pub fn processFile(ctx: ScanCtx) void {
     defer file.close(ctx.io);
 
     const file_size = file.length(ctx.io) catch return;
-    const buffer = aa.alloc(u8, file_size) catch return;
+    const buffer = aa.alloc(u8, file_size) catch return oom(ctx.path);
     // A short read means the file shrank under us (being rewritten): leave the
     // row as it was and let the next event or scan pick up the final file.
     const n_read = file.readPositionalAll(ctx.io, buffer, 0) catch return;
@@ -1015,16 +1037,20 @@ pub fn processFile(ctx: ScanCtx) void {
     // mtime is not stored, so the next event or scan reads it again.
     var parse_failed = false;
     if (std.ascii.endsWithIgnoreCase(ctx.path, ".png")) {
-        parse_failed = gatherPngSections(aa, ctx.io, buffer, &sections) catch |err| blk: {
-            log.warn("parse failed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
-            break :blk true;
+        parse_failed = gatherPngSections(aa, ctx.io, buffer, &sections) catch |err| switch (err) {
+            // Out of memory, the row isn't saved: the next scan reads it again.
+            error.OutOfMemory => return oom(ctx.path),
+            else => blk: {
+                log.warn("parse failed {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
+                break :blk true;
+            },
         };
     } else {
-        gatherEmbeddedSections(aa, buffer, &sections);
+        gatherEmbeddedSections(aa, buffer, &sections) catch return oom(ctx.path);
     }
 
     var parser = comfy_mod.ComfyParser.init(aa);
-    const maybe_result: ?comfy_mod.ParseResult = parser.parseImageMetadata(sections.items) catch null;
+    const maybe_result: ?comfy_mod.ParseResult = parser.parseImageMetadata(sections.items) catch return oom(ctx.path);
     if (maybe_result == null) log.debug("no metadata: {s}", .{std.Io.Dir.path.basename(ctx.path)});
 
     // Hash the raw file bytes (every image: duplicate detection needs it
@@ -1043,9 +1069,10 @@ pub fn processFile(ctx: ScanCtx) void {
 
     // Replace the stored metadata with what this version of the file carries
     // (none, if it was rewritten without any).
-    applyParseResult(ctx.allocator, &image, maybe_result);
+    applyParseResult(ctx.allocator, &image, maybe_result) catch return oom(ctx.path);
     if (image.hash) |h| ctx.allocator.free(h);
-    image.hash = ctx.allocator.dupe(u8, &hash_hex) catch null;
+    image.hash = null;
+    image.hash = ctx.allocator.dupe(u8, &hash_hex) catch return oom(ctx.path);
     image.mtime = if (parse_failed) null else current_mtime;
 
     // DB write.

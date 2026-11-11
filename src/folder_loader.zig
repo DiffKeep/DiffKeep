@@ -68,11 +68,20 @@ pub const FolderLoader = struct {
     }
 
     /// Queue loading the subfolders of `path` (copied). A folder already
-    /// queued is not queued twice. Main thread; cheap.
-    pub fn request(self: *FolderLoader, library_id: u64, path: []const u8) void {
-        const owned = self.allocator.dupe(u8, path) catch return;
+    /// queued is not queued twice. Main thread; cheap. Returns false if it
+    /// couldn't be queued (out of memory), so the caller can ask again later.
+    pub fn request(self: *FolderLoader, library_id: u64, path: []const u8) bool {
+        const owned = self.allocator.dupe(u8, path) catch |err| {
+            log.warn("folder list: {}", .{err});
+            return false;
+        };
         const req: Request = .{ .library_id = library_id, .path = owned };
-        _ = self.queue.pushUnique(req, Request.eql) catch self.allocator.free(owned);
+        _ = self.queue.pushUnique(req, Request.eql) catch |err| {
+            self.allocator.free(owned);
+            log.warn("folder list: {}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// The lists finished since the last call, oldest first. Main thread; the

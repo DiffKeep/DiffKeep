@@ -42,18 +42,32 @@ const cell_border: f32 = 2; // border on each side; must be factored into h_marg
 const label_h: f32 = 20;
 const prefetch_screens: usize = 2;
 
-const ViewLoad = bg.Latest(LoadedView, LoadedView.free);
+/// A finished view load: the view, or why it couldn't be loaded.
+const ViewResult = union(enum) {
+    view: LoadedView,
+    failed: anyerror,
+
+    fn free(r: *ViewResult, a: std.mem.Allocator) void {
+        switch (r.*) {
+            .view => |v| v.deinit(a),
+            .failed => {},
+        }
+    }
+};
+
+const ViewLoad = bg.Latest(ViewResult, ViewResult.free);
 
 /// Load `query` (owned; freed here) on the grid's own connection.
-fn loadTask(ticket: ViewLoad.Ticket, g: *GridState, query: ViewQuery) ?LoadedView {
+fn loadTask(ticket: ViewLoad.Ticket, g: *GridState, query: ViewQuery) ?ViewResult {
     var q = query;
     defer q.deinit(g.allocator);
     // A newer view request is already on its way: don't run this query.
     if (!ticket.current()) return null;
-    return loadView(&g.view_db, g.allocator, q) catch |err| {
+    const view = loadView(&g.view_db, g.allocator, q) catch |err| {
         log.warn("view load failed: {}", .{err});
-        return null;
+        return .{ .failed = err };
     };
+    return .{ .view = view };
 }
 
 // ── GridState ─────────────────────────────────────────────────────────────────
@@ -69,6 +83,9 @@ pub const GridState = struct {
     // older one, and update() applies only the latest.
     load: ViewLoad = .{},
     load_keep_scroll: bool = false, // main-thread
+    /// Why the newest view couldn't be loaded; the grid shows that instead of
+    /// an empty view until a load succeeds. Main-thread.
+    load_error: ?anyerror = null,
     // Ids removed while a load was in flight; filtered out of its result so a
     // just-deleted image can't come back. Main-thread.
     load_dropped: std.AutoHashMap(u64, void),
@@ -209,11 +226,16 @@ pub const GridState = struct {
         return null;
     }
 
-    /// Set the FTS query (copied; the grid owns it). Null clears it.
-    pub fn setSearchQuery(self: *GridState, q: ?[]const u8) !void {
-        const copy = if (q) |t| try self.allocator.dupe(u8, t) else null;
-        if (self.search_query) |old| self.allocator.free(old);
+    /// Set the FTS query (copied; the grid owns it).
+    pub fn setSearchQuery(self: *GridState, q: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, q);
+        self.clearSearchQuery();
         self.search_query = copy;
+    }
+
+    pub fn clearSearchQuery(self: *GridState) void {
+        if (self.search_query) |old| self.allocator.free(old);
+        self.search_query = null;
     }
 
     pub fn deinit(self: *GridState) void {
@@ -266,11 +288,21 @@ pub const GridState = struct {
     /// Reload the image list for the current view in the background. The old
     /// list stays on screen until update() swaps the result in; a newer
     /// request supersedes an older one still loading.
-    pub fn reloadImages(self: *GridState) !void {
-        return self.reloadImagesEx(.{});
+    /// If the load can't even be started, the grid shows the error instead.
+    pub fn reloadImages(self: *GridState) void {
+        self.reloadImagesEx(.{});
     }
 
-    pub fn reloadImagesEx(self: *GridState, opts: ReloadOptions) !void {
+    pub fn reloadImagesEx(self: *GridState, opts: ReloadOptions) void {
+        self.startLoad(opts) catch |err| {
+            log.warn("view load not started: {}", .{err});
+            // An older load still in flight is for an older query: drop it.
+            self.load.cancel();
+            self.showLoadError(err);
+        };
+    }
+
+    fn startLoad(self: *GridState, opts: ReloadOptions) !void {
         const query = try self.currentQuery().dupe(self.allocator);
         self.load_keep_scroll = opts.keep_scroll;
         self.load.wakeup_fn = self.wakeup_fn;
@@ -279,6 +311,19 @@ pub const GridState = struct {
             q.deinit(self.allocator);
             return err;
         };
+    }
+
+    /// The in-memory merge of a change ran out of memory. The DB has every
+    /// change, so reload the view from it instead.
+    fn resync(self: *GridState) void {
+        log.warn("grid update out of memory; reloading the view", .{});
+        self.reloadImagesEx(.{ .keep_scroll = true });
+    }
+
+    /// Empty the grid and show `err` in its place.
+    pub fn showLoadError(self: *GridState, err: anyerror) void {
+        self.clearImages(.{ .keep_scroll = false });
+        self.load_error = err;
     }
 
     /// True while a requested reload hasn't been applied yet.
@@ -304,17 +349,22 @@ pub const GridState = struct {
 
     /// Record ids removed from the grid while a load is in flight.
     pub fn noteRemoved(self: *GridState, id: u64) void {
-        if (self.reloadPending()) self.load_dropped.put(id, {}) catch {};
+        if (!self.reloadPending()) return;
+        // Without the note the load may bring the image back: load again,
+        // after the removal, instead.
+        self.load_dropped.put(id, {}) catch self.resync();
     }
 
     /// Main thread: swap in a finished load if it is the latest request.
     fn applyReloadIfDone(self: *GridState) bool {
         const outcome = self.load.take() orelse return false;
-        // A failed load (null) keeps the current list.
-        if (outcome.value) |v| {
-            self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
-            self.readdScannedImages();
-        }
+        if (outcome.value) |r| switch (r) {
+            .view => |v| {
+                self.replaceImages(v, .{ .keep_scroll = self.load_keep_scroll });
+                self.readdScannedImages();
+            },
+            .failed => |err| self.showLoadError(err),
+        };
         for (self.load_added.items) |e| self.allocator.free(e.path);
         self.load_added.clearRetainingCapacity();
         self.load_dropped.clearRetainingCapacity();
@@ -325,34 +375,32 @@ pub const GridState = struct {
     /// result doesn't have (it may have queried before they were inserted).
     fn readdScannedImages(self: *GridState) void {
         if (self.load_added.items.len == 0) return;
-        var present = std.AutoHashMap(u64, void).init(self.allocator);
-        defer present.deinit();
-        for (self.images.items) |img| present.put(img.id, {}) catch {};
+        var present: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer present.deinit(self.allocator);
+        // Reserve everything first, so the list is never half-merged.
+        const n_added: u32 = @intCast(self.load_added.items.len);
+        present.ensureTotalCapacity(self.allocator, @as(u32, @intCast(self.images.items.len)) + n_added) catch return self.resync();
+        self.images.ensureUnusedCapacity(self.allocator, n_added) catch return self.resync();
+        for (self.images.items) |img| present.putAssumeCapacity(img.id, {});
         var added = false;
         for (self.load_added.items) |*e| {
             if (present.contains(e.id) or self.load_dropped.contains(e.id)) continue;
             if (!self.incomingBelongs(e.path)) continue;
-            self.images.append(self.allocator, .{
+            self.images.appendAssumeCapacity(.{
                 .id = e.id,
                 .path = e.path,
                 .filename = std.Io.Dir.path.basename(e.path),
                 .mtime = e.mtime,
-            }) catch continue;
+            });
             e.path = ""; // ownership moved to the grid
-            present.put(e.id, {}) catch {};
+            present.putAssumeCapacity(e.id, {});
             added = true;
         }
         if (added) self.applySortOrder();
     }
 
-    /// Replace the image list with a loaded view. Takes ownership of `view`.
-    /// Clears selection and navigation state.
-    pub fn replaceImages(self: *GridState, view: LoadedView, opts: ReloadOptions) void {
-        defer {
-            self.allocator.free(view.entries);
-            self.allocator.free(view.favorite_ids);
-            self.allocator.free(view.media);
-        }
+    /// Empty the list, its selection and navigation state.
+    fn clearImages(self: *GridState, opts: ReloadOptions) void {
         // Clear queues before freeing images so workers don't access freed path pointers.
         self.thumbs.clearQueued();
         for (self.images.items) |e| {
@@ -367,10 +415,24 @@ pub const GridState = struct {
         self.anchor_idx = null;
         // Switching to a new view starts at the top.
         if (!opts.keep_scroll) self.scroll_info.viewport.y = 0;
+    }
 
-        self.images.ensureTotalCapacity(self.allocator, view.entries.len) catch {};
+    /// Replace the image list with a loaded view. Takes ownership of `view`.
+    /// Clears selection and navigation state.
+    pub fn replaceImages(self: *GridState, view: LoadedView, opts: ReloadOptions) void {
+        self.images.ensureTotalCapacity(self.allocator, view.entries.len) catch |err| {
+            view.deinit(self.allocator);
+            return self.showLoadError(err);
+        };
+        defer {
+            self.allocator.free(view.entries);
+            self.allocator.free(view.favorite_ids);
+            self.allocator.free(view.media);
+        }
+        self.clearImages(opts);
+        self.load_error = null;
         for (view.entries) |e| {
-            if (self.load_dropped.contains(e.id) or self.images.items.len == self.images.capacity) {
+            if (self.load_dropped.contains(e.id)) {
                 self.allocator.free(e.path);
                 if (e.trash_name) |tn| self.allocator.free(tn);
                 continue;
@@ -391,31 +453,42 @@ pub const GridState = struct {
     }
 
     /// Flag which loaded entries are favorites. Keeps the per-entry flag
-    /// accurate without threading a column through every grid query.
-    pub fn applyFavorites(self: *GridState, fav_ids: []const u64) void {
-        if (fav_ids.len == 0) {
-            for (self.images.items) |*e| e.favorite = false;
-            return;
-        }
-        var set = std.AutoHashMap(u64, void).init(self.allocator);
-        defer set.deinit();
-        set.ensureTotalCapacity(@intCast(fav_ids.len)) catch {};
-        for (fav_ids) |id| set.put(id, {}) catch {};
-        for (self.images.items) |*e| e.favorite = set.contains(e.id);
+    /// accurate without threading a column through every grid query. Sorts
+    /// `fav_ids` (a binary search needs no allocation that could fail).
+    fn applyFavorites(self: *GridState, fav_ids: []u64) void {
+        std.mem.sort(u64, fav_ids, {}, std.sort.asc(u64));
+        for (self.images.items) |*e| e.favorite = sortedFind(u64, fav_ids, e.id, struct {
+            fn key(id: u64) u64 {
+                return id;
+            }
+        }.key) != null;
     }
 
     /// Set the playback classification (animated / video) of loaded entries
-    /// from the (small) list of non-image rows.
-    pub fn applyMediaTypes(self: *GridState, rows: []const db_mod.VectorDb.MediaTypeRow) void {
-        for (self.images.items) |*e| e.media_type = .image;
-        if (rows.len == 0) return;
-        var map = std.AutoHashMap(u64, db_mod.VectorDb.MediaType).init(self.allocator);
-        defer map.deinit();
-        map.ensureTotalCapacity(@intCast(rows.len)) catch {};
-        for (rows) |r| map.put(r.id, r.media_type) catch {};
+    /// from the (small) list of non-image rows. Sorts `rows`.
+    fn applyMediaTypes(self: *GridState, rows: []db_mod.VectorDb.MediaTypeRow) void {
+        const Row = db_mod.VectorDb.MediaTypeRow;
+        const byId = struct {
+            fn key(r: Row) u64 {
+                return r.id;
+            }
+            fn less(_: void, a: Row, b: Row) bool {
+                return a.id < b.id;
+            }
+        };
+        std.mem.sort(Row, rows, {}, byId.less);
         for (self.images.items) |*e| {
-            if (map.get(e.id)) |mt| e.media_type = mt;
+            e.media_type = if (sortedFind(Row, rows, e.id, byId.key)) |i| rows[i].media_type else .image;
         }
+    }
+
+    /// Index of the item whose `key` is `id` in `items`, sorted by key.
+    fn sortedFind(comptime T: type, items: []const T, id: u64, comptime key: fn (T) u64) ?usize {
+        return std.sort.binarySearch(T, items, id, struct {
+            fn cmp(want: u64, item: T) std.math.Order {
+                return std.math.order(want, key(item));
+            }
+        }.cmp);
     }
 
     /// Whether an entry is a live-playable type (animated image or video).
@@ -457,7 +530,8 @@ pub const GridState = struct {
         // them; the other views (and the library view's next load) read the
         // DB. Elsewhere just drop each id's stale cached thumbnail — the id may
         // be one SQLite recycled — so the queue can't grow during a long scan.
-        self.notifier.drain(self.io, self.allocator, &self.incoming);
+        const notes_lost = self.notifier.drain(self.io, self.allocator, &self.incoming);
+        if (notes_lost) self.resync();
         if (self.view_mode != .library) {
             for (self.incoming.items) |e| {
                 self.thumbs.invalidate(e.id);
@@ -466,65 +540,90 @@ pub const GridState = struct {
             self.incoming.clearRetainingCapacity();
         }
         const before_count = self.images.items.len;
-        if (self.incoming.items.len > 0) {
-            // Ids already in the grid (a reparse or change re-notified them)
-            // update in place instead of appearing twice. One pass over the
-            // grid against the few incoming ids, rather than hashing the grid.
-            var existing = std.AutoHashMap(u64, void).init(self.allocator);
-            defer existing.deinit();
-            {
-                var wanted = std.AutoHashMap(u64, void).init(self.allocator);
-                defer wanted.deinit();
-                for (self.incoming.items) |e| wanted.put(e.id, {}) catch {};
-                for (self.images.items) |img| {
-                    if (wanted.contains(img.id)) existing.put(img.id, {}) catch {};
-                }
-            }
+        if (self.incoming.items.len > 0) self.mergeIncoming() catch {
+            // Nothing was merged. The DB has these images: reload from it.
             for (self.incoming.items) |e| {
-                if (existing.contains(e.id)) {
-                    // Already present: a reparse / change re-notified it. Drop the
-                    // now-stale cached thumbnail so it regenerates, and flag the id
-                    // so the detail panel reloads from the freshly-saved DB row.
-                    self.thumbs.invalidate(e.id);
-                    self.refreshed.put(e.id, {}) catch {};
-                    self.allocator.free(e.path);
-                    continue;
-                }
-                // A newly appearing id may be one SQLite recycled from a just-
-                // deleted image; clear any cache entry it left behind (and any
-                // stale in-flight load result) so this image loads its own thumb.
-                // Do this even when the image isn't shown here, so the stale
-                // thumbnail can't resurface when it later appears in its own view.
                 self.thumbs.invalidate(e.id);
-                // Don't inject images that don't belong in the current view
-                // (different folder/library, or not matching the active search).
-                if (!self.incomingBelongs(e.path)) {
-                    self.allocator.free(e.path);
-                    continue;
-                }
-                self.images.append(self.allocator, .{
-                    .id = e.id,
-                    .path = e.path,
-                    .filename = std.Io.Dir.path.basename(e.path),
-                    .mtime = e.mtime,
-                }) catch {
-                    self.allocator.free(e.path);
-                    continue;
-                };
-                existing.put(e.id, {}) catch {};
-                // A load in flight may not include it; remember it until applied.
-                if (self.reloadPending()) {
-                    if (self.allocator.dupe(u8, e.path)) |copy| {
-                        self.load_added.append(self.allocator, .{ .id = e.id, .path = copy, .mtime = e.mtime }) catch self.allocator.free(copy);
-                    } else |_| {}
-                }
+                self.allocator.free(e.path);
             }
-        }
+            self.resync();
+        };
         self.incoming.clearAndFree(self.allocator);
         if (self.images.items.len != before_count) self.reorder(before_count);
 
         // 2. Move finished thumbnails into the cache; evict old ones.
         self.thumbs.commitPending();
+    }
+
+    /// Add `incoming` to the list, or refresh the entries it already has. Takes
+    /// every incoming path. On error (out of memory) nothing has changed and
+    /// the caller still owns the paths.
+    fn mergeIncoming(self: *GridState) !void {
+        const a = self.allocator;
+        const n: u32 = @intCast(self.incoming.items.len);
+        // Ids already in the grid (a reparse or change re-notified them)
+        // update in place instead of appearing twice. One pass over the grid
+        // against the few incoming ids, rather than hashing the grid.
+        var existing: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer existing.deinit(a);
+        try existing.ensureTotalCapacity(a, n);
+        {
+            var wanted: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer wanted.deinit(a);
+            try wanted.ensureTotalCapacity(a, n);
+            for (self.incoming.items) |e| wanted.putAssumeCapacity(e.id, {});
+            for (self.images.items) |img| {
+                if (wanted.contains(img.id)) existing.putAssumeCapacity(img.id, {});
+            }
+        }
+        // Reserve the rest too: past this point nothing fails.
+        try self.images.ensureUnusedCapacity(a, n);
+        try self.refreshed.ensureUnusedCapacity(n);
+        const pending = self.reloadPending();
+        var copies: std.ArrayList([]u8) = .empty;
+        defer copies.deinit(a);
+        if (pending) {
+            // A load in flight may not include a new image: it is remembered,
+            // with its own path copy, until that load is applied.
+            try self.load_added.ensureUnusedCapacity(a, n);
+            try copies.ensureTotalCapacity(a, n);
+            errdefer for (copies.items) |c| a.free(c);
+            for (self.incoming.items) |e| copies.appendAssumeCapacity(try a.dupe(u8, e.path));
+        }
+
+        for (self.incoming.items, 0..) |e, i| {
+            if (existing.contains(e.id)) {
+                // Already present: a reparse / change re-notified it. Drop the
+                // now-stale cached thumbnail so it regenerates, and flag the id
+                // so the detail panel reloads from the freshly-saved DB row.
+                self.thumbs.invalidate(e.id);
+                self.refreshed.putAssumeCapacity(e.id, {});
+                self.allocator.free(e.path);
+                if (pending) a.free(copies.items[i]);
+                continue;
+            }
+            // A newly appearing id may be one SQLite recycled from a just-
+            // deleted image; clear any cache entry it left behind (and any
+            // stale in-flight load result) so this image loads its own thumb.
+            // Do this even when the image isn't shown here, so the stale
+            // thumbnail can't resurface when it later appears in its own view.
+            self.thumbs.invalidate(e.id);
+            // Don't inject images that don't belong in the current view
+            // (different folder/library, or not matching the active search).
+            if (!self.incomingBelongs(e.path)) {
+                self.allocator.free(e.path);
+                if (pending) a.free(copies.items[i]);
+                continue;
+            }
+            self.images.appendAssumeCapacity(.{
+                .id = e.id,
+                .path = e.path,
+                .filename = std.Io.Dir.path.basename(e.path),
+                .mtime = e.mtime,
+            });
+            existing.putAssumeCapacity(e.id, {});
+            if (pending) self.load_added.appendAssumeCapacity(.{ .id = e.id, .path = copies.items[i], .mtime = e.mtime });
+        }
     }
 
     pub fn wasRefreshedThisFrame(self: *const GridState, id: u64) bool {
@@ -548,7 +647,7 @@ pub const GridState = struct {
         const i = @min(target orelse 0, n - 1);
         self.focused_idx = i;
         self.anchor_idx = i;
-        self.selection.put(self.images.items[i].id, {}) catch {};
+        self.select(self.images.items[i].id);
         self.scroll_to_focused = true;
     }
 
@@ -600,16 +699,33 @@ pub const GridState = struct {
         return thumb_size_min + self.thumb_fraction * (thumb_size_max - thumb_size_min);
     }
 
+    /// Add `id` to the selection. Out of memory, it just isn't selected (and
+    /// isn't drawn as selected).
+    fn select(self: *GridState, id: u64) void {
+        self.selection.put(id, {}) catch |err| log.warn("select: {}", .{err});
+    }
+
+    fn selectAll(self: *GridState) void {
+        self.selection.ensureTotalCapacity(@intCast(self.images.items.len)) catch |err| {
+            log.warn("select all: {}", .{err});
+            return;
+        };
+        for (self.images.items) |img| self.selection.putAssumeCapacity(img.id, {});
+    }
+
     /// Replace the current selection with all items in [from, to] (inclusive, order-independent).
     fn applyRangeSelect(self: *GridState, from: usize, to: usize) void {
         const n = self.images.items.len;
         if (n == 0) return;
         const lo = @min(from, to);
         const hi = @min(@max(from, to), n - 1);
+        // All or nothing: a range half selected would be acted on half.
         self.selection.clearRetainingCapacity();
-        for (lo..hi + 1) |i| {
-            self.selection.put(self.images.items[i].id, {}) catch {};
-        }
+        self.selection.ensureTotalCapacity(@intCast(hi + 1 - lo)) catch |err| {
+            log.warn("select range: {}", .{err});
+            return;
+        };
+        for (lo..hi + 1) |i| self.selection.putAssumeCapacity(self.images.items[i].id, {});
     }
 
     /// Returns the actual on-disk path for an entry.
@@ -660,14 +776,14 @@ pub const GridState = struct {
             const is_searching = self.search_query != null or
                 self.query_embeddings.any() or
                 self.filters.len > 0;
-            const empty_text = switch (self.view_mode) {
+            const empty_text = if (self.load_error != null) i18n.t(.view_load_failed) else switch (self.view_mode) {
                 .trash => i18n.t(.trash_empty),
                 .duplicates => i18n.t(.duplicates_empty),
                 .favorites => i18n.t(.favorites_empty),
                 .library => if (is_searching) i18n.t(.search_no_results) else i18n.t(.library_empty),
             };
             dvui.label(@src(), "{s}", .{empty_text}, .{
-                .tag = "grid-empty",
+                .tag = if (self.load_error != null) "grid-load-failed" else "grid-empty",
                 .gravity_x = 0.5,
                 .gravity_y = 0.5,
                 .expand = .both,
@@ -757,7 +873,7 @@ pub const GridState = struct {
                                 // Move cursor only — selection unchanged.
                             } else {
                                 self.selection.clearRetainingCapacity();
-                                self.selection.put(self.images.items[new_fi].id, {}) catch {};
+                                self.select(self.images.items[new_fi].id);
                                 self.anchor_idx = new_fi;
                             }
                             e.handle(@src(), grid_box.data());
@@ -770,7 +886,7 @@ pub const GridState = struct {
                                 if (self.selection.contains(id)) {
                                     _ = self.selection.remove(id);
                                 } else {
-                                    self.selection.put(id, {}) catch {};
+                                    self.select(id);
                                 }
                                 self.anchor_idx = fi;
                             }
@@ -778,9 +894,7 @@ pub const GridState = struct {
                         },
                         .a => {
                             if (ke.mod.control()) {
-                                for (self.images.items) |img| {
-                                    self.selection.put(img.id, {}) catch {};
-                                }
+                                self.selectAll();
                                 e.handle(@src(), grid_box.data());
                             }
                         },
@@ -958,7 +1072,7 @@ pub const GridState = struct {
                 // If the right-clicked item is not already in the selection, select only it.
                 if (!self.selection.contains(entry.id)) {
                     self.selection.clearRetainingCapacity();
-                    self.selection.put(entry.id, {}) catch {};
+                    self.select(entry.id);
                     self.anchor_idx = idx;
                     self.focused_idx = idx;
                 }
@@ -1152,7 +1266,7 @@ pub const GridState = struct {
                 if (self.selection.contains(entry.id)) {
                     _ = self.selection.remove(entry.id);
                 } else {
-                    self.selection.put(entry.id, {}) catch {};
+                    self.select(entry.id);
                 }
                 self.anchor_idx = idx;
             } else if (mod.shift()) {
@@ -1161,7 +1275,7 @@ pub const GridState = struct {
             } else {
                 // Plain click: single selection.
                 self.selection.clearRetainingCapacity();
-                self.selection.put(entry.id, {}) catch {};
+                self.select(entry.id);
                 self.anchor_idx = idx;
             }
             self.focused_idx = idx;
@@ -1197,16 +1311,20 @@ pub const GridState = struct {
             dvui.captureMouse(null, e.num);
             dvui.dragEnd(e.evt.mouse.button);
             log.debug("drag gesture fired on id={d}", .{entry.id});
-            self.drag_requested = true;
             self.drag_requested_ids.clearRetainingCapacity();
+            const dragged = if (self.selection.contains(entry.id)) self.selection.count() else 1;
+            // A drag of fewer files than were picked up would be wrong: none.
+            self.drag_requested_ids.ensureTotalCapacity(self.allocator, dragged) catch |err| {
+                log.warn("drag: {}", .{err});
+                continue;
+            };
+            self.drag_requested = true;
             if (self.selection.contains(entry.id)) {
                 // Drag all selected images
                 var it = self.selection.keyIterator();
-                while (it.next()) |id| {
-                    self.drag_requested_ids.append(self.allocator, id.*) catch {};
-                }
+                while (it.next()) |id| self.drag_requested_ids.appendAssumeCapacity(id.*);
             } else {
-                self.drag_requested_ids.append(self.allocator, entry.id) catch {};
+                self.drag_requested_ids.appendAssumeCapacity(entry.id);
             }
         }
 

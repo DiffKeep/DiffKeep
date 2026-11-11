@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - When adding a new feature or fixing a bug, add unit / integration tests as appropriate.
 - Make sure all tests are still passing after working on something. If they aren't, fix it - even if the test was previously broken.
 - NEVER add any IO tasks to the main thread. This will freeze the UI and result in a bad experience.
+- Don't swallow errors (`catch {}`, `catch null`) where losing them leaves wrong state. Reserve capacity before an irreversible step (a file trashed, a row deleted) so recording it can't fail; when an in-memory update can't be completed, reload from the DB (`GridState.resync`); a DB read that fails is shown as failed, never as empty. Log failures at `warn`: an `err` log fails any test that triggers it.
 - Remember that the best code is often the simplest code. Tend towards simple solutions where possible, that will work for all the edge cases.
 - If the user asks for something that may cause issues, push back and get confirmation before doing it.
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.

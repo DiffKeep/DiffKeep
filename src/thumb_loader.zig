@@ -108,6 +108,9 @@ pub const ThumbLoader = struct {
     // Ids the loader deleted from the DB because their file is gone. Drained by
     // app.zig each frame to drop them from the grid and viewers. Guarded by queue_mutex.
     missing_ids: std.ArrayList(u64) = .empty,
+    /// A deleted row's id couldn't be queued (out of memory): the grid
+    /// reloads from the DB instead. Guarded by `queue_mutex`.
+    missing_lost: bool = false,
     queue_mutex: std.Io.Mutex = std.Io.Mutex.init,
     queue_cond: std.Io.Condition = std.Io.Condition.init,
 
@@ -240,7 +243,13 @@ pub const ThumbLoader = struct {
     /// Free an entry that has left `committed`.
     fn release(self: *ThumbLoader, e: CacheEntry) void {
         self.total_bytes -= e.bytes.len;
-        if (e.tex_key != 0) self.released_keys.append(self.allocator, e.tex_key) catch {};
+        if (e.tex_key != 0) self.released_keys.append(self.allocator, e.tex_key) catch |err| {
+            // The grid can't be told to drop this texture. Keep the bytes, so
+            // their address (the texture's key) is never reused by another
+            // thumbnail, which would then be drawn with this image.
+            log.warn("release thumbnail texture: {}", .{err});
+            return;
+        };
         self.allocator.free(e.bytes);
     }
 
@@ -287,8 +296,19 @@ pub const ThumbLoader = struct {
             _ = self.queued.remove(id);
             _ = self.load_failed.remove(id);
             // A worker still decoding the id's previous file: drop its result.
-            if (self.in_flight.contains(id)) self.stale_in_flight.put(id, {}) catch {};
+            // Can't fail: a worker reserves room for this before it takes an id.
+            if (self.in_flight.contains(id)) self.stale_in_flight.putAssumeCapacity(id, {});
         }
+    }
+
+    /// Worker side, under `queue_mutex`: `id` is being loaded. Reserves room
+    /// to mark it stale too, so `invalidate` never fails to (a stale result
+    /// would show the previous file's thumbnail).
+    pub fn markInFlight(self: *ThumbLoader, id: u64) !void {
+        const room = @as(u32, @intCast(self.in_flight.count())) + 1;
+        try self.in_flight.ensureTotalCapacity(room);
+        try self.stale_in_flight.ensureTotalCapacity(room);
+        self.in_flight.putAssumeCapacity(id, {});
     }
 
     /// Worker side: hand over a finished load (`bytes` null = it failed),
@@ -327,7 +347,8 @@ pub const ThumbLoader = struct {
             // the main thread drains it (removal then invalidates it).
             self.queue_mutex.lockUncancelable(self.io);
             defer self.queue_mutex.unlock(self.io);
-            self.load_failed.put(id, {}) catch {};
+            // Without the mark the id is only retried, which is harmless.
+            self.load_failed.put(id, {}) catch |err| log.warn("mark thumbnail failed: {}", .{err});
         }
         if (fileDeleted(self.io, path)) {
             self.loader_db_mutex.lockUncancelable(self.io);
@@ -339,7 +360,10 @@ pub const ThumbLoader = struct {
             if (deleted) {
                 log.info("removed missing file {s} from the library", .{std.Io.Dir.path.basename(path)});
                 self.queue_mutex.lockUncancelable(self.io);
-                self.missing_ids.append(self.allocator, id) catch {};
+                self.missing_ids.append(self.allocator, id) catch |err| {
+                    log.warn("queue missing id: {}", .{err});
+                    self.missing_lost = true;
+                };
                 self.queue_mutex.unlock(self.io);
                 if (self.wakeup_fn) |wakeup| wakeup();
             }
@@ -348,12 +372,21 @@ pub const ThumbLoader = struct {
 
     /// Move the ids `noteLoadFailure` deleted from the DB into `out` (which
     /// grows with `gpa`). Main-thread only; called once per frame.
-    pub fn drainMissingIds(self: *ThumbLoader, gpa: std.mem.Allocator, out: *std.ArrayList(u64)) void {
+    /// Returns true when some couldn't be recorded, so the view must reload
+    /// from the DB.
+    pub fn drainMissingIds(self: *ThumbLoader, gpa: std.mem.Allocator, out: *std.ArrayList(u64)) bool {
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
-        if (self.missing_ids.items.len == 0) return;
-        out.appendSlice(gpa, self.missing_ids.items) catch return;
+        const lost = self.missing_lost;
+        self.missing_lost = false;
+        if (self.missing_ids.items.len == 0) return lost;
+        // On failure the ids stay queued for the next frame.
+        out.appendSlice(gpa, self.missing_ids.items) catch |err| {
+            log.warn("drain missing ids: {}", .{err});
+            return lost;
+        };
         self.missing_ids.clearRetainingCapacity();
+        return lost;
     }
 
     /// True if `id` was re-notified (reparsed / changed) during this frame's
@@ -423,7 +456,12 @@ fn workerFn(state: *ThumbLoader) void {
         // Move from queued → in_flight so requestLoad won't re-queue it while the
         // per-frame queue rebuild is dropping stale requests.
         _ = state.queued.remove(req.id);
-        state.in_flight.put(req.id, {}) catch {};
+        state.markInFlight(req.id) catch |err| {
+            state.queue_mutex.unlock(state.io);
+            log.warn("thumbnail load: {}", .{err});
+            state.allocator.free(req.path);
+            continue; // requested again next frame
+        };
         state.queue_mutex.unlock(state.io);
         defer {
             state.queue_mutex.lockUncancelable(state.io);
@@ -439,7 +477,10 @@ fn workerFn(state: *ThumbLoader) void {
         var bytes: ?[]u8 = null;
         if (state.thumbnails_in_db.load(.acquire) or is_video) {
             state.loader_db_mutex.lockUncancelable(state.io);
-            bytes = state.loader_db.getThumbnailBytes(state.allocator, req.id) catch null;
+            bytes = state.loader_db.getThumbnailBytes(state.allocator, req.id) catch |err| blk: {
+                log.warn("thumbnail {d} from the DB: {}", .{ req.id, err });
+                break :blk null;
+            };
             state.loader_db_mutex.unlock(state.io);
         }
 

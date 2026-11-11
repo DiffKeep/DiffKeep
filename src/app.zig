@@ -33,6 +33,9 @@ var g_app_ready = false;
 /// --config / -c: <dir>/DiffKeep.cfg instead of the XDG config dir. Owned
 /// until handed to `g_app.init`.
 var g_config_arg: ?[]const u8 = null;
+/// `--config` was given but couldn't be recorded: startup fails rather than
+/// silently using (and writing to) the default config and library.
+var g_config_arg_err: ?anyerror = null;
 var g_wakeup_event_type: u32 = 0;
 var g_dnd: ?dnd_mod.DragSource = null;
 var g_dnd_drag_cursor: ?*SDLBackend.c.SDL_Cursor = null;
@@ -57,7 +60,7 @@ fn openViewer(app: *app_state.AppState, grid: *image_grid_mod.GridState, start_i
 fn startDrag(items: []const app_state.DragItem) void {
     const dnd = if (g_dnd) |*d| d else return;
     const gpa = g_app.gpa;
-    const native = gpa.alloc(dnd_mod.DragItem, items.len) catch return;
+    const native = gpa.alloc(dnd_mod.DragItem, items.len) catch |err| return log.warn("drag: {}", .{err});
     defer gpa.free(native);
     for (items, native) |it, *n| n.* = .{ .path = it.path, .thumb_jpeg = it.thumb_jpeg };
     dnd.startDrag(native);
@@ -80,7 +83,10 @@ fn appStart() dvui.App.StartOptions {
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
                 if (it.next()) |val| {
-                    g_config_arg = std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch null;
+                    g_config_arg = std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch |err| blk: {
+                        g_config_arg_err = err;
+                        break :blk null;
+                    };
                 }
             }
         }
@@ -106,6 +112,7 @@ fn appInit(win: *dvui.Window) !void {
     // only renders on input otherwise).
     g_wakeup_event_type = SDLBackend.c.SDL_RegisterEvents(1);
 
+    if (g_config_arg_err) |err| return err;
     const config_path = g_config_arg;
     g_config_arg = null;
     try g_app.init(init.io, init.gpa, init.environ_map, .{
@@ -161,12 +168,12 @@ fn routeAllSDLEvents(main_back: *SDLBackend, main_win: *dvui.Window) void {
         }
         const eid = sdlEventWindowID(event);
         if (eid == 0 or eid == main_id) {
-            _ = main_back.addEvent(main_win, event) catch {};
+            _ = main_back.addEvent(main_win, event) catch |err| log.warn("input event dropped: {}", .{err});
             continue;
         }
         for (g_viewer_manager.windows.items) |vw| {
             if (vw.sdl_window_id == eid) {
-                _ = vw.back.addEvent(&vw.win, event) catch {};
+                _ = vw.back.addEvent(&vw.win, event) catch |err| log.warn("input event dropped: {}", .{err});
                 break;
             }
         }

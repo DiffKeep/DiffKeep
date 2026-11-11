@@ -127,10 +127,15 @@ const platform = switch (builtin.target.os.tag) {
 
                 var path_ptrs: [3][*:0]const u8 = undefined;
                 var path_bufs: [3][:0]const u8 = undefined;
-                defer for (path_bufs[0..n]) |b| self.allocator.free(b);
+                var made: usize = 0; // only these are freed
+                defer for (path_bufs[0..made]) |b| self.allocator.free(b);
 
                 for (0..n) |i| {
-                    path_bufs[i] = self.allocator.dupeSentinel(u8, items[i].path, 0) catch return;
+                    path_bufs[i] = self.allocator.dupeSentinel(u8, items[i].path, 0) catch |err| {
+                        std.log.warn("dnd: {}", .{err});
+                        return;
+                    };
+                    made += 1;
                     path_ptrs[i] = path_bufs[i].ptr;
                 }
 

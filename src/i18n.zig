@@ -43,6 +43,7 @@ pub const Strings = struct {
 
     search_placeholder: [:0]const u8,
     search_no_results: [:0]const u8,
+    view_load_failed: [:0]const u8,
     filter_heading: [:0]const u8,
     filter_search_placeholder: [:0]const u8,
     filter_add: [:0]const u8,
@@ -223,6 +224,7 @@ pub const en: Strings = .{
 
     .search_placeholder = "Search prompts\u{2026}",
     .search_no_results = "No results.",
+    .view_load_failed = "Couldn't load these images. The log has the details.",
     .filter_heading = "Add Filter",
     .filter_search_placeholder = "Type to search\u{2026}",
     .filter_add = "Add",

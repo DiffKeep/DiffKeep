@@ -685,7 +685,11 @@ const X11DragSource = struct {
         self.target   = 0;
         self.accepted = false;
         self.watcher_stop.store(false, .release);
-        self.watcher_thread = std.Thread.spawn(.{}, dndWatcher, .{self}) catch null;
+        // Without it the drop target's replies wait for the next input event.
+        self.watcher_thread = std.Thread.spawn(.{}, dndWatcher, .{self}) catch |err| blk: {
+            std.log.warn("dnd: watcher thread: {}", .{err});
+            break :blk null;
+        };
         std.log.debug("dnd: startDrag {d} item(s), uri_list={d}b", .{ items.len, self.uri_list.len });
     }
 

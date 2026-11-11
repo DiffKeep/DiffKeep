@@ -122,10 +122,7 @@ pub const SearchState = struct {
     /// and supersede (or are superseded by) any other view change.
     pub fn run(self: *SearchState, grid: *image_grid_mod.GridState) void {
         grid.view_mode = .library;
-        grid.reloadImages() catch |err| {
-            log.warn("search load: {}", .{err});
-            return;
-        };
+        grid.reloadImages();
         self.search_gen = grid.requestedGen();
     }
 
@@ -140,14 +137,15 @@ pub const SearchState = struct {
         switch (self.mode) {
             .fts => {
                 self.cancelEmbed();
-                grid.setSearchQuery(if (q.len > 0) q else null) catch |err| {
+                if (q.len == 0) grid.clearSearchQuery() else grid.setSearchQuery(q) catch |err| {
                     log.warn("search query: {}", .{err});
+                    grid.showLoadError(err);
                     return;
                 };
                 self.run(grid);
             },
             .semantic, .visual, .combined => {
-                grid.setSearchQuery(null) catch {};
+                grid.clearSearchQuery();
                 if (q.len == 0) {
                     // Empty query: show all/library images without embedding.
                     self.cancelEmbed();

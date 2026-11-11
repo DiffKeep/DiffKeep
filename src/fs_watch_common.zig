@@ -31,6 +31,8 @@ pub const EventQueue = struct {
     allocator: std.mem.Allocator,
     lock: Spinlock = .{},
     events: std.ArrayList(DirtyEvent) = .empty,
+    /// An event was dropped (out of memory). Guarded by `lock`.
+    lost: bool = false,
     /// Called after each push (from the watcher's thread) to wake the app.
     on_dirty: ?*const fn () void = null,
 
@@ -48,8 +50,11 @@ pub const EventQueue = struct {
     pub fn push(self: *EventQueue, ev: DirtyEvent) void {
         self.lock.lock();
         self.events.append(self.allocator, ev) catch {
+            self.lost = true;
             self.lock.unlock();
             self.allocator.free(ev.path);
+            std.log.scoped(.fs_watch).warn("event dropped (out of memory); libraries will be rescanned", .{});
+            if (self.on_dirty) |cb| cb();
             return;
         };
         self.lock.unlock();
@@ -59,9 +64,33 @@ pub const EventQueue = struct {
     /// Ask the app to reconcile a whole library with a scan. The app merges
     /// these per library, so a burst of them costs one scan.
     pub fn pushRescan(self: *EventQueue, library_id: u64, library_path: []const u8) void {
-        const path = self.allocator.dupe(u8, library_path) catch return;
+        const path = self.allocator.dupe(u8, library_path) catch {
+            self.lock.lock();
+            self.lost = true;
+            self.lock.unlock();
+            return;
+        };
         std.log.scoped(.fs_watch).info("rescan requested for library {} ({s})", .{ library_id, library_path });
         self.push(.{ .library_id = library_id, .path = path, .deleted = false, .kind = .rescan_library });
+    }
+
+    /// Record that an event was dropped before it could be queued.
+    pub fn markLost(self: *EventQueue) void {
+        self.lock.lock();
+        self.lost = true;
+        self.lock.unlock();
+        std.log.scoped(.fs_watch).warn("event dropped (out of memory); libraries will be rescanned", .{});
+        if (self.on_dirty) |cb| cb();
+    }
+
+    /// Whether an event was dropped since the last call: the caller then
+    /// rescans every library, which finds whatever changed.
+    pub fn takeLost(self: *EventQueue) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const lost = self.lost;
+        self.lost = false;
+        return lost;
     }
 
     /// Take every queued event. The caller owns the list and each path.
@@ -102,4 +131,19 @@ test "EventQueue: push, rescan and drain hand over every event once" {
 
     // Undrained events are freed by deinit (the testing allocator checks).
     q.push(.{ .library_id = 1, .path = try a.dupe(u8, "/lib/b.png"), .deleted = true });
+}
+
+test "EventQueue: a dropped event is reported once" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var q = EventQueue.init(failing.allocator());
+    defer q.deinit();
+    const path = try std.testing.allocator.dupe(u8, "/lib/a.png");
+    // The queue can't grow: the event (and its path) is dropped and noted.
+    var fq = EventQueue.init(failing.allocator());
+    defer fq.deinit();
+    fq.push(.{ .library_id = 1, .path = path, .deleted = false });
+    try std.testing.expect(fq.takeLost());
+    try std.testing.expect(!fq.takeLost());
+    q.markLost();
+    try std.testing.expect(q.takeLost());
 }

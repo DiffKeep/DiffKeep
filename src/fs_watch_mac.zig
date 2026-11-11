@@ -230,6 +230,11 @@ pub const FsWatcher = struct {
     pub fn drainEvents(self: *FsWatcher) std.ArrayList(DirtyEvent) {
         return self.events.drain();
     }
+
+    /// Whether events were dropped since the last call (see `EventQueue.takeLost`).
+    pub fn takeLost(self: *FsWatcher) bool {
+        return self.events.takeLost();
+    }
 };
 
 // ── GCD callbacks ─────────────────────────────────────────────────────────────
@@ -370,7 +375,10 @@ fn fseventsCallback(
         const deleted = (f.item_removed or f.item_renamed) and
             std.c.access(raw_path, std.c.F_OK) != 0;
 
-        const path_copy = allocator.dupe(u8, event_path) catch continue;
+        const path_copy = allocator.dupe(u8, event_path) catch {
+            watcher.events.markLost();
+            continue;
+        };
         log.info("FSEvents: file event {s} deleted={}", .{ event_path, deleted });
         watcher.events.push(.{
             .library_id = ctx.library_id,

@@ -496,7 +496,7 @@ test "grid: empty library shows placeholder" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     g_grid_test_ptr = &grid;
@@ -520,7 +520,7 @@ test "grid: render with images doesn't crash" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
 
@@ -550,10 +550,10 @@ test "grid: autoplay renders playable cells without crashing (missing files fall
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     grid.autoplay = true;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     g_grid_test_ptr = &grid;
@@ -597,7 +597,7 @@ test "sidebar: clicking Trash / Duplicates switches the grid view" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
@@ -809,7 +809,7 @@ test "grid: incomingBelongs respects the active view filters" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     // Fully unfiltered "all images" view accepts anything.
@@ -831,7 +831,7 @@ test "grid: incomingBelongs respects the active view filters" {
     // images are withheld until the query is re-run.
     try grid.setSearchQuery("kitten");
     try std.testing.expect(!grid.incomingBelongs("/lib/cats/x.png"));
-    try grid.setSearchQuery(null);
+    grid.clearSearchQuery();
 
     // Same for an active embedding (semantic/visual) query.
     const dummy_embedding: [4]f32 = @splat(0.0);
@@ -888,24 +888,24 @@ test "grid: reloadImages reflects the active view_mode" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     // Library view: every non-trashed image, trashed one excluded.
     grid.view_mode = .library;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b, c });
 
     // Trash view: only the trashed image.
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{d});
 
     // Duplicates view: only the images that share a hash.
     grid.view_mode = .duplicates;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, b });
 }
@@ -918,12 +918,12 @@ test "grid: reloadImages resets the scroll position to the top" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     // Pretend the user had scrolled down, then switch view.
     grid.scroll_info.viewport.y = 500;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(f32, 0), grid.scroll_info.viewport.y);
 }
@@ -937,7 +937,7 @@ test "grid: a scanned image is only injected if it belongs to the current view" 
     // Empty DB → grid starts empty in the (default) library view.
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     grid.filter_library_path = "/lib";
     grid.filter_folder_path = "/lib/cats";
@@ -1008,7 +1008,7 @@ test "toolbar: sort buttons do nothing while a search is active" {
 
     // Cleared: the same buttons work again, from the settings left untouched.
     // (Move off sort-dir first, so its tooltip isn't covering sort-mode.)
-    try grid.setSearchQuery(null);
+    grid.clearSearchQuery();
     try dvui.testing.moveTo("search-box");
     try dvui.testing.settle(toolbarFrame);
     try dvui.testing.moveTo("sort-mode");
@@ -1100,12 +1100,12 @@ test "grid: favorites view lists only favorites; loaded entries carry the favori
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     // Library view: every entry carries the correct favorite flag.
     grid.view_mode = .library;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     for (grid.images.items) |e| {
         try std.testing.expectEqual(e.id == a or e.id == c, e.favorite);
@@ -1114,7 +1114,7 @@ test "grid: favorites view lists only favorites; loaded entries carry the favori
 
     // Favorites view: only favorited images, all flagged.
     grid.view_mode = .favorites;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try expectGridIds(&grid, &.{ a, c });
     for (grid.images.items) |e| try std.testing.expect(e.favorite);
@@ -1300,10 +1300,10 @@ test "grid: a load flags animated and video entries from the DB" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     grid.view_mode = .library;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     for (grid.images.items) |e| {
@@ -1630,7 +1630,7 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     grid.thumbs.noteLoadFailure(gone.id, dir ++ "/gone.png");
@@ -1638,7 +1638,7 @@ test "grid: a deleted file is removed from the DB and drained; other failures ar
 
     var drained: std.ArrayList(u64) = .empty;
     defer drained.deinit(alloc);
-    grid.thumbs.drainMissingIds(alloc, &drained);
+    _ = grid.thumbs.drainMissingIds(alloc, &drained);
     try std.testing.expectEqualSlices(u64, &.{gone.id}, drained.items);
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
 
@@ -1702,7 +1702,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     var grid = try dk.GridState.init(io, alloc, db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 2), grid.images.items.len);
 
@@ -1717,7 +1717,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     // Restore it from the trash view.
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
     grid.selection.clearRetainingCapacity();
@@ -1729,7 +1729,7 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     // Permanently delete b: file and row are gone.
     grid.view_mode = .library;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(b.id, {});
@@ -1759,9 +1759,9 @@ test "grid: background reloads apply only the latest request and keep removed im
 
     // Two requests in a row: the trash view is superseded by the library view.
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.view_mode = .library;
-    try grid.reloadImages();
+    grid.reloadImages();
     try std.testing.expect(grid.reloadPending());
     grid.awaitReload();
     try std.testing.expect(!grid.reloadPending());
@@ -1769,7 +1769,7 @@ test "grid: background reloads apply only the latest request and keep removed im
     try std.testing.expectEqual(a.id, grid.images.items[0].id);
 
     // An image removed while a load is in flight stays out of its result.
-    try grid.reloadImages();
+    grid.reloadImages();
     var ids = std.AutoHashMap(u64, void).init(alloc);
     defer ids.deinit();
     try ids.put(a.id, {});
@@ -1836,7 +1836,7 @@ test "search: a late search result or embedding can't replace a different view" 
     search.run(&grid);
     try std.testing.expect(search.isSearchLoading(&grid));
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expect(!search.isSearchLoading(&grid));
     try expectGridIds(&grid, &.{b.id});
@@ -1861,7 +1861,7 @@ test "grid: an image scanned in while a load is running survives the load" {
     // Hold the DB so the load can't finish, then let a scan report an image the
     // load's query won't contain.
     db.db_mutex.lockUncancelable(io);
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.notifier.push(io, 77, "/lib/new.png", 0);
     grid.update();
     try expectGridIds(&grid, &.{77});
@@ -2325,7 +2325,7 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
 
     var grid = try dk.GridState.init(io, alloc, db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try grid.selection.put(a.id, {});
     ops.performTrash(alloc, &grid);
@@ -2337,7 +2337,7 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
     defer b.deinit(alloc);
 
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(a.id, {});
@@ -2415,7 +2415,7 @@ test "grid: vector search results stay in relevance order, not the sort order" {
     grid.semantic_min_similarity = -1;
     for ([_]dk.image_grid.SortMode{ .date, .name, .random }) |mode| {
         grid.sort_mode = mode;
-        try grid.reloadImages();
+        grid.reloadImages();
         grid.awaitReload();
         try std.testing.expectEqual(@as(usize, 3), grid.images.items.len);
         try std.testing.expectEqual(ids[2], grid.images.items[0].id);
@@ -2454,7 +2454,7 @@ test "grid: text search results stay in rank order; sort settings return after" 
         for ([_]dk.image_grid.SortDir{ .asc, .desc }) |dir| {
             grid.sort_mode = mode;
             grid.sort_dir = dir;
-            try grid.reloadImages();
+            grid.reloadImages();
             grid.awaitReload();
             try std.testing.expectEqual(@as(usize, 3), grid.images.items.len);
             try std.testing.expectEqual(ids[1], grid.images.items[0].id);
@@ -2468,11 +2468,11 @@ test "grid: text search results stay in rank order; sort settings return after" 
     try std.testing.expect(!grid.isRelevanceRanked());
 
     // Clearing the search applies the sort settings again.
-    try grid.setSearchQuery(null);
+    grid.clearSearchQuery();
     try std.testing.expect(!grid.isRelevanceRanked());
     grid.sort_mode = .name;
     grid.sort_dir = .asc;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
     try std.testing.expectEqual(ids[0], grid.images.items[0].id);
     try std.testing.expectEqual(ids[1], grid.images.items[1].id);
@@ -2575,7 +2575,7 @@ test "scan: rows the scan removes are reported so the grid drops them" {
 
     var removed: std.ArrayList(u64) = .empty;
     defer removed.deinit(alloc);
-    fx.mgr.drainRemovedIds(io, &removed);
+    try std.testing.expect(!fx.mgr.drainRemovedIds(io, &removed));
     try std.testing.expectEqualSlices(u64, &.{a.id}, removed.items);
 }
 
@@ -2797,7 +2797,7 @@ test "image_ops: duplicate removal runs on the file-op queue and updates grid an
     }
     var grid = try dk.GridState.init(io, alloc, db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     // The user trashes b while "remove duplicates" is also asked for: both go
@@ -2858,7 +2858,7 @@ test "library_manager: files deleted on disk are removed in the background and r
 
     var removed: std.ArrayList(u64) = .empty;
     defer removed.deinit(alloc);
-    mgr.drainRemovedIds(io, &removed);
+    try std.testing.expect(!mgr.drainRemovedIds(io, &removed));
     std.mem.sort(u64, removed.items, {}, std.sort.asc(u64));
     try std.testing.expectEqualSlices(u64, &.{ a.id, b.id }, removed.items);
     try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
@@ -2946,7 +2946,7 @@ test "sidebar: folder lists load in the background; a refresh keeps the open tre
     const loader = &sb.folders.?;
 
     // Nothing is listed until the background load lands.
-    loader.request(lib_id, "/lib");
+    try std.testing.expect(loader.request(lib_id, "/lib"));
     loader.awaitIdle();
     try std.testing.expectEqual(@as(usize, 0), lib.top_folders.len);
     sb.applyFolderResults(alloc);
@@ -2957,7 +2957,7 @@ test "sidebar: folder lists load in the background; a refresh keeps the open tre
     const cats = folderNode(lib.top_folders, "/lib/cats").?;
     try std.testing.expectEqual(@as(i64, 2), cats.count);
     cats.expanded = true;
-    loader.request(lib_id, "/lib/cats");
+    try std.testing.expect(loader.request(lib_id, "/lib/cats"));
     loader.awaitIdle();
     sb.applyFolderResults(alloc);
     try std.testing.expectEqual(@as(usize, 1), cats.children.len);
@@ -2975,7 +2975,7 @@ test "sidebar: folder lists load in the background; a refresh keeps the open tre
     try std.testing.expectEqual(@as(i64, 2), cats2.children[0].count);
 
     // A list for a library that is gone is dropped (and freed).
-    loader.request(999, "/gone");
+    try std.testing.expect(loader.request(999, "/gone"));
     loader.awaitIdle();
     sb.applyFolderResults(alloc);
 }
@@ -2988,7 +2988,7 @@ test "grid: scan notifications don't pile up while another view is shown" {
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
     grid.view_mode = .trash;
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     for (0..100) |k| grid.notifier.push(io, k + 1, "/lib/x.png", 0);
@@ -3007,7 +3007,7 @@ test "grid: a thumbnail load in flight when its id is invalidated is discarded" 
 
     // A worker is decoding id 7's old file when the id is recycled.
     grid.thumbs.queue_mutex.lockUncancelable(io);
-    try grid.thumbs.in_flight.put(7, {});
+    try grid.thumbs.markInFlight(7);
     grid.thumbs.queue_mutex.unlock(io);
     grid.thumbs.invalidate(7);
 
@@ -3016,7 +3016,7 @@ test "grid: a thumbnail load in flight when its id is invalidated is discarded" 
     try std.testing.expect(grid.thumbs.pending.get(7) == null);
     // …nor may a failed old load block the new image's thumbnail.
     grid.thumbs.queue_mutex.lockUncancelable(io);
-    try grid.thumbs.in_flight.put(7, {});
+    try grid.thumbs.markInFlight(7);
     grid.thumbs.queue_mutex.unlock(io);
     grid.thumbs.invalidate(7);
     grid.thumbs.finishLoad(7, "/lib/old.png", null);
@@ -3024,7 +3024,7 @@ test "grid: a thumbnail load in flight when its id is invalidated is discarded" 
 
     // A load that wasn't invalidated is kept.
     grid.thumbs.queue_mutex.lockUncancelable(io);
-    try grid.thumbs.in_flight.put(8, {});
+    try grid.thumbs.markInFlight(8);
     grid.thumbs.queue_mutex.unlock(io);
     grid.thumbs.finishLoad(8, "/lib/new.png", try alloc.dupe(u8, "new-jpeg"));
     try std.testing.expect(grid.thumbs.pending.get(8) != null);
@@ -3069,7 +3069,7 @@ test "library_manager: removing a library stops its scan, reports its images and
     try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/data/trash/1_0.png", .{}));
     var removed: std.ArrayList(u64) = .empty;
     defer removed.deinit(alloc);
-    mgr.drainRemovedIds(io, &removed);
+    try std.testing.expect(!mgr.drainRemovedIds(io, &removed));
     try std.testing.expectEqual(@as(usize, 60), removed.items.len);
 }
 
@@ -3299,7 +3299,7 @@ test "delete dialog: confirming acts on the images chosen when it opened" {
     defer b.deinit(alloc);
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     var dlg: dk.delete_dialog.DeleteDialogState = .{};
@@ -3611,7 +3611,7 @@ test "grid: a freed thumbnail's texture is dropped before the next draw" {
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
-    try grid.reloadImages();
+    grid.reloadImages();
     grid.awaitReload();
 
     var px: [4 * 4 * 4]u8 = @splat(200);
@@ -4066,4 +4066,179 @@ test "db: upgrading drops prompt vectors that may span past the local attention 
     defer db.deinit();
     try std.testing.expect(try hasPromptVector(&db, short_id));
     try std.testing.expect(!try hasPromptVector(&db, long_id));
+}
+
+// ── Out of memory and failed loads ───────────────────────────────────────────
+
+/// An allocator that fails allocations on demand: after `skip` more, the next
+/// `n` fail. Only allocations on the thread that armed it count (so a
+/// background view load the failure starts is never the one that fails), or,
+/// with `elsewhere`, only those on other threads.
+const FailNext = struct {
+    parent: std.mem.Allocator,
+    thread: std.Thread.Id = 0,
+    elsewhere: bool = false,
+    skip: std.atomic.Value(u32) = .init(0),
+    n: std.atomic.Value(u32) = .init(0),
+
+    fn allocator(self: *FailNext) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn } };
+    }
+
+    fn arm(self: *FailNext, skip: u32, n: u32) void {
+        self.thread = std.Thread.getCurrentId();
+        self.elsewhere = false;
+        self.skip.store(skip, .release);
+        self.n.store(n, .release);
+    }
+
+    fn armElsewhere(self: *FailNext, n: u32) void {
+        self.arm(0, n);
+        self.elsewhere = true;
+    }
+
+    fn pending(self: *FailNext) u32 {
+        return self.n.load(.acquire);
+    }
+
+    /// Single-threaded per arming (the armed side), so plain decrements do.
+    fn fails(self: *FailNext) bool {
+        if (self.n.load(.acquire) == 0) return false;
+        if ((std.Thread.getCurrentId() == self.thread) == self.elsewhere) return false;
+        if (self.skip.load(.acquire) > 0) {
+            _ = self.skip.fetchSub(1, .acq_rel);
+            return false;
+        }
+        _ = self.n.fetchSub(1, .acq_rel);
+        return true;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailNext = @ptrCast(@alignCast(ctx));
+        if (self.fails()) return null;
+        return self.parent.rawAlloc(len, a, ra);
+    }
+    fn resizeFn(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FailNext = @ptrCast(@alignCast(ctx));
+        if (new_len > mem.len and self.fails()) return false;
+        return self.parent.rawResize(mem, a, new_len, ra);
+    }
+    fn remapFn(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FailNext = @ptrCast(@alignCast(ctx));
+        if (new_len > mem.len and self.fails()) return null;
+        return self.parent.rawRemap(mem, a, new_len, ra);
+    }
+    fn freeFn(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FailNext = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(mem, a, ra);
+    }
+};
+
+test "grid: a view that fails to load says so, until a load succeeds" {
+    const path = "/tmp/diffkeep_test_view_load_error.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+    const a = try makeImage(&db, lib, "/lib/a.png");
+
+    var fail: FailNext = .{ .parent = alloc };
+    var grid = try dk.GridState.init(io, fail.allocator(), &db, false, null);
+    defer grid.deinit();
+    grid.reloadImages();
+    grid.awaitReload();
+    try expectGridIds(&grid, &.{a});
+
+    // The load fails: the grid empties and keeps the error (not "no images").
+    fail.armElsewhere(1);
+    grid.reloadImages();
+    grid.awaitReload();
+    try std.testing.expectEqual(0, fail.pending());
+    try std.testing.expect(grid.load_error != null);
+    try expectGridIds(&grid, &.{});
+    {
+        g_grid_test_ptr = &grid;
+        var t = try dvui.testing.init(.{});
+        defer t.deinit();
+        try dvui.testing.settle(gridFrame);
+        try dvui.testing.expectVisible("grid-load-failed");
+        try std.testing.expect(dvui.tagGet("grid-empty") == null);
+    }
+
+    grid.reloadImages();
+    grid.awaitReload();
+    try std.testing.expect(grid.load_error == null);
+    try expectGridIds(&grid, &.{a});
+
+    // A load that can't even start says so too, and drops an older one. (A
+    // search query gives the request something to copy.)
+    try grid.setSearchQuery("a");
+    db.db_mutex.lockUncancelable(io);
+    grid.reloadImagesEx(.{ .keep_scroll = true }); // held up by the lock
+    fail.arm(0, 1);
+    grid.reloadImages();
+    try std.testing.expectEqual(0, fail.pending());
+    db.db_mutex.unlock(io);
+    grid.awaitReload();
+    try std.testing.expect(grid.load_error != null);
+    try expectGridIds(&grid, &.{});
+}
+
+test "grid: scanned images it runs out of memory taking in are reloaded from the DB" {
+    const path = "/tmp/diffkeep_test_grid_merge_oom.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+
+    var fail: FailNext = .{ .parent = alloc };
+    var grid = try dk.GridState.init(io, fail.allocator(), &db, false, null);
+    defer grid.deinit();
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(alloc);
+    try ids.append(alloc, try makeImage(&db, lib, "/lib/0.png"));
+    grid.reloadImages();
+    grid.awaitReload();
+
+    // Fail each allocation of taking in a scanned image in turn (and a re-
+    // notified one, which updates in place): whichever fails, the grid ends
+    // up exactly the DB's images, none missing and none twice.
+    var skip: u32 = 0;
+    while (true) : (skip += 1) {
+        var name_buf: [32]u8 = undefined;
+        const p = try std.fmt.bufPrint(&name_buf, "/lib/{d}.png", .{skip + 1});
+        const id = try makeImage(&db, lib, p);
+        try ids.append(alloc, id);
+        grid.notifier.push(io, id, p, 0);
+        grid.notifier.push(io, ids.items[0], "/lib/0.png", 0); // re-notified
+        fail.arm(skip, 1);
+        grid.update();
+        const failed = fail.pending() == 0;
+        fail.arm(0, 0);
+        grid.awaitReload();
+        try std.testing.expect(grid.load_error == null);
+        try expectGridIds(&grid, ids.items);
+        if (!failed) break; // past the last allocation: every one was tried
+    }
+    try std.testing.expect(skip > 2);
+}
+
+test "notifier: an image it can't pass on is reported, so the grid reloads" {
+    var fail: FailNext = .{ .parent = alloc };
+    var n: @FieldType(dk.GridState, "notifier") = .{ .allocator = fail.allocator() };
+    defer n.deinit();
+    var out: std.ArrayList(@FieldType(dk.GridState, "notifier").Entry) = .empty;
+    defer {
+        for (out.items) |e| alloc.free(e.path);
+        out.deinit(alloc);
+    }
+
+    fail.arm(0, 1);
+    n.push(io, 1, "/lib/a.png", 0);
+    try std.testing.expect(n.drain(io, alloc, &out));
+    try std.testing.expectEqual(0, out.items.len);
+
+    n.push(io, 2, "/lib/b.png", 0);
+    try std.testing.expect(!n.drain(io, alloc, &out));
+    try std.testing.expectEqual(1, out.items.len);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.image_viewer);
 const dvui = @import("dvui");
 const image_grid_mod = @import("image_grid.zig");
 const video_player_mod = @import("video_player.zig");
@@ -250,7 +251,9 @@ pub const ViewerState = struct {
 
             // Its thread is finishing; reap it once it has exited.
             if (self.cache_threads[i]) |w| {
-                self.orphan_threads.append(self.gpa, w) catch {};
+                // Out of memory it can't be reaped later: wait for it now
+                // (it is already finishing).
+                self.orphan_threads.append(self.gpa, w) catch joinWorker(self.gpa, w);
                 self.cache_threads[i] = null;
             }
             return;
@@ -1117,7 +1120,7 @@ pub const ViewerState = struct {
                 } },
                 .{ .r = img_rect, .s = s },
                 .{},
-            ) catch {};
+            ) catch |err| log.debug("render image: {} (retried next frame)", .{err});
             dvui.clipSet(prev_clip);
         } else if (self.image_failed or (self.video_failed and self.currentIsPlayable())) {
             dvui.label(@src(), "{s}", .{i18n.t(.viewer_load_failed)}, .{

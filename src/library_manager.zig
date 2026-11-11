@@ -125,6 +125,9 @@ pub const LibraryManager = struct {
     /// Image ids removed by the watcher (file deleted on disk).  Drained by frame()
     /// to drop them from the grid and viewers incrementally — no full reload.
     removed_ids: std.ArrayList(u64) = .empty,
+    /// Removed ids that couldn't be queued (out of memory): views reload from
+    /// the DB instead. Guarded by `removed_mutex`.
+    removed_lost: bool = false,
     removed_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Embedding progress counters — updated by the scan embed consumer.
     embed_done:  std.atomic.Value(u32) = .init(0),
@@ -169,13 +172,21 @@ pub const LibraryManager = struct {
     }
 
     /// Move all watcher-removed image ids into `out` (owned by `self.allocator`).
-    /// Main-thread only; called once per frame.
-    pub fn drainRemovedIds(self: *LibraryManager, io: std.Io, out: *std.ArrayList(u64)) void {
+    /// Returns true when some removals couldn't be recorded, so the views must
+    /// reload from the DB. Main-thread only; called once per frame.
+    pub fn drainRemovedIds(self: *LibraryManager, io: std.Io, out: *std.ArrayList(u64)) bool {
         self.removed_mutex.lockUncancelable(io);
         defer self.removed_mutex.unlock(io);
-        if (self.removed_ids.items.len == 0) return;
-        out.appendSlice(self.allocator, self.removed_ids.items) catch {};
+        const lost = self.removed_lost;
+        self.removed_lost = false;
+        if (self.removed_ids.items.len == 0) return lost;
+        // On failure the ids stay queued for the next frame.
+        out.appendSlice(self.allocator, self.removed_ids.items) catch |err| {
+            log.warn("drain removed ids: {}", .{err});
+            return lost;
+        };
         self.removed_ids.clearRetainingCapacity();
+        return lost;
     }
 
     /// Queue ids of rows deleted in the background for `drainRemovedIds`, and
@@ -183,7 +194,10 @@ pub const LibraryManager = struct {
     pub fn pushRemovedIds(self: *LibraryManager, io: std.Io, ids: []const u64) void {
         if (ids.len == 0) return;
         self.removed_mutex.lockUncancelable(io);
-        self.removed_ids.appendSlice(self.allocator, ids) catch {};
+        self.removed_ids.appendSlice(self.allocator, ids) catch |err| {
+            log.warn("queue removed ids: {}", .{err});
+            self.removed_lost = true;
+        };
         self.removed_mutex.unlock(io);
         if (self.wakeup_fn) |wake| wake();
     }
@@ -249,9 +263,12 @@ pub const LibraryManager = struct {
     /// Force re-parse of a single image: a file worker resets its stored
     /// mtime (so the scanner treats it as changed) and then indexes it.
     pub fn reparseImage(self: *LibraryManager, id: u64, library_id: u64, path: []const u8) void {
-        const path_owned = self.allocator.dupe(u8, path) catch return;
+        const path_owned = self.allocator.dupe(u8, path) catch |err| return log.warn("reparse: {}", .{err});
         const req: FileRequest = .{ .library_id = library_id, .path = path_owned, .reset_id = id };
-        _ = self.file_queue.pushUnique(req, FileRequest.eql) catch self.allocator.free(path_owned);
+        _ = self.file_queue.pushUnique(req, FileRequest.eql) catch |err| {
+            self.allocator.free(path_owned);
+            log.warn("reparse: {}", .{err});
+        };
     }
 
     pub const AddError = error{ LibraryExists, LibraryOverlaps };
@@ -274,7 +291,8 @@ pub const LibraryManager = struct {
         }
         const id = try self.db.storeLibrary(path);
         try self.enqueue(id, path);
-        if (self.watcher) |w| w.addLibrary(id, path) catch {};
+        if (self.watcher) |w| w.addLibrary(id, path) catch |err|
+            log.warn("watch library {s}: {} (changes show up on the next scan)", .{ path, err });
         return id;
     }
 
@@ -419,6 +437,13 @@ fn removeFilesTask(manager: *LibraryManager, io: std.Io, items: []DeletedFile) v
     defer conn.deinit();
     var removed: std.ArrayList(u64) = .empty;
     defer removed.deinit(manager.allocator);
+    // Every deleted row must be reported, or it stays in the grid: make the
+    // room before deleting any. Without it the events stay unprocessed until
+    // the next scan.
+    removed.ensureTotalCapacity(manager.allocator, items.len) catch |err| {
+        log.warn("delete task: {}", .{err});
+        return;
+    };
     // One transaction: thousands of deletions (rm -r) commit once.
     const in_tx = if (conn.db.exec("BEGIN IMMEDIATE")) |_| true else |_| false;
     for (items) |d| {
@@ -426,7 +451,7 @@ fn removeFilesTask(manager: *LibraryManager, io: std.Io, items: []DeletedFile) v
             log.warn("delete {s}: {}", .{ std.Io.Dir.path.basename(d.path), err });
             continue;
         } orelse continue;
-        removed.append(manager.allocator, id) catch {};
+        removed.appendAssumeCapacity(id);
     }
     if (in_tx) conn.db.exec("COMMIT") catch |err| {
         log.warn("delete commit: {}", .{err});

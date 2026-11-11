@@ -191,7 +191,8 @@ pub const AppState = struct {
         }
 
         const db = if (self.db) |*d| d else return;
-        try self.sidebar.loadLibraries(gpa, db);
+        // The grid's own load fails the same way and says so on screen.
+        self.sidebar.loadLibraries(gpa, db) catch |err| log.warn("library list: {}", .{err});
 
         // The grid comes first so the library manager can take its notifier.
         self.grid = try image_grid_mod.GridState.init(io, gpa, db, self.cfg.thumbnails_in_db, hooks.wakeup);
@@ -203,7 +204,7 @@ pub const AppState = struct {
         grid.visual_min_similarity = self.cfg.visual_min_similarity;
         try grid.startWorker();
         // The list loads in the background; the grid fills in when it lands.
-        try grid.reloadImages();
+        grid.reloadImages();
 
         // The watcher comes before the library manager, so it can take
         // addLibrary commands as soon as the manager exists.
@@ -239,12 +240,16 @@ pub const AppState = struct {
 
         // Register all existing libraries with the watcher.
         if (self.fs_watcher) |*watcher| {
-            const libs = db.listLibraries(gpa) catch &[_]db_mod.LibraryInfo{};
+            const libs = db.listLibraries(gpa) catch |err| blk: {
+                log.warn("libraries not watched: {}", .{err});
+                break :blk &[_]db_mod.LibraryInfo{};
+            };
             defer {
                 for (libs) |li| gpa.free(li.path);
                 gpa.free(libs);
             }
-            for (libs) |li| watcher.addLibrary(li.id, li.path) catch {};
+            for (libs) |li| watcher.addLibrary(li.id, li.path) catch |err|
+                log.warn("watch library {s}: {} (changes show up on the next scan)", .{ li.path, err });
         }
 
         self.counts = counts_mod.CountsLoader.init(gpa, io, db);
@@ -356,7 +361,7 @@ pub const AppState = struct {
             if (grid.view_mode == .favorites and !new_val) {
                 var ids = std.AutoHashMap(u64, void).init(self.gpa);
                 defer ids.deinit();
-                ids.put(id, {}) catch {};
+                ids.put(id, {}) catch return grid.reloadImagesEx(.{ .keep_scroll = true });
                 const saved_y = grid.scroll_info.viewport.y;
                 image_ops_mod.removeFromGrid(grid, &ids);
                 grid.scroll_info.viewport.y = saved_y;
@@ -460,15 +465,23 @@ pub const AppState = struct {
             // so scroll and focus are kept.
             var removed: std.ArrayList(u64) = .empty;
             defer removed.deinit(self.gpa);
-            if (self.library_manager) |*mgr| mgr.drainRemovedIds(self.io, &removed);
-            grid.thumbs.drainMissingIds(self.gpa, &removed);
+            var lost = false;
+            if (self.library_manager) |*mgr| lost = mgr.drainRemovedIds(self.io, &removed);
+            if (grid.thumbs.drainMissingIds(self.gpa, &removed)) lost = true;
             if (removed.items.len > 0) {
                 var ids = std.AutoHashMap(u64, void).init(self.gpa);
                 defer ids.deinit();
-                for (removed.items) |id| ids.put(id, {}) catch {};
-                image_ops_mod.removeFromGrid(grid, &ids);
-                self.hooks.viewers_remove(&ids);
+                if (ids.ensureTotalCapacity(@intCast(removed.items.len))) {
+                    for (removed.items) |id| ids.putAssumeCapacity(id, {});
+                    image_ops_mod.removeFromGrid(grid, &ids);
+                    self.hooks.viewers_remove(&ids);
+                } else |err| {
+                    log.warn("removed images: {}", .{err});
+                    lost = true;
+                }
             }
+            // Some removals couldn't be applied here: reload from the DB.
+            if (lost) grid.reloadImagesEx(.{ .keep_scroll = true });
             if (grid.images.items.len != prev_len) self.refreshCounts();
             self.search.applyEmbedIfDone(self.gpa, grid);
             // Finished file operations leave the grid (and viewers).
@@ -525,7 +538,10 @@ pub const AppState = struct {
         if (grid.copy_prompt_requested) {
             grid.copy_prompt_requested = false;
             // A point query on the main connection.
-            if (self.db) |*db| if (db.getPositivePromptText(self.gpa, grid.copy_prompt_id) catch null) |prompt| {
+            if (self.db) |*db| if (db.getPositivePromptText(self.gpa, grid.copy_prompt_id) catch |err| blk: {
+                log.warn("copy prompt: {}", .{err});
+                break :blk null;
+            }) |prompt| {
                 defer self.gpa.free(prompt);
                 dvui.clipboardTextSet(prompt);
             };
@@ -540,7 +556,10 @@ pub const AppState = struct {
             if (self.db) |*db| if (self.library_manager) |*mgr| {
                 // A file worker resets the image's mtime and re-reads it; the
                 // detail panel reloads once the new data lands.
-                if (db.getImageDetails(self.gpa, grid.reparse_id) catch null) |det| {
+                if (db.getImageDetails(self.gpa, grid.reparse_id) catch |err| blk: {
+                    log.warn("reparse: {}", .{err});
+                    break :blk null;
+                }) |det| {
                     var d = det;
                     defer d.deinit(self.gpa);
                     mgr.reparseImage(d.id, d.library_id, d.library_path);
@@ -551,15 +570,18 @@ pub const AppState = struct {
             grid.drag_requested = false;
             var items: std.ArrayList(DragItem) = .empty;
             defer items.deinit(self.gpa);
-            for (grid.drag_requested_ids.items) |id| {
-                const entry = grid.entryById(id) orelse continue;
-                const thumb = grid.thumbs.committed.get(id);
-                items.append(self.gpa, .{
-                    .path = entry.path,
-                    .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
-                }) catch break;
-            }
-            if (items.items.len > 0) self.hooks.start_drag(items.items);
+            // A drag of fewer files than were picked up would be wrong: none.
+            if (items.ensureTotalCapacity(self.gpa, grid.drag_requested_ids.items.len)) {
+                for (grid.drag_requested_ids.items) |id| {
+                    const entry = grid.entryById(id) orelse continue;
+                    const thumb = grid.thumbs.committed.get(id);
+                    items.appendAssumeCapacity(.{
+                        .path = entry.path,
+                        .thumb_jpeg = if (thumb) |t| t.bytes else &.{},
+                    });
+                }
+                if (items.items.len > 0) self.hooks.start_drag(items.items);
+            } else |err| log.warn("drag: {}", .{err});
             grid.drag_requested_ids.clearRetainingCapacity();
         }
     }
@@ -586,10 +608,17 @@ pub const AppState = struct {
         if (self.fs_watcher) |*watcher| {
             var new_events = watcher.drainEvents();
             defer new_events.deinit(self.gpa);
+            var lost = watcher.takeLost();
             if (new_events.items.len > 0) {
                 self.rescan_deadline_ns = std.Io.Clock.real.now(self.io).nanoseconds + 200 * std.time.ns_per_ms;
-                for (new_events.items) |ev| self.pending_file_events.add(self.gpa, ev) catch {};
+                for (new_events.items) |ev| self.pending_file_events.add(self.gpa, ev) catch |err| {
+                    log.warn("watcher event: {}", .{err});
+                    lost = true;
+                };
             }
+            // A change was dropped: a scan of every library finds it.
+            if (lost) if (self.library_manager) |*mgr|
+                mgr.scanAllLibraries() catch |err| log.warn("rescan after dropped events: {}", .{err});
         }
         if (self.rescan_deadline_ns == 0) return;
         if (std.Io.Clock.real.now(self.io).nanoseconds < self.rescan_deadline_ns) {
@@ -729,10 +758,12 @@ pub const AppState = struct {
 
     // ── Embedder loading ──────────────────────────────────────────────────
 
-    fn loadArgs(self: *AppState) EmbedderLoad.Args {
+    fn loadArgs(self: *AppState) !EmbedderLoad.Args {
+        const text_dir = if (self.cfg.text_model_dir) |d| try self.gpa.dupe(u8, d) else null;
+        errdefer if (text_dir) |d| self.gpa.free(d);
         return .{
-            .text_dir = if (self.cfg.text_model_dir) |d| self.gpa.dupe(u8, d) catch null else null,
-            .visual_dir = if (self.cfg.visual_model_dir) |d| self.gpa.dupe(u8, d) catch null else null,
+            .text_dir = text_dir,
+            .visual_dir = if (self.cfg.visual_model_dir) |d| try self.gpa.dupe(u8, d) else null,
             .gpu_backend = self.cfg.embed_gpu_backend,
             .threshold = self.cfg.embed_gpu_threshold,
         };
@@ -769,12 +800,16 @@ pub const AppState = struct {
     /// load is already running, this one starts when it finishes.
     fn startEmbedderLoad(self: *AppState) void {
         if (self.cfg.text_model_dir == null and self.cfg.visual_model_dir == null) return;
+        const args = self.loadArgs() catch |err| {
+            log.warn("embedder not loaded: {}", .{err});
+            return;
+        };
         if (self.emb_load.thread != null) {
             if (self.emb_load.pending) |old| freeLoadArgs(self.gpa, old);
-            self.emb_load.pending = self.loadArgs();
+            self.emb_load.pending = args;
             return;
         }
-        self.spawnEmbedderLoad(self.loadArgs());
+        self.spawnEmbedderLoad(args);
     }
 
     /// Unhook and free the current embedder. Scans, watcher file workers and

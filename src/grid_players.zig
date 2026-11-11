@@ -11,6 +11,7 @@
 //! `draw`, and calls `beginFrame` / `endFrame` around its rows.
 
 const std = @import("std");
+const log = std.log.scoped(.grid_players);
 const dvui = @import("dvui");
 const video_player_mod = @import("video_player.zig");
 
@@ -182,7 +183,8 @@ pub const PlayerPool = struct {
 
         for (ready.items) |rp| {
             const player = rp.player orelse {
-                if (install) self.failed.put(rp.id, {}) catch {};
+                // Without the mark the open is only retried.
+                if (install) self.failed.put(rp.id, {}) catch |err| log.warn("mark player failed: {}", .{err});
                 continue;
             };
             if (!install) { player.deinit(); continue; }
@@ -259,14 +261,19 @@ pub const PlayerPool = struct {
                 self.cond.waitUncancelable(self.io, &self.mutex);
             if (self.stop.load(.acquire)) { self.mutex.unlock(self.io); break; }
             const req = self.queue.orderedRemove(0);
-            self.in_flight.put(req.id, {}) catch {};
+            // Without the mark a second request may open it again; the extra
+            // player is discarded on arrival.
+            self.in_flight.put(req.id, {}) catch |err| log.warn("player open: {}", .{err});
             self.mutex.unlock(self.io);
 
             const player = video_player_mod.VideoPlayer.init(self.allocator, self.io, req.path_z, .{
                 .wakeup_fn = self.wakeup_fn,
                 .audio = false,
                 .max_dim = grid_player_dim,
-            }) catch null;
+            }) catch |err| blk: {
+                log.warn("grid player {s}: {}", .{ std.Io.Dir.path.basename(req.path_z), err });
+                break :blk null;
+            };
             self.allocator.free(req.path_z);
 
             self.mutex.lockUncancelable(self.io);

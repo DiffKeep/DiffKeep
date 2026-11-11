@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.delete_dialog);
 const dvui = @import("dvui");
 const i18n = @import("i18n.zig");
 const image_grid_mod = @import("image_grid.zig");
@@ -25,19 +26,29 @@ pub const DeleteDialogState = struct {
     /// Remember the grid's selection (or focused image) as the dialog's target.
     pub fn snapshot(self: *DeleteDialogState, gpa: std.mem.Allocator, grid: *const image_grid_mod.GridState) void {
         self.ids.clearRetainingCapacity();
+        // All or nothing: a dialog acting on part of what was picked would
+        // delete a different set than the user chose.
+        self.ids.ensureTotalCapacity(gpa, @max(grid.selection.count(), 1)) catch |err| {
+            log.warn("delete dialog: {}", .{err});
+            return;
+        };
         if (grid.selection.count() > 0) {
             var it = grid.selection.keyIterator();
-            while (it.next()) |id| self.ids.append(gpa, id.*) catch {};
+            while (it.next()) |id| self.ids.appendAssumeCapacity(id.*);
         } else if (grid.focused_idx) |fi| {
-            if (fi < grid.images.items.len) self.ids.append(gpa, grid.images.items[fi].id) catch {};
+            if (fi < grid.images.items.len) self.ids.appendAssumeCapacity(grid.images.items[fi].id);
         }
     }
 
     /// Select exactly the snapshotted images that are still in the grid.
     pub fn restoreSelection(self: *const DeleteDialogState, grid: *image_grid_mod.GridState) void {
         grid.selection.clearRetainingCapacity();
+        grid.selection.ensureTotalCapacity(@intCast(self.ids.items.len)) catch |err| {
+            log.warn("restore selection: {}", .{err});
+            return;
+        };
         for (self.ids.items) |id| {
-            if (grid.entryById(id) != null) grid.selection.put(id, {}) catch {};
+            if (grid.entryById(id) != null) grid.selection.putAssumeCapacity(id, {});
         }
     }
 

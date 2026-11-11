@@ -402,7 +402,11 @@ pub const Embedder = struct {
         for (paths, 0..) |p, i| {
             // Stop decoding promptly on close/cancel (decode is the slow part).
             if (stop) |s| if (s.load(.acquire)) break;
-            const t = loadImageAsTensor(allocator, p) catch continue;
+            // Not embedded; the next scan queues it again.
+            const t = loadImageAsTensor(allocator, p) catch |err| {
+                log.warn("embed {s}: {}", .{ std.Io.Dir.path.basename(p), err });
+                continue;
+            };
             batch[m] = t;
             idx[m] = i;
             m += 1;

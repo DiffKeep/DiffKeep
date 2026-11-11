@@ -193,6 +193,11 @@ pub const FsWatcher = struct {
     pub fn drainEvents(self: *FsWatcher) std.ArrayList(DirtyEvent) {
         return self.events.drain();
     }
+
+    /// Whether events were dropped since the last call (see `EventQueue.takeLost`).
+    pub fn takeLost(self: *FsWatcher) bool {
+        return self.events.takeLost();
+    }
 };
 
 /// `path` (a Win32 path, UTF-8) as a NUL-terminated UTF-16 NT object path:

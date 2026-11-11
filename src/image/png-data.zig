@@ -119,11 +119,11 @@ pub const PngParser = struct {
 
         for (self.chunks.items) |chunk| {
             if (std.mem.eql(u8, &chunk.type, &ChunkType.tEXt)) {
-                result.append(self.allocator, chunk) catch continue;
+                try result.append(self.allocator, chunk);
             }
         }
 
-        return result.toOwnedSlice(self.allocator) catch &[_]Chunk{};
+        return result.toOwnedSlice(self.allocator);
     }
 
     /// Get all iTXt chunks
@@ -133,11 +133,11 @@ pub const PngParser = struct {
 
         for (self.chunks.items) |chunk| {
             if (std.mem.eql(u8, &chunk.type, &ChunkType.iTXt)) {
-                result.append(self.allocator, chunk) catch continue;
+                try result.append(self.allocator, chunk);
             }
         }
 
-        return result.toOwnedSlice(self.allocator) catch &[_]Chunk{};
+        return result.toOwnedSlice(self.allocator);
     }
 
     /// Parse an iTXt chunk into its components

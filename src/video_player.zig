@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.video_player);
 const video = @import("video");
 const vips = @import("vips");
 const media = @import("media.zig");
@@ -128,7 +129,10 @@ pub const VideoPlayer = struct {
         // Video duration comes from a header probe; animated-image duration is the
         // sum of per-frame delays, known to the decoder.
         const duration_ms: i64 = switch (source) {
-            .video => if (video.probe(path) catch null) |i| @intFromFloat(i.duration_sec * 1000.0) else 0,
+            .video => if (video.probe(path)) |i| @intFromFloat(i.duration_sec * 1000.0) else |err| blk: {
+                log.warn("duration of {s}: {}", .{ std.Io.Dir.path.basename(path), err });
+                break :blk 0;
+            },
             .anim => |d| d.durationMs(),
         };
 

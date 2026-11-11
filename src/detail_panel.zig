@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.detail_panel);
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const bg = @import("bg.zig");
@@ -95,7 +96,10 @@ pub const DetailState = struct {
     const Load = bg.Latest(db_mod.ImageDetails, db_mod.ImageDetails.deinit);
 
     fn loadTask(_: Load.Ticket, db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64) ?db_mod.ImageDetails {
-        var conn = db.getConnection() catch return null;
+        var conn = db.getConnection() catch |err| {
+            log.warn("details connection: {}", .{err});
+            return null;
+        };
         defer conn.deinit();
         return loadDetails(&conn, gpa, io, id);
     }
@@ -177,7 +181,10 @@ pub const DetailState = struct {
 /// the file, its size and (PNG only) dimensions and raw text chunks. Does DB
 /// and file IO: call it off the main thread.
 pub fn loadDetails(db: *db_mod.VectorDb, gpa: std.mem.Allocator, io: std.Io, id: u64) ?db_mod.ImageDetails {
-    var det = (db.getImageDetails(gpa, id) catch null) orelse return null;
+    var det = (db.getImageDetails(gpa, id) catch |err| {
+        log.warn("details for {d}: {}", .{ id, err });
+        return null;
+    }) orelse return null;
     const img_path = det.library_path;
 
     if (std.Io.Dir.cwd().statFile(io, img_path, .{})) |st| {

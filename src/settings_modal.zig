@@ -126,7 +126,10 @@ const Download = struct {
             a.destroy(d);
         }
         if (!d.ok) return null;
-        return gpa.dupe(u8, d.target_dir) catch null;
+        return gpa.dupe(u8, d.target_dir) catch |err| {
+            log.warn("downloaded model {s}: {}", .{ d.target_dir, err });
+            return null;
+        };
     }
 
     fn run(d: *Download) void {
@@ -523,13 +526,24 @@ pub const SettingsModalState = struct {
                     @memcpy(buf[0..len], dir[0..len]);
                     buf[len] = 0;
                     if (!self.open) {
-                        if (@field(cfg, f[2])) |p| init.gpa.free(p);
-                        @field(cfg, f[2]) = init.gpa.dupe(u8, buf[0..len]) catch null;
-                        self.model_paths_changed = true;
+                        if (setPath(init.gpa, &@field(cfg, f[2]), buf[0..len])) self.model_paths_changed = true;
                     }
                 }
             };
         }
+    }
+
+    /// Set a config path to `value` (empty = unset). Out of memory, the old
+    /// value is kept, rather than saving the setting as cleared. Returns
+    /// whether it was set.
+    fn setPath(gpa: std.mem.Allocator, field: *?[]const u8, value: []const u8) bool {
+        const copy = if (value.len > 0) gpa.dupe(u8, value) catch |err| {
+            log.warn("setting not changed: {}", .{err});
+            return false;
+        } else null;
+        if (field.*) |old| gpa.free(old);
+        field.* = copy;
+        return true;
     }
 
     pub fn onClosed(
@@ -558,12 +572,8 @@ pub const SettingsModalState = struct {
             !std.mem.eql(u8, &self.visual_model_dir_buf, &self.model_snapshot.visual_dir);
         if (model_changed) {
             if (dvui.App.main_init) |init| {
-                if (cfg.text_model_dir) |p| init.gpa.free(p);
-                const text_str = std.mem.sliceTo(&self.text_model_dir_buf, 0);
-                cfg.text_model_dir = if (text_str.len > 0) init.gpa.dupe(u8, text_str) catch null else null;
-                if (cfg.visual_model_dir) |p| init.gpa.free(p);
-                const visual_str = std.mem.sliceTo(&self.visual_model_dir_buf, 0);
-                cfg.visual_model_dir = if (visual_str.len > 0) init.gpa.dupe(u8, visual_str) catch null else null;
+                _ = setPath(init.gpa, &cfg.text_model_dir, std.mem.sliceTo(&self.text_model_dir_buf, 0));
+                _ = setPath(init.gpa, &cfg.visual_model_dir, std.mem.sliceTo(&self.visual_model_dir_buf, 0));
             }
             self.model_paths_changed = true;
             if (cfg.prompt_embeddings or cfg.image_embeddings) need_rescan = true;
@@ -580,9 +590,7 @@ pub const SettingsModalState = struct {
         // into the config here — no live re-init or rescan.
         if (!std.mem.eql(u8, &self.data_path_buf, &self.data_path_snapshot)) {
             if (dvui.App.main_init) |init| {
-                if (cfg.data_path) |p| init.gpa.free(p);
-                const data_str = std.mem.sliceTo(&self.data_path_buf, 0);
-                cfg.data_path = if (data_str.len > 0) init.gpa.dupe(u8, data_str) catch null else null;
+                _ = setPath(init.gpa, &cfg.data_path, std.mem.sliceTo(&self.data_path_buf, 0));
             }
         }
 

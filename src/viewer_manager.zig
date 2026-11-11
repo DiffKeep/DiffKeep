@@ -104,7 +104,10 @@ pub const ViewerManager = struct {
         const use_selection = grid.selection.count() > 1;
         for (grid.images.items) |e| {
             if (use_selection and !grid.selection.contains(e.id)) continue;
-            const path_copy = init.gpa.dupe(u8, e.path) catch continue;
+            const path_copy = init.gpa.dupe(u8, e.path) catch |err| {
+                std.log.warn("viewer: {}", .{err});
+                continue;
+            };
             // Carry over trash metadata so the viewer can locate trashed files
             // (which live in <data_dir>/trash/<trash_name>, not at e.path).
             const trash_name_copy: ?[]const u8 = if (e.trash_name) |tn|

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.filter_modal);
 const dvui = @import("dvui");
 const db_mod = @import("db.zig");
 const image_grid_mod = @import("image_grid.zig");
@@ -57,7 +58,10 @@ pub const FilterModalState = struct {
             if (dvui.App.main_init) |init| {
                 self.deinit(init.gpa);
                 if (db) |d| {
-                    self.options = d.getDistinctColumnValues(init.gpa, self.kind) catch null;
+                    self.options = d.getDistinctColumnValues(init.gpa, self.kind) catch |err| blk: {
+                        log.warn("filter options: {}", .{err});
+                        break :blk null;
+                    };
                 }
             }
             self.options_kind = self.kind;
@@ -209,7 +213,7 @@ pub const FilterModalState = struct {
                     });
                     if (grid) |g| {
                         g.filters = active_filters.items;
-                        g.reloadImages() catch {};
+                        g.reloadImages();
                     }
                 }
                 self.open = false;

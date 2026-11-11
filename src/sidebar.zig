@@ -156,21 +156,18 @@ pub const SidebarState = struct {
         if (self.filter_folder) |f| gpa.free(f);
     }
 
+    /// The library list. Counts arrive from the counts loader (`applyLibraryCounts`).
     pub fn loadLibraries(self: *SidebarState, gpa: std.mem.Allocator, db: *db_mod.VectorDb) !void {
-        if (db.listLibraries(gpa)) |libs| {
-            defer {
-                for (libs) |li| gpa.free(li.path);
-                gpa.free(libs);
-            }
-            for (libs) |li| {
-                const count = db.getLibraryImageCount(li.id) catch 0;
-                try self.libraries.append(gpa, .{
-                    .id = li.id,
-                    .path = try gpa.dupe(u8, li.path),
-                    .image_count = count,
-                });
-            }
-        } else |_| {}
+        const libs = try db.listLibraries(gpa);
+        defer {
+            for (libs) |li| gpa.free(li.path);
+            gpa.free(libs);
+        }
+        try self.libraries.ensureUnusedCapacity(gpa, libs.len);
+        for (libs) |li| self.libraries.appendAssumeCapacity(.{
+            .id = li.id,
+            .path = try gpa.dupe(u8, li.path),
+        });
     }
 
     /// Show freshly loaded per-library counts (from counts.zig). An open
@@ -189,14 +186,15 @@ pub const SidebarState = struct {
     /// Queue a reload of every folder list of `lib` that is loaded.
     fn requestLoadedFolders(self: *SidebarState, lib: *LibraryState) void {
         const loader = if (self.folders) |*f| f else return;
-        loader.request(lib.id, lib.path);
+        // A refresh that can't be queued keeps the current lists.
+        _ = loader.request(lib.id, lib.path);
         requestLoadedNodes(loader, lib.id, lib.top_folders);
     }
 
     fn requestLoadedNodes(loader: *folder_loader_mod.FolderLoader, library_id: u64, nodes: []FolderNode) void {
         for (nodes) |*n| {
             if (!n.loaded) continue;
-            loader.request(library_id, n.path);
+            _ = loader.request(library_id, n.path);
             requestLoadedNodes(loader, library_id, n.children);
         }
     }
@@ -309,20 +307,27 @@ pub const SidebarState = struct {
                     node.expanded = !node.expanded;
                     if (node.expanded and !node.loaded and !node.requested) {
                         if (self.folders) |*loader| {
-                            loader.request(lib.id, node.path);
-                            node.requested = true;
+                            node.requested = loader.request(lib.id, node.path);
                         }
                     }
                 }
-                if (self.filter_folder) |f| gpa.free(f);
-                self.filter_folder = gpa.dupe(u8, node.path) catch null;
-                self.filter_library_id = lib.id;
-                if (grid) |g| {
-                    g.filter_library_id = lib.id;
-                    g.filter_folder_path = self.filter_folder;
-                    g.filter_library_path = lib.path;
-                    g.view_mode = .library;
-                    g.reloadImages() catch {};
+                select: {
+                    // Out of memory the click selects nothing, rather than
+                    // showing the whole library as if it were this folder.
+                    const folder = gpa.dupe(u8, node.path) catch |err| {
+                        log.warn("select folder: {}", .{err});
+                        break :select;
+                    };
+                    if (self.filter_folder) |f| gpa.free(f);
+                    self.filter_folder = folder;
+                    self.filter_library_id = lib.id;
+                    if (grid) |g| {
+                        g.filter_library_id = lib.id;
+                        g.filter_folder_path = self.filter_folder;
+                        g.filter_library_path = lib.path;
+                        g.view_mode = .library;
+                        g.reloadImages();
+                    }
                 }
             }
 
@@ -418,7 +423,7 @@ pub const SidebarState = struct {
                         g.filter_folder_path = null;
                         g.filter_library_path = null;
                         g.view_mode = .library;
-                        g.reloadImages() catch {};
+                        g.reloadImages();
                     }
                 }
                 style.sectionHead(@src(), i18n.t(.nav_library), .{
@@ -494,8 +499,7 @@ pub const SidebarState = struct {
                     // shown; applyLibraryCounts reloads it when counts change.
                     if (lib.expanded and !lib.top_loaded and !lib.top_requested) {
                         if (self.folders) |*loader| {
-                            loader.request(lib.id, lib.path);
-                            lib.top_requested = true;
+                            lib.top_requested = loader.request(lib.id, lib.path);
                         }
                     }
 
@@ -515,7 +519,7 @@ pub const SidebarState = struct {
                                 g.filter_folder_path = null;
                                 g.filter_library_path = lib.path;
                                 g.view_mode = .library;
-                                g.reloadImages() catch {};
+                                g.reloadImages();
                             }
                         }
                         // A library is a root, so its name gets the 500-weight
@@ -588,7 +592,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .trash) {
                         g.view_mode = .trash;
-                        g.reloadImages() catch {};
+                        g.reloadImages();
                     }
                 }
             }
@@ -622,7 +626,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .duplicates) {
                         g.view_mode = .duplicates;
-                        g.reloadImages() catch {};
+                        g.reloadImages();
                     }
                 }
             }
@@ -654,7 +658,7 @@ pub const SidebarState = struct {
                 if (grid) |g| {
                     if (g.view_mode != .favorites) {
                         g.view_mode = .favorites;
-                        g.reloadImages() catch {};
+                        g.reloadImages();
                     }
                 }
             }
@@ -735,7 +739,7 @@ pub const SidebarState = struct {
                             }
                         }
                         if (grid) |g| {
-                            g.reloadImages() catch {};
+                            g.reloadImages();
                         }
                         needs_count_refresh = true;
                     }
