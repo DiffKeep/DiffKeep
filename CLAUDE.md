@@ -48,7 +48,8 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 
 | File | Role |
 |---|---|
-| `src/app.zig` | Entry point. Owns all global state (`g_grid`, `g_db`, `g_library_manager`, `g_cfg`). Wires together dvui callbacks (`appInit`/`frame`/`appDeinit`) and renders the toolbar, left sidebar, center grid, right metadata panel, and status bar. |
+| `src/app.zig` | Entry point: the SDL window and event loop, viewer windows, native drag-and-drop, and the wakeup event. Owns one `AppState` (`g_app`) and drives it from dvui's callbacks (`appInit`/`frame`/`appDeinit`). Keep it to what needs SDL. |
+| `src/app_state.zig` | `AppState` — everything the main window holds (config, DB, grid, library manager, embedder and its loader, watcher, file ops, counts, panels, dialogs, search, filters) and its per-frame logic (`frame`: apply background results, act on grid requests, search debounce, watcher flush, render). No SDL: what needs it comes in through `Hooks`, so tests run whole frames headless. |
 | `src/image_grid.zig` | `GridState` — the grid widget: the image list, selection, keyboard navigation, view reloads (`bg.Latest`) and rendering. |
 | `src/view_query.zig` | What a view shows and how it loads, with no UI: view/search/sort types, `ImageEntry`, `ViewQuery`, `loadView`, FTS sanitising, relevance and sort order. Services and tests use it without the widget. |
 | `src/thumb_loader.zig` | `ThumbLoader` — the grid's thumbnail cache and loader threads (visible cells first; queue rebuilt each frame). A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`). |
@@ -57,9 +58,9 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/scan.zig` | `LibraryScanner` — walks a directory tree, detects new/changed/removed images (mtime-first, hash on change), generates thumbnails via libvips, and optionally runs text/image embeddings. |
 | `src/db.zig` | `VectorDb` — thin SQLite wrapper. Schema is append-only migration list. Embeds sqlite-vec for KNN vector search (768-dim float32). Supports soft-delete (trash) with 30-day auto-purge. `getConnection()` hands out per-thread handles sharing one pool. |
 | `src/embedder.zig` | `Embedder` — all embeddings via TensorPencil: EmbeddingGemma 300M (prompts), SigLIP2 visual (images) and SigLIP2 text (visual queries). Batches route to CUDA/Vulkan at or above `embed_gpu_threshold`, single items to CPU. |
-| `src/image_ops.zig` | Trash / delete / restore and bulk ops (empty trash, dedupe), all on background threads; `fileOpsPoll` / `bulkPoll` apply results each frame. |
+| `src/image_ops.zig` | `FileOps` (owned by `AppState`) — trash / delete / restore and the bulk ops (empty trash, dedupe) as jobs on one worker; `poll` applies results each frame. |
 | `src/config.zig` | `Config` struct loaded/saved as JSON in the XDG config dir (saved via temp file + rename; an unparseable file loads as defaults, kept as `.bak`). |
-| `src/counts.zig` | `CountsLoader` — sidebar/toolbar/settings counts (total, trash, duplicates, favorites, per library; DB stats on `requestStats`) loaded in the background, plus the settings' clear-cache ops (`clear`); `app.zig` `refreshCounts()` requests, `applyCounts()` shows. |
+| `src/counts.zig` | `CountsLoader` — sidebar/toolbar/settings counts (total, trash, duplicates, favorites, per library; DB stats on `requestStats`) loaded in the background, plus the settings' clear-cache ops (`clear`); `AppState.refreshCounts()` requests, `applyCounts()` shows. |
 | `src/bg.zig` | Background-task building blocks: `Latest(T)` (a newer request supersedes older ones; only the newest result is taken — grid view loads, search query embeddings, detail panel) and `WorkQueue(Item)` (FIFO drained by up to N workers — library scans, watcher file workers, file ops, folder lists, count refreshes). Use these rather than hand-writing spawn/flag/poll code. |
 | `src/folder_loader.zig` | `FolderLoader` — the sidebar's folder lists (`listImmediateSubdirs`) loaded on one background worker; `SidebarState.applyFolderResults` merges them into the tree, keeping its open folders. |
 | `src/i18n.zig` | Compile-time string table (English only so far). |
@@ -90,7 +91,7 @@ The render loop runs on the main thread and does no file or DB IO beyond small p
 5. `image_ops` runs every file operation — single-image trash/delete/restore and the bulk empty-trash / dedupe — as jobs on one worker thread, so they never race each other.
 6. `LibraryManager.flushFileEvents` removes rows for watcher-reported deletions in one background transaction; `removeLibrary` stops the library's scan and deletes its rows and trashed files in the background. Both report removed ids through `drainRemovedIds`.
 7. `counts.zig` (`CountsLoader`, also the settings' DB stats and cache clearing), `folder_loader.zig` (sidebar folder lists) and the detail panel (`DetailState`) load in the background; the viewer decodes images, and opens video/animation players, on background threads. Copy-image reads the file on a background task at copy time.
-8. The embedder is freed only after `app.zig:releaseEmbedder` has awaited every user of it (`SearchState.awaitEmbed`, `LibraryManager.quiesce`).
+8. The embedder is freed only after `AppState.releaseEmbedder` has awaited every user of it (`SearchState.awaitEmbed`, `LibraryManager.quiesce`).
 
 ### Database schema
 

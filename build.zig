@@ -43,7 +43,6 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.strip = optimize != .debug;
     exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
-    exe.root_module.addImport("known-folders", known_folders);
 
     const icons_dep = b.dependency("icons", .{ .target = target, .optimize = optimize });
     exe.root_module.link_libcpp = true;
@@ -227,6 +226,7 @@ pub fn build(b: *std.Build) !void {
         .video_lib = video_helper_lib,
         .video = video_module,
         .icons = icons_dep.module("icons"),
+        .known_folders = known_folders,
         .git_version = git_version,
     };
     try wireCore(b, exe, exe.root_module, core);
@@ -346,6 +346,7 @@ const Core = struct {
     video_lib: *std.Build.Step.Compile,
     video: *std.Build.Module,
     icons: *std.Build.Module,
+    known_folders: *std.Build.Module,
     git_version: std.Build.LazyPath,
 };
 
@@ -368,6 +369,7 @@ fn wireCore(b: *std.Build, compile: *std.Build.Step.Compile, import_mod: *std.Bu
     import_mod.addImport("vips", core.vips);
     import_mod.addImport("video", core.video);
     import_mod.addImport("icons", core.icons);
+    import_mod.addImport("known-folders", core.known_folders);
     import_mod.addAnonymousImport("git_version", .{ .root_source_file = core.git_version });
     // TensorPencil: all embeddings (EmbeddingGemma text + SigLIP2 image/text).
     try addTensorPencil(b, compile, import_mod);

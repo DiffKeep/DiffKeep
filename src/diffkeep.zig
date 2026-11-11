@@ -3,7 +3,6 @@ const db_mod = @import("db.zig");
 const image_grid_mod = @import("image_grid.zig");
 const library_manager_mod = @import("library_manager.zig");
 const models_mod = @import("models.zig");
-const embedder_mod = @import("embedder.zig");
 
 // UI modules — re-exported so the headless test build compiles and can drive
 // them. They reach the backend only through the `platform` seam, so they build
@@ -28,6 +27,7 @@ pub const vips = @import("vips");
 pub const library_manager = library_manager_mod;
 pub const counts = @import("counts.zig");
 pub const video_player = @import("video_player.zig");
+pub const app_state = @import("app_state.zig");
 
 pub const Config = config_mod.Config;
 pub const VectorDb = db_mod.VectorDb;
@@ -40,10 +40,3 @@ pub const ImageEntry = image_grid_mod.ImageEntry;
 pub const LibraryManager = library_manager_mod.LibraryManager;
 pub const Image = models_mod.Image;
 pub const Library = models_mod.Library;
-
-/// Global state — owned by app.zig in production; set by the test shim in tests.
-pub var g_cfg: Config = .{};
-pub var g_db: ?VectorDb = null;
-pub var g_grid: ?GridState = null;
-pub var g_library_manager: ?LibraryManager = null;
-pub var g_embedder: ?embedder_mod.Embedder = null;

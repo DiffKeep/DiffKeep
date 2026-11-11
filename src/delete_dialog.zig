@@ -2,6 +2,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const i18n = @import("i18n.zig");
 const image_grid_mod = @import("image_grid.zig");
+const image_ops = @import("image_ops.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 
@@ -44,8 +45,8 @@ pub const DeleteDialogState = struct {
         self: *DeleteDialogState,
         trash_enabled: bool,
         grid: ?*image_grid_mod.GridState,
-        perform_trash: *const fn (std.Io, std.mem.Allocator, *image_grid_mod.GridState) void,
-        perform_delete: *const fn (std.Io, std.mem.Allocator, *image_grid_mod.GridState) void,
+        file_ops: ?*image_ops.FileOps,
+        gpa: std.mem.Allocator,
     ) !void {
         if (!self.open) return;
 
@@ -98,10 +99,7 @@ pub const DeleteDialogState = struct {
                 else           self.skip_delete_confirm = true;
                 if (grid) |g| {
                     self.restoreSelection(g);
-                    if (dvui.App.main_init) |init| {
-                        if (permanent) perform_delete(init.io, init.gpa, g)
-                        else           perform_trash(init.io, init.gpa, g);
-                    }
+                    perform(file_ops, gpa, g, permanent);
                 }
             }
         }
@@ -115,11 +113,13 @@ pub const DeleteDialogState = struct {
             self.open = false;
             if (grid) |g| {
                 self.restoreSelection(g);
-                if (dvui.App.main_init) |init| {
-                    if (permanent) perform_delete(init.io, init.gpa, g)
-                    else           perform_trash(init.io, init.gpa, g);
-                }
+                perform(file_ops, gpa, g, permanent);
             }
         }
     }
 };
+
+fn perform(file_ops: ?*image_ops.FileOps, gpa: std.mem.Allocator, grid: *image_grid_mod.GridState, permanent: bool) void {
+    const ops = file_ops orelse return;
+    if (permanent) ops.performDelete(gpa, grid) else ops.performTrash(gpa, grid);
+}

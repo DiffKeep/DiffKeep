@@ -8,7 +8,6 @@ const image_grid_mod = @import("image_grid.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const search_mod = @import("search.zig");
-const image_ops = @import("image_ops.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 

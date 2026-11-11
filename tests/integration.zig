@@ -624,8 +624,6 @@ test "detail panel: Copy on the prompt writes it to the clipboard" {
     try std.testing.expectEqualStrings("a fluffy cat", dvui.clipboardText());
 }
 
-fn noopRefresh() void {}
-
 /// Owns every piece of app state the toolbar's RenderCtx points at, so a test
 /// can build a valid context with one struct.
 const ToolbarFix = struct {
@@ -677,7 +675,6 @@ const ToolbarFix = struct {
             .right_w = &self.right_w,
             .right_w_open = &self.right_w_open,
             .total_image_count = &self.total_image_count,
-            .on_refresh_counts = noopRefresh,
             .embedder_loading = false,
         };
     }
@@ -1610,14 +1607,15 @@ var g_ops_data_dir: ?[]const u8 = null;
 var g_ops_removed: usize = 0;
 
 fn opsNoop() void {}
-fn opsRemoved(ids: *const std.AutoHashMap(u64, void)) void {
+fn opsCounts(_: ?*anyopaque) void {}
+fn opsRemoved(_: ?*anyopaque, ids: *const std.AutoHashMap(u64, void)) void {
     g_ops_removed += ids.count();
 }
 
 /// Poll until the file-op worker has applied something (or time out).
-fn pollFileOps(grid: *dk.GridState) !void {
+fn pollFileOps(ops: *dk.image_ops.FileOps, grid: *dk.GridState) !void {
     for (0..5000) |_| {
-        if (dk.image_ops.fileOpsPoll(io, alloc, grid)) return;
+        if (ops.poll(alloc, grid)) return;
         try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
     }
     return error.FileOpTimedOut;
@@ -1638,15 +1636,14 @@ test "image_ops: trash, restore and delete run off the main thread and update th
     defer db.deinit();
     g_ops_data_dir = dir ++ "/data";
     g_ops_removed = 0;
-    dk.image_ops.init(.{
+    var ops = dk.image_ops.FileOps.init(io, .{
         .db = &g_ops_db,
         .data_dir = &g_ops_data_dir,
-        .cfg = &dk.g_cfg,
-        .on_counts_changed = opsNoop,
+        .on_counts_changed = opsCounts,
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin();
+    defer ops.deinit();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
@@ -1662,8 +1659,8 @@ test "image_ops: trash, restore and delete run off the main thread and update th
 
     // Trash a: the file moves to <data>/trash, the row is marked, the grid drops it.
     try grid.selection.put(a.id, {});
-    dk.image_ops.performTrash(io, alloc, &grid);
-    try pollFileOps(&grid);
+    ops.performTrash(alloc, &grid);
+    try pollFileOps(&ops, &grid);
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
     try std.testing.expectEqual(@as(usize, 1), g_ops_removed);
     try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/lib/a.png", .{}));
@@ -1676,8 +1673,8 @@ test "image_ops: trash, restore and delete run off the main thread and update th
     try std.testing.expectEqual(@as(usize, 1), grid.images.items.len);
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(a.id, {});
-    dk.image_ops.performRestore(io, alloc, &grid);
-    try pollFileOps(&grid);
+    ops.performRestore(alloc, &grid);
+    try pollFileOps(&ops, &grid);
     try cwd.access(io, dir ++ "/lib/a.png", .{});
     try std.testing.expectEqual(@as(i64, 0), (try db.getTrashStats()).count);
 
@@ -1687,8 +1684,8 @@ test "image_ops: trash, restore and delete run off the main thread and update th
     grid.awaitReload();
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(b.id, {});
-    dk.image_ops.performDelete(io, alloc, &grid);
-    try pollFileOps(&grid);
+    ops.performDelete(alloc, &grid);
+    try pollFileOps(&ops, &grid);
     try std.testing.expectError(error.FileNotFound, cwd.access(io, dir ++ "/lib/b.png", .{}));
     try std.testing.expectEqual(@as(i64, 1), try db.getTotalImageCount());
 }
@@ -2228,15 +2225,14 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
     const db = &g_ops_db.?;
     defer db.deinit();
     g_ops_data_dir = dir ++ "/data";
-    dk.image_ops.init(.{
+    var ops = dk.image_ops.FileOps.init(io, .{
         .db = &g_ops_db,
         .data_dir = &g_ops_data_dir,
-        .cfg = &dk.g_cfg,
-        .on_counts_changed = opsNoop,
+        .on_counts_changed = opsCounts,
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin();
+    defer ops.deinit();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var a = try db.findOrCreateImage(alloc, lib_id, dir ++ "/lib/a.png");
@@ -2247,8 +2243,8 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
     try grid.reloadImages();
     grid.awaitReload();
     try grid.selection.put(a.id, {});
-    dk.image_ops.performTrash(io, alloc, &grid);
-    try pollFileOps(&grid);
+    ops.performTrash(alloc, &grid);
+    try pollFileOps(&ops, &grid);
 
     // ComfyUI writes a new a.png, which the scan indexes as a new image.
     try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = "new" });
@@ -2260,8 +2256,8 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
     grid.awaitReload();
     grid.selection.clearRetainingCapacity();
     try grid.selection.put(a.id, {});
-    dk.image_ops.performRestore(io, alloc, &grid);
-    try pollFileOps(&grid);
+    ops.performRestore(alloc, &grid);
+    try pollFileOps(&ops, &grid);
 
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("new", try cwd.readFile(io, dir ++ "/lib/a.png", &buf));
@@ -2285,19 +2281,18 @@ test "image_ops: trashing an entry whose row is gone leaves the file alone" {
     const db = &g_ops_db.?;
     defer db.deinit();
     g_ops_data_dir = dir ++ "/data";
-    dk.image_ops.init(.{
+    var ops = dk.image_ops.FileOps.init(io, .{
         .db = &g_ops_db,
         .data_dir = &g_ops_data_dir,
-        .cfg = &dk.g_cfg,
-        .on_counts_changed = opsNoop,
+        .on_counts_changed = opsCounts,
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin();
+    defer ops.deinit();
 
     // A viewer still shows id 77 for a.png, but that row no longer exists.
-    dk.image_ops.performOnEntry(io, .{ .id = 77, .path = dir ++ "/lib/a.png", .filename = "a.png", .mtime = null }, .trash);
-    dk.image_ops.fileOpsJoin();
+    ops.performOnEntry(.{ .id = 77, .path = dir ++ "/lib/a.png", .filename = "a.png", .mtime = null }, .trash);
+    ops.queue.awaitIdle();
     try cwd.access(io, dir ++ "/lib/a.png", .{});
 }
 
@@ -2697,15 +2692,14 @@ test "image_ops: duplicate removal runs on the file-op queue and updates grid an
     defer db.deinit();
     g_ops_data_dir = dir ++ "/data";
     g_ops_removed = 0;
-    dk.image_ops.init(.{
+    var ops = dk.image_ops.FileOps.init(io, .{
         .db = &g_ops_db,
         .data_dir = &g_ops_data_dir,
-        .cfg = &dk.g_cfg,
-        .on_counts_changed = opsNoop,
+        .on_counts_changed = opsCounts,
         .on_images_removed = opsRemoved,
         .on_wakeup = opsNoop,
     });
-    defer dk.image_ops.fileOpsJoin();
+    defer ops.deinit();
 
     const lib_id = try db.storeLibrary(dir ++ "/lib");
     var ids: [2]u64 = undefined;
@@ -2724,15 +2718,15 @@ test "image_ops: duplicate removal runs on the file-op queue and updates grid an
     // The user trashes b while "remove duplicates" is also asked for: both go
     // through one queue, so b is trashed exactly once and nothing is orphaned.
     try grid.selection.put(ids[1], {});
-    dk.image_ops.performTrash(io, alloc, &grid);
-    dk.image_ops.startRemoveRedundantDuplicates(io);
-    try pollFileOps(&grid);
+    ops.performTrash(alloc, &grid);
+    ops.startRemoveRedundantDuplicates();
+    try pollFileOps(&ops, &grid);
     for (0..5000) |_| {
-        _ = dk.image_ops.fileOpsPoll(io, alloc, &grid);
-        if (!dk.image_ops.bulkActive()) break;
+        _ = ops.poll(alloc, &grid);
+        if (!ops.bulkActive()) break;
         try std.Io.sleep(io, .{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake);
     }
-    try std.testing.expect(!dk.image_ops.bulkActive());
+    try std.testing.expect(!ops.bulkActive());
     try std.testing.expectEqual(@as(i64, 1), (try db.getTrashStats()).count);
     try cwd.access(io, dir ++ "/lib/a.png", .{});
     try expectGridIds(&grid, &.{ids[0]});
@@ -3233,4 +3227,67 @@ test "delete dialog: confirming acts on the images chosen when it opened" {
     dlg.restoreSelection(&grid);
     try std.testing.expectEqual(@as(u32, 1), grid.selection.count());
     try std.testing.expect(grid.selection.contains(a.id));
+}
+
+// ── Whole app (AppState) ─────────────────────────────────────────────────────
+
+var g_app_under_test: *dk.app_state.AppState = undefined;
+
+fn appFrame() anyerror!dvui.App.Result {
+    try g_app_under_test.frame();
+    return .ok;
+}
+
+/// Run frames until `done` holds (background work lands between them).
+fn framesUntil(app: *dk.app_state.AppState, comptime done: fn (*dk.app_state.AppState) bool) !void {
+    for (0..1000) |_| {
+        try dvui.testing.settle(appFrame);
+        if (done(app)) return;
+        try std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+    }
+    return error.FramesTimedOut;
+}
+
+fn showsBothImages(app: *dk.app_state.AppState) bool {
+    return app.total_image_count == 2 and app.grid.?.images.items.len == 2;
+}
+
+fn showsNoImages(app: *dk.app_state.AppState) bool {
+    return app.grid.?.images.items.len == 0;
+}
+
+test "app: whole main-window frames run headless, from start-up to shutdown" {
+    const dir = "/tmp/diffkeep_test_app_frames";
+    const cwd = std.Io.Dir.cwd();
+    try freshDir(dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data");
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = plain_png });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/b.png", .data = plain_png });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/DiffKeep.cfg", .data = "{\"data_path\": \"" ++ dir ++ "/data/diffkeep.db\"}" });
+    try dk.vips.init();
+
+    var app: dk.app_state.AppState = undefined;
+    try app.init(io, alloc, null, .{}, try alloc.dupe(u8, dir ++ "/DiffKeep.cfg"));
+    defer app.deinit();
+    const mgr = &app.library_manager.?;
+    _ = try mgr.addLibrary(dir ++ "/lib");
+    try waitForScans(mgr);
+
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 1200, .h = 800 } });
+    defer t.deinit();
+    dk.style.install();
+    g_app_under_test = &app;
+
+    // Frames take in the scanned images and the background counts.
+    try framesUntil(&app, showsBothImages);
+
+    // A search typed into the toolbar runs after its debounce: nothing has
+    // the prompt "zzz", so the grid empties and the sort buttons go inert.
+    try dvui.testing.moveTo("search-box");
+    try dvui.testing.click(.left);
+    try dvui.testing.writeText("zzz");
+    try framesUntil(&app, showsNoImages);
+    try std.testing.expect(app.grid.?.isRelevanceRanked());
 }

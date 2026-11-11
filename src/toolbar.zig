@@ -13,14 +13,13 @@ const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
 const widgets_mod = @import("widgets.zig");
 const image_ops_mod = @import("image_ops.zig");
+const counts_mod = @import("counts.zig");
 const style = @import("style.zig");
 
 pub const left_w_min: f32 = 160;
 pub const left_w_max: f32 = 400;
 pub const right_w_min: f32 = 220;
 pub const right_w_max: f32 = 480;
-
-fn noop() void {}
 
 pub const RenderCtx = struct {
     search: *search_mod.SearchState,
@@ -42,9 +41,11 @@ pub const RenderCtx = struct {
     right_w: *f32,
     right_w_open: *f32,
     total_image_count: *i64,
-    on_refresh_counts: *const fn () void,
-    /// Settings opened: load its database stats in the background.
-    on_settings_opened: *const fn () void = noop,
+    /// Background counts; refreshed after a sidebar change, and asked for
+    /// the database stats when Settings opens. Null: nothing to refresh.
+    counts: ?*counts_mod.CountsLoader = null,
+    /// For the "working" indicator while a bulk operation runs.
+    file_ops: ?*image_ops_mod.FileOps = null,
     embedder_loading: bool,
 };
 
@@ -352,7 +353,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
 ///  * duplicates → accent (highlight) banner: move all but one of each to Trash.
 ///  * trash      → danger (err) banner: permanently empty the trash.
 /// While a bulk op runs it shows a "Working…" label in place of the button.
-fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, trash_stats: ?db_mod.TrashStats) void {
+fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, trash_stats: ?db_mod.TrashStats, bulk_active: bool) void {
     const Action = enum { dedupe, empty_trash };
     var action: Action = undefined;
     var accent: style.Color = undefined;
@@ -400,7 +401,7 @@ fn renderActionBanner(grid: *image_grid_mod.GridState, duplicate_count: i64, tra
 
     // A bulk op in flight is the machine working: amber, with the spinner that
     // says so, never a disabled-looking grey.
-    if (image_ops_mod.bulkActive()) {
+    if (bulk_active) {
         _ = dvui.spinner(@src(), .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 12, .h = 12 },
@@ -449,7 +450,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
                 ctx.trash_stats.*,
                 ctx.duplicate_count.*,
                 ctx.favorite_count.*,
-            )) ctx.on_refresh_counts();
+            )) if (ctx.counts) |c| c.request();
         }
     }
 
@@ -461,7 +462,7 @@ pub fn renderContent(ctx: RenderCtx) !void {
 
         if (ctx.grid.*) |*grid| {
             grid.trash_enabled = ctx.cfg.trash_enabled;
-            renderActionBanner(grid, ctx.duplicate_count.*, ctx.trash_stats.*);
+            renderActionBanner(grid, ctx.duplicate_count.*, ctx.trash_stats.*, if (ctx.file_ops) |o| o.bulkActive() else false);
             grid.render();
         } else {
             dvui.label(@src(), "{s}", .{i18n.t(.library_empty)}, .{
@@ -610,7 +611,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     })) {
         ctx.settings.open = !ctx.settings.open;
         if (ctx.settings.open) {
-            ctx.on_settings_opened();
+            if (ctx.counts) |c| c.requestStats();
             ctx.settings.scan_snapshot = .{
                 .thumbnails_in_db = ctx.cfg.thumbnails_in_db,
                 .prompt_embeddings = ctx.cfg.prompt_embeddings,
