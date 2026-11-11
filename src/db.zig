@@ -306,6 +306,75 @@ pub const ActiveFilter = struct {
     value: []const u8,
 };
 
+/// What a listing or search is narrowed to: a library, a folder in it, and the
+/// filter chips. Every search mode applies the same conditions
+/// (`appendScopeWhere` / `bindScope`).
+pub const Scope = struct {
+    library_id: ?u64 = null,
+    folder_path: ?[]const u8 = null,
+    filters: []const ActiveFilter = &.{},
+};
+
+/// Append ` AND ...` conditions on `images` for `scope`.
+fn appendScopeWhere(a: std.mem.Allocator, sql: *std.ArrayList(u8), scope: Scope) !void {
+    if (scope.library_id != null) try sql.appendSlice(a, " AND images.library_id = ?");
+    if (scope.folder_path != null) try sql.appendSlice(a, " AND images.library_path >= ? AND images.library_path < ?");
+    for (scope.filters) |f| {
+        if (f.column == .format) {
+            // Virtual column: match the file extension of library_path.
+            try sql.appendSlice(a, " AND LOWER(images.library_path) LIKE ?");
+        } else if (f.column == .resource_type) {
+            // "image" means non-video (includes animated); others are exact.
+            if (std.mem.eql(u8, f.value, "image"))
+                try sql.appendSlice(a, " AND images.media_type != ?")
+            else
+                try sql.appendSlice(a, " AND images.media_type = ?");
+        } else {
+            try sql.appendSlice(a, " AND images.");
+            try sql.appendSlice(a, f.column.name());
+            try sql.appendSlice(a, " = ?");
+        }
+    }
+}
+
+/// Bind `scope`'s parameters from `first`, in `appendScopeWhere`'s order.
+/// Returns the next free parameter index.
+fn bindScope(a: std.mem.Allocator, stmt: *sqlite.PreparedStatement, first: u32, scope: Scope) !u32 {
+    var param = first;
+    if (scope.library_id) |lib_id| {
+        try stmt.bind(param, lib_id);
+        param += 1;
+    }
+    if (scope.folder_path) |fp| {
+        const range = try folderRange(a, fp);
+        defer a.free(range.lo);
+        defer a.free(range.hi);
+        try stmt.bind(param, @as([]const u8, range.lo));
+        try stmt.bind(param + 1, @as([]const u8, range.hi));
+        param += 2;
+    }
+    for (scope.filters) |f| {
+        if (f.column == .format) {
+            // Build a lowercase "%.<ext>" LIKE pattern (matches LOWER(library_path)).
+            const pattern = try a.print("%.{s}", .{f.value});
+            defer a.free(pattern);
+            for (pattern) |*ch| ch.* = std.ascii.toLower(ch.*);
+            try stmt.bind(param, @as([]const u8, pattern));
+        } else if (f.column == .resource_type) {
+            // image → != 2 (non-video); animated → 1; video → 2; unknown → no match.
+            const mt: i64 = if (std.mem.eql(u8, f.value, "image")) 2
+                else if (std.mem.eql(u8, f.value, "animated")) 1
+                else if (std.mem.eql(u8, f.value, "video")) 2
+                else -1;
+            try stmt.bind(param, mt);
+        } else {
+            try stmt.bind(param, f.value);
+        }
+        param += 1;
+    }
+    return param;
+}
+
 /// One SQLite connection plus a shared pool. The handle returned by `init` owns
 /// the pool; `getConnection` hands out further handles (one per thread) that
 /// share it by pointer. Deinit every `getConnection` handle before the owner.
@@ -410,87 +479,67 @@ pub const VectorDb = struct {
 
     /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 768-dim.
     /// Results with cosine similarity below `min_similarity` are dropped (pass -1 to disable).
-    pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
-        return self.searchByEmbedding(allocator, "positive_prompt_embeddings", query, limit, min_similarity);
+    pub fn searchByPromptEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32, scope: Scope) ![]GridEntry {
+        return self.searchByEmbedding(allocator, "positive_prompt_embeddings", query, limit, min_similarity, scope);
     }
 
     /// KNN search on image_embeddings. query must be L2-normalized, 768-dim.
     /// Results with cosine similarity below `min_similarity` are dropped (pass -1 to disable).
-    pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
-        return self.searchByEmbedding(allocator, "image_embeddings", query, limit, min_similarity);
+    pub fn searchByImageEmbedding(self: *VectorDb, allocator: std.mem.Allocator, query: []const f32, limit: usize, min_similarity: f32, scope: Scope) ![]GridEntry {
+        return self.searchByEmbedding(allocator, "image_embeddings", query, limit, min_similarity, scope);
     }
 
-    /// KNN over a vec0 embedding table using the optimized MATCH path, then a
-    /// rowid join to non-trashed images preserving KNN order.
+    /// KNN over a vec0 embedding table using the optimized MATCH path,
+    /// restricted to non-trashed images in `scope`, in KNN order.
     /// The tables use the default L2 metric; since all stored vectors and the
     /// query are L2-normalized, L2 order equals cosine order and
     /// sim = 1 - d²/2 recovers cosine similarity for thresholding.
     /// `table` is a compile-time-trusted internal identifier (not user input).
-    fn searchByEmbedding(self: *VectorDb, allocator: std.mem.Allocator, comptime table: []const u8, query: []const f32, limit: usize, min_similarity: f32) ![]GridEntry {
+    fn searchByEmbedding(self: *VectorDb, allocator: std.mem.Allocator, comptime table: []const u8, query: []const f32, limit: usize, min_similarity: f32, scope: Scope) ![]GridEntry {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
+
+        // Filter first, then rank: the trash and the scope go into the KNN as
+        // `rowid IN (...)`, which sqlite-vec applies inside its scan (a bitmap
+        // per chunk), so the k nearest are the k nearest that qualify. Ranking
+        // everything and filtering afterwards lost a narrow filter's matches
+        // behind more than 4096 nearer rows it rejects.
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "SELECT rowid, distance FROM " ++ table ++
+            " WHERE vector MATCH ? AND k = ? AND rowid IN" ++
+            " (SELECT images.id FROM images WHERE images.trashed_at IS NULL");
+        try appendScopeWhere(allocator, &sql, scope);
+        try sql.appendSlice(allocator, ")");
+        var knn = try self.db.prepare(sql.items);
+        defer knn.deinit();
+        try knn.bindBlob(1, std.mem.sliceAsBytes(query));
+        try knn.bind(2, @as(i64, @intCast(@min(limit, vec0_k_max))));
+        _ = try bindScope(allocator, &knn, 3, scope);
+
+        var stmt = try self.db.prepare("SELECT library_path, mtime FROM images WHERE id = ?");
+        defer stmt.deinit();
 
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {
             for (list.items) |e| allocator.free(e.path);
             list.deinit(allocator);
         }
-        var stmt = try self.db.prepare(
-            "SELECT id, library_path, mtime FROM images WHERE id = ? AND trashed_at IS NULL",
-        );
-        defer stmt.deinit();
-        var knn = try self.db.prepare(
-            "SELECT rowid, distance FROM " ++ table ++ " WHERE vector MATCH ? AND k = ?",
-        );
-        defer knn.deinit();
-
-        // Over-fetch to absorb rows the trash filter removes. If trashed rows
-        // still leave the result short and KNN hasn't run out of neighbours
-        // above the similarity floor, re-query with a larger k and continue
-        // past the rows already checked (KNN order is stable).
-        var k: usize = @min(limit * 2, vec0_k_max);
-        var checked: usize = 0;
-        while (true) {
-            try knn.reset();
-            try knn.bindBlob(1, std.mem.sliceAsBytes(query));
-            try knn.bind(2, @as(i64, @intCast(k)));
-            var rows: usize = 0;
-            var exhausted = false;
-            while (try knn.step()) : (rows += 1) {
-                const d: f32 = @floatCast(knn.columnDouble(1));
-                const sim = 1.0 - (d * d) / 2.0;
-                // KNN returns nearest-first; the first miss ends the useful prefix.
-                if (sim < min_similarity) {
-                    exhausted = true;
-                    break;
-                }
-                if (rows < checked) continue;
-                if (list.items.len >= limit) break;
-                try stmt.reset();
-                try stmt.bind(1, knn.columnInt64(0));
-                if (!try stmt.step()) continue; // trashed or deleted
-                const id: u64 = @intCast(stmt.columnInt64(0));
-                const path = try allocator.dupe(u8, stmt.columnText(1));
-                errdefer allocator.free(path);
-                const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
-                try list.append(allocator, .{ .id = id, .path = path, .mtime = mtime });
-            }
-            if (rows < k) exhausted = true; // fewer neighbours than asked for
-            checked = rows;
-            if (list.items.len >= limit or exhausted or k >= vec0_k_max) break;
-            k = @min(k * 4, vec0_k_max);
+        while (try knn.step()) {
+            const d: f32 = @floatCast(knn.columnDouble(1));
+            // KNN returns nearest-first; the first miss ends the useful prefix.
+            if (1.0 - (d * d) / 2.0 < min_similarity) break;
+            const id = knn.columnInt64(0);
+            try stmt.reset();
+            try stmt.bind(1, id);
+            if (!try stmt.step()) continue;
+            const path = try allocator.dupe(u8, stmt.columnText(0));
+            errdefer allocator.free(path);
+            const mtime: ?i64 = if (stmt.columnIsNull(1)) null else stmt.columnInt64(1);
+            try list.append(allocator, .{ .id = @intCast(id), .path = path, .mtime = mtime });
         }
         return list.toOwnedSlice(allocator);
     }
-
-    /// RRF-merged KNN search over both prompt and image embeddings.
-    /// The two tables live in different embedding spaces, so each leg takes its
-    /// own query vector: `prompt_query` from the text-retrieval encoder
-    /// (EmbeddingGemma) and `visual_query` from the cross-modal text encoder
-    /// (SigLIP2).  Runs both KNNs independently (top `limit` each), merges via
-    /// Reciprocal Rank Fusion (k=60), and returns the top `limit` results
-    /// sorted by combined score descending.  Both vectors must be
-    /// L2-normalized, 768-dim.
     pub fn searchCombined(
         self: *VectorDb,
         allocator: std.mem.Allocator,
@@ -499,13 +548,14 @@ pub const VectorDb = struct {
         limit: usize,
         prompt_min_similarity: f32,
         visual_min_similarity: f32,
+        scope: Scope,
     ) ![]GridEntry {
-        const prompt_results = try self.searchByPromptEmbedding(allocator, prompt_query, limit, prompt_min_similarity);
+        const prompt_results = try self.searchByPromptEmbedding(allocator, prompt_query, limit, prompt_min_similarity, scope);
         defer {
             for (prompt_results) |e| allocator.free(e.path);
             allocator.free(prompt_results);
         }
-        const image_results = try self.searchByImageEmbedding(allocator, visual_query, limit, visual_min_similarity);
+        const image_results = try self.searchByImageEmbedding(allocator, visual_query, limit, visual_min_similarity, scope);
         defer {
             for (image_results) |e| allocator.free(e.path);
             allocator.free(image_results);
@@ -1194,24 +1244,8 @@ pub const VectorDb = struct {
                 " ON fts.rowid = images.id");
         }
         try sql.appendSlice(allocator, " WHERE images.trashed_at IS NULL");
-        if (library_id != null) try sql.appendSlice(allocator, " AND images.library_id = ?");
-        if (folder_path != null) try sql.appendSlice(allocator, " AND images.library_path >= ? AND images.library_path < ?");
-        for (filters) |f| {
-            if (f.column == .format) {
-                // Virtual column: match the file extension of library_path.
-                try sql.appendSlice(allocator, " AND LOWER(images.library_path) LIKE ?");
-            } else if (f.column == .resource_type) {
-                // "image" means non-video (includes animated); others are exact.
-                if (std.mem.eql(u8, f.value, "image"))
-                    try sql.appendSlice(allocator, " AND images.media_type != ?")
-                else
-                    try sql.appendSlice(allocator, " AND images.media_type = ?");
-            } else {
-                try sql.appendSlice(allocator, " AND images.");
-                try sql.appendSlice(allocator, f.column.name());
-                try sql.appendSlice(allocator, " = ?");
-            }
-        }
+        const scope: Scope = .{ .library_id = library_id, .folder_path = folder_path, .filters = filters };
+        try appendScopeWhere(allocator, &sql, scope);
         if (search_query != null) {
             try sql.appendSlice(allocator, " ORDER BY fts.rank LIMIT 10000");
         } else {
@@ -1227,37 +1261,7 @@ pub const VectorDb = struct {
             try stmt.bind(param, q);
             param += 1;
         }
-        if (library_id) |lib_id| {
-            try stmt.bind(param, lib_id);
-            param += 1;
-        }
-        if (folder_path) |fp| {
-            const range = try folderRange(allocator, fp);
-            defer allocator.free(range.lo);
-            defer allocator.free(range.hi);
-            try stmt.bind(param, @as([]const u8, range.lo));
-            try stmt.bind(param + 1, @as([]const u8, range.hi));
-            param += 2;
-        }
-        for (filters) |f| {
-            if (f.column == .format) {
-                // Build a lowercase "%.<ext>" LIKE pattern (matches LOWER(library_path)).
-                const pattern = try allocator.print("%.{s}", .{f.value});
-                defer allocator.free(pattern);
-                for (pattern) |*ch| ch.* = std.ascii.toLower(ch.*);
-                try stmt.bind(param, @as([]const u8, pattern));
-            } else if (f.column == .resource_type) {
-                // image → != 2 (non-video); animated → 1; video → 2; unknown → no match.
-                const mt: i64 = if (std.mem.eql(u8, f.value, "image")) 2
-                    else if (std.mem.eql(u8, f.value, "animated")) 1
-                    else if (std.mem.eql(u8, f.value, "video")) 2
-                    else -1;
-                try stmt.bind(param, mt);
-            } else {
-                try stmt.bind(param, f.value);
-            }
-            param += 1;
-        }
+        _ = try bindScope(allocator, &stmt, param, scope);
 
         var list: std.ArrayList(GridEntry) = .empty;
         errdefer {

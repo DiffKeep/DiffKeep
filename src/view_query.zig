@@ -136,20 +136,21 @@ fn queryEntries(db: *db_mod.VectorDb, a: std.mem.Allocator, q: ViewQuery) ![]db_
     }
     // Vector search modes, only when the needed embedding is available.
     // Combined degrades to a single-space search when only one encoder
-    // produced an embedding.
+    // produced an embedding. Every mode is narrowed like a listing.
+    const scope: db_mod.Scope = .{ .library_id = q.filter_library_id, .folder_path = q.filter_folder_path, .filters = q.filters };
     switch (q.search_mode) {
         .semantic => if (q.embeddings.prompt) |e|
-            return db.searchByPromptEmbedding(a, e, 200, q.semantic_min_similarity),
+            return db.searchByPromptEmbedding(a, e, 200, q.semantic_min_similarity, scope),
         .visual => if (q.embeddings.visual) |e|
-            return db.searchByImageEmbedding(a, e, 200, q.visual_min_similarity),
+            return db.searchByImageEmbedding(a, e, 200, q.visual_min_similarity, scope),
         .combined => {
             if (q.embeddings.prompt) |pe| {
                 if (q.embeddings.visual) |ve|
-                    return db.searchCombined(a, pe, ve, 200, q.semantic_min_similarity, q.visual_min_similarity);
-                return db.searchByPromptEmbedding(a, pe, 200, q.semantic_min_similarity);
+                    return db.searchCombined(a, pe, ve, 200, q.semantic_min_similarity, q.visual_min_similarity, scope);
+                return db.searchByPromptEmbedding(a, pe, 200, q.semantic_min_similarity, scope);
             }
             if (q.embeddings.visual) |ve|
-                return db.searchByImageEmbedding(a, ve, 200, q.visual_min_similarity);
+                return db.searchByImageEmbedding(a, ve, 200, q.visual_min_similarity, scope);
         },
         .fts => {},
     }

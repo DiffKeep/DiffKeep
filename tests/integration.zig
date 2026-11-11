@@ -413,7 +413,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
-        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0, .{});
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -426,7 +426,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q: [dim]f32 = @splat(0);
         q[12] = 1.0;
-        const hits = try db.searchByImageEmbedding(alloc, &q, 3, -1.0);
+        const hits = try db.searchByImageEmbedding(alloc, &q, 3, -1.0, .{});
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -439,7 +439,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
-        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, 0.5);
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, 0.5, .{});
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -455,7 +455,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
         pq[1] = 1.0;
         var vq: [dim]f32 = @splat(0);
         vq[12] = 1.0;
-        const hits = try db.searchCombined(alloc, &pq, &vq, 2, -1.0, -1.0);
+        const hits = try db.searchCombined(alloc, &pq, &vq, 2, -1.0, -1.0, .{});
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -469,7 +469,7 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
     {
         var q: [dim]f32 = @splat(0);
         q[1] = 1.0;
-        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0);
+        const hits = try db.searchByPromptEmbedding(alloc, &q, 3, -1.0, .{});
         defer {
             for (hits) |e| alloc.free(e.path);
             alloc.free(hits);
@@ -1804,7 +1804,7 @@ test "db: vector search fills the limit past trashed nearest neighbours" {
     q[0] = 1.0;
     // limit 2 over-fetches k = 4 at first: all four are trashed, so the search
     // must widen to reach the two live images.
-    const hits = try db.searchByPromptEmbedding(alloc, &q, 2, -1.0);
+    const hits = try db.searchByPromptEmbedding(alloc, &q, 2, -1.0, .{});
     defer {
         for (hits) |e| alloc.free(e.path);
         alloc.free(hits);
@@ -2003,9 +2003,9 @@ test "db: storing an embedding again replaces the old vector" {
 
     for ([_]bool{ true, false }) |prompt| {
         const hits = if (prompt)
-            try db.searchByPromptEmbedding(alloc, &dupVec(1), 5, 0.9)
+            try db.searchByPromptEmbedding(alloc, &dupVec(1), 5, 0.9, .{})
         else
-            try db.searchByImageEmbedding(alloc, &dupVec(1), 5, 0.9);
+            try db.searchByImageEmbedding(alloc, &dupVec(1), 5, 0.9, .{});
         defer {
             for (hits) |h| alloc.free(h.path);
             alloc.free(hits);
@@ -3831,4 +3831,139 @@ test "embedder: a video's visual-search input is its first frame" {
     // The fixture is solid red (mpeg4 at low quality: roughly).
     for ([_]usize{ 0, 224 * 112 + 112, 224 * 224 - 1 }) |p|
         try std.testing.expect(px[p * 3] > 200 and px[p * 3 + 1] < 60 and px[p * 3 + 2] < 60);
+}
+
+// ── Filters apply to every search mode ───────────────────────────────────────
+
+/// An image with a model, both embeddings near axis 0 (`off` moves it away),
+/// and a prompt containing "fox". Returns its id.
+fn searchableImage(db: *dk.VectorDb, lib: u64, path: []const u8, model: []const u8, off: f32) !u64 {
+    var img = try db.findOrCreateImage(alloc, lib, path);
+    defer img.deinit(alloc);
+    img.model = try alloc.dupe(u8, model);
+    img.positivePromptText = try alloc.dupe(u8, "a red fox");
+    try db.saveImage(&img);
+    var v: [768]f32 = @splat(0);
+    v[0] = 1.0;
+    v[1] = off;
+    const n = @sqrt(1.0 + off * off);
+    for (&v) |*x| x.* /= n;
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &v);
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &v);
+    return img.id;
+}
+
+/// The ids a view shows, sorted.
+fn viewIds(db: *dk.VectorDb, q: dk.view_query.ViewQuery) ![]u64 {
+    const v = try dk.view_query.loadView(db, alloc, q);
+    defer v.deinit(alloc);
+    const ids = try alloc.alloc(u64, v.entries.len);
+    for (v.entries, ids) |e, *id| id.* = e.id;
+    std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+    return ids;
+}
+
+test "search: filters, library and folder narrow every search mode" {
+    const path = "/tmp/diffkeep_test_search_filters.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib1 = try db.storeLibrary("/lib1");
+    const lib2 = try db.storeLibrary("/lib2");
+    const a = try searchableImage(&db, lib1, "/lib1/a.png", "m1", 0);
+    const b = try searchableImage(&db, lib1, "/lib1/sub/b.png", "m2", 0.1);
+    const c = try searchableImage(&db, lib1, "/lib1/c.mp4", "m1", 0.2);
+    try db.setMediaType(c, .video);
+    const d = try searchableImage(&db, lib2, "/lib2/d.png", "m1", 0.3);
+
+    var qv: [768]f32 = @splat(0);
+    qv[0] = 1.0;
+    const m1 = [_]dk.ActiveFilter{.{ .column = .model, .value = "m1" }};
+    const video = [_]dk.ActiveFilter{.{ .column = .resource_type, .value = "video" }};
+    const Case = struct { lib: ?u64 = null, folder: ?[]const u8 = null, filters: []const dk.ActiveFilter = &.{}, want: []const u64 };
+    const cases = [_]Case{
+        .{ .want = &.{ a, b, c, d } },
+        .{ .filters = &m1, .want = &.{ a, c, d } },
+        .{ .filters = &video, .want = &.{c} },
+        .{ .lib = lib1, .want = &.{ a, b, c } },
+        .{ .lib = lib1, .folder = "/lib1/sub", .want = &.{b} },
+        .{ .lib = lib1, .filters = &m1, .want = &.{ a, c } },
+    };
+    for ([_]dk.view_query.SearchMode{ .fts, .semantic, .visual, .combined }) |mode| {
+        for (cases) |cs| {
+            const got = try viewIds(&db, .{
+                .search_mode = mode,
+                .search_query = "fox",
+                .embeddings = .{ .prompt = &qv, .visual = &qv },
+                .semantic_min_similarity = -1,
+                .visual_min_similarity = -1,
+                .filter_library_id = cs.lib,
+                .filter_folder_path = cs.folder,
+                .filters = cs.filters,
+            });
+            defer alloc.free(got);
+            std.testing.expectEqualSlices(u64, cs.want, got) catch |err| {
+                std.debug.print("mode={s} lib={?} folder={?s} filters={d}\n", .{ @tagName(mode), cs.lib, cs.folder, cs.filters.len });
+                return err;
+            };
+        }
+    }
+}
+
+test "search: a filtered vector search looks past nearer rows the filter rejects" {
+    const path = "/tmp/diffkeep_test_search_filter_depth.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+    // 500 nearer neighbours from another model, then the 3 that match.
+    var buf: [64]u8 = undefined;
+    for (0..500) |i|
+        _ = try searchableImage(&db, lib, try std.fmt.bufPrint(&buf, "/lib/n{d}.png", .{i}), "other", 0.01);
+    var want: [3]u64 = undefined;
+    for (&want, 0..) |*id, i|
+        id.* = try searchableImage(&db, lib, try std.fmt.bufPrint(&buf, "/lib/m{d}.png", .{i}), "m1", 0.5);
+
+    var qv: [768]f32 = @splat(0);
+    qv[0] = 1.0;
+    const m1 = [_]dk.ActiveFilter{.{ .column = .model, .value = "m1" }};
+    const got = try viewIds(&db, .{
+        .search_mode = .semantic,
+        .embeddings = .{ .prompt = &qv },
+        .semantic_min_similarity = -1,
+        .filters = &m1,
+    });
+    defer alloc.free(got);
+    try std.testing.expectEqualSlices(u64, &want, got);
+}
+
+test "search: filters apply before ranking, so a rare filter still finds its nearest" {
+    // More non-matching rows than sqlite-vec will rank (4096) sit nearer the
+    // query than the two that match. Filtering the ranked list afterwards
+    // finds nothing; filtering first ranks just the two.
+    const path = "/tmp/diffkeep_test_search_prefilter.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib = try db.storeLibrary("/lib");
+    var buf: [64]u8 = undefined;
+    for (0..4100) |i|
+        _ = try searchableImage(&db, lib, try std.fmt.bufPrint(&buf, "/lib/n{d}.png", .{i}), "other", 0.01);
+    const far = try searchableImage(&db, lib, "/lib/far.png", "rare", 0.9);
+    const near = try searchableImage(&db, lib, "/lib/near.png", "rare", 0.6);
+
+    var qv: [768]f32 = @splat(0);
+    qv[0] = 1.0;
+    const rare = [_]dk.ActiveFilter{.{ .column = .model, .value = "rare" }};
+    const v = try dk.view_query.loadView(&db, alloc, .{
+        .search_mode = .semantic,
+        .embeddings = .{ .prompt = &qv },
+        .semantic_min_similarity = -1,
+        .filters = &rare,
+    });
+    defer v.deinit(alloc);
+    // Both, nearest first.
+    try std.testing.expectEqual(@as(usize, 2), v.entries.len);
+    try std.testing.expectEqual(near, v.entries[0].id);
+    try std.testing.expectEqual(far, v.entries[1].id);
 }
