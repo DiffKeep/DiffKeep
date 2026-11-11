@@ -163,20 +163,9 @@ int diffkeep_rgba_to_jpeg(
     return 0;
 }
 
-int diffkeep_image_to_rgb_square(
-    const char *filename,
-    int size,
-    void **buf,
-    size_t *len
-) {
-    VipsImage *thumb = NULL;
-    if (vips_thumbnail(filename, &thumb, size,
-            "height", size,
-            "size", VIPS_SIZE_FORCE,
-            "no_rotate", TRUE,
-            NULL) != 0)
-        return -1;
-
+/* Finish a SigLIP input: flatten alpha, force 3-band sRGB uchar, and hand the
+   packed pixels out. Takes ownership of `thumb`. */
+static int rgb_square_finish(VipsImage *thumb, void **buf, size_t *len) {
     /* Flatten alpha; we want plain RGB */
     if (vips_image_hasalpha(thumb)) {
         VipsImage *flat = NULL;
@@ -216,6 +205,46 @@ int diffkeep_image_to_rgb_square(
     *buf = pixels;
     *len = out_len;
     return 0;
+}
+
+int diffkeep_image_to_rgb_square(
+    const char *filename,
+    int size,
+    void **buf,
+    size_t *len
+) {
+    VipsImage *thumb = NULL;
+    if (vips_thumbnail(filename, &thumb, size,
+            "height", size,
+            "size", VIPS_SIZE_FORCE,
+            "no_rotate", TRUE,
+            NULL) != 0)
+        return -1;
+    return rgb_square_finish(thumb, buf, len);
+}
+
+int diffkeep_rgba_to_rgb_square(
+    const void *rgba,
+    int width,
+    int height,
+    int size,
+    void **buf,
+    size_t *len
+) {
+    /* Wraps the caller's pixels: they must outlive this call (they do: the
+       pipeline is written out before it returns). */
+    VipsImage *src = vips_image_new_from_memory(rgba, (size_t)width * (size_t)height * 4,
+                                                width, height, 4, VIPS_FORMAT_UCHAR);
+    if (!src) return -1;
+    src->Type = VIPS_INTERPRETATION_sRGB;
+    VipsImage *thumb = NULL;
+    int rc = vips_thumbnail_image(src, &thumb, size,
+            "height", size,
+            "size", VIPS_SIZE_FORCE,
+            NULL);
+    g_object_unref(src);
+    if (rc != 0) return -1;
+    return rgb_square_finish(thumb, buf, len);
 }
 
 /* ── Animated-image decoder ───────────────────────────────────────────────── */

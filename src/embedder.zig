@@ -23,6 +23,8 @@ const std = @import("std");
 const tp  = @import("TensorPencil");
 const vips = @import("vips").c;
 const config = @import("config.zig");
+const media = @import("media.zig");
+const video = @import("video");
 
 const log = std.log.scoped(.embedder);
 
@@ -341,21 +343,36 @@ pub const Embedder = struct {
 
 // ── Image loading ─────────────────────────────────────────────────────────────
 
+/// The SigLIP2 input pixels for `path`: packed RGB8, 224 x 224. Caller owns
+/// them. A video stands in with its first frame (the image loader can't open
+/// one): it gets an image embedding for visual search like any image.
+pub fn siglipPixels(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
+    var buf: ?*anyopaque = null;
+    var len: usize = 0;
+    if (media.isVideoFile(path)) {
+        // Decoded at twice the input size: plenty for a 224² squash.
+        const dec = try video.Decoder.open(path, 2 * SIGLIP_IMAGE_SIZE);
+        defer dec.close();
+        const frame = (try dec.next(allocator, null)) orelse return error.VideoDecodeFailed;
+        defer allocator.free(frame.pixels);
+        if (vips.diffkeep_rgba_to_rgb_square(frame.pixels.ptr, @intCast(frame.width), @intCast(frame.height),
+            SIGLIP_IMAGE_SIZE, &buf, &len) != 0) return error.VipsLoadFailed;
+    } else if (vips.diffkeep_image_to_rgb_square(path.ptr, SIGLIP_IMAGE_SIZE, &buf, &len) != 0)
+        return error.VipsLoadFailed;
+    defer vips.diffkeep_vips_free(buf);
+    // A real check, not an assert: ReleaseFast would compile that out and
+    // read past a buffer of any other layout.
+    if (len != SIGLIP_IMAGE_SIZE * SIGLIP_IMAGE_SIZE * 3) return error.BadPixelLayout;
+    return allocator.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]);
+}
+
 /// Decode+resize `path` to the SigLIP2 preprocessed tensor: 224², /255, mean/std
 /// 0.5, planar CHW `f32` ([3*224*224]) — exactly what TensorPencil's visual tower
 /// expects. Caller owns the result.
 fn loadImageAsTensor(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
-    var buf: ?*anyopaque = null;
-    var len: usize = 0;
-    if (vips.diffkeep_image_to_rgb_square(path.ptr, SIGLIP_IMAGE_SIZE, &buf, &len) != 0)
-        return error.VipsLoadFailed;
-    defer vips.diffkeep_vips_free(buf);
-
-    const pixels: [*]const u8 = @ptrCast(buf.?);
+    const pixels = try siglipPixels(allocator, path);
+    defer allocator.free(pixels);
     const n_pixels = SIGLIP_IMAGE_SIZE * SIGLIP_IMAGE_SIZE;
-    // A real check, not an assert: ReleaseFast would compile that out and
-    // read past a buffer of any other layout.
-    if (len != n_pixels * 3) return error.BadPixelLayout;
 
     const tensor = try allocator.alloc(f32, 3 * n_pixels);
     for (0..n_pixels) |p| {

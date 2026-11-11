@@ -3816,3 +3816,19 @@ test "video: timestamps count from the start of the clip, and seeks agree" {
     }
     try std.testing.expectEqual(@as(i64, 300), got);
 }
+
+test "embedder: a video's visual-search input is its first frame" {
+    // Videos used to get no image embedding (the image loader can't open an
+    // MP4), so every scan queued them again. Their first frame stands in.
+    const dir = "/tmp/diffkeep_test_video_siglip";
+    try freshDir(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/v.mp4", .data = tagged_mp4 });
+
+    const px = try dk.embedder.siglipPixels(alloc, dir ++ "/v.mp4");
+    defer alloc.free(px);
+    try std.testing.expectEqual(@as(usize, 224 * 224 * 3), px.len);
+    // The fixture is solid red (mpeg4 at low quality: roughly).
+    for ([_]usize{ 0, 224 * 112 + 112, 224 * 224 - 1 }) |p|
+        try std.testing.expect(px[p * 3] > 200 and px[p * 3 + 1] < 60 and px[p * 3 + 2] < 60);
+}

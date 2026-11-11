@@ -53,6 +53,11 @@ int diffkeep_load_image_rgba(
 /* Load image, center-crop to square, resize to size×size.
    Returns packed RGB uint8 (HWC, 3 bytes/pixel) of exactly size*size*3 bytes.
    Returns 0 on success; *buf is g_malloc-allocated, free with diffkeep_vips_free(). */
+/* Same as diffkeep_image_to_rgb_square, from packed RGBA8 pixels (a video
+   frame). */
+int diffkeep_rgba_to_rgb_square(const void *rgba, int width, int height, int size,
+                                void **buf, size_t *len);
+
 int diffkeep_image_to_rgb_square(
     const char *filename,
     int size,

@@ -281,6 +281,9 @@ pub fn build(b: *std.Build) !void {
     });
     bench_embed_exe.root_module.addImport("vips", vips_module);
     bench_embed_exe.root_module.linkLibrary(vips_helper_lib);
+    // The embedder decodes a video's first frame for its image embedding.
+    bench_embed_exe.root_module.addImport("video", video_module);
+    bench_embed_exe.root_module.linkLibrary(video_helper_lib);
     try addTensorPencil(b, bench_embed_exe, bench_embed_exe.root_module);
     const run_bench_embed = b.addRunArtifact(bench_embed_exe);
     run_bench_embed.addPassthruArgs();
