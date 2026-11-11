@@ -58,7 +58,8 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/embedder.zig` | `Embedder` — all embeddings via TensorPencil: EmbeddingGemma 300M (prompts), SigLIP2 visual (images) and SigLIP2 text (visual queries). Batches route to CUDA/Vulkan at or above `embed_gpu_threshold`, single items to CPU. |
 | `src/image_ops.zig` | Trash / delete / restore and bulk ops (empty trash, dedupe), all on background threads; `fileOpsPoll` / `bulkPoll` apply results each frame. |
 | `src/config.zig` | `Config` struct loaded/saved as JSON in the XDG config dir (saved via temp file + rename; an unparseable file loads as defaults, kept as `.bak`). |
-| `src/counts.zig` | `CountsLoader` — sidebar/toolbar counts (total, trash, duplicates, favorites, per library) loaded in the background; `app.zig` `refreshCounts()` requests, `applyCounts()` shows. |
+| `src/counts.zig` | `CountsLoader` — sidebar/toolbar/settings counts (total, trash, duplicates, favorites, per library; DB stats on `requestStats`) loaded in the background, plus the settings' clear-cache ops (`clear`); `app.zig` `refreshCounts()` requests, `applyCounts()` shows. |
+| `src/folder_loader.zig` | `FolderLoader` — the sidebar's folder lists (`listImmediateSubdirs`) loaded on one background worker; `SidebarState.applyFolderResults` merges them into the tree, keeping its open folders. |
 | `src/i18n.zig` | Compile-time string table (English only so far). |
 | `src/app_icons.zig` | Vendored TVG icons. The `icons` package's heroicons/solid set is broken (stored as hollow strokes), so the favorite star lives in `src/icons/` instead. Don't use `icons.tvg.heroicons.solid.*`. |
 | `src/models.zig` | Shared data structs (`Library`, `Image`). |
@@ -81,13 +82,13 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 ### Threading model
 
 The render loop runs on the main thread and does no file or DB IO beyond small point queries. Background work, each waking the render loop via a custom SDL event (`g_wakeup_event_type`):
-1. `LibraryManager` dispatches `std.Io` concurrent tasks for library scans. Each scan produces thumbnail bytes and embeddings, then calls `ImageNotifier` to push new IDs.
+1. `LibraryManager` dispatches `std.Io` concurrent tasks for library scans. Each scan produces thumbnail bytes and embeddings, then calls `ImageNotifier` to push new IDs. Watcher-reported new/changed files go to a queue drained by at most `max_file_workers` file workers.
 2. `GridState` worker threads load thumbnails from disk/DB. A thumbnail that fails because its file was deleted outside the app removes the row (`noteLoadFailure`).
 3. `GridState.reloadImages` loads a view (list + favorites + media types) as a background task on the grid's own connection (`view_db`); `update()` swaps in the newest result. Tests call `awaitReload()`.
 4. `SearchState` (`search.zig`) embeds queries and runs searches as background tasks, through the same `image_grid.loadView`. A query embedding is delivered under a mutex tagged with its generation; only the latest is applied.
 5. `image_ops` runs every file operation — single-image trash/delete/restore and the bulk empty-trash / dedupe — as jobs on one worker thread, so they never race each other.
 6. `LibraryManager.flushFileEvents` removes rows for watcher-reported deletions in one background transaction; `removeLibrary` stops the library's scan and deletes its rows and trashed files in the background. Both report removed ids through `drainRemovedIds`.
-7. `counts.zig` (`CountsLoader`) and the detail panel (`DetailState`) load in the background; the viewer decodes images, and opens video/animation players, on background threads.
+7. `counts.zig` (`CountsLoader`, also the settings' DB stats and cache clearing), `folder_loader.zig` (sidebar folder lists) and the detail panel (`DetailState`) load in the background; the viewer decodes images, and opens video/animation players, on background threads. Copy-image reads the file on a background task at copy time.
 8. The embedder is freed only after `app.zig:releaseEmbedder` has awaited every user of it (`SearchState.awaitEmbed`, `LibraryManager.quiesce`).
 
 ### Database schema

@@ -233,3 +233,13 @@ if (result.term != .Exited or result.term.Exited != 0) { ... }
 // New (0.16.0)
 if (result.term != .exited or result.term.exited != 0) { ... }
 ```
+
+## `std.EnumSet.initEmpty()` / `initFull()` are now `.empty` / `.full`
+
+```zig
+// Old
+var set = std.EnumSet(E).initEmpty();
+
+// New (0.17.0)
+var set: std.EnumSet(E) = .empty;
+```

@@ -57,6 +57,7 @@ fn wakeupFrame() void {
 var g_db_stats: ?db_mod.DbStats = null;
 var g_trash_stats: ?db_mod.TrashStats = null;
 var g_duplicate_count: i64 = 0;
+var g_redundant_duplicate_count: i64 = 0;
 var g_favorite_count: i64 = 0;
 var g_total_image_count: i64 = 0;
 
@@ -97,6 +98,11 @@ fn refreshCounts() void {
     if (g_counts) |*c| c.request();
 }
 
+/// Ask for the settings' database stats (with fresh counts).
+fn refreshStats() void {
+    if (g_counts) |*c| c.requestStats();
+}
+
 /// Main thread, each frame: show counts a background load has finished.
 fn applyCounts() void {
     const loader = if (g_counts) |*c| c else return;
@@ -105,31 +111,27 @@ fn applyCounts() void {
     g_total_image_count = c.total;
     g_trash_stats = c.trash;
     g_duplicate_count = c.duplicates;
+    g_redundant_duplicate_count = c.redundant_duplicates;
+    if (c.db_stats) |st| g_db_stats = st;
     g_favorite_count = c.favorites;
-    if (dvui.App.main_init) |init| g_sidebar.applyLibraryCounts(init.gpa, c.libraries);
+    g_sidebar.applyLibraryCounts(c.libraries);
 }
 
 /// Toggle an image's favorite flag (raised from the grid star or the viewer
 /// toolbar). Writes the DB, reflects it live in the grid and any open viewers,
-/// and refreshes the sidebar count.
-fn toggleFavorite(id: u64) void {
+/// and refreshes the sidebar count. `path` and `current` come from the entry
+/// the user acted on; the update only applies if the row is still that file
+/// (ids are recycled).
+fn toggleFavorite(id: u64, path: []const u8, current: bool) void {
     const init = dvui.App.main_init orelse return;
     const db = if (dk.g_db) |*d| d else return;
+    const new_val = !current;
 
-    // New state = inverse of the current cached flag (grid first, else viewers).
-    var new_val = true;
-    var found = false;
-    if (dk.g_grid) |*grid| {
-        for (grid.images.items) |e| {
-            if (e.id == id) { new_val = !e.favorite; found = true; break; }
-        }
-    }
-    if (!found) new_val = !g_viewer_manager.favoriteState(id);
-
-    db.setFavorite(id, new_val) catch |err| {
+    const matched = db.setFavorite(id, path, new_val) catch |err| {
         log.warn("setFavorite {d}: {}", .{ id, err });
         return;
     };
+    if (!matched) return; // the row is gone; a pending reload drops the entry
 
     if (dk.g_grid) |*grid| {
         for (grid.images.items) |*e| {
@@ -303,6 +305,7 @@ fn appInit(win: *dvui.Window) !void {
             dk.g_library_manager = library_manager_mod.LibraryManager.init(init.gpa, db, dk.g_cfg.thumbnails_in_db, dk.g_cfg.prompt_embeddings, dk.g_cfg.image_embeddings, notifier, watcher_ptr);
             g_search.wakeup_fn = wakeupFrame;
             g_sidebar.wakeup_fn = wakeupFrame;
+            g_sidebar.initFolderLoader(init.gpa, init.io, db);
             g_detail.wakeup_fn = wakeupFrame;
             if (dk.g_library_manager) |*mgr| mgr.data_dir = g_data_dir;
 
@@ -406,12 +409,15 @@ fn appDeinit() void {
     timer.lap("grid");
     if (g_counts) |*c| c.deinit();
     g_counts = null;
+    // These await their background loads, which use the DB: before it closes.
+    if (dvui.App.main_init) |init| {
+        g_detail.deinit(init.gpa);
+        g_sidebar.deinit(init.gpa);
+    }
     vips_mod.deinit();
     if (dk.g_db) |*database| database.deinit();
     timer.lap("vips + db");
     if (dvui.App.main_init) |init| {
-        g_detail.deinit(init.gpa);
-        g_sidebar.deinit(init.gpa);
         g_delete_dialog.deinit(init.gpa);
         if (g_config) |cfg_path| {
             config_mod.save(dk.g_cfg, init.io, cfg_path) catch |err| {
@@ -557,11 +563,11 @@ fn frame() !dvui.App.Result {
         }
         if (grid.favorite_toggle_id) |id| {
             grid.favorite_toggle_id = null;
-            toggleFavorite(id);
+            if (grid.entryById(id)) |e| toggleFavorite(e.id, e.path, e.favorite);
         }
         if (grid.dedupe_requested) {
             grid.dedupe_requested = false;
-            if (dk.g_db) |*db| g_pending_bulk_count = db.getRedundantDuplicateCount() catch 0;
+            g_pending_bulk_count = g_redundant_duplicate_count;
             if (g_pending_bulk_count > 0) g_pending_bulk = .dedupe;
         }
         if (grid.empty_trash_requested or g_settings.empty_trash_requested) {
@@ -724,6 +730,7 @@ fn frame() !dvui.App.Result {
         .right_w_open = &g_right_w_open,
         .total_image_count = &g_total_image_count,
         .on_refresh_counts = refreshCounts,
+        .on_settings_opened = refreshStats,
         .embedder_loading = g_embedder_thread != null,
     };
     toolbar_mod.renderToolbar(render_ctx);
@@ -733,8 +740,12 @@ fn frame() !dvui.App.Result {
     // ── Settings modal ────────────────────────────────────────────────────────
     const settings_was_open = g_settings.open;
     try g_settings.render(&dk.g_cfg, &g_db_stats, &g_trash_stats, g_data_dir,
-        if (dk.g_db) |*db| db else null,
+        dk.g_db != null,
         wakeupFrame);
+    if (g_settings.clear_requested) |cache| {
+        g_settings.clear_requested = null;
+        if (g_counts) |*c| c.clear(cache);
+    }
     if (settings_was_open and !g_settings.open) {
         g_settings.onClosed(&dk.g_cfg, &dk.g_library_manager, &g_search);
         if (dk.g_grid) |*grid| grid.thumbnails_in_db.store(dk.g_cfg.thumbnails_in_db, .release);
@@ -1194,7 +1205,7 @@ pub fn main(init: std.process.Init) !void {
 
             if (vw.state.favorite_toggle_requested) {
                 vw.state.favorite_toggle_requested = false;
-                if (vw.state.currentImage()) |img| toggleFavorite(img.id);
+                if (vw.state.currentImage()) |img| toggleFavorite(img.id, img.path, img.favorite);
             }
 
             if (vw.state.delete_confirmed) {

@@ -1423,14 +1423,18 @@ pub const VectorDb = struct {
     }
 
     /// Set (or clear) an image's favorite flag.
-    pub fn setFavorite(self: *VectorDb, id: u64, favorite: bool) !void {
+    /// Set the favorite flag of image `id`, only if it is still at `path`
+    /// (ids are recycled). Returns whether a row matched.
+    pub fn setFavorite(self: *VectorDb, id: u64, path: []const u8, favorite: bool) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        var stmt = try self.db.prepare("UPDATE images SET favorite = ? WHERE id = ?");
+        var stmt = try self.db.prepare("UPDATE images SET favorite = ? WHERE id = ? AND library_path = ?");
         defer stmt.deinit();
         try stmt.bind(1, @as(i64, if (favorite) 1 else 0));
         try stmt.bind(2, id);
+        try stmt.bind(3, path);
         _ = try stmt.step();
+        return sqlite.c.sqlite3_changes(self.db.db) > 0;
     }
 
     /// Number of favorited, non-trashed images (for the sidebar badge).

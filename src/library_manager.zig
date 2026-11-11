@@ -60,6 +60,17 @@ pub const PendingFileEvents = struct {
     }
 };
 
+/// A new or changed file waiting for a file worker.
+const FileRequest = struct {
+    library_id: u64,
+    path: []const u8, // owned
+};
+
+/// At most this many file workers index watcher-reported files at once, so a
+/// burst of thousands of new files can't spawn thousands of tasks (each with
+/// its own DB connection).
+pub const max_file_workers = 4;
+
 const ScanRequest = struct {
     library_id: u64,
     library_path: []const u8, // owned; freed by drain worker
@@ -91,8 +102,13 @@ pub const LibraryManager = struct {
     /// Embedding progress counters — updated by the scan embed consumer.
     embed_done:  std.atomic.Value(u32) = .init(0),
     embed_total: std.atomic.Value(u32) = .init(0),
-    /// Separate io group for single-file processing tasks spawned by the watcher.
+    /// Separate io group for the file workers and deletion/removal tasks.
     file_group: std.Io.Group,
+    /// New or changed files for the file workers, oldest first. Guarded by
+    /// `file_mutex`, as is `file_workers` (workers running).
+    file_queue: std.ArrayList(FileRequest) = .empty,
+    file_workers: u32 = 0,
+    file_mutex: std.Io.Mutex = .init,
     embedder: ?*embedder_mod.Embedder = null,  // borrowed from dk.g_embedder, not owned
     /// The app's data dir (holds `trash/`); needed to delete a removed
     /// library's trashed files. Borrowed.
@@ -129,6 +145,8 @@ pub const LibraryManager = struct {
         for (self.pending.items) |req| self.allocator.free(req.library_path);
         self.pending.deinit(self.allocator);
         self.queue_mutex.unlock(io);
+        for (self.file_queue.items) |req| self.allocator.free(req.path);
+        self.file_queue.deinit(self.allocator);
         self.removed_ids.deinit(self.allocator);
     }
 
@@ -187,24 +205,40 @@ pub const LibraryManager = struct {
     }
 
     /// (Re)index one new or changed file in the background. `path` is
-    /// heap-allocated and owned by this call (freed when the task completes).
-    /// Deletions go through `flushFileEvents`.
+    /// heap-allocated and owned by this call. The file joins a queue drained by
+    /// up to `max_file_workers` workers; a file already queued isn't queued
+    /// again. Deletions go through `flushFileEvents`.
     pub fn processFileEvent(
         self: *LibraryManager,
         io: std.Io,
         library_id: u64,
         path: []const u8,
     ) void {
-        const ctx = FileEventCtx{
-            .manager = self,
-            .io = io,
-            .library_id = library_id,
-            .path = path,
-        };
-        self.file_group.concurrent(io, processFileEventTask, .{ctx}) catch |err| {
-            log.warn("spawn file event task: {}", .{err});
+        self.file_mutex.lockUncancelable(io);
+        defer self.file_mutex.unlock(io);
+        for (self.file_queue.items) |req| {
+            if (req.library_id == library_id and std.mem.eql(u8, req.path, path)) {
+                self.allocator.free(path);
+                return;
+            }
+        }
+        self.file_queue.append(self.allocator, .{ .library_id = library_id, .path = path }) catch {
             self.allocator.free(path);
+            return;
         };
+        self.startFileWorkersLocked(io);
+    }
+
+    /// Start workers for the queued files, up to `max_file_workers`. Caller
+    /// holds `file_mutex`.
+    fn startFileWorkersLocked(self: *LibraryManager, io: std.Io) void {
+        while (self.file_workers < max_file_workers and self.file_workers < self.file_queue.items.len) {
+            self.file_group.concurrent(io, fileWorker, .{ self, io }) catch |err| {
+                log.warn("spawn file worker: {}", .{err});
+                return;
+            };
+            self.file_workers += 1;
+        }
     }
 
     /// Queue a full scan of one library, to reconcile changes the watcher can
@@ -323,6 +357,18 @@ pub const LibraryManager = struct {
         self.scan_group = .init;
         self.file_group = .init;
         self.stop_scan.store(false, .release);
+        // File workers stop early when told to; pick their queue up again.
+        self.file_mutex.lockUncancelable(io);
+        if (drop) |id| {
+            var i: usize = 0;
+            while (i < self.file_queue.items.len) {
+                if (self.file_queue.items[i].library_id == id) {
+                    self.allocator.free(self.file_queue.orderedRemove(i).path);
+                } else i += 1;
+            }
+        }
+        self.startFileWorkersLocked(io);
+        self.file_mutex.unlock(io);
         self.queue_mutex.lockUncancelable(io);
         if (drop) |id| dropPending(self, id);
         const resume_scans = self.pending.items.len > 0 and !self.scan_active.load(.acquire);
@@ -450,34 +496,43 @@ fn removeFilesTask(manager: *LibraryManager, io: std.Io, items: []DeletedFile) v
     manager.pushRemovedIds(io, removed.items);
 }
 
-const FileEventCtx = struct {
-    manager: *LibraryManager,
-    io: std.Io,
-    library_id: u64,
-    path: []const u8, // owned; freed here
-};
-
-fn processFileEventTask(ctx: FileEventCtx) void {
-    defer ctx.manager.allocator.free(ctx.path);
-    var file_db = ctx.manager.db.getConnection() catch |err| {
-        log.warn("file event db connection: {}", .{err});
+/// Index queued files one at a time on one connection until the queue is
+/// empty or the manager is told to stop (shutdown, `quiesce`); a stopped
+/// worker leaves the rest queued.
+fn fileWorker(manager: *LibraryManager, io: std.Io) void {
+    var file_db = manager.db.getConnection() catch |err| {
+        log.warn("file worker db connection: {}", .{err});
+        manager.file_mutex.lockUncancelable(io);
+        manager.file_workers -= 1;
+        manager.file_mutex.unlock(io);
         return;
     };
     defer file_db.deinit();
-    var scanner = scan_mod.LibraryScanner.init(ctx.manager.allocator, &file_db, ctx.manager.notifier);
+    var scanner = scan_mod.LibraryScanner.init(manager.allocator, &file_db, manager.notifier);
     defer scanner.deinit();
-    scanner.embedder = ctx.manager.embedder;
-    scanner.processSingleFile(
-        ctx.io,
-        ctx.library_id,
-        ctx.path,
-        &ctx.manager.stop_scan,
-        ctx.manager.thumbnails_in_db,
-        ctx.manager.prompt_embeddings,
-        ctx.manager.image_embeddings,
-    );
-    // Wake the render loop so grid.update() drains the notifier and shows the new image.
-    if (ctx.manager.wakeup_fn) |wake| wake();
+    scanner.embedder = manager.embedder;
+    while (true) {
+        manager.file_mutex.lockUncancelable(io);
+        if (manager.stop_scan.load(.acquire) or manager.file_queue.items.len == 0) {
+            manager.file_workers -= 1;
+            manager.file_mutex.unlock(io);
+            return;
+        }
+        const req = manager.file_queue.orderedRemove(0);
+        manager.file_mutex.unlock(io);
+        defer manager.allocator.free(req.path);
+        scanner.processSingleFile(
+            io,
+            req.library_id,
+            req.path,
+            &manager.stop_scan,
+            manager.thumbnails_in_db,
+            manager.prompt_embeddings,
+            manager.image_embeddings,
+        );
+        // Wake the render loop so grid.update() drains the notifier and shows the new image.
+        if (manager.wakeup_fn) |wake| wake();
+    }
 }
 
 fn drainQueue(manager: *LibraryManager, io: std.Io) void {

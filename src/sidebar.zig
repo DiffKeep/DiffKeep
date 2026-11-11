@@ -8,6 +8,7 @@ const app_icons = @import("app_icons.zig");
 const platform = @import("platform.zig");
 const library_manager_mod = @import("library_manager.zig");
 const counts_mod = @import("counts.zig");
+const folder_loader_mod = @import("folder_loader.zig");
 const image_grid_mod = @import("image_grid.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
@@ -60,6 +61,7 @@ pub const LibraryState = struct {
     expanded: bool = false,
     top_folders: []FolderNode = &.{}, // immediate subdirs of library root; owned
     top_loaded: bool = false,
+    top_requested: bool = false, // a background load of `top_folders` is queued
 
     pub fn deinit(self: *LibraryState, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -73,6 +75,7 @@ pub const FolderNode = struct {
     has_children: bool = false, // whether this folder has subdirectories (known before expanding)
     children: []FolderNode = &.{}, // heap-allocated; empty until loaded
     loaded: bool = false,
+    requested: bool = false, // a background load of `children` is queued
     expanded: bool = false,
 };
 
@@ -84,16 +87,41 @@ pub fn freeFolderNodes(allocator: std.mem.Allocator, nodes: []FolderNode) void {
     if (nodes.len > 0) allocator.free(nodes);
 }
 
-fn loadTopFolders(gpa: std.mem.Allocator, db: *db_mod.VectorDb, lib: *LibraryState) void {
-    lib.top_loaded = true;
-    const subs = db.listImmediateSubdirs(gpa, lib.id, lib.path) catch return;
-    defer gpa.free(subs);
-    const nodes = gpa.alloc(FolderNode, subs.len) catch {
-        for (subs) |s| gpa.free(s.path);
-        return;
+/// Build the new list of folder rows from a fresh load, carrying each
+/// folder's expanded state and loaded children over from `old` by path, so a
+/// refresh doesn't collapse the tree. Takes ownership of `fresh` (and its
+/// paths) and frees `old`; on failure `old` is left as it was.
+fn mergeFolders(gpa: std.mem.Allocator, old: []FolderNode, fresh: []folder_loader_mod.FolderCount) ![]FolderNode {
+    const nodes = gpa.alloc(FolderNode, fresh.len) catch |err| {
+        for (fresh) |f| gpa.free(f.path);
+        gpa.free(fresh);
+        return err;
     };
-    for (subs, nodes) |s, *n| n.* = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
-    lib.top_folders = nodes;
+    for (fresh, nodes) |f, *n| {
+        n.* = .{ .path = f.path, .count = f.count, .has_children = f.has_children };
+        for (old) |*o| {
+            if (!std.mem.eql(u8, o.path, f.path)) continue;
+            n.expanded = o.expanded;
+            n.loaded = o.loaded;
+            n.requested = o.requested;
+            n.children = o.children;
+            o.children = &.{};
+            break;
+        }
+    }
+    gpa.free(fresh);
+    freeFolderNodes(gpa, old);
+    return nodes;
+}
+
+/// The node for folder `path` in `nodes`' subtree, if it is there.
+fn findFolder(nodes: []FolderNode, path: []const u8) ?*FolderNode {
+    for (nodes) |*n| {
+        if (std.mem.eql(u8, n.path, path)) return n;
+        if (std.mem.startsWith(u8, path, n.path) and path.len > n.path.len and path[n.path.len] == '/')
+            return findFolder(n.children, path);
+    }
+    return null;
 }
 
 pub const SidebarState = struct {
@@ -112,8 +140,17 @@ pub const SidebarState = struct {
     add_error: ?[:0]const u8 = null,
     filter_library_id: ?u64 = null,
     filter_folder: ?[]const u8 = null, // heap-allocated, owned
+    /// Loads folder lists in the background. Set with `initFolderLoader`;
+    /// without it the library trees stay empty.
+    folders: ?folder_loader_mod.FolderLoader = null,
+
+    pub fn initFolderLoader(self: *SidebarState, gpa: std.mem.Allocator, io: std.Io, db: *db_mod.VectorDb) void {
+        self.folders = folder_loader_mod.FolderLoader.init(gpa, io, db);
+        self.folders.?.wakeup_fn = self.wakeup_fn;
+    }
 
     pub fn deinit(self: *SidebarState, gpa: std.mem.Allocator) void {
+        if (self.folders) |*f| f.deinit();
         for (self.libraries.items) |*lib| lib.deinit(gpa);
         self.libraries.deinit(gpa);
         if (self.filter_folder) |f| gpa.free(f);
@@ -136,17 +173,63 @@ pub const SidebarState = struct {
         } else |_| {}
     }
 
-    /// Show freshly loaded per-library counts (from counts.zig). Folder trees
-    /// are dropped too, so an open one reloads with current counts.
-    pub fn applyLibraryCounts(self: *SidebarState, gpa: std.mem.Allocator, counts: []const counts_mod.LibraryCount) void {
+    /// Show freshly loaded per-library counts (from counts.zig). An open
+    /// library whose count changed has its loaded folder lists reloaded, so
+    /// their counts stay current; the tree keeps its shape meanwhile.
+    pub fn applyLibraryCounts(self: *SidebarState, counts: []const counts_mod.LibraryCount) void {
         for (self.libraries.items) |*lib| {
             for (counts) |c| {
-                if (c.id == lib.id) lib.image_count = c.count;
+                if (c.id != lib.id or c.count == lib.image_count) continue;
+                lib.image_count = c.count;
+                if (lib.top_loaded) self.requestLoadedFolders(lib);
             }
-            if (lib.top_loaded) {
-                freeFolderNodes(gpa, lib.top_folders);
-                lib.top_folders = &.{};
-                lib.top_loaded = false;
+        }
+    }
+
+    /// Queue a reload of every folder list of `lib` that is loaded.
+    fn requestLoadedFolders(self: *SidebarState, lib: *LibraryState) void {
+        const loader = if (self.folders) |*f| f else return;
+        loader.request(lib.id, lib.path);
+        requestLoadedNodes(loader, lib.id, lib.top_folders);
+    }
+
+    fn requestLoadedNodes(loader: *folder_loader_mod.FolderLoader, library_id: u64, nodes: []FolderNode) void {
+        for (nodes) |*n| {
+            if (!n.loaded) continue;
+            loader.request(library_id, n.path);
+            requestLoadedNodes(loader, library_id, n.children);
+        }
+    }
+
+    /// Main thread: put finished folder loads into the trees. A list for a
+    /// library or folder that is no longer shown is dropped.
+    pub fn applyFolderResults(self: *SidebarState, gpa: std.mem.Allocator) void {
+        const loader = if (self.folders) |*f| f else return;
+        const results = loader.take();
+        defer gpa.free(results);
+        for (results) |r| {
+            defer gpa.free(r.path);
+            const lib = for (self.libraries.items) |*l| {
+                if (l.id == r.library_id) break l;
+            } else null;
+            const is_root = if (lib) |l| std.mem.eql(u8, l.path, r.path) else false;
+            const node: ?*FolderNode = if (lib) |l| (if (is_root) null else findFolder(l.top_folders, r.path)) else null;
+            if (is_root) lib.?.top_requested = false;
+            if (node) |n| n.requested = false;
+
+            // A failed load keeps what is shown, and counts as loaded so an
+            // open library doesn't retry every frame.
+            if (is_root) lib.?.top_loaded = true;
+            if (node) |n| n.loaded = true;
+            const fresh = r.folders orelse continue;
+            if (is_root) {
+                const l = lib.?;
+                l.top_folders = mergeFolders(gpa, l.top_folders, fresh) catch l.top_folders;
+            } else if (node) |n| {
+                n.children = mergeFolders(gpa, n.children, fresh) catch n.children;
+            } else {
+                for (fresh) |f| gpa.free(f.path);
+                gpa.free(fresh);
             }
         }
     }
@@ -225,21 +308,10 @@ pub const SidebarState = struct {
             if (dvui.clickedEx(row.data(), .{})) |_| {
                 if (may_have_children or node.expanded) {
                     node.expanded = !node.expanded;
-                    if (node.expanded and !node.loaded) {
-                        if (db) |d| {
-                            if (d.listImmediateSubdirs(gpa, lib.id, node.path)) |subs| {
-                                if (gpa.alloc(FolderNode, subs.len)) |new_nodes| {
-                                    for (subs, 0..) |s, i| {
-                                        new_nodes[i] = .{ .path = s.path, .count = s.count, .has_children = s.has_children };
-                                    }
-                                    gpa.free(subs);
-                                    node.children = new_nodes;
-                                } else |_| {
-                                    for (subs) |s| gpa.free(s.path);
-                                    gpa.free(subs);
-                                }
-                            } else |_| {}
-                            node.loaded = true;
+                    if (node.expanded and !node.loaded and !node.requested) {
+                        if (self.folders) |*loader| {
+                            loader.request(lib.id, node.path);
+                            node.requested = true;
                         }
                     }
                 }
@@ -304,6 +376,7 @@ pub const SidebarState = struct {
         favorite_count: i64,
     ) !bool {
         var needs_count_refresh = false;
+        self.applyFolderResults(gpa);
 
         var sidebar = dvui.box(@src(), .{}, .{
             .min_size_content = .{ .w = panel_w, .h = 0 },
@@ -418,10 +491,13 @@ pub const SidebarState = struct {
                     })) {
                         lib.expanded = !lib.expanded;
                     }
-                    // (Re)load whenever an open library has no folder list: on
-                    // expand, and after applyLibraryCounts dropped a stale one.
-                    if (lib.expanded and !lib.top_loaded) {
-                        if (db) |d| loadTopFolders(gpa, d, lib);
+                    // Load an open library's folder list the first time it is
+                    // shown; applyLibraryCounts reloads it when counts change.
+                    if (lib.expanded and !lib.top_loaded and !lib.top_requested) {
+                        if (self.folders) |*loader| {
+                            loader.request(lib.id, lib.path);
+                            lib.top_requested = true;
+                        }
                     }
 
                     {

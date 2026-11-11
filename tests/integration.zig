@@ -1002,8 +1002,8 @@ test "db: favorite flag set/count/list lifecycle" {
 
     try std.testing.expectEqual(@as(i64, 0), try db.getFavoriteCount());
 
-    try db.setFavorite(a, true);
-    try db.setFavorite(c, true);
+    _ = try db.setFavorite(a, "/lib/a.png", true);
+    _ = try db.setFavorite(c, "/lib/c.png", true);
     try std.testing.expectEqual(@as(i64, 2), try db.getFavoriteCount());
 
     {
@@ -1017,13 +1017,30 @@ test "db: favorite flag set/count/list lifecycle" {
     }
 
     // Clearing a favorite drops the count.
-    try db.setFavorite(a, false);
+    _ = try db.setFavorite(a, "/lib/a.png", false);
     try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
 
     // A trashed favorite is excluded from the (non-trashed) favorite count.
-    try db.setFavorite(b, true); // now b and c are favorites
+    _ = try db.setFavorite(b, "/lib/b.png", true); // now b and c are favorites
     try std.testing.expectEqual(@as(i64, 2), try db.getFavoriteCount());
     try trashById(&db, b, "b_trash.png", 0, 1000);
+    try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
+}
+
+test "db: setFavorite on a recycled id leaves the new image alone" {
+    const path = "/tmp/diffkeep_test_favorite_stale.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib = try db.storeLibrary("/lib");
+    const a = try makeImage(&db, lib, "/lib/a.png");
+    try std.testing.expect(try db.deleteImage(a, "/lib/a.png"));
+    // The new image may reuse a's id; a stale tile still says "/lib/a.png".
+    const b = try makeImage(&db, lib, "/lib/b.png");
+    try std.testing.expect(!try db.setFavorite(a, "/lib/a.png", true));
+    try std.testing.expectEqual(@as(i64, 0), try db.getFavoriteCount());
+    try std.testing.expect(try db.setFavorite(b, "/lib/b.png", true));
     try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
 }
 
@@ -1037,8 +1054,8 @@ test "grid: favorites view lists only favorites; loaded entries carry the favori
     const a = try makeImage(&db, lib, "/lib/a.png");
     const b = try makeImage(&db, lib, "/lib/b.png");
     const c = try makeImage(&db, lib, "/lib/c.png");
-    try db.setFavorite(a, true);
-    try db.setFavorite(c, true);
+    _ = try db.setFavorite(a, "/lib/a.png", true);
+    _ = try db.setFavorite(c, "/lib/c.png", true);
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
     defer grid.deinit();
@@ -1934,11 +1951,11 @@ test "db: a lookup that finds a row doesn't pin the connection to a stale snapsh
     defer again.deinit(alloc);
     _ = try db.storeLibrary("/lib");
     _ = try db.getLibraryIdByPath("/lib");
-    try other.setFavorite(a.id, true);
+    _ = try other.setFavorite(a.id, "/lib/a.png", true);
 
     // `db` must see that commit and be able to write after it.
     try std.testing.expectEqual(@as(i64, 1), try db.getFavoriteCount());
-    try db.setFavorite(a.id, false);
+    _ = try db.setFavorite(a.id, "/lib/a.png", false);
     try std.testing.expectEqual(@as(i64, 0), try other.getFavoriteCount());
 }
 
@@ -2768,6 +2785,29 @@ test "library_manager: files deleted on disk are removed in the background and r
     try std.testing.expectEqual(@as(i64, 0), try db.getTotalImageCount());
 }
 
+test "library_manager: a burst of new files is indexed by a bounded set of workers" {
+    const dir = "/tmp/diffkeep_test_watch_burst";
+    try freshDir(dir);
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+
+    const n = 40;
+    for (0..n) |k| {
+        var buf: [96]u8 = undefined;
+        const p = try std.mem.print(&buf, dir ++ "/f{d}.png", .{k});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = plain_png });
+        fx.mgr.processFileEvent(io, fx.lib_id, try alloc.dupe(u8, p));
+        // The same file reported again while queued is not queued twice.
+        fx.mgr.processFileEvent(io, fx.lib_id, try alloc.dupe(u8, p));
+        try std.testing.expect(fx.mgr.file_workers <= dk.library_manager.max_file_workers);
+    }
+    fx.mgr.awaitFileTasks(io);
+    try std.testing.expectEqual(@as(u32, 0), fx.mgr.file_workers);
+    try std.testing.expectEqual(@as(usize, 0), fx.mgr.file_queue.items.len);
+    try std.testing.expectEqual(@as(i64, n), try fx.db.getTotalImageCount());
+}
+
 test "sidebar: an expanded library keeps its folders after the counts refresh" {
     const path = "/tmp/diffkeep_test_sidebar_refresh.db";
     var db = try openDb(path);
@@ -2782,6 +2822,7 @@ test "sidebar: an expanded library keeps its folders after the counts refresh" {
     var sb = dk.sidebar.SidebarState{};
     defer sb.deinit(alloc);
     try sb.loadLibraries(alloc, &db);
+    sb.initFolderLoader(alloc, io, &db);
     sb.libraries.items[0].expanded = true;
 
     g_sidebar = &sb;
@@ -2792,12 +2833,72 @@ test "sidebar: an expanded library keeps its folders after the counts refresh" {
     dk.style.install();
 
     try dvui.testing.settle(sidebarFrame);
+    sb.folders.?.awaitIdle();
+    try dvui.testing.settle(sidebarFrame);
     try std.testing.expectEqual(@as(usize, 1), sb.libraries.items[0].top_folders.len);
     // A favorite toggle or file op refreshes the counts…
-    sb.applyLibraryCounts(alloc, &.{.{ .id = lib_id, .count = 1 }});
+    sb.applyLibraryCounts(&.{.{ .id = lib_id, .count = 2 }});
+    try dvui.testing.settle(sidebarFrame);
+    sb.folders.?.awaitIdle();
     try dvui.testing.settle(sidebarFrame);
     // …and the open tree still shows its folders.
     try std.testing.expectEqual(@as(usize, 1), sb.libraries.items[0].top_folders.len);
+}
+
+fn folderNode(nodes: []dk.sidebar.FolderNode, path: []const u8) ?*dk.sidebar.FolderNode {
+    for (nodes) |*n| if (std.mem.eql(u8, n.path, path)) return n;
+    return null;
+}
+
+test "sidebar: folder lists load in the background; a refresh keeps the open tree" {
+    const path = "/tmp/diffkeep_test_sidebar_folder_loader.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    for ([_][]const u8{ "/lib/cats/a.png", "/lib/cats/kittens/b.png", "/lib/dogs/c.png" }) |p|
+        _ = try makeImage(&db, lib_id, p);
+
+    var sb = dk.sidebar.SidebarState{};
+    defer sb.deinit(alloc);
+    try sb.loadLibraries(alloc, &db);
+    sb.initFolderLoader(alloc, io, &db);
+    const lib = &sb.libraries.items[0];
+    const loader = &sb.folders.?;
+
+    // Nothing is listed until the background load lands.
+    loader.request(lib_id, "/lib");
+    loader.awaitIdle();
+    try std.testing.expectEqual(@as(usize, 0), lib.top_folders.len);
+    sb.applyFolderResults(alloc);
+    try std.testing.expect(lib.top_loaded);
+    try std.testing.expectEqual(@as(usize, 2), lib.top_folders.len);
+
+    // Open /lib/cats and load its children.
+    const cats = folderNode(lib.top_folders, "/lib/cats").?;
+    try std.testing.expectEqual(@as(i64, 2), cats.count);
+    cats.expanded = true;
+    loader.request(lib_id, "/lib/cats");
+    loader.awaitIdle();
+    sb.applyFolderResults(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cats.children.len);
+
+    // A new image changes the library count: the loaded lists reload with
+    // the new counts, and /lib/cats stays open with its children.
+    _ = try makeImage(&db, lib_id, "/lib/cats/kittens/d.png");
+    sb.applyLibraryCounts(&.{.{ .id = lib_id, .count = 4 }});
+    loader.awaitIdle();
+    sb.applyFolderResults(alloc);
+    const cats2 = folderNode(lib.top_folders, "/lib/cats").?;
+    try std.testing.expectEqual(@as(i64, 3), cats2.count);
+    try std.testing.expect(cats2.expanded);
+    try std.testing.expectEqual(@as(usize, 1), cats2.children.len);
+    try std.testing.expectEqual(@as(i64, 2), cats2.children[0].count);
+
+    // A list for a library that is gone is dropped (and freed).
+    loader.request(999, "/gone");
+    loader.awaitIdle();
+    sb.applyFolderResults(alloc);
 }
 
 test "grid: scan notifications don't pile up while another view is shown" {
@@ -2961,7 +3062,7 @@ test "counts: the loader computes every count on its own connection" {
         defer img.deinit(alloc);
         img.hash = try alloc.dupe(u8, if (k < 2) "same" else "other");
         try db.saveImage(&img);
-        if (k == 0) try db.setFavorite(img.id, true);
+        if (k == 0) _ = try db.setFavorite(img.id, p, true);
         if (k == 2) try trashById(&db, img.id, "t.png", 10, 1000);
     }
 
@@ -2983,6 +3084,47 @@ test "counts: the loader computes every count on its own connection" {
     try std.testing.expectEqual(@as(i64, 1), c.favorites);
     try std.testing.expectEqual(@as(usize, 1), c.libraries.len);
     try std.testing.expectEqual(@as(i64, 2), c.libraries[0].count);
+    try std.testing.expectEqual(@as(i64, 1), c.redundant_duplicates);
+    try std.testing.expect(c.db_stats == null); // not asked for
+}
+
+test "counts: stats load on request, and clearing a cache runs in the background" {
+    const path = "/tmp/diffkeep_test_counts_stats.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    for ([_][]const u8{ "/lib/a.png", "/lib/b.png" }) |p| {
+        var img = try db.findOrCreateImage(alloc, lib_id, p);
+        defer img.deinit(alloc);
+        img.thumbnail = try alloc.dupe(u8, "jpegbytes");
+        try db.saveImage(&img);
+    }
+
+    var loader = dk.counts.CountsLoader.init(alloc, io, &db);
+    defer loader.deinit();
+
+    loader.requestStats();
+    loader.awaitIdle();
+    var c1 = loader.poll() orelse return error.NoCounts;
+    defer c1.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 2), c1.db_stats.?.thumbnail_count);
+
+    // A plain refresh that lands before the stats were read keeps them.
+    loader.requestStats();
+    loader.awaitIdle();
+    loader.request();
+    loader.awaitIdle();
+    var c2 = loader.poll() orelse return error.NoCounts;
+    defer c2.deinit(alloc);
+    try std.testing.expect(c2.db_stats != null);
+
+    loader.clear(.thumbnails);
+    loader.awaitIdle();
+    var c3 = loader.poll() orelse return error.NoCounts;
+    defer c3.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 0), c3.db_stats.?.thumbnail_count);
+    try std.testing.expectEqual(@as(i64, 2), c3.total);
 }
 
 test "detail panel: details load in the background and the newest selection wins" {

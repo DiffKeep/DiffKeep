@@ -281,6 +281,15 @@ Tests went red then green unless marked *(fix only)*. "Red" was sometimes a comp
 - **Model downloads:** a self-contained detached job; no UI-buffer race; downloads to `.part` and renames.
 - **Misc:** i18n for byte units and icon-button labels; a stopped scan no longer logs "decode failed"; docs updated (CLAUDE.md, ZIG.md).
 
+### Fixed in a second pass (2026-11-10)
+
+- Settings DB stats, the clear-cache buttons and the dedupe count now come from the background counts loader.
+- Sidebar folder lists load on a background worker (`folder_loader.zig`); a counts refresh reloads open lists without collapsing the tree.
+- Copy-image reads the file on a background task at copy time; paste only hands over the bytes.
+- Watcher-reported files go to a queue drained by at most 4 workers instead of one task each; a removed library's queued files are dropped.
+- `setFavorite` matches id AND path.
+- The sidebar and detail panel are shut down before the DB closes (their background loads use it).
+
 ### Not done (deliberately left; say if you want any)
 
 - **Structural recommendations:**
@@ -300,17 +309,11 @@ Tests went red then green unless marked *(fix only)*. "Red" was sometimes a comp
   - raw-JSON relayout;
   - embed queue backpressure;
   - viewer refresh at full vsync.
-- **Still on the main thread:**
-  - settings `getStats` and clear-cache buttons;
-  - the dedupe-count query when "remove duplicates" is clicked;
-  - `listImmediateSubdirs` on expand;
-  - copy-image's lazy read happens on paste.
-- **Watcher:** one task per changed file (unbounded threads/connections on bursts).
 - **Platform:**
   - X11 XdndStatus/Finished target matching;
   - `XDefineCursor` on foreign windows;
   - Wayland drag stuck on a bad serial;
   - Windows `EnumFormatEtc`/`SetData`;
   - video `start_time` offsets.
-- **Other:** `setFavorite` path guard; GPU weight eviction at embedder deinit.
+- **Other:** GPU weight eviction at embedder deinit.
 - **Unverified at runtime:** none of this was exercised in the running GUI (only `zig build` and the test suites). The Windows and macOS code was only compile-checked.

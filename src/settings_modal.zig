@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const i18n = @import("i18n.zig");
 const config_mod = @import("config.zig");
 const db_mod = @import("db.zig");
+const counts_mod = @import("counts.zig");
 const image_grid_mod = @import("image_grid.zig");
 const detail_panel_mod = @import("detail_panel.zig");
 const library_manager_mod = @import("library_manager.zig");
@@ -196,6 +197,9 @@ pub const SettingsModalState = struct {
     /// "Empty trash" was clicked; app.zig asks for confirmation (it deletes
     /// files for good), like the toolbar's trash-view button does.
     empty_trash_requested: bool = false,
+    /// Set when a cache's Clear button is clicked; app.zig hands it to the
+    /// counts loader, which clears it in the background.
+    clear_requested: ?counts_mod.Cache = null,
 
     gemma_dl: ?*Download = null,
     siglip2_dl: ?*Download = null,
@@ -224,7 +228,7 @@ pub const SettingsModalState = struct {
         db_stats: *?db_mod.DbStats,
         trash_stats: *?db_mod.TrashStats,
         data_dir: ?[]const u8,
-        db: ?*db_mod.VectorDb,
+        has_db: bool,
         wakeup_fn: ?*const fn () void,
     ) !void {
         if (!self.open) return;
@@ -450,11 +454,11 @@ pub const SettingsModalState = struct {
                     const db_rows = [_]struct {
                         count: i64,
                         bytes: i64,
-                        clear_fn: *const fn (*db_mod.VectorDb) anyerror!void,
+                        cache: counts_mod.Cache,
                     }{
-                        .{ .count = stats.thumbnail_count,        .bytes = stats.thumbnail_bytes,                   .clear_fn = db_mod.VectorDb.clearThumbnails },
-                        .{ .count = stats.prompt_embedding_count, .bytes = stats.prompt_embedding_count * 768 * 4,  .clear_fn = db_mod.VectorDb.clearPromptEmbeddings },
-                        .{ .count = stats.image_embedding_count,  .bytes = stats.image_embedding_count * 768 * 4,   .clear_fn = db_mod.VectorDb.clearImageEmbeddings },
+                        .{ .count = stats.thumbnail_count,        .bytes = stats.thumbnail_bytes,                   .cache = .thumbnails },
+                        .{ .count = stats.prompt_embedding_count, .bytes = stats.prompt_embedding_count * 768 * 4,  .cache = .prompt_embeddings },
+                        .{ .count = stats.image_embedding_count,  .bytes = stats.image_embedding_count * 768 * 4,   .cache = .image_embeddings },
                     };
                     inline for (db_label_keys, db_rows, 0..) |label_key, r, ri| {
                         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -478,14 +482,14 @@ pub const SettingsModalState = struct {
                             .gravity_y = 0.5,
                             .style = .err,
                         }))) {
-                            if (db) |d| {
-                                r.clear_fn(d) catch {};
-                                db_stats.* = d.getStats() catch null;
-                            }
+                            // Runs in the background (counts.zig); the
+                            // stats update when it is done.
+                            self.clear_requested = r.cache;
                         }
                     }
                 } else {
-                    dvui.label(@src(), "{s}", .{i18n.t(.settings_db_no_database)}, .{
+                    const msg = if (has_db) i18n.t(.settings_db_loading) else i18n.t(.settings_db_no_database);
+                    dvui.label(@src(), "{s}", .{msg}, .{
                         .color_text = .{ .color = style.C.text_ghost },
                     });
                 }

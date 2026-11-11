@@ -20,6 +20,8 @@ pub const left_w_max: f32 = 400;
 pub const right_w_min: f32 = 220;
 pub const right_w_max: f32 = 480;
 
+fn noop() void {}
+
 pub const RenderCtx = struct {
     search: *search_mod.SearchState,
     active_filters: *std.ArrayList(db_mod.ActiveFilter),
@@ -41,6 +43,8 @@ pub const RenderCtx = struct {
     right_w_open: *f32,
     total_image_count: *i64,
     on_refresh_counts: *const fn () void,
+    /// Settings opened: load its database stats in the background.
+    on_settings_opened: *const fn () void = noop,
     embedder_loading: bool,
 };
 
@@ -606,10 +610,7 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     })) {
         ctx.settings.open = !ctx.settings.open;
         if (ctx.settings.open) {
-            if (ctx.db.*) |*db| {
-                ctx.db_stats.* = db.getStats() catch null;
-                ctx.trash_stats.* = db.getTrashStats() catch null;
-            }
+            ctx.on_settings_opened();
             ctx.settings.scan_snapshot = .{
                 .thumbnails_in_db = ctx.cfg.thumbnails_in_db,
                 .prompt_embeddings = ctx.cfg.prompt_embeddings,

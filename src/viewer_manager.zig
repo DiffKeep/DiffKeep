@@ -217,13 +217,4 @@ pub const ViewerManager = struct {
         for (self.windows.items) |vw| vw.state.setFavorite(id, favorite);
     }
 
-    /// Current favorite flag for `id` as known to any open viewer (false if none).
-    pub fn favoriteState(self: *ViewerManager, id: u64) bool {
-        for (self.windows.items) |vw| {
-            for (vw.state.images.items) |e| {
-                if (e.id == id) return e.favorite;
-            }
-        }
-        return false;
-    }
 };

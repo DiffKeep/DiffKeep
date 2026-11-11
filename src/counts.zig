@@ -1,11 +1,14 @@
-//! Library-wide counts shown in the sidebar and toolbar (total, trash,
-//! duplicates, favorites, per library), loaded off the render thread.
+//! Library-wide counts shown in the sidebar, toolbar and settings (total,
+//! trash, duplicates, favorites, per library, database size), loaded off the
+//! render thread, plus the settings' clear-cache operations.
 //!
 //! Some of these are full-table aggregates (the duplicate count groups every
 //! hash), and they are wanted after every favorite toggle, file operation and
 //! scanned image, so they must not run in `frame()`. `request` asks for fresh
 //! counts; requests made while a load runs coalesce into one more load.
-//! `poll` hands the latest result to the main thread.
+//! `requestStats` also asks for the database stats (they read every
+//! thumbnail, so only while settings are open), and `clear` drops a cache
+//! before the next load. `poll` hands the latest result to the main thread.
 
 const std = @import("std");
 const db_mod = @import("db.zig");
@@ -18,7 +21,11 @@ pub const Counts = struct {
     total: i64 = 0,
     trash: ?db_mod.TrashStats = null,
     duplicates: i64 = 0,
+    /// Copies "remove duplicates" would move to the trash (all but one of each).
+    redundant_duplicates: i64 = 0,
     favorites: i64 = 0,
+    /// Only when asked for with `requestStats` or `clear`.
+    db_stats: ?db_mod.DbStats = null,
     /// Owned (by the loader's allocator); free with `deinit`.
     libraries: []LibraryCount = &.{},
 
@@ -28,13 +35,32 @@ pub const Counts = struct {
     }
 };
 
-/// Compute every count on `db`. Does DB IO: call it off the main thread.
-pub fn load(db: *db_mod.VectorDb, a: std.mem.Allocator) !Counts {
+/// A derived-data cache the settings can clear.
+pub const Cache = enum { thumbnails, prompt_embeddings, image_embeddings };
+
+/// Which caches to clear on the next load.
+pub const ClearSet = std.EnumSet(Cache);
+
+/// Clear `caches` on `db`. Does DB IO: call it off the main thread.
+pub fn clearCaches(db: *db_mod.VectorDb, caches: ClearSet) !void {
+    var it = caches.iterator();
+    while (it.next()) |c| switch (c) {
+        .thumbnails => try db.clearThumbnails(),
+        .prompt_embeddings => try db.clearPromptEmbeddings(),
+        .image_embeddings => try db.clearImageEmbeddings(),
+    };
+}
+
+/// Compute every count on `db` (and the database stats if `with_stats`).
+/// Does DB IO: call it off the main thread.
+pub fn load(db: *db_mod.VectorDb, a: std.mem.Allocator, with_stats: bool) !Counts {
     var c: Counts = .{
         .total = try db.getTotalImageCount(),
         .trash = try db.getTrashStats(),
         .duplicates = try db.getDuplicateCount(),
+        .redundant_duplicates = try db.getRedundantDuplicateCount(),
         .favorites = try db.getFavoriteCount(),
+        .db_stats = if (with_stats) try db.getStats() else null,
     };
     const libs = try db.listLibraries(a);
     defer {
@@ -59,6 +85,8 @@ pub const CountsLoader = struct {
     // Guarded by `mutex`.
     running: bool = false,
     again: bool = false,
+    want_stats: bool = false,
+    clears: ClearSet = .empty,
     result: ?Counts = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, db: *db_mod.VectorDb) CountsLoader {
@@ -90,6 +118,29 @@ pub const CountsLoader = struct {
         };
     }
 
+    /// Ask for fresh counts and database stats. Main thread.
+    pub fn requestStats(self: *CountsLoader) void {
+        self.mutex.lockUncancelable(self.io);
+        self.want_stats = true;
+        self.mutex.unlock(self.io);
+        self.request();
+    }
+
+    /// Clear `cache` in the background, then load fresh counts and stats.
+    /// Main thread.
+    pub fn clear(self: *CountsLoader, cache: Cache) void {
+        self.mutex.lockUncancelable(self.io);
+        self.clears.insert(cache);
+        self.want_stats = true;
+        self.mutex.unlock(self.io);
+        self.request();
+    }
+
+    /// Wait for a running load (tests).
+    pub fn awaitIdle(self: *CountsLoader) void {
+        self.group.await(self.io) catch {};
+    }
+
     /// The newest counts, if a load finished since the last poll. Main thread;
     /// the caller owns the result (free with `Counts.deinit(loader.allocator)`).
     pub fn poll(self: *CountsLoader) ?Counts {
@@ -110,14 +161,26 @@ pub const CountsLoader = struct {
         };
         defer conn.deinit();
         while (true) {
-            const loaded: ?Counts = load(&conn, self.allocator) catch |err| blk: {
+            self.mutex.lockUncancelable(self.io);
+            const clears = self.clears;
+            const with_stats = self.want_stats;
+            self.clears = .empty;
+            self.want_stats = false;
+            self.mutex.unlock(self.io);
+            clearCaches(&conn, clears) catch |err| log.warn("clear caches: {}", .{err});
+            const loaded: ?Counts = load(&conn, self.allocator, with_stats) catch |err| blk: {
                 log.warn("counts load: {}", .{err});
                 break :blk null;
             };
             self.mutex.lockUncancelable(self.io);
             if (loaded) |c| {
-                if (self.result) |*old| old.deinit(self.allocator);
-                self.result = c;
+                var fresh = c;
+                if (self.result) |*old| {
+                    // Unclaimed stats survive a newer load that skipped them.
+                    if (fresh.db_stats == null) fresh.db_stats = old.db_stats;
+                    old.deinit(self.allocator);
+                }
+                self.result = fresh;
             }
             const again = self.again;
             self.again = false;

@@ -26,21 +26,31 @@ pub const vtable: platform.Vtable = .{
 
 // ── Image clipboard ─────────────────────────────────────────────────────────
 //
-// SDL calls the data callback only when another app pastes, so copying does no
-// file IO: the bytes are read on the first request and freed by the cleanup
-// callback when the clipboard is replaced.
+// Copying starts reading the file on a background task and offers the data to
+// SDL at once; the data callback (called on the main thread when another app
+// pastes) awaits that read, which has long finished by then, and hands over
+// the bytes. The cleanup callback frees them when the clipboard is replaced.
 
 const ClipboardImageData = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []u8,
+    /// The background read; `bytes` is valid once it is awaited.
+    read: std.Io.Group = .init,
     bytes: ?[]u8 = null,
+
+    fn readTask(d: *ClipboardImageData) void {
+        d.bytes = readWholeFile(d.gpa, d.io, d.path) catch |err| blk: {
+            std.log.warn("copy image {s}: {}", .{ d.path, err });
+            break :blk null;
+        };
+    }
 };
 
 fn clipboardImageCallback(userdata: ?*anyopaque, mime_type: [*c]const u8, size: [*c]usize) callconv(.c) ?*const anyopaque {
     _ = mime_type;
     const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
-    if (d.bytes == null) d.bytes = readWholeFile(d.gpa, d.io, d.path) catch null;
+    d.read.await(d.io) catch {};
     const bytes = d.bytes orelse {
         size.* = 0;
         return null;
@@ -51,6 +61,7 @@ fn clipboardImageCallback(userdata: ?*anyopaque, mime_type: [*c]const u8, size: 
 
 fn clipboardImageCleanup(userdata: ?*anyopaque) callconv(.c) void {
     const d: *ClipboardImageData = @ptrCast(@alignCast(userdata.?));
+    d.read.await(d.io) catch {};
     if (d.bytes) |b| d.gpa.free(b);
     d.gpa.free(d.path);
     d.gpa.destroy(d);
@@ -67,7 +78,7 @@ fn readWholeFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 }
 
 fn copyImageFile(path: []const u8, gpa: std.mem.Allocator, io: std.Io) void {
-    copyImageFileImpl(path, gpa, io) catch {};
+    copyImageFileImpl(path, gpa, io) catch |err| std.log.warn("copy image: {}", .{err});
 }
 
 fn copyImageFileImpl(path: []const u8, gpa: std.mem.Allocator, io: std.Io) !void {
@@ -76,9 +87,12 @@ fn copyImageFileImpl(path: []const u8, gpa: std.mem.Allocator, io: std.Io) !void
     const d = try gpa.create(ClipboardImageData);
     errdefer gpa.destroy(d);
     d.* = .{ .gpa = gpa, .io = io, .path = try gpa.dupe(u8, path) };
+    errdefer gpa.free(d.path);
+    try d.read.concurrent(io, ClipboardImageData.readTask, .{d});
     var mime: [*c]const u8 = mime_z.ptr;
     if (!SDLBackend.c.SDL_SetClipboardData(clipboardImageCallback, clipboardImageCleanup, d, &mime, 1)) {
-        gpa.free(d.path);
+        d.read.await(io) catch {};
+        if (d.bytes) |b| gpa.free(b);
         return error.ClipboardFailed;
     }
 }
