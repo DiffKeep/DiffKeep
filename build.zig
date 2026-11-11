@@ -49,7 +49,6 @@ pub fn build(b: *std.Build) !void {
     const os = target.result.os.tag;
     if (os == .linux) {
         exe.root_module.linkSystemLibrary("X11", .{});
-        exe.root_module.linkSystemLibrary("Xcursor", .{});
         exe.root_module.linkSystemLibrary("Xi", .{});
         exe.root_module.linkSystemLibrary("wayland-client", .{});
     } else if (os == .windows) {
@@ -108,7 +107,6 @@ pub fn build(b: *std.Build) !void {
             .c_source_file = b.addWriteFiles().add("x11_c.h",
                 \\#include <X11/Xlib.h>
                 \\#include <X11/Xatom.h>
-                \\#include <X11/Xcursor/Xcursor.h>
                 \\#include <X11/extensions/XInput2.h>
                 \\
             ),

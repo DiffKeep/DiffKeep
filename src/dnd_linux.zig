@@ -564,7 +564,6 @@ const X11DragSource = struct {
     uri_list:        []u8 = &.{},
     finish_ns:       i96 = 0,
     button_released: bool = false,
-    drag_x11_cursor: xlib.Cursor = 0,
     drag_sdl_cursor: ?*SDLBackend.c.SDL_Cursor = null,
     wakeup_event_type: u32 = 0,
     watcher_stop:      std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -739,8 +738,6 @@ const X11DragSource = struct {
         const new_target = self.findTarget(top_child, rx, ry);
         if (new_target != self.target) {
             std.log.debug("dnd: target 0x{x} → 0x{x}", .{ self.target, new_target });
-            if (self.target != 0) _ = xlib.XUndefineCursor(self.dnd_dpy, self.target);
-            if (new_target != 0) _ = xlib.XDefineCursor(self.dnd_dpy, new_target, self.drag_x11_cursor);
             if (self.target != 0)
                 self.sendMsg(self.target, self.atoms.XdndLeave,
                     @bitCast(self.src_win), 0, 0, 0, 0);
@@ -792,7 +789,6 @@ const X11DragSource = struct {
         self.watcher_stop.store(true, .release);
         if (self.watcher_thread) |t| { t.join(); self.watcher_thread = null; }
         _ = xlib.XSetSelectionOwner(self.dnd_dpy, self.atoms.XdndSelection, 0, 0);
-        if (self.target != 0) _ = xlib.XUndefineCursor(self.dnd_dpy, self.target);
         _ = xlib.XFlush(self.dnd_dpy);
         self.phase  = .idle;
         self.target = 0;
@@ -823,29 +819,13 @@ const X11DragSource = struct {
             self.drag_sdl_cursor = SDLBackend.c.SDL_CreateColorCursor(surface, hot_x, hot_y);
             SDLBackend.c.SDL_DestroySurface(surface);
         }
-
-        const ximg = xlib.XcursorImageCreate(@intCast(w), @intCast(h)) orelse return;
-        defer xlib.XcursorImageDestroy(ximg);
-        ximg.*.xhot = @intCast(w / 2);
-        ximg.*.yhot = @intCast(h / 2);
-        const pixels = decoded.pixels;
-        var i: usize = 0;
-        while (i < w * h) : (i += 1) {
-            const r = pixels[i * 4 + 0];
-            const g = pixels[i * 4 + 1];
-            const b = pixels[i * 4 + 2];
-            const a = pixels[i * 4 + 3];
-            ximg.*.pixels[i] = (@as(u32, a) << 24) | (@as(u32, r) << 16) |
-                                (@as(u32, g) << 8)  |  @as(u32, b);
-        }
-        self.drag_x11_cursor = xlib.XcursorImageLoadCursor(self.dnd_dpy, ximg);
+        // Only our own window's cursor: the drag holds the pointer grab, so
+        // X shows it over every window. (Setting it on drop targets' windows
+        // as well changed nothing on screen, and undoing that reset whatever
+        // cursor those apps had set. Checked under Xephyr with xed and Nemo.)
     }
 
     fn freeDragCursors(self: *X11DragSource) void {
-        if (self.drag_x11_cursor != 0) {
-            _ = xlib.XFreeCursor(self.dnd_dpy, self.drag_x11_cursor);
-            self.drag_x11_cursor = 0;
-        }
         if (self.drag_sdl_cursor) |c| {
             _ = SDLBackend.c.SDL_SetCursor(null);
             SDLBackend.c.SDL_DestroyCursor(c);
@@ -1191,3 +1171,4 @@ pub const DragSource = struct {
         }
     }
 };
+

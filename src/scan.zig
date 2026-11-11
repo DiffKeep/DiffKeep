@@ -805,6 +805,16 @@ fn embedAndStoreInline(ctx: ScanCtx, image: *const models.Image, do_prompt: bool
 
 /// Queue embedding work for one image. Returns false when there was nothing to
 /// embed (no prompt and no image wanted) or the item couldn't be allocated.
+/// The prompt to embed, or null when there is no text to embed. An empty
+/// prompt ('') is kept in the DB (a generation whose positive prompt was
+/// empty, unlike NULL: no metadata), but has nothing to embed. Must agree
+/// with the scan prefetch's `has_prompt` (db.zig), or the image is queued
+/// again on every scan.
+fn embeddablePrompt(prompt: ?[]const u8) ?[]const u8 {
+    const p = prompt orelse return null;
+    return if (p.len == 0) null else p;
+}
+
 fn pushEmbed(ctx: ScanCtx, q: *EmbedQueue, id: u64, prompt: ?[]const u8, want_image: bool) bool {
     if (prompt == null and !want_image) return false;
     const path = ctx.allocator.dupeSentinel(u8, ctx.path, 0) catch return false;
@@ -935,7 +945,7 @@ pub fn processFile(ctx: ScanCtx) void {
                 did_work = true;
             }
             const needs_prompt_backfill = ctx.prompt_embeddings and !ctx.has_prompt_embedding and
-                image.positivePromptText != null;
+                embeddablePrompt(image.positivePromptText) != null;
             const needs_image_backfill  = ctx.image_embeddings  and !ctx.has_image_embedding;
 
             if (ctx.embed_queue) |q| {
@@ -1034,7 +1044,7 @@ pub fn processFile(ctx: ScanCtx) void {
 
     if (ctx.embed_queue) |q| {
         // Queue mode: push embedding inputs to the concurrent consumer.
-        _ = pushEmbed(ctx, q, image.id, if (ctx.prompt_embeddings) image.positivePromptText else null, ctx.image_embeddings);
+        _ = pushEmbed(ctx, q, image.id, if (ctx.prompt_embeddings) embeddablePrompt(image.positivePromptText) else null, ctx.image_embeddings);
         if (is_new) _ = ctx.stats.added.fetchAdd(1, .acq_rel)
         else _ = ctx.stats.updated.fetchAdd(1, .acq_rel);
         log.debug("processed {s}", .{std.Io.Dir.path.basename(ctx.path)});

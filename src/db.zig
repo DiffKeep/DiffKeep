@@ -1014,7 +1014,7 @@ pub const VectorDb = struct {
         // upgrade that renames them.
         var stmt = try self.db.prepare(
             \\SELECT i.id, i.library_path, i.mtime,
-            \\       (i.thumbnail IS NOT NULL), (i.positive_prompt_text IS NOT NULL),
+            \\       (i.thumbnail IS NOT NULL), (COALESCE(i.positive_prompt_text, '') <> ''),
             \\       EXISTS (SELECT 1 FROM positive_prompt_embeddings_rowids r WHERE r.rowid = i.id),
             \\       EXISTS (SELECT 1 FROM image_embeddings_rowids r WHERE r.rowid = i.id)
             \\FROM images i

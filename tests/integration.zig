@@ -1899,6 +1899,42 @@ test "db: scan prefetch reports which images already have embeddings" {
     try std.testing.expect(!mb.has_prompt_embedding and mb.has_image_embedding);
 }
 
+test "db: scan prefetch counts only a non-empty prompt as one to embed" {
+    // An empty prompt is a real record (a ComfyUI generation whose positive
+    // prompt was empty), unlike NULL (no metadata), but neither has text to
+    // embed. Counting '' as a prompt queued it for embedding on every scan,
+    // where the embedder skipped it again.
+    const path = "/tmp/diffkeep_test_prefetch_empty_prompt.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    const prompts = [_]?[]const u8{ null, "", "a red fox" };
+    const names = [_][]const u8{ "/lib/none.png", "/lib/empty.png", "/lib/fox.png" };
+    for (prompts, names) |prompt, name| {
+        var img = try db.findOrCreateImage(alloc, lib_id, name);
+        defer img.deinit(alloc);
+        img.positivePromptText = if (prompt) |t| try alloc.dupe(u8, t) else null;
+        try db.saveImage(&img);
+    }
+
+    var known = try db.prefetchLibraryImages(alloc, lib_id);
+    defer {
+        var it = known.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        known.deinit();
+    }
+    try std.testing.expect(!known.get("/lib/none.png").?.has_prompt);
+    try std.testing.expect(!known.get("/lib/empty.png").?.has_prompt);
+    try std.testing.expect(known.get("/lib/fox.png").?.has_prompt);
+
+    // The empty prompt itself is kept: it isn't turned into NULL.
+    var details = (try db.getImageDetails(alloc, known.get("/lib/empty.png").?.id)).?;
+    defer details.deinit(alloc);
+    try std.testing.expectEqualStrings("", details.positive_prompt_text.?);
+}
+
 /// Sum of vertex-interpolated alpha (0..1, composited) of `tri` at point `p`.
 fn meshCoverage(tri: dvui.Triangles, p: dvui.Point.Physical) f32 {
     var a: f32 = 0;
