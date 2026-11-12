@@ -4,6 +4,7 @@
 //!   - `(text:1.2)` weight suffixes are removed, keeping `text`
 //!   - grouping `((text))`, `[text]`, `<(text):0.9>` is unwrapped
 //!   - `\(` `\)` `\[` `\]` escapes become literal characters
+//!   - A1111's `BREAK` keyword (a chunk boundary) becomes a separator
 //!   - comma runs and whitespace runs are collapsed
 //! Queries typed by users are natural language already and must NOT be
 //! passed through this; it is for index-time prompt documents only.
@@ -38,6 +39,21 @@ fn weightSuffixLen(rest: []const u8) ?usize {
     if (!digits) return null;
     if (j < rest.len and (rest[j] == ')' or rest[j] == ']' or rest[j] == '>')) return j;
     return null;
+}
+
+const break_keyword = "BREAK";
+
+fn isWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Whether A1111's `BREAK` keyword starts at `raw[i]`: uppercase, as a whole
+/// word ("break", "BREAKING" and "XBREAK" are ordinary text).
+fn isBreakKeyword(raw: []const u8, i: usize) bool {
+    if (!std.mem.startsWith(u8, raw[i..], break_keyword)) return false;
+    if (i > 0 and isWordChar(raw[i - 1])) return false;
+    const end = i + break_keyword.len;
+    return end == raw.len or !isWordChar(raw[end]);
 }
 
 /// Returns a cleaned copy of `raw`. Caller owns the result.
@@ -81,8 +97,14 @@ pub fn cleanPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
                 }
             },
             else => {
-                stripped.appendAssumeCapacity(c);
-                i += 1;
+                if (isBreakKeyword(raw, i)) {
+                    // A chunk boundary, not a word: split there like a comma.
+                    stripped.appendAssumeCapacity(',');
+                    i += break_keyword.len;
+                } else {
+                    stripped.appendAssumeCapacity(c);
+                    i += 1;
+                }
             },
         }
     }
@@ -163,4 +185,19 @@ test "cleanPrompt: unclosed angle bracket kept verbatim" {
 
 test "cleanPrompt: weight without decimal" {
     try expectClean("detailed face", "(detailed face:2)");
+}
+
+test "cleanPrompt: BREAK keyword becomes a separator" {
+    try expectClean(
+        "red dress, blue sky, sunset",
+        "red dress BREAK blue sky,\nBREAK\n(sunset:1.1) BREAK",
+    );
+    try expectClean("a, b", "(a BREAK b)");
+}
+
+test "cleanPrompt: break as ordinary text survives" {
+    try expectClean(
+        "coffee break, BREAKING news, XBREAK, Break dance, BREAK_ME",
+        "coffee break, BREAKING news, XBREAK, Break dance, BREAK_ME",
+    );
 }
