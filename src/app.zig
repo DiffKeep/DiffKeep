@@ -136,11 +136,25 @@ fn appDeinit() void {
     vips_mod.deinit();
 }
 
-fn frame() !dvui.App.Result {
+/// Whether this frame's events ask `win` to close: a window close, or with
+/// `include_quit` an app quit. Marks them handled, since we close windows
+/// ourselves: dvui's `Window.end` warns about any it sees unhandled when the
+/// window has no `open_flag`.
+fn takeCloseEvents(win: *dvui.Window, include_quit: bool) bool {
+    var close = false;
     for (dvui.events()) |*e| {
-        if (e.evt == .window and e.evt.window.action == .close) return .close;
-        if (e.evt == .app and e.evt.app.action == .quit) return .close;
+        if (e.handled) continue;
+        const is_close = (e.evt == .window and e.evt.window.action == .close) or
+            (include_quit and e.evt == .app and e.evt.app.action == .quit);
+        if (!is_close) continue;
+        e.handle(@src(), win.data());
+        close = true;
     }
+    return close;
+}
+
+fn frame(win: *dvui.Window) !dvui.App.Result {
+    if (takeCloseEvents(win, true)) return .close;
     try g_app.frame();
     return .ok;
 }
@@ -272,11 +286,8 @@ fn renderViewerWindow(vw: *viewer_manager_mod.ViewerWindow, nstime: i128, io: st
         };
     }
 
-    var close = !vw.state.open;
-    for (dvui.events()) |*e| {
-        if (!e.handled and e.evt == .window and e.evt.window.action == .close)
-            close = true;
-    }
+    // Quit is routed to the main window only (no window id).
+    const close = takeCloseEvents(&vw.win, false) or !vw.state.open;
     const wait: ?u32 = try vw.win.end(.{ .manage_backend = false });
     vw.back.setCursor(vw.win.cursorRequested());
     if (vw.dnd) |*d| updateDragCursor(d, &vw.dnd_drag_cursor);
@@ -347,12 +358,7 @@ pub fn main(init: std.process.Init) !void {
         try win.begin(nstime);
         _ = SDLBackend.c.SDL_SetRenderDrawColor(back.renderer, 0, 0, 0, 255);
         _ = SDLBackend.c.SDL_RenderClear(back.renderer);
-        var res = try frame();
-        for (dvui.events()) |*e| {
-            if (e.handled) continue;
-            if ((e.evt == .window and e.evt.window.action == .close) or
-                (e.evt == .app and e.evt.app.action == .quit)) res = .close;
-        }
+        const res = try frame(&win);
         // Remember the window geometry (saved with the config on exit).
         window_state.capture(back.window, &g_app.cfg.main_window);
         // Backend is managed by hand below: the DnD cursor overrides dvui's.
