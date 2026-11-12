@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dvui = @import("dvui");
 const dk = @import("diffkeep");
 
@@ -2617,6 +2618,8 @@ test "scan: rows the scan removes are reported so the grid drops them" {
 }
 
 test "scan: an unreadable subfolder doesn't abort the scan or lose its images" {
+    // Makes the folder unreadable with Unix permissions.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Exercises a path that logs a warning.
     const quiet = quietWarnings();
     defer quiet.restore();
@@ -4427,4 +4430,24 @@ test "search: the grid keeps its own copy of a shown search" {
     _ = search.takeEmbedded(alloc).?;
     try std.testing.expectEqual(@as(f32, 1.0), grid.query_embeddings.prompt.?[1]);
     try std.testing.expectEqual(dk.image_grid.SearchMode.semantic, grid.search_mode);
+}
+
+test "sqlite: bound text is copied, and an empty string binds as '' not NULL" {
+    const path = "/tmp/diffkeep_test_bind_text.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var stmt = try db.db.prepare("SELECT ?1, ?1 IS NULL, length(?1), ?2");
+    defer stmt.deinit();
+
+    // sqlite owns its copy: the caller's buffer can change before step.
+    var buf = "hello".*;
+    try stmt.bind(1, @as([]const u8, ""));
+    try stmt.bind(2, @as([]const u8, &buf));
+    buf[0] = 'J';
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("", stmt.columnText(0));
+    try std.testing.expectEqual(0, stmt.columnInt(1));
+    try std.testing.expectEqual(0, stmt.columnInt(2));
+    try std.testing.expectEqualStrings("hello", stmt.columnText(3));
 }

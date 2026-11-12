@@ -114,7 +114,7 @@ pub const PreparedStatement = struct {
             i32 => c.sqlite3_bind_int(self.stmt, @intCast(index), value),
             i64, u64 => c.sqlite3_bind_int64(self.stmt, @intCast(index), @intCast(value)),
             f64 => c.sqlite3_bind_double(self.stmt, @intCast(index), value),
-            []const u8 => c.sqlite3_bind_text(self.stmt, @intCast(index), value.ptr, @intCast(value.len), c.SQLITE_TRANSIENT),
+            []const u8 => bindTextCopy(self.stmt, @intCast(index), value),
             // Add more types as needed
             else => @compileError("Unsupported type for binding: " ++ @typeName(T)),
         };
@@ -122,6 +122,19 @@ pub const PreparedStatement = struct {
         if (result != c.SQLITE_OK) {
             return Error.SQLiteError;
         }
+    }
+
+    /// `sqlite3_bind_text` with a copy sqlite owns and frees: what
+    /// SQLITE_TRANSIENT asks for. SQLITE_TRANSIENT itself is the address -1 as
+    /// a function pointer, which Zig rejects where functions are aligned
+    /// (aarch64: Apple Silicon, ARM Linux).
+    fn bindTextCopy(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) c_int {
+        // sqlite3_malloc64(0) is NULL, which would bind NULL, not "".
+        if (value.len == 0) return c.sqlite3_bind_text(stmt, index, "", 0, c.SQLITE_STATIC);
+        const copy: [*]u8 = @ptrCast(c.sqlite3_malloc64(value.len) orelse return c.SQLITE_NOMEM);
+        @memcpy(copy[0..value.len], value);
+        // sqlite calls the destructor even when the bind fails.
+        return c.sqlite3_bind_text64(stmt, index, copy, value.len, &c.sqlite3_free, c.SQLITE_UTF8);
     }
 
     pub fn bindBlob(self: *PreparedStatement, index: usize, data: []const u8) !void {

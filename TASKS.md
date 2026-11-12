@@ -12,8 +12,15 @@ List of tasks that need doing. Mark as completed when done; user will remove onc
 - [x] Vector search returned fewer than `limit` results when trashed images were among
       the nearest neighbours. It now widens the KNN until the limit is filled or the
       similarity floor is reached.
-- [ ] macOS and Windows code is not compiled by a Linux build; cross-compile under Zig
-      0.17 (`-Dtarget=aarch64-macos`, `-Dtarget=x86_64-windows`) and fix what breaks.
+- [x] macOS and Windows Zig code is now compiled from Linux: `zig build check
+      -Dtarget=x86_64-windows-gnu` (whole app) and `zig build check-lib
+      -Dtarget=aarch64-macos` (all but the SDL layer). Fixed what they found: the
+      Windows/macOS drag sources' missing methods, Windows command-line parsing,
+      sqlite's flags on macOS, and `SQLITE_TRANSIENT` on aarch64.
+- [ ] Full Windows and macOS binaries can't be built from Linux: libvips (with glib)
+      and FFmpeg are system libraries, and macOS SDL needs Apple's SDK. Build natively
+      (Windows: MSYS2 mingw packages; macOS: Homebrew) and fix what that finds; the
+      drag-and-drop C files (`lib/dnd/`) and app.zig's macOS paths are unchecked.
 - [x] Prompts over 512 tokens got no prompt embedding (skipped, not truncated). They are
       now embedded with EmbeddingGemma's full window, split into at most 8 window-sized
       chunks and averaged past that (`embedPromptChunked`).

@@ -258,6 +258,30 @@ const attrs = windows.OBJECT.ATTRIBUTES{ ..., .Attributes = .{}, ... }; // packe
 const n = iosb.Information; // no longer inside the `u` union
 ```
 
-Platform code is only type-checked when something references it: check the
-watcher backends with `zig test -target x86_64-windows-gnu -fno-emit-bin src/fs_watch.zig`
-(and `aarch64-macos`), whose test block references every `FsWatcher` method.
+Platform code is only type-checked when something references it. `zig build check
+-Dtarget=x86_64-windows-gnu` compiles the whole app for another target without
+linking its C libraries; `zig build check-lib -Dtarget=aarch64-macos` does the same
+minus the SDL layer (app.zig), for targets whose SDL needs an SDK this machine
+lacks. The watcher backends alone: `zig test -target x86_64-windows-gnu -fno-emit-bin
+src/fs_watch.zig` (and `aarch64-macos`), whose test block references every
+`FsWatcher` method.
+
+## `std.process.Args.Iterator.init` is a compile error on Windows
+
+```zig
+// Old (compiles on POSIX only)
+var it = std.process.Args.Iterator.init(init.minimal.args);
+
+// New: portable; decodes the Windows command line into an allocated buffer
+var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+defer it.deinit();
+```
+
+## translate-c: `SQLITE_TRANSIENT` fails to compile on aarch64
+
+`SQLITE_TRANSIENT` is `((sqlite3_destructor_type)-1)`. Translated, it is
+`@ptrFromInt(maxInt(usize))` as a function pointer, and functions are 4-byte
+aligned on aarch64, so the comptime cast is rejected ("requires aligned
+address"). x86_64 has no such alignment, so it only shows on Apple Silicon / ARM
+Linux. `sqlite.zig` binds text with its own `sqlite3_malloc` copy and
+`sqlite3_free` as the destructor instead (`bindTextCopy`).

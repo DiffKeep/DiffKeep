@@ -76,21 +76,26 @@ fn viewersSetFavorite(id: u64, favorite: bool) void {
 
 // ── dvui callbacks ───────────────────────────────────────────────────────────
 
-fn appStart() dvui.App.StartOptions {
-    if (dvui.App.main_init) |init| {
-        var it = std.process.Args.Iterator.init(init.minimal.args);
-        _ = it.skip(); // skip argv[0] (executable path)
-        while (it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-                if (it.next()) |val| {
-                    g_config_arg = std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" }) catch |err| blk: {
-                        g_config_arg_err = err;
-                        break :blk null;
-                    };
-                }
+/// Read `--config` / `-c <dir>` into `g_config_arg`.
+fn parseArgs(init: std.process.Init) !void {
+    // Windows needs an allocator to decode the command line.
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer it.deinit();
+    _ = it.skip(); // skip argv[0] (executable path)
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (it.next()) |val| {
+                g_config_arg = try std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" });
             }
         }
     }
+}
+
+fn appStart() dvui.App.StartOptions {
+    // An error is reported by appInit, which can fail.
+    if (dvui.App.main_init) |init| parseArgs(init) catch |err| {
+        g_config_arg_err = err;
+    };
 
     return .{
         .size = .{ .w = 1200.0, .h = 800.0 },

@@ -41,7 +41,7 @@ const platform = switch (builtin.target.os.tag) {
                 return win32.dnd_win32_is_dragging();
             }
 
-            pub fn startDrag(self: *@This(), items: []const @This().DragItem) void {
+            pub fn startDrag(self: *@This(), items: []const ghost_mod.DragItem) void {
                 if (items.len == 0) return;
 
                 const ghost = ghost_mod.composeGhost(self.allocator, items);
@@ -83,6 +83,14 @@ const platform = switch (builtin.target.os.tag) {
             pub fn pumpEvents(_: *@This()) void {}
 
             pub fn tick(_: *@This(), _: std.Io) void {}
+
+            /// The OS draws the drag image itself: no SDL cursor to show.
+            pub fn getSdlCursor(_: *const @This()) ?*SDLBackend.c.SDL_Cursor {
+                return null;
+            }
+
+            /// The OS's drag loop sees the release itself.
+            pub fn notifyButtonUp(_: *@This()) void {}
         };
     },
 
@@ -100,10 +108,11 @@ const platform = switch (builtin.target.os.tag) {
             pub extern fn dnd_macos_is_dragging() bool;
         };
 
-        pub const DragItem = struct {
+        const Item = struct {
             path:       []const u8,
             thumb_jpeg: []const u8,
         };
+        pub const DragItem = Item;
 
         pub const DragSource = struct {
             allocator: std.mem.Allocator,
@@ -121,7 +130,7 @@ const platform = switch (builtin.target.os.tag) {
                 return macos_c.dnd_macos_is_dragging();
             }
 
-            pub fn startDrag(self: *@This(), items: []const @This().DragItem) void {
+            pub fn startDrag(self: *@This(), items: []const Item) void {
                 if (items.len == 0) return;
                 const n = @min(items.len, 3);
 
@@ -162,6 +171,14 @@ const platform = switch (builtin.target.os.tag) {
             pub fn pumpEvents(_: *@This()) void {}
 
             pub fn tick(_: *@This(), _: std.Io) void {}
+
+            /// The OS draws the drag image itself: no SDL cursor to show.
+            pub fn getSdlCursor(_: *const @This()) ?*SDLBackend.c.SDL_Cursor {
+                return null;
+            }
+
+            /// The OS's drag loop sees the release itself.
+            pub fn notifyButtonUp(_: *@This()) void {}
         };
     },
 
@@ -175,6 +192,8 @@ const platform = switch (builtin.target.os.tag) {
             pub fn startDrag(_: *@This(), _: anytype) void {}
             pub fn pumpEvents(_: *@This()) void {}
             pub fn tick(_: *@This(), _: std.Io) void {}
+            pub fn getSdlCursor(_: *const @This()) ?*SDLBackend.c.SDL_Cursor { return null; }
+            pub fn notifyButtonUp(_: *@This()) void {}
         };
     },
 };

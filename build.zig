@@ -101,6 +101,8 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    // Platform header translations the app imports (also used by `check`).
+    var os_imports: std.ArrayList(std.Build.Module.Import) = .empty;
     if (os == .linux) {
         const x11_c: Translator = .init(translate_c, .{
             .name = "x11_c",
@@ -119,9 +121,10 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
-        exe.root_module.addImport("x11_c", x11_c.mod);
-        exe.root_module.addImport("wayland_c", wayland_c.mod);
+        try os_imports.append(b.allocator, .{ .name = "x11_c", .module = x11_c.mod });
+        try os_imports.append(b.allocator, .{ .name = "wayland_c", .module = wayland_c.mod });
     }
+    for (os_imports.items) |imp| exe.root_module.addImport(imp.name, imp.module);
 
     // *** sqlite ***
     const sqlite_c_module = b.createModule(.{
@@ -133,7 +136,10 @@ pub fn build(b: *std.Build) !void {
         .file = b.path("lib/sqlite/sqlite3.c"),
         .flags = &[_][]const u8{
             "-std=c99",
-            "-D_POSIX_C_SOURCE=200809L",
+            // On macOS _POSIX_C_SOURCE hides the BSD types (u_int, ...) that
+            // sqlite's Darwin code needs through <sys/sysctl.h>; there the
+            // full API is the default.
+            if (os.isDarwin()) "-D_DARWIN_C_SOURCE" else "-D_POSIX_C_SOURCE=200809L",
             "-DSQLITE_ENABLE_RTREE",
             "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_JSON1",
@@ -228,6 +234,25 @@ pub fn build(b: *std.Build) !void {
         .git_version = git_version,
     };
     try wireCore(b, exe, exe.root_module, core);
+
+    // *** check: compile the app's Zig code for -Dtarget, no binary ***
+    // Links none of the C libraries (libvips, libav*, sqlite, the drag
+    // helpers), so other platforms' code can be checked from Linux without
+    // their builds of those libraries: `zig build check -Dtarget=x86_64-windows-gnu`.
+    const check_exe = b.addExecutable(.{
+        .name = "DiffKeep-check",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/app.zig"),
+        }),
+    });
+    check_exe.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
+    check_exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
+    for (os_imports.items) |imp| check_exe.root_module.addImport(imp.name, imp.module);
+    try wireImports(b, check_exe, check_exe.root_module, core);
+    const check_step = b.step("check", "Compile the app's Zig code for -Dtarget without building a binary or linking C libraries");
+    check_step.dependOn(&check_exe.step);
 
     // Dev tool: probe a media file's streams/metadata/first-frame.
     const video_probe_exe = b.addExecutable(.{
@@ -350,6 +375,32 @@ pub fn build(b: *std.Build) !void {
     try wireCore(b, integration_tests, diffkeep_test_module, core);
 
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    // *** check-lib: `check` without SDL ***
+    // The integration tests' build, compiled with no binary and no C
+    // libraries linked: everything but app.zig's SDL layer, against dvui's
+    // headless backend. For targets whose SDL needs an SDK this machine
+    // lacks (macOS): `zig build check-lib -Dtarget=aarch64-macos`.
+    // Own modules: the integration tests' have the C libraries linked in.
+    const check_lib_dk = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diffkeep.zig"),
+    });
+    check_lib_dk.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+    const check_lib = b.addTest(.{
+        .name = "diffkeep-check-lib",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("tests/integration.zig"),
+        }),
+    });
+    check_lib.root_module.addImport("diffkeep", check_lib_dk);
+    check_lib.root_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+    try wireImports(b, check_lib, check_lib_dk, core);
+    const check_lib_step = b.step("check-lib", "Like check, minus the SDL layer (app.zig): for targets whose SDL can't be built here");
+    check_lib_step.dependOn(&check_lib.step);
 }
 
 /// The C libraries and Zig modules behind the app's own code (src/diffkeep.zig
@@ -376,6 +427,13 @@ fn wireCore(b: *std.Build, compile: *std.Build.Step.Compile, import_mod: *std.Bu
     root.linkLibrary(core.sqlite_lib);
     root.linkLibrary(core.vips_lib);
     root.linkLibrary(core.video_lib);
+    try wireImports(b, compile, import_mod, core);
+}
+
+/// `wireCore` without linking the C libraries: enough to compile the Zig code
+/// (the `check` step), not to link a binary.
+fn wireImports(b: *std.Build, compile: *std.Build.Step.Compile, import_mod: *std.Build.Module, core: Core) !void {
+    const root = compile.root_module;
     for ([_]*std.Build.Module{ root, import_mod }) |m| {
         m.addIncludePath(b.path("lib/sqlite"));
         m.addIncludePath(b.path("lib/sqlite-vec"));

@@ -31,6 +31,10 @@ zig build
 # Run unit tests (src/test.zig)
 zig build test
 
+# Compile for another platform without its C libraries (no binary)
+zig build check -Dtarget=x86_64-windows-gnu      # whole app
+zig build check-lib -Dtarget=aarch64-macos       # minus the SDL layer (macOS SDL needs Apple's SDK)
+
 # Dev tools (not part of the GUI)
 zig build video_probe -- file.mp4         # probe a media file's streams/metadata/first frame
 zig build test_tp_batch -- ...            # TensorPencil single vs batch embed throughput
