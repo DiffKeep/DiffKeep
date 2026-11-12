@@ -2367,6 +2367,9 @@ test "image_ops: restoring next to a new file at the old path keeps both" {
 }
 
 test "image_ops: trashing an entry whose row is gone leaves the file alone" {
+    // Exercises a path that logs a warning.
+    const quiet = quietWarnings();
+    defer quiet.restore();
     const dir = "/tmp/diffkeep_test_trash_stale";
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, dir) catch {};
@@ -2548,6 +2551,24 @@ const ScanFixture = struct {
     }
 };
 
+/// For a test that exercises a path which logs a warning: keeps the expected
+/// warning off stderr, which `zig build test` prints after a passing run as
+/// if the step had failed. Errors still log (and still fail the test). The
+/// test runner doesn't reset the level between tests under the build runner,
+/// so restore it: `const quiet = quietWarnings(); defer quiet.restore();`.
+const QuietWarnings = struct {
+    prev: std.log.Level,
+    fn restore(self: QuietWarnings) void {
+        std.testing.log_level = self.prev;
+    }
+};
+
+fn quietWarnings() QuietWarnings {
+    const prev = std.testing.log_level;
+    std.testing.log_level = .err;
+    return .{ .prev = prev };
+}
+
 fn freshDir(dir: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, dir) catch {};
@@ -2555,6 +2576,9 @@ fn freshDir(dir: []const u8) !void {
 }
 
 test "scan: an emptied library folder (unmounted drive) keeps its images" {
+    // Exercises a path that logs a warning.
+    const quiet = quietWarnings();
+    defer quiet.restore();
     const dir = "/tmp/diffkeep_test_scan_unmounted";
     try freshDir(dir);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/a.png", .data = plain_png });
@@ -2593,6 +2617,9 @@ test "scan: rows the scan removes are reported so the grid drops them" {
 }
 
 test "scan: an unreadable subfolder doesn't abort the scan or lose its images" {
+    // Exercises a path that logs a warning.
+    const quiet = quietWarnings();
+    defer quiet.restore();
     const dir = "/tmp/diffkeep_test_scan_unreadable";
     try freshDir(dir);
     const cwd = std.Io.Dir.cwd();
@@ -4146,6 +4173,9 @@ const FailNext = struct {
 };
 
 test "grid: a view that fails to load says so, until a load succeeds" {
+    // Exercises a path that logs a warning.
+    const quiet = quietWarnings();
+    defer quiet.restore();
     const path = "/tmp/diffkeep_test_view_load_error.db";
     var db = try openDb(path);
     defer db.deinit();
@@ -4196,6 +4226,9 @@ test "grid: a view that fails to load says so, until a load succeeds" {
 }
 
 test "grid: scanned images it runs out of memory taking in are reloaded from the DB" {
+    // Exercises a path that logs a warning.
+    const quiet = quietWarnings();
+    defer quiet.restore();
     const path = "/tmp/diffkeep_test_grid_merge_oom.db";
     var db = try openDb(path);
     defer db.deinit();
@@ -4323,6 +4356,7 @@ test "viewer: prefetch decodes land in their slots, and close waits for them" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    dk.style.install(); // as a viewer window does on its first frame
     var vs = dk.image_viewer.ViewerState.init(alloc, 1, try viewerFiles(dir, &names), 0, null, null, io, null, null);
     defer vs.deinit();
 
@@ -4355,6 +4389,7 @@ test "viewer: an animation's player opens in the background and is adopted" {
 
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    dk.style.install(); // as a viewer window does on its first frame
     var images = try viewerFiles(dir, &.{"anim.gif"});
     images.items[0].media_type = .animated;
     var vs = dk.image_viewer.ViewerState.init(alloc, 1, images, 0, null, null, io, null, null);

@@ -22,7 +22,15 @@ List of tasks that need doing. Mark as completed when done; user will remove onc
       keep their old embedding until rescanned (no re-embed migration).
 - [x] `refreshCounts` ran five count queries on the UI thread after every change. It now
       only requests a load from `CountsLoader`, which runs them in the background.
-- [ ] dvui warns "processed closing window event but it has no open_flag" on shutdown.
+- [x] dvui warned "processed closing window event but it has no open_flag" on shutdown.
+      We close windows ourselves, so the close/quit events are now marked handled
+      (`takeCloseEvents` in app.zig) and `Window.end` no longer sees them.
+- [x] `zig build test` sometimes printed what looked like an integration-test failure
+      ("run test diffkeep-integration-tests w" + "failed command:"). Not a failure: it
+      exited 0. The build runner shows a passing step's stderr that way, and only when
+      the tests actually ran (not cached). The stderr was warnings the tests trigger on
+      purpose (now hidden per test with `quietWarnings`) and the viewer tests' missing
+      fonts (they now install the style). A passing run prints nothing.
 
 ## Improvements
 
