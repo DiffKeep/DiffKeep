@@ -31,10 +31,6 @@ pub const ImageMeta = struct {
     id: u64,
     mtime: ?i64,
     has_thumbnail: bool,
-    /// The row has a positive prompt (only those can get a prompt embedding).
-    has_prompt: bool = false,
-    has_prompt_embedding: bool,
-    has_image_embedding: bool,
     seen: bool = false,
 };
 
@@ -224,6 +220,25 @@ const migrations = [_][:0]const u8{
     // Re-embedding a shorter one changes nothing, so the cut only costs time.
     \\DELETE FROM positive_prompt_embeddings WHERE rowid IN
     \\  (SELECT id FROM images WHERE length(positive_prompt_text) > 240);
+    ,
+    // v17: embeddings are computed from the DB (`embed_worker.zig`), not
+    // queued by the scan. A row's vectors describe its content, so they go
+    // when it changes: both with the hash (a rewritten file), the prompt's
+    // with the prompt (a reparse). `*_embed_skip` holds the hash of content
+    // an embedding kind gave up on (an image that doesn't decode, a prompt
+    // that cleans to nothing), so it isn't offered again until it changes.
+    \\ALTER TABLE images ADD COLUMN prompt_embed_skip TEXT;
+    \\ALTER TABLE images ADD COLUMN image_embed_skip TEXT;
+    \\CREATE TRIGGER images_embeddings_au_hash AFTER UPDATE OF hash ON images
+    \\WHEN old.hash IS NOT new.hash BEGIN
+    \\  DELETE FROM image_embeddings WHERE rowid = new.id;
+    \\  DELETE FROM positive_prompt_embeddings WHERE rowid = new.id;
+    \\END;
+    \\CREATE TRIGGER images_prompt_embedding_au AFTER UPDATE OF positive_prompt_text ON images
+    \\WHEN old.positive_prompt_text IS NOT new.positive_prompt_text BEGIN
+    \\  DELETE FROM positive_prompt_embeddings WHERE rowid = new.id;
+    \\  UPDATE images SET prompt_embed_skip = NULL WHERE id = new.id;
+    \\END;
     ,
 };
 
@@ -434,13 +449,15 @@ pub const VectorDb = struct {
     }
 
     /// Store (or replace) the image embedding of row `id`, but only while that
-    /// row still holds `path`: an embedding finished after its image was deleted
-    /// would otherwise land on whichever image SQLite gives the recycled id.
-    /// Returns whether it was stored.
-    pub fn storeImageEmbedding(self: *VectorDb, id: u64, path: []const u8, embedding: []const f32) !bool {
+    /// row still holds `path` with content `hash` (the row's hash when the
+    /// caller read it): an embedding finished after its image was deleted
+    /// would otherwise land on whichever image SQLite gives the recycled id,
+    /// and one of a file replaced at the same path (same recycled id too) on
+    /// the new file. Returns whether it was stored.
+    pub fn storeImageEmbedding(self: *VectorDb, id: u64, path: []const u8, hash: ?[]const u8, embedding: []const f32) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        return self.db.insertVector("image_embeddings", @as(i64, @intCast(id)), path, embedding);
+        return self.db.insertVector("image_embeddings", @as(i64, @intCast(id)), path, hash, embedding);
     }
 
     pub fn findSimilarImages(self: *VectorDb, query_embedding: []const f32, limit: usize) !std.ArrayList(sqlite.VecResult) {
@@ -480,11 +497,128 @@ pub const VectorDb = struct {
         return @intCast(self.db.getLastInsertRowID());
     }
 
-    /// Prompt-embedding counterpart of `storeImageEmbedding` (same `path` guard).
-    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, path: []const u8, embedding: []const f32) !bool {
+    /// Prompt-embedding counterpart of `storeImageEmbedding` (same guard).
+    pub fn storePromptEmbedding(self: *VectorDb, image_id: u64, path: []const u8, hash: ?[]const u8, embedding: []const f32) !bool {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
-        return self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), path, embedding);
+        return self.db.insertVector("positive_prompt_embeddings", @as(i64, @intCast(image_id)), path, hash, embedding);
+    }
+
+    /// Which embeddings to compute (config switches, and an encoder loaded).
+    pub const EmbedKinds = struct {
+        prompt: bool = false,
+        image: bool = false,
+
+        pub fn any(k: EmbedKinds) bool {
+            return k.prompt or k.image;
+        }
+    };
+
+    /// A live, indexed image missing an embedding `EmbedKinds` asks for.
+    pub const PendingEmbed = struct {
+        id: u64,
+        path: [:0]u8,
+        /// The row's content hash when read: the store guard (`storeImageEmbedding`).
+        hash: []u8,
+        /// The prompt to embed; null when its embedding isn't needed.
+        prompt: ?[]u8,
+        want_image: bool,
+
+        pub fn deinit(p: PendingEmbed, a: std.mem.Allocator) void {
+            a.free(p.path);
+            a.free(p.hash);
+            if (p.prompt) |t| a.free(t);
+        }
+    };
+
+    /// Which embedding kind gave up on a row's content (`skipEmbed`).
+    pub const EmbedKind = enum { prompt, image };
+
+    // The pending rows, with what each needs. A row counts once indexed (it
+    // has a hash) and live, for each kind wanted that it lacks, unless that
+    // kind gave up on this content (`*_embed_skip` = the hash). Only a
+    // non-empty prompt has anything to embed. Embedding presence is checked
+    // against vec0's plain `<table>_rowids` shadow tables: a rowid lookup
+    // through the vec0 virtual table costs ~0.4 ms, so joining it took ~17 s
+    // for a 44k-image library (39 ms this way). The pending-embeds tests in
+    // tests/integration.zig catch a sqlite-vec upgrade that renames them.
+    // ?1 = prompt wanted,
+    // ?2 = image wanted, ?3 = only ids above this.
+    const pending_rows_sql =
+        \\SELECT * FROM (
+        \\  SELECT i.id, i.library_path, i.hash, i.positive_prompt_text,
+        \\    (?1 AND COALESCE(i.positive_prompt_text, '') <> '' AND i.prompt_embed_skip IS NOT i.hash
+        \\     AND NOT EXISTS (SELECT 1 FROM positive_prompt_embeddings_rowids r WHERE r.rowid = i.id)) AS need_prompt,
+        \\    (?2 AND i.image_embed_skip IS NOT i.hash
+        \\     AND NOT EXISTS (SELECT 1 FROM image_embeddings_rowids r WHERE r.rowid = i.id)) AS need_image
+        \\  FROM images i
+        \\  WHERE i.trashed_at IS NULL AND i.hash IS NOT NULL AND i.id > ?3
+        \\) WHERE need_prompt OR need_image
+    ;
+
+    /// How many rows `pendingEmbeds` would return in all.
+    pub fn countPendingEmbeds(self: *VectorDb, kinds: EmbedKinds) !u64 {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare("SELECT COUNT(*) FROM (" ++ pending_rows_sql ++ ")");
+        defer stmt.deinit();
+        try bindKinds(&stmt, kinds, 0);
+        if (!try stmt.step()) return 0;
+        return @intCast(stmt.columnInt64(0));
+    }
+
+    /// Up to `limit` rows missing an embedding `kinds` asks for, with ids above
+    /// `after_id`, in id order. Caller frees each, then the slice.
+    pub fn pendingEmbeds(self: *VectorDb, allocator: std.mem.Allocator, kinds: EmbedKinds, after_id: u64, limit: usize) ![]PendingEmbed {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(pending_rows_sql ++ " ORDER BY id LIMIT ?4");
+        defer stmt.deinit();
+        try bindKinds(&stmt, kinds, after_id);
+        try stmt.bind(4, @as(u64, limit));
+        var out: std.ArrayList(PendingEmbed) = .empty;
+        errdefer {
+            for (out.items) |p| p.deinit(allocator);
+            out.deinit(allocator);
+        }
+        while (try stmt.step()) {
+            const path = try allocator.dupeSentinel(u8, stmt.columnText(1), 0);
+            errdefer allocator.free(path);
+            const hash = try allocator.dupe(u8, stmt.columnText(2));
+            errdefer allocator.free(hash);
+            const prompt = if (stmt.columnInt64(4) != 0) try allocator.dupe(u8, stmt.columnText(3)) else null;
+            errdefer if (prompt) |t| allocator.free(t);
+            try out.append(allocator, .{
+                .id = @intCast(stmt.columnInt64(0)),
+                .path = path,
+                .hash = hash,
+                .prompt = prompt,
+                .want_image = stmt.columnInt64(5) != 0,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn bindKinds(stmt: *sqlite.PreparedStatement, kinds: EmbedKinds, after_id: u64) !void {
+        try stmt.bind(1, @as(i64, @intFromBool(kinds.prompt)));
+        try stmt.bind(2, @as(i64, @intFromBool(kinds.image)));
+        try stmt.bind(3, after_id);
+    }
+
+    /// Stop offering row `id` for a `kind` embedding while its content is
+    /// `hash` (it can't be embedded: the image doesn't decode, the prompt
+    /// cleans to nothing). A changed file has a new hash, and is tried again.
+    pub fn skipEmbed(self: *VectorDb, id: u64, hash: []const u8, kind: EmbedKind) !void {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        var stmt = try self.db.prepare(switch (kind) {
+            .prompt => "UPDATE images SET prompt_embed_skip = ?2 WHERE id = ?1 AND hash IS ?2",
+            .image => "UPDATE images SET image_embed_skip = ?2 WHERE id = ?1 AND hash IS ?2",
+        });
+        defer stmt.deinit();
+        try stmt.bind(1, id);
+        try stmt.bind(2, hash);
+        _ = try stmt.step();
     }
 
     /// KNN search on positive_prompt_embeddings. query must be L2-normalized, 768-dim.
@@ -1067,16 +1201,8 @@ pub const VectorDb = struct {
             while (it.next()) |k| allocator.free(k.*);
             map.deinit();
         }
-        // Embedding presence is checked against vec0's plain `<table>_rowids`
-        // shadow tables: a rowid lookup through the vec0 virtual table costs
-        // ~0.4 ms, so joining it took ~17 s for a 44k-image library (39 ms this
-        // way). The prefetch test in tests/integration.zig catches a sqlite-vec
-        // upgrade that renames them.
         var stmt = try self.db.prepare(
-            \\SELECT i.id, i.library_path, i.mtime,
-            \\       (i.thumbnail IS NOT NULL), (COALESCE(i.positive_prompt_text, '') <> ''),
-            \\       EXISTS (SELECT 1 FROM positive_prompt_embeddings_rowids r WHERE r.rowid = i.id),
-            \\       EXISTS (SELECT 1 FROM image_embeddings_rowids r WHERE r.rowid = i.id)
+            \\SELECT i.id, i.library_path, i.mtime, (i.thumbnail IS NOT NULL)
             \\FROM images i
             \\WHERE i.library_id = ? AND i.trashed_at IS NULL
         );
@@ -1088,15 +1214,12 @@ pub const VectorDb = struct {
             errdefer allocator.free(path);
             const mtime: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnInt64(2);
             const has_thumbnail = stmt.columnInt64(3) != 0;
-            const has_prompt = stmt.columnInt64(4) != 0;
-            const has_prompt_embedding = stmt.columnInt64(5) != 0;
-            const has_image_embedding = stmt.columnInt64(6) != 0;
             const gop = try map.getOrPut(path);
             if (gop.found_existing) {
                 allocator.free(path);
                 continue;
             }
-            gop.value_ptr.* = .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail, .has_prompt = has_prompt, .has_prompt_embedding = has_prompt_embedding, .has_image_embedding = has_image_embedding };
+            gop.value_ptr.* = .{ .id = id, .mtime = mtime, .has_thumbnail = has_thumbnail };
         }
         return map;
     }

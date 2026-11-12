@@ -327,11 +327,15 @@ pub const Embedder = struct {
     /// Embed an image file (siglip2 visual, 768-dim, L2-norm). Caller owns result.
     pub fn embedImage(self: *Embedder, allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
         const enc = if (self.image) |*e| e else return error.ModelNotLoaded;
+        const decode_start = self.now();
         const tensor = try loadImageAsTensor(allocator, path); // CPU decode, no lock
         defer allocator.free(tensor);
+        const asked = self.now();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const got = self.now();
         const backend = self.backendFor(1);
+        defer self.logCall(.{ .what = "image", .n = 1, .backend = backend, .decode_start = decode_start, .asked = asked, .got = got });
         enc.backend = backend;
         self.bindThreadFor(backend);
         return enc.embedImage(allocator, tensor);
@@ -356,9 +360,12 @@ pub const Embedder = struct {
     /// (see `backendFor`).
     fn embedDocuments(self: *Embedder, allocator: std.mem.Allocator, texts: []const []const u8, route_n: usize) ![][]f32 {
         const enc = if (self.text) |*e| e else return error.ModelNotLoaded;
+        const asked = self.now();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const got = self.now();
         const backend = self.backendFor(route_n);
+        defer self.logCall(.{ .what = "prompt batch", .n = texts.len, .backend = backend, .asked = asked, .got = got });
         enc.backend = backend;
         self.bindThreadFor(backend);
         return enc.embedTextBatch(allocator, texts, .{ .role = .document });
@@ -394,6 +401,7 @@ pub const Embedder = struct {
         const batch = try allocator.alloc([]const f32, n);
         const idx = try allocator.alloc(usize, n);
         var m: usize = 0;
+        const decode_start = self.now();
         defer {
             for (batch[0..m]) |t| allocator.free(t);
             allocator.free(batch);
@@ -416,9 +424,12 @@ pub const Embedder = struct {
         if (m == 0 or (stop != null and stop.?.load(.acquire))) return out;
 
         // One batched forward over the decoded images (GPU when m >= threshold).
+        const asked = self.now();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const locked = self.now();
         const backend = self.backendFor(m);
+        defer self.logCall(.{ .what = "image batch", .n = m, .backend = backend, .decode_start = decode_start, .asked = asked, .got = locked });
         enc.backend = backend;
         self.bindThreadFor(backend);
         const got = try enc.embedImageBatch(allocator, batch[0..m]);
@@ -431,6 +442,38 @@ pub const Embedder = struct {
 
     // ── Internal ────────────────────────────────────────────────────────────────
 
+    fn now(self: *const Embedder) i96 {
+        return std.Io.Clock.awake.now(self.io).nanoseconds;
+    }
+
+    /// One embed call, for `logCall`. Times are `now()` readings.
+    const CallLog = struct {
+        what: []const u8,
+        n: usize,
+        backend: tp.embed.Backend,
+        /// When decoding started (image calls only; decode runs before the lock).
+        decode_start: ?i96 = null,
+        /// When the call asked for the embed lock, and when it got it.
+        asked: i96,
+        got: i96,
+    };
+
+    /// Debug-log an embed call: its size, where it ran, and where the time
+    /// went (decode, waiting for the lock, the forward itself). Called while
+    /// still holding the lock, right after the forward.
+    fn logCall(self: *const Embedder, c: CallLog) void {
+        const ms = struct {
+            fn f(from: i96, to: i96) f64 {
+                return @as(f64, @floatFromInt(to - from)) / std.time.ns_per_ms;
+            }
+        }.f;
+        const done = self.now();
+        log.debug("{s}: {d} on {s} (decode {d:.1} ms, lock wait {d:.1} ms, forward {d:.1} ms)", .{
+            c.what,                                           c.n,                 @tagName(c.backend),
+            if (c.decode_start) |d| ms(d, c.asked) else 0.0, ms(c.asked, c.got), ms(c.got, done),
+        });
+    }
+
     fn embedTextOne(
         self:      *Embedder,
         enc:       *tp.embed.TextEncoder,
@@ -438,9 +481,12 @@ pub const Embedder = struct {
         text:      []const u8,
         role:      tp.embed.Role,
     ) ![]f32 {
+        const asked = self.now();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const got = self.now();
         const backend = self.backendFor(1);
+        defer self.logCall(.{ .what = "text", .n = 1, .backend = backend, .asked = asked, .got = got });
         enc.backend = backend;
         self.bindThreadFor(backend);
         return enc.embedText(allocator, text, .{ .role = role });

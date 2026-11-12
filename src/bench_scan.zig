@@ -4,7 +4,8 @@
 //!   zig build bench_scan -Doptimize=ReleaseFast -- DIR [--db FILE] [--runs N]
 //!       [--text-model DIR] [--visual-model DIR] [--gpu none|cuda|vulkan]
 //!
-//! With a model dir, the scan also computes those embeddings (prompt / image).
+//! With a model dir, the embed worker also computes those embeddings (prompt /
+//! image), alongside the scan as in the app; the time runs until both finish.
 //!
 //! Each run starts from an empty DB (the file is deleted first), so every file
 //! is new. Prints wall time, files/s and peak RSS. Peak threads can be sampled
@@ -15,6 +16,7 @@ const db_mod = @import("db.zig");
 const scan = @import("scan.zig");
 const vips = @import("vips");
 const embedder_mod = @import("embedder.zig");
+const embed_worker = @import("embed_worker.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -67,23 +69,33 @@ pub fn main(init: std.process.Init) !void {
         defer db.deinit();
         const lib_id = try db.storeLibrary(lib_path);
 
+        var embeds: embed_worker.EmbedWorker = .init(gpa, io, &db, .{ .prompt = text_model != null, .image = visual_model != null });
+        defer embeds.deinit();
         var scanner = scan.LibraryScanner.init(gpa, &db, null);
         defer scanner.deinit();
-        if (embedder) |*e| scanner.embedder = e;
+        if (embedder) |*e| {
+            embeds.configure(e, embeds.kinds);
+            scanner.embeds = &embeds;
+        }
         var stop: std.atomic.Value(bool) = .init(false);
         var scanned: std.atomic.Value(u32) = .init(0);
-        var embed_done: std.atomic.Value(u32) = .init(0);
-        var embed_total: std.atomic.Value(u32) = .init(0);
 
         const t0 = std.Io.Clock.awake.now(io);
-        const stats = try scanner.scanLibrary(io, lib_id, lib_path, &stop, &scanned, &embed_done, &embed_total, true, text_model != null, visual_model != null);
-        const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
+        const stats = try scanner.scanLibrary(io, lib_id, lib_path, &stop, &scanned, true);
+        const scan_ms = msSince(io, t0);
+        embeds.awaitIdle();
+        const ms = msSince(io, t0);
 
         const files = stats.added + stats.updated + stats.unchanged;
-        std.debug.print("run {d}: {d} files in {d:.0} ms ({d:.1} files/s), {d}/{d} embedded, peak RSS {d} MB\n", .{
-            run + 1, files, ms, @as(f64, @floatFromInt(files)) * 1000.0 / ms, embed_done.load(.acquire), embed_total.load(.acquire), peakRssMb(),
+        const p = embeds.progress();
+        std.debug.print("run {d}: {d} files in {d:.0} ms (scan {d:.0} ms, {d:.1} files/s), {d}/{d} embedded, peak RSS {d} MB\n", .{
+            run + 1, files, ms, scan_ms, @as(f64, @floatFromInt(files)) * 1000.0 / ms, p.done, p.total, peakRssMb(),
         });
     }
+}
+
+fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
 }
 
 fn peakRssMb() i64 {

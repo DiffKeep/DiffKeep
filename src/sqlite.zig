@@ -375,7 +375,10 @@ pub const Database = struct {
     /// has `owner_path`. Returns whether it was stored. vec0 ignores `INSERT OR
     /// REPLACE` (an existing rowid fails with a UNIQUE error), so delete first,
     /// inside a savepoint so a failed insert keeps the old vector.
-    pub fn insertVector(self: *Database, table_name: []const u8, id: i64, owner_path: []const u8, vector: []const f32) !bool {
+    /// Store `vector` as row `id`'s, replacing any it had, only while image
+    /// `id` still holds `owner_path` with content `owner_hash` (null: no hash
+    /// yet). Returns whether it was stored.
+    pub fn insertVector(self: *Database, table_name: []const u8, id: i64, owner_path: []const u8, owner_hash: ?[]const u8, vector: []const f32) !bool {
         try self.exec("SAVEPOINT insert_vector");
         errdefer self.exec("ROLLBACK TO insert_vector; RELEASE insert_vector") catch {};
 
@@ -388,7 +391,7 @@ pub const Database = struct {
 
         const sql = try self.allocator.print(
             "INSERT INTO {s}(rowid, vector) SELECT ?1, ?2 " ++
-                "WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1 AND library_path = ?3)",
+                "WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1 AND library_path = ?3 AND hash IS ?4)",
             .{table_name},
         );
         defer self.allocator.free(sql);
@@ -397,6 +400,7 @@ pub const Database = struct {
         try ins.bind(1, id);
         try ins.bindBlob(2, std.mem.sliceAsBytes(vector));
         try ins.bind(3, owner_path);
+        if (owner_hash) |h| try ins.bind(4, h) else try ins.bindNull(4);
         _ = try ins.step();
         const stored = c.sqlite3_changes(self.db) > 0;
 

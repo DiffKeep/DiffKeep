@@ -26,6 +26,7 @@ pub const image_ops = @import("image_ops.zig");
 pub const vips = @import("vips");
 pub const video = @import("video");
 pub const scan = @import("scan.zig");
+pub const embed_worker = @import("embed_worker.zig");
 pub const embedder = @import("embedder.zig");
 pub const library_manager = library_manager_mod;
 pub const counts = @import("counts.zig");

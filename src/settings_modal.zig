@@ -555,16 +555,16 @@ pub const SettingsModalState = struct {
         _ = search;
         var need_rescan = false;
 
-        const changed = cfg.thumbnails_in_db != self.scan_snapshot.thumbnails_in_db or
-            cfg.prompt_embeddings != self.scan_snapshot.prompt_embeddings or
-            cfg.image_embeddings != self.scan_snapshot.image_embeddings;
-        if (changed) {
-            if (library_manager.*) |*mgr| {
-                mgr.thumbnails_in_db = cfg.thumbnails_in_db;
-                mgr.prompt_embeddings = cfg.prompt_embeddings;
-                mgr.image_embeddings = cfg.image_embeddings;
-            }
+        // Thumbnails are the scan's to fill in; embeddings the embed worker's,
+        // which finds what's missing in the DB (no rescan needed).
+        if (cfg.thumbnails_in_db != self.scan_snapshot.thumbnails_in_db) {
+            if (library_manager.*) |*mgr| mgr.thumbnails_in_db = cfg.thumbnails_in_db;
             need_rescan = true;
+        }
+        if (cfg.prompt_embeddings != self.scan_snapshot.prompt_embeddings or
+            cfg.image_embeddings != self.scan_snapshot.image_embeddings)
+        {
+            if (library_manager.*) |*mgr| mgr.setEmbedKinds(cfg.prompt_embeddings, cfg.image_embeddings);
         }
 
         const model_changed =
@@ -576,7 +576,6 @@ pub const SettingsModalState = struct {
                 _ = setPath(init.gpa, &cfg.visual_model_dir, std.mem.sliceTo(&self.visual_model_dir_buf, 0));
             }
             self.model_paths_changed = true;
-            if (cfg.prompt_embeddings or cfg.image_embeddings) need_rescan = true;
         }
 
         const gpu_changed = cfg.embed_gpu_backend != self.gpu_snapshot.backend or

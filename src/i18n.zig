@@ -184,7 +184,7 @@ pub const Strings = struct {
 
     status_indexing: [:0]const u8,
     status_embedding: [:0]const u8,
-    status_loading_model: [:0]const u8,
+    status_embed_model_loading: [:0]const u8,
 };
 
 pub const en: Strings = .{
@@ -365,7 +365,7 @@ pub const en: Strings = .{
 
     .status_indexing = "Indexing",
     .status_embedding = "Embedding",
-    .status_loading_model = "Loading model\u{2026}",
+    .status_embed_model_loading = "Embeddings: loading model\u{2026}",
 };
 
 pub var active: *const Strings = &en;

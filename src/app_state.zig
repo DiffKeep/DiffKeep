@@ -240,6 +240,7 @@ pub const AppState = struct {
         const mgr = &self.library_manager.?;
         mgr.data_dir = self.data_dir;
         mgr.wakeup_fn = hooks.wakeup;
+        mgr.embeds.wakeup_fn = hooks.wakeup;
         self.search.wakeup_fn = hooks.wakeup;
         self.sidebar.wakeup_fn = hooks.wakeup;
         self.sidebar.setFolderLoader(folder_loader_mod.FolderLoader.init(gpa, io, db));
@@ -822,17 +823,13 @@ pub const AppState = struct {
         self.spawnEmbedderLoad(args);
     }
 
-    /// Unhook and free the current embedder. Scans, watcher file workers and
-    /// search query embeds hold a raw pointer to it, so they are stopped and
-    /// awaited first (interrupted scans resume without an embedder; the
-    /// backfill scan after the next load fills in what they skipped).
+    /// Unhook and free the current embedder. The embed worker and search
+    /// query embeds hold a raw pointer to it, so they are stopped and awaited
+    /// first (the embed worker carries on with the next embedder).
     fn releaseEmbedder(self: *AppState) void {
         self.search.embedder = null;
         self.search.awaitEmbed();
-        if (self.library_manager) |*mgr| {
-            mgr.embedder = null;
-            mgr.quiesce(self.io);
-        }
+        if (self.library_manager) |*mgr| mgr.setEmbedder(null);
         if (self.embedder) |*emb| emb.deinit();
         self.embedder = null;
     }
@@ -848,21 +845,12 @@ pub const AppState = struct {
         self.emb_load.result = null;
         const emb_ptr: ?*embedder_mod.Embedder = if (self.embedder) |*e| e else null;
         self.search.embedder = emb_ptr;
-        if (self.library_manager) |*mgr| mgr.embedder = emb_ptr;
-        // A reload asked for meanwhile starts now; its own completion runs
-        // the backfill scan.
+        // The embed worker picks up whatever was indexed meanwhile.
+        if (self.library_manager) |*mgr| mgr.setEmbedder(emb_ptr);
+        // A reload asked for meanwhile starts now.
         if (self.emb_load.pending) |args| {
             self.emb_load.pending = null;
             self.spawnEmbedderLoad(args);
-            return;
-        }
-        // Backfill embeddings skipped while the embedder was loading. Files
-        // that already have them are fast-pathed by the scanner.
-        if (emb_ptr == null) return;
-        if (self.library_manager) |*mgr| {
-            if (mgr.prompt_embeddings or mgr.image_embeddings) {
-                mgr.scanAllLibraries() catch |err| log.warn("embedder-ready backfill scan failed: {}", .{err});
-            }
         }
     }
 };

@@ -15,6 +15,7 @@ const widgets_mod = @import("widgets.zig");
 const image_ops_mod = @import("image_ops.zig");
 const counts_mod = @import("counts.zig");
 const style = @import("style.zig");
+const activity = @import("activity.zig");
 
 pub const left_w_min: f32 = 160;
 pub const left_w_max: f32 = 400;
@@ -509,20 +510,33 @@ pub fn renderContent(ctx: RenderCtx) !void {
 /// One "the machine is busy" line: amber spinner, amber mono caption. Every
 /// background job in the status bar reads identically, so the user learns one
 /// shape rather than four.
-fn activityLine(src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype) void {
-    var line = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+/// One spinner, then each running activity, separated by dots.
+fn activityLine(running: []const activity.Activity) void {
+    var line = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
     defer line.deinit();
     _ = dvui.spinner(@src(), .{
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 12, .h = 12 },
         .color_text = .{ .color = style.C.amber },
     });
-    dvui.label(@src(), fmt, args, .{
+    const opts: dvui.Options = .{
         .gravity_y = 0.5,
-        .margin = .{ .x = 6 },
         .font = style.F.mono,
         .color_text = .{ .color = style.C.amber },
-    });
+    };
+    for (running, 0..) |a, i| {
+        var item = opts;
+        item.id_extra = i;
+        item.margin = .{ .x = 6 };
+        if (i > 0) dvui.label(@src(), "\u{00b7}", .{}, item.override(.{ .color_text = .{ .color = style.C.text_dim } }));
+        switch (a) {
+            .indexing => |n| dvui.label(@src(), "{s}: {d}", .{ i18n.t(.status_indexing), n }, item),
+            .embedding => |e| dvui.label(@src(), "{s}: {d} / {d}", .{ i18n.t(.status_embedding), e.done, e.total }, item),
+            .embed_model_loading => dvui.label(@src(), "{s}", .{i18n.t(.status_embed_model_loading)}, item),
+            .searching => dvui.label(@src(), "{s}", .{i18n.t(.search_loading)}, item),
+            .downloading => dvui.label(@src(), "{s}", .{i18n.t(.settings_download_running)}, item),
+        }
+    }
 }
 
 pub fn renderStatusBar(ctx: RenderCtx) void {
@@ -575,26 +589,15 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
         });
         defer activity_box.deinit();
 
-        const is_scanning = if (ctx.library_manager.*) |*mgr| mgr.isScanActive() else false;
-        const is_searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g.appliedGen() else null);
-        const is_downloading = ctx.settings.gemma_dl != null or ctx.settings.siglip2_dl != null;
-
-        if (is_scanning) {
-            const embed_total = if (ctx.library_manager.*) |*mgr| mgr.embedsTotal() else 0;
-            if (embed_total > 0) {
-                const embed_done = if (ctx.library_manager.*) |*mgr| mgr.embedsDone() else 0;
-                activityLine(@src(), "{s}: {d} / {d}", .{ i18n.t(.status_embedding), embed_done, embed_total });
-            } else {
-                const scanned = if (ctx.library_manager.*) |*mgr| mgr.filesScanned() else 0;
-                activityLine(@src(), "{s}: {d}", .{ i18n.t(.status_indexing), scanned });
-            }
-        } else if (is_searching) {
-            activityLine(@src(), "{s}", .{i18n.t(.search_loading)});
-        } else if (ctx.embedder_loading) {
-            activityLine(@src(), "{s}", .{i18n.t(.status_loading_model)});
-        } else if (is_downloading) {
-            activityLine(@src(), "{s}", .{i18n.t(.settings_download_running)});
-        }
+        var buf: [activity.max]activity.Activity = undefined;
+        const running = activity.list(.{
+            .scan = if (ctx.library_manager.*) |*mgr| mgr.scanActivity() else .{},
+            .embed = if (ctx.library_manager.*) |*mgr| mgr.embedActivity() else .{},
+            .embedder_loading = ctx.embedder_loading,
+            .searching = ctx.search.isSearchLoading(if (ctx.grid.*) |*g| g.appliedGen() else null),
+            .downloading = ctx.settings.gemma_dl != null or ctx.settings.siglip2_dl != null,
+        }, &buf);
+        if (running.len > 0) activityLine(running);
     }
 
     _ = dvui.spacer(@src(), .{ .expand = .horizontal });

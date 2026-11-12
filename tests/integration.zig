@@ -9,6 +9,20 @@ const io = std.testing.io;
 // ── DB helpers ────────────────────────────────────────────────────────────────
 
 /// Trash the row `id` in the DB only (no file move), at its current path.
+/// Make a fully migrated DB look like schema `version`, so opening it again
+/// replays the later migrations. A migration that can't simply run twice
+/// (ALTER TABLE ADD COLUMN, CREATE without IF NOT EXISTS) is undone here.
+fn rewindSchema(db: *dk.VectorDb, version: u32) !void {
+    if (version < 17) try db.db.exec(
+        \\DROP TRIGGER images_embeddings_au_hash;
+        \\DROP TRIGGER images_prompt_embedding_au;
+        \\ALTER TABLE images DROP COLUMN prompt_embed_skip;
+        \\ALTER TABLE images DROP COLUMN image_embed_skip;
+    );
+    var buf: [48]u8 = undefined;
+    try db.db.exec(try std.mem.printSentinel(&buf, "PRAGMA user_version = {d}", .{version}, 0));
+}
+
 fn trashById(db: *dk.VectorDb, id: u64, trash_name: []const u8, size: i64, at: i64) !void {
     var details = (try db.getImageDetails(alloc, id)).?;
     defer details.deinit(alloc);
@@ -406,8 +420,8 @@ test "db: vector KNN search (prompt + image) ranks nearest and excludes trash" {
         var image_vec: [dim]f32 = @splat(0);
         prompt_vec[k] = 1.0; // prompt axis k
         image_vec[k + 10] = 1.0; // image axis k+10 (distinct from prompt axes)
-        _ = try db.storePromptEmbedding(img.id, img.libraryPath, &prompt_vec);
-        _ = try db.storeImageEmbedding(img.id, img.libraryPath, &image_vec);
+        _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &prompt_vec);
+        _ = try db.storeImageEmbedding(img.id, img.libraryPath, img.hash, &image_vec);
     }
 
     // Prompt query nearest to image b (axis 1).
@@ -1573,8 +1587,8 @@ test "db: deleting an image drops its embeddings, so a recycled id starts clean"
     defer img.deinit(alloc);
     var vec: [768]f32 = @splat(0);
     vec[0] = 1.0;
-    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &vec);
-    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &vec);
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &vec);
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, img.hash, &vec);
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
 
@@ -1809,7 +1823,7 @@ test "db: vector search fills the limit past trashed nearest neighbours" {
         const t: f32 = @as(f32, @floatFromInt(k)) * 0.1;
         v[0] = @cos(t);
         v[1] = @sin(t);
-        _ = try db.storePromptEmbedding(img.id, img.libraryPath, &v);
+        _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &v);
         if (k < 4) try trashById(&db, img.id, "t", 1, 1000);
     }
     var q: [768]f32 = @splat(0);
@@ -1885,66 +1899,82 @@ test "grid: an image scanned in while a load is running survives the load" {
     try expectGridIds(&grid, &.{77});
 }
 
-test "db: scan prefetch reports which images already have embeddings" {
-    const path = "/tmp/diffkeep_test_prefetch_embeds.db";
-    var db = try openDb(path);
-    defer db.deinit();
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-
-    const lib_id = try db.storeLibrary("/lib");
-    var a = try db.findOrCreateImage(alloc, lib_id, "/lib/a.png");
-    defer a.deinit(alloc);
-    var b = try db.findOrCreateImage(alloc, lib_id, "/lib/b.png");
-    defer b.deinit(alloc);
-    var v: [768]f32 = @splat(0);
-    v[0] = 1.0;
-    _ = try db.storePromptEmbedding(a.id, a.libraryPath, &v);
-    _ = try db.storeImageEmbedding(b.id, b.libraryPath, &v);
-
-    var known = try db.prefetchLibraryImages(alloc, lib_id);
-    defer {
-        var it = known.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        known.deinit();
-    }
-    const ma = known.get("/lib/a.png").?;
-    const mb = known.get("/lib/b.png").?;
-    try std.testing.expect(ma.has_prompt_embedding and !ma.has_image_embedding);
-    try std.testing.expect(!mb.has_prompt_embedding and mb.has_image_embedding);
+/// An indexed image: a row with `hash` (and `prompt`) saved. Returns its id.
+fn indexedImage(db: *dk.VectorDb, lib_id: u64, path: []const u8, hash: []const u8, prompt: ?[]const u8) !u64 {
+    var img = try db.findOrCreateImage(alloc, lib_id, path);
+    defer img.deinit(alloc);
+    if (img.hash) |h| alloc.free(h);
+    img.hash = null;
+    img.hash = try alloc.dupe(u8, hash);
+    if (img.positivePromptText) |t| alloc.free(t);
+    img.positivePromptText = null;
+    img.positivePromptText = if (prompt) |t| try alloc.dupe(u8, t) else null;
+    try db.saveImage(&img);
+    return img.id;
 }
 
-test "db: scan prefetch counts only a non-empty prompt as one to embed" {
-    // An empty prompt is a real record (a ComfyUI generation whose positive
-    // prompt was empty), unlike NULL (no metadata), but neither has text to
-    // embed. Counting '' as a prompt queued it for embedding on every scan,
-    // where the embedder skipped it again.
-    const path = "/tmp/diffkeep_test_prefetch_empty_prompt.db";
+const both_kinds: dk.VectorDb.EmbedKinds = .{ .prompt = true, .image = true };
+
+/// The pending rows as (id, wants prompt, wants image), freed.
+fn pendingSummary(db: *dk.VectorDb, kinds: dk.VectorDb.EmbedKinds, after: u64, limit: usize) ![]struct { u64, bool, bool } {
+    const rows = try db.pendingEmbeds(alloc, kinds, after, limit);
+    defer {
+        for (rows) |r| r.deinit(alloc);
+        alloc.free(rows);
+    }
+    const out = try alloc.alloc(struct { u64, bool, bool }, rows.len);
+    for (rows, out) |r, *o| o.* = .{ r.id, r.prompt != null, r.want_image };
+    return out;
+}
+
+test "db: pending embeds are the indexed, live images missing a wanted embedding" {
+    const path = "/tmp/diffkeep_test_pending_embeds.db";
     var db = try openDb(path);
     defer db.deinit();
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const lib_id = try db.storeLibrary("/lib");
-    const prompts = [_]?[]const u8{ null, "", "a red fox" };
-    const names = [_][]const u8{ "/lib/none.png", "/lib/empty.png", "/lib/fox.png" };
-    for (prompts, names) |prompt, name| {
-        var img = try db.findOrCreateImage(alloc, lib_id, name);
-        defer img.deinit(alloc);
-        img.positivePromptText = if (prompt) |t| try alloc.dupe(u8, t) else null;
-        try db.saveImage(&img);
-    }
+    // Not indexed yet (no hash): not offered.
+    var placeholder = try db.findOrCreateImage(alloc, lib_id, "/lib/new.png");
+    defer placeholder.deinit(alloc);
+    const fox = try indexedImage(&db, lib_id, "/lib/fox.png", "h1", "a red fox");
+    // An empty prompt is a real record (a generation whose positive prompt
+    // was empty), unlike NULL (no metadata), but neither has text to embed.
+    const empty = try indexedImage(&db, lib_id, "/lib/empty.png", "h2", "");
+    const none = try indexedImage(&db, lib_id, "/lib/none.png", "h3", null);
+    const trashed = try indexedImage(&db, lib_id, "/lib/trashed.png", "h4", "x");
+    try trashById(&db, trashed, "t", 1, 1000);
 
-    var known = try db.prefetchLibraryImages(alloc, lib_id);
-    defer {
-        var it = known.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        known.deinit();
+    {
+        const got = try pendingSummary(&db, both_kinds, 0, 10);
+        defer alloc.free(got);
+        try std.testing.expectEqual(@as(usize, 3), got.len);
+        try std.testing.expectEqual(.{ fox, true, true }, got[0]);
+        try std.testing.expectEqual(.{ empty, false, true }, got[1]);
+        try std.testing.expectEqual(.{ none, false, true }, got[2]);
+        try std.testing.expectEqual(@as(u64, 3), try db.countPendingEmbeds(both_kinds));
     }
-    try std.testing.expect(!known.get("/lib/none.png").?.has_prompt);
-    try std.testing.expect(!known.get("/lib/empty.png").?.has_prompt);
-    try std.testing.expect(known.get("/lib/fox.png").?.has_prompt);
+    // Only the kinds asked for count; prompts only: just the fox.
+    try std.testing.expectEqual(@as(u64, 1), try db.countPendingEmbeds(.{ .prompt = true }));
+    try std.testing.expectEqual(@as(u64, 0), try db.countPendingEmbeds(.{}));
 
+    // Paged by id; an embedding stored takes its kind off the list.
+    {
+        const got = try pendingSummary(&db, both_kinds, fox, 1);
+        defer alloc.free(got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqual(empty, got[0][0]);
+    }
+    try std.testing.expect(try db.storePromptEmbedding(fox, "/lib/fox.png", "h1", &dupVec(0)));
+    {
+        const got = try pendingSummary(&db, both_kinds, 0, 1);
+        defer alloc.free(got);
+        try std.testing.expectEqual(.{ fox, false, true }, got[0]);
+    }
+    try std.testing.expect(try db.storeImageEmbedding(fox, "/lib/fox.png", "h1", &dupVec(0)));
+    try std.testing.expectEqual(@as(u64, 2), try db.countPendingEmbeds(both_kinds));
     // The empty prompt itself is kept: it isn't turned into NULL.
-    var details = (try db.getImageDetails(alloc, known.get("/lib/empty.png").?.id)).?;
+    var details = (try db.getImageDetails(alloc, empty)).?;
     defer details.deinit(alloc);
     try std.testing.expectEqualStrings("", details.positive_prompt_text.?);
 }
@@ -1967,6 +1997,85 @@ fn meshCoverage(tri: dvui.Triangles, p: dvui.Point.Physical) f32 {
         a += va / 255.0 * (1 - a);
     }
     return a;
+}
+
+test "db: an embedding is stored only for the content it was computed from" {
+    const path = "/tmp/diffkeep_test_embed_hash_guard.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    // The worker read a.png at hash "old"; the file was replaced at the same
+    // path, and its row (same id, recycled) now holds "new".
+    const id = try indexedImage(&db, lib_id, "/lib/a.png", "new", "p");
+    try std.testing.expect(!try db.storeImageEmbedding(id, "/lib/a.png", "old", &dupVec(0)));
+    try std.testing.expect(!try db.storePromptEmbedding(id, "/lib/a.png", "old", &dupVec(0)));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expect(try db.storeImageEmbedding(id, "/lib/a.png", "new", &dupVec(0)));
+}
+
+test "db: a changed file loses its embeddings; a changed prompt its prompt one" {
+    const path = "/tmp/diffkeep_test_embed_invalidate.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    const id = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "a fox");
+    _ = try db.storePromptEmbedding(id, "/lib/a.png", "h1", &dupVec(0));
+    _ = try db.storeImageEmbedding(id, "/lib/a.png", "h1", &dupVec(0));
+    try std.testing.expectEqual(@as(u64, 0), try db.countPendingEmbeds(both_kinds));
+
+    // Saved again unchanged (a rescan of a touched file): both kept.
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "a fox");
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+
+    // Reparsed to a different prompt, same file: only the prompt's goes.
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "a wolf");
+    try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+    _ = try db.storePromptEmbedding(id, "/lib/a.png", "h1", &dupVec(0));
+
+    // The file itself changed: both go, and it is pending again.
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h2", "a wolf");
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
+    try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
+    try std.testing.expectEqual(@as(u64, 1), try db.countPendingEmbeds(both_kinds));
+}
+
+test "db: content an embedding gave up on isn't offered again until it changes" {
+    const path = "/tmp/diffkeep_test_embed_skip.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const lib_id = try db.storeLibrary("/lib");
+    const id = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "<lora:x:1>");
+    // The image didn't decode; the prompt cleaned to nothing.
+    try db.skipEmbed(id, "h1", .image);
+    try db.skipEmbed(id, "h1", .prompt);
+    try std.testing.expectEqual(@as(u64, 0), try db.countPendingEmbeds(both_kinds));
+    // A skip for content the row no longer holds is ignored.
+    const other = try indexedImage(&db, lib_id, "/lib/b.png", "h9", null);
+    try db.skipEmbed(other, "stale", .image);
+    try std.testing.expectEqual(@as(u64, 1), try db.countPendingEmbeds(both_kinds));
+
+    // A new prompt is tried again (the image still doesn't decode)...
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "a fox");
+    {
+        const got = try pendingSummary(&db, both_kinds, 0, 10);
+        defer alloc.free(got);
+        try std.testing.expectEqual(.{ id, true, false }, got[0]);
+    }
+    // ...and a changed file is tried for both.
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h2", "a fox");
+    {
+        const got = try pendingSummary(&db, both_kinds, 0, 10);
+        defer alloc.free(got);
+        try std.testing.expectEqual(.{ id, true, true }, got[0]);
+    }
 }
 
 test "icons: favorite star is a solid fill, not a hollow outline" {
@@ -2008,10 +2117,10 @@ test "db: storing an embedding again replaces the old vector" {
     defer img.deinit(alloc);
 
     // A changed or reparsed image is embedded again: the new vector must win.
-    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &dupVec(0));
-    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &dupVec(1));
-    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &dupVec(0));
-    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &dupVec(1));
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &dupVec(0));
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &dupVec(1));
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, img.hash, &dupVec(0));
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, img.hash, &dupVec(1));
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "positive_prompt_embeddings"));
     try std.testing.expectEqual(@as(i64, 1), try embeddingRowCount(&db, "image_embeddings"));
 
@@ -2208,7 +2317,7 @@ test "db: upgrading merges duplicate live rows left by the old scan/watcher race
         // Recreate the pre-index state: no unique index, two rows for one path.
         try db.db.exec("DROP INDEX IF EXISTS idx_images_live_path");
         try db.db.exec("INSERT INTO images (library_id, library_path, favorite) VALUES (1, '/lib/a.png', 1)");
-        try db.db.exec("PRAGMA user_version = 13");
+        try rewindSchema(&db, 13);
     }
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
@@ -2258,8 +2367,8 @@ test "db: an embedding finished after its image was deleted isn't stored" {
     defer next.deinit(alloc);
     try std.testing.expectEqual(gone_id, next.id);
 
-    try std.testing.expect(!try db.storePromptEmbedding(gone_id, "/lib/gone.png", &dupVec(0)));
-    try std.testing.expect(!try db.storeImageEmbedding(gone_id, "/lib/gone.png", &dupVec(0)));
+    try std.testing.expect(!try db.storePromptEmbedding(gone_id, "/lib/gone.png", null, &dupVec(0)));
+    try std.testing.expect(!try db.storeImageEmbedding(gone_id, "/lib/gone.png", null, &dupVec(0)));
     try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "positive_prompt_embeddings"));
     try std.testing.expectEqual(@as(i64, 0), try embeddingRowCount(&db, "image_embeddings"));
 }
@@ -2420,7 +2529,7 @@ test "grid: vector search results stay in relevance order, not the sort order" {
         var v: [768]f32 = @splat(0);
         v[0] = @cos(t);
         v[1] = @sin(t);
-        _ = try db.storePromptEmbedding(img.id, n, &v);
+        _ = try db.storePromptEmbedding(img.id, n, img.hash, &v);
     }
 
     var grid = try dk.GridState.init(io, alloc, &db, false, null);
@@ -2707,10 +2816,8 @@ test "library_manager: quiesce stops running scans and resumes them afterwards" 
 
     _ = try mgr.addLibrary(dir ++ "/a");
     _ = try mgr.addLibrary(dir ++ "/b");
-    // Swapping the embedder: nothing may still be scanning when this returns.
+    // Interrupted and queued scans still complete after a quiesce.
     mgr.quiesce(io);
-    try std.testing.expect(!mgr.scanUsesEmbedder());
-    // …and the interrupted / queued scans still complete.
     try waitForScans(&mgr);
     try std.testing.expectEqual(@as(i64, 80), try db.getTotalImageCount());
 }
@@ -3731,45 +3838,27 @@ test "detail panel: long raw metadata lays out only the blocks on screen" {
     try std.testing.expectEqual(full_height, g_long_height);
 }
 
-fn embedItem(id: u64) !dk.scan.EmbedInput {
-    return .{
-        .image_id = id,
-        .path = try alloc.dupeSentinel(u8, "/lib/a.png", 0),
-        .prompt_text = null,
-        .want_image = true,
-        .allocator = alloc,
-    };
-}
+test "embed worker: without an embedder a poke runs a pass that does nothing" {
+    const path = "/tmp/diffkeep_test_embed_worker_idle.db";
+    var db = try openDb(path);
+    defer db.deinit();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const lib_id = try db.storeLibrary("/lib");
+    _ = try indexedImage(&db, lib_id, "/lib/a.png", "h1", "a fox");
 
-fn fillEmbedQueue(q: *dk.scan.EmbedQueue, first: u64, n: u64) void {
-    for (first..first + n) |id| q.push(io, embedItem(id) catch unreachable);
-}
-
-test "scan: the embed queue is FIFO and makes producers wait when full" {
-    var done: std.atomic.Value(u32) = .init(0);
-    var total: std.atomic.Value(u32) = .init(0);
-    var q: dk.scan.EmbedQueue = .{ .allocator = alloc, .embed_done = &done, .embed_total = &total, .consumers = 1 };
-    defer q.deinit(io);
-    const cap = dk.scan.EmbedQueue.capacity;
-
-    // A producer pushing one more than fits waits for the consumer.
-    const t = try std.Thread.spawn(.{}, fillEmbedQueue, .{ &q, 0, cap + 1 });
-    while (total.load(.acquire) < cap) std.Thread.yield() catch {};
-    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
-    try std.testing.expectEqual(@as(u32, cap), total.load(.acquire));
-
-    // Popping makes room; items come out in the order they went in.
-    for (0..cap + 1) |want| {
-        var it = q.pop(io).?;
-        defer it.deinit();
-        try std.testing.expectEqual(@as(u64, want), it.image_id);
-    }
-    t.join();
-
-    // With no consumer left (stopped), pushes are dropped, never waited on.
-    q.consumerExit(io);
-    fillEmbedQueue(&q, 0, cap + 10);
-    try std.testing.expect(q.tryPop(io) == null);
+    var w: dk.embed_worker.EmbedWorker = .init(alloc, io, &db, both_kinds);
+    defer w.deinit();
+    w.poke();
+    w.awaitIdle();
+    const p = w.progress();
+    try std.testing.expect(!p.active);
+    try std.testing.expectEqual(@as(u32, 0), p.done);
+    try std.testing.expectEqual(@as(u32, 0), p.total);
+    // Reconfiguring waits for any pass, then runs one for the new setup.
+    w.configure(null, .{ .image = true });
+    w.awaitIdle();
+    try std.testing.expect(!w.busy());
+    try std.testing.expectEqual(@as(u64, 1), try db.countPendingEmbeds(both_kinds));
 }
 
 test "video player: nextDueNs says when tick will next have a frame" {
@@ -3889,8 +3978,8 @@ fn searchableImage(db: *dk.VectorDb, lib: u64, path: []const u8, model: []const 
     v[1] = off;
     const n = @sqrt(1.0 + off * off);
     for (&v) |*x| x.* /= n;
-    _ = try db.storePromptEmbedding(img.id, img.libraryPath, &v);
-    _ = try db.storeImageEmbedding(img.id, img.libraryPath, &v);
+    _ = try db.storePromptEmbedding(img.id, img.libraryPath, img.hash, &v);
+    _ = try db.storeImageEmbedding(img.id, img.libraryPath, img.hash, &v);
     return img.id;
 }
 
@@ -4093,13 +4182,14 @@ test "db: upgrading drops prompt vectors that may span past the local attention 
         const lib = try db.storeLibrary("/lib");
         short_id = try searchableImage(&db, lib, "/lib/short.png", "m", 0);
         long_id = try searchableImage(&db, lib, "/lib/long.png", "m", 0);
+        // Before the edit below: v17's trigger would drop the vector itself.
+        try rewindSchema(&db, 15);
         var img = try db.findOrCreateImage(alloc, lib, "/lib/long.png");
         defer img.deinit(alloc);
         alloc.free(img.positivePromptText.?);
         img.positivePromptText = try alloc.alloc(u8, 241);
         @memset(@constCast(img.positivePromptText.?), 'a');
         try db.saveImage(&img);
-        try db.db.exec("PRAGMA user_version = 15");
     }
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 

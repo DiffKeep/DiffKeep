@@ -5,6 +5,8 @@ const notifier_mod = @import("notifier.zig");
 const fs_watch_mod = @import("fs_watch.zig");
 const bg = @import("bg.zig");
 const embedder_mod = @import("embedder.zig");
+const activity = @import("activity.zig");
+const embed_worker = @import("embed_worker.zig");
 const log = std.log.scoped(.library_manager);
 
 /// `path` without trailing separators (a bare root stays as is), so library
@@ -114,10 +116,12 @@ pub const LibraryManager = struct {
     /// most once.
     scans: bg.WorkQueue(ScanRequest),
     stop_scan: std.atomic.Value(bool),
-    files_scanned: std.atomic.Value(u32),
+    /// Files the current run of scans has looked at, for the status bar.
+    files_scanned: std.atomic.Value(u32) = .init(0),
     thumbnails_in_db: bool,
-    prompt_embeddings: bool,
-    image_embeddings: bool,
+    /// Computes the embeddings indexed rows are missing; scans and file
+    /// workers tell it about each row they save.
+    embeds: embed_worker.EmbedWorker,
     notifier: ?*notifier_mod.ImageNotifier,
     watcher: ?*fs_watch_mod.FsWatcher,
     /// Called from any thread after a single-file task completes, to wake the render loop.
@@ -129,15 +133,11 @@ pub const LibraryManager = struct {
     /// the DB instead. Guarded by `removed_mutex`.
     removed_lost: bool = false,
     removed_mutex: std.Io.Mutex = std.Io.Mutex.init,
-    /// Embedding progress counters — updated by the scan embed consumer.
-    embed_done:  std.atomic.Value(u32) = .init(0),
-    embed_total: std.atomic.Value(u32) = .init(0),
     /// Separate io group for the file workers and deletion/removal tasks.
     file_group: std.Io.Group,
     /// New or changed files reported by the watcher, indexed by up to
     /// `max_file_workers` workers (`fileWorker`).
     file_queue: bg.WorkQueue(FileRequest),
-    embedder: ?*embedder_mod.Embedder = null,  // borrowed from dk.g_embedder, not owned
     /// The app's data dir (holds `trash/`); needed to delete a removed
     /// library's trashed files. Borrowed.
     data_dir: ?[]const u8 = null,
@@ -150,10 +150,8 @@ pub const LibraryManager = struct {
             .db = db,
             .scans = .init(allocator, io, 1, scanWorker, ScanRequest.free),
             .stop_scan = .init(false),
-            .files_scanned = .init(0),
             .thumbnails_in_db = thumbnails_in_db,
-            .prompt_embeddings = prompt_embeddings,
-            .image_embeddings = image_embeddings,
+            .embeds = .init(allocator, io, db, .{ .prompt = prompt_embeddings, .image = image_embeddings }),
             .notifier = notifier,
             .watcher = watcher,
             .file_group = .init,
@@ -168,6 +166,8 @@ pub const LibraryManager = struct {
         self.scans.deinit();
         self.file_group.await(io) catch {};
         self.file_queue.deinit();
+        // After everything that tells it about rows.
+        self.embeds.deinit();
         self.removed_ids.deinit(self.allocator);
     }
 
@@ -341,22 +341,33 @@ pub const LibraryManager = struct {
         return self.scans.busy();
     }
 
-    pub fn filesScanned(self: *const LibraryManager) u32 {
-        return self.files_scanned.load(.acquire);
+    /// What the scans are doing, for the status bar.
+    pub fn scanActivity(self: *LibraryManager) activity.Scan {
+        return .{
+            .active = self.isScanActive(),
+            .files_scanned = self.files_scanned.load(.acquire),
+        };
     }
 
-    pub fn embedsDone(self: *const LibraryManager) u32 {
-        return self.embed_done.load(.acquire);
+    /// What the embed worker is doing, for the status bar.
+    pub fn embedActivity(self: *LibraryManager) activity.Embed {
+        const p = self.embeds.progress();
+        return .{ .active = p.active, .done = p.done, .total = p.total };
     }
 
-    pub fn embedsTotal(self: *const LibraryManager) u32 {
-        return self.embed_total.load(.acquire);
+    /// Hand the embed worker a new embedder (null: none). When this returns
+    /// nothing uses the old one, so it can be freed. Main thread.
+    pub fn setEmbedder(self: *LibraryManager, embedder: ?*embedder_mod.Embedder) void {
+        self.embeds.configure(embedder, self.embeds.kinds);
     }
 
-    /// Stop every running scan and single-file task and wait for them, so
-    /// nothing holds the embedder (or other borrowed state) when this returns.
-    /// Main thread. Interrupted and queued scans start again afterwards; set
-    /// `embedder` first if they must not use the old one.
+    /// Which embeddings to compute (config switches). Main thread.
+    pub fn setEmbedKinds(self: *LibraryManager, prompt: bool, image: bool) void {
+        self.embeds.configure(self.embeds.embedder, .{ .prompt = prompt, .image = image });
+    }
+
+    /// Stop every running scan and single-file task and wait for them. Main
+    /// thread. Interrupted and queued scans start again afterwards.
     pub fn quiesce(self: *LibraryManager, io: std.Io) void {
         self.quiesceDropping(io, null);
     }
@@ -378,11 +389,6 @@ pub const LibraryManager = struct {
         // An interrupted scan put itself back at the front; it runs again.
         self.scans.unpause();
         self.file_queue.unpause();
-    }
-
-    /// Whether a scan task may currently be running (and using the embedder).
-    pub fn scanUsesEmbedder(self: *LibraryManager) bool {
-        return self.embedder != null and self.isScanActive();
     }
 
     /// Queue a scan of `library_id`, unless one is already waiting.
@@ -475,7 +481,7 @@ fn fileWorker(q: *bg.WorkQueue(FileRequest)) void {
     defer file_db.deinit();
     var scanner = scan_mod.LibraryScanner.init(manager.allocator, &file_db, manager.notifier);
     defer scanner.deinit();
-    scanner.embedder = manager.embedder;
+    scanner.embeds = &manager.embeds;
     while (q.next()) |req| {
         defer manager.allocator.free(req.path);
         if (req.reset_id) |id| file_db.resetImageMtimeById(id) catch |err|
@@ -486,8 +492,6 @@ fn fileWorker(q: *bg.WorkQueue(FileRequest)) void {
             req.path,
             &manager.stop_scan,
             manager.thumbnails_in_db,
-            manager.prompt_embeddings,
-            manager.image_embeddings,
         );
         // Wake the render loop so grid.update() drains the notifier and shows the new image.
         if (manager.wakeup_fn) |wake| wake();
@@ -502,8 +506,6 @@ fn scanWorker(q: *bg.WorkQueue(ScanRequest)) void {
     const io = q.io;
     // Progress counts from the start of this run of scans.
     manager.files_scanned.store(0, .release);
-    manager.embed_done.store(0, .release);
-    manager.embed_total.store(0, .release);
     while (q.next()) |req| {
         var requeue = false;
         defer if (!requeue) manager.allocator.free(req.library_path);
@@ -517,14 +519,14 @@ fn scanWorker(q: *bg.WorkQueue(ScanRequest)) void {
         defer scan_db.deinit();
         var scanner = scan_mod.LibraryScanner.init(manager.allocator, &scan_db, manager.notifier);
         defer scanner.deinit();
-        scanner.embedder = manager.embedder;
+        scanner.embeds = &manager.embeds;
         var removed: std.ArrayList(u64) = .empty;
         defer removed.deinit(scanner.allocator);
         scanner.removed_ids = &removed;
         defer manager.pushRemovedIds(io, removed.items);
         manager.active_library.store(req.library_id, .release);
         defer manager.active_library.store(0, .release);
-        _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, &manager.embed_done, &manager.embed_total, manager.thumbnails_in_db, manager.prompt_embeddings, manager.image_embeddings) catch |err| {
+        _ = scanner.scanLibrary(io, req.library_id, req.library_path, &manager.stop_scan, &manager.files_scanned, manager.thumbnails_in_db) catch |err| {
             log.err("scan {s}: {}", .{ std.Io.Dir.path.basename(req.library_path), err });
         };
         if (manager.stop_scan.load(.acquire)) {
