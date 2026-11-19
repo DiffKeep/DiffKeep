@@ -2,6 +2,8 @@
 
 DiffKeep is a desktop library manager for AI-generated images and videos. Add your output folders as libraries and it indexes everything in them, reads the generation metadata (ComfyUI workflows, Automatic1111/Forge parameters, [TensorPencil](https://github.com/qskousen/TensorPencil)), and lets you browse, filter and search (text, semantic, visual).
 
+![DiffKeep showing combined search results for "dragon cat"](docs/screenshot.webp)
+
 DiffKeep is free and open source under the [MIT License](LICENSE).
 
 > This is a ground-up rewrite in [Zig](https://ziglang.org). The original C# version lives on the [`legacy-csharp`](https://github.com/DiffKeep/DiffKeep/tree/legacy-csharp) branch and its releases (v0.4.6 and earlier) are still on the releases page.

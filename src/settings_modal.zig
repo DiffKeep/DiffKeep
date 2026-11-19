@@ -318,12 +318,7 @@ pub const SettingsModalState = struct {
                     .color_text = .{ .color = style.C.text_dim },
                     .padding = .{},
                 });
-                dvui.labelNoFmt(@src(), about.gemma_terms_url, .{}, .{
-                    .font = style.F.mono,
-                    .color_text = .{ .color = style.C.text_dim },
-                    .padding = .{},
-                    .margin = .{ .h = 4 },
-                });
+                style.link(@src(), about.gemma_terms_url, .{ .margin = .{ .h = 4 } });
 
                 fieldHead(@src(), i18n.t(.settings_mmproj_path), 10);
                 {

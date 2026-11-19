@@ -134,10 +134,9 @@ fn noticeRow(n: Notice, id: usize) void {
         .color_text = .{ .color = style.C.text_hi },
         .padding = .{},
     });
-    const sep: []const u8 = if (n.url.len > 0) "  \u{00b7}  " else "";
-    dvui.label(@src(), "{s}{s}{s}", .{ n.holder, sep, n.url }, .{
-        .font = style.F.mono,
+    dvui.labelNoFmt(@src(), n.holder, .{}, .{
         .color_text = .{ .color = style.C.text_dim },
         .padding = .{},
     });
+    if (n.url.len > 0) style.link(@src(), n.url, .{});
 }

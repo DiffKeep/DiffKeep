@@ -464,6 +464,13 @@ pub fn modalTitle(src: std.builtin.SourceLocation, text: []const u8) void {
     });
 }
 
+/// A web link: body text, underlined, in `blue` (following it is the user's
+/// act). Opens in the system browser through dvui's `openURL`.
+pub fn link(src: std.builtin.SourceLocation, url: []const u8, opts: dvui.Options) void {
+    const defaults: dvui.Options = .{ .padding = .{} };
+    dvui.link(src, .{ .url = url }, defaults.override(opts));
+}
+
 /// Truncate `text` to `max_w` logical px in `font`, appending an ellipsis.
 /// Returns a slice of `buf`, or `text` itself when it already fits.
 ///
