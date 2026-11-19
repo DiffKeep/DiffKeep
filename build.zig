@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) !void {
         exe.root_module.linkSystemLibrary("ole32", .{});
         exe.root_module.linkSystemLibrary("shell32", .{});
         exe.root_module.linkSystemLibrary("uuid", .{});
+        exe.root_module.addWin32ResourceFile(.{ .file = b.path("src/icons/diffkeep.rc") });
         exe.root_module.addCSourceFile(.{
             .file = b.path("lib/dnd/dnd_win32.c"),
             .flags = &.{ "-DUNICODE", "-D_UNICODE" },

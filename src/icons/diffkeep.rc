@@ -1,0 +1,3 @@
+// The executable's icon (Explorer, the taskbar, Alt-Tab). Same artwork as
+// diffkeep.png, which app_icons.zig sets on the windows at run time.
+1 ICON "diffkeep.ico"

@@ -12,6 +12,7 @@ const vips_mod = @import("vips");
 const SDLBackend = @import("backend");
 const image_grid_mod = @import("image_grid.zig");
 const dnd_mod = @import("dnd.zig");
+const app_icons = @import("app_icons.zig");
 const viewer_manager_mod = @import("viewer_manager.zig");
 const window_state = @import("window_state.zig");
 const platform = @import("platform.zig");
@@ -344,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
         .min_size = opts.min_size,
         .vsync = opts.vsync,
         .title = opts.title,
+        .icon = app_icons.app_png,
         .environ_map = init.environ_map,
         // Geometry is persisted in our own config (window_state.zig).
         .persist_window_geometry = false,

@@ -15,7 +15,7 @@ rm -f "$stage"/*.pdb "$stage"/video_probe "$stage"/video_probe.exe
 for f in "$stage"/*; do
   if [ -f "$f" ] && head -c 4 "$f" | grep -q $'\x7fELF'; then strip --strip-debug "$f"; fi
 done
-cp README.md tools/release/BUNDLED_LIBRARIES.txt "$stage/"
+cp README.md tools/release/BUNDLED_LIBRARIES.txt src/icons/diffkeep.png "$stage/"
 if [ -d "$prefix/share/licenses" ]; then cp -r "$prefix/share/licenses" "$stage/licenses"; fi
 (cd dist/stage && zip -qr "../diffkeep-$name.zip" "diffkeep-$name")
 echo "dist/diffkeep-$name.zip: $(du -h "dist/diffkeep-$name.zip" | cut -f1)"

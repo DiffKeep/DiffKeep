@@ -6,6 +6,7 @@ const image_grid_mod = @import("image_grid.zig");
 const db_mod = @import("db.zig");
 const config_mod = @import("config.zig");
 const window_state = @import("window_state.zig");
+const app_icons = @import("app_icons.zig");
 const dnd_mod = @import("dnd.zig");
 
 pub const ViewerWindow = struct {
@@ -163,6 +164,7 @@ pub const ViewerManager = struct {
             .min_size = .{ .w = 400, .h = 300 },
             .vsync = true,
             .title = "DiffKeep Viewer",
+            .icon = app_icons.app_png,
             // Created hidden; shown after geometry is applied and the first frame
             // is presented (see ViewerWindow.shown).
             .hidden = true,
