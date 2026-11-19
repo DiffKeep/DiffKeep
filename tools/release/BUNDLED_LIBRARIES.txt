@@ -1,0 +1,33 @@
+DiffKeep release package — bundled libraries
+
+DiffKeep itself is MIT-licensed (LICENSE). This package also carries prebuilt
+libraries it loads at run time, beside the executable:
+
+  FFmpeg 8.1.2 (libavformat, libavcodec, libavutil, libswscale,
+  libswresample): BtbN's "gpl-shared" build, autobuild-2026-08-31-13-27.
+  It is a GPL build (GPL-3.0-or-later): it includes GPL encoders such as x264.
+
+  libvips 8.18.7 and the libraries it uses (glib, cairo, pango, librsvg,
+  libheif, libwebp and others):
+    Windows: libvips' build-win64-mxe "all" build, v8.18.7.
+    Linux:   sharp's prebuilt libvips, @img/sharp-libvips-linux-x64 1.3.4.
+  Their versions are listed in licenses/vips_*/versions.json.
+
+Because FFmpeg here is a GPL build, this package as a whole is distributed
+under the GNU General Public License, version 3 (licenses/ffmpeg_*/LICENSE.txt).
+DiffKeep's own source code stays under the MIT License.
+
+The license texts are in licenses/ and in THIRD_PARTY_LICENSES.txt.
+
+Source code:
+  DiffKeep:     https://github.com/DiffKeep/DiffKeep (the tag of this release)
+  FFmpeg:       https://git.ffmpeg.org/ffmpeg.git, n8.1.2-50-g1a748fe2cd
+  FFmpeg build: https://github.com/BtbN/FFmpeg-Builds, tag
+                autobuild-2026-08-31-13-27 (its scripts name the source
+                version of every library in the build)
+  libvips:      https://github.com/libvips/libvips, v8.18.7
+  Windows libvips build: https://github.com/libvips/build-win64-mxe, v8.18.7
+  Linux libvips build:   https://github.com/lovell/sharp-libvips, v1.3.4
+
+These libraries are dynamically linked: you can replace any of them with
+your own build of a compatible version.

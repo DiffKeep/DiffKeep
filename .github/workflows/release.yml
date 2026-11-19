@@ -1,0 +1,152 @@
+name: Release
+
+# Linux and Windows x86-64, both cross-compiled on Ubuntu against the prebuilt
+# libvips and FFmpeg that build.zig.zon pins (-Dbundle-libs on Linux, always on
+# Windows). Their libraries install beside the executable: nothing is taken from
+# the system but glibc (2.31 or newer) and, on Linux, X11/Xi/wayland-client.
+# macOS is not built yet.
+#
+# The binaries need an x86-64-v3 CPU (AVX2, FMA, 2013 or later), which the
+# embedding encoders' vector code is much faster with.
+#
+# A tag push tests, builds both and drafts a release; a manual run stops after the
+# build, and the zips are the run's artifacts.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config \
+            libvips-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libx11-dev libxi-dev libwayland-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          cache-size-limit: 4096
+
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-test-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-test-
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            zig build -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
+
+      - name: Tests
+        run: zig build test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: -Dtarget=x86_64-linux-gnu.2.31 -Dbundle-libs
+          - name: windows-x86_64
+            target: -Dtarget=x86_64-windows-gnu
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      # Full history and tags, so `--version` and the About dialog name the tag.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools and libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip libx11-dev libxi-dev libwayland-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          cache-key: release-${{ matrix.name }}
+          cache-size-limit: 4096
+
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ matrix.name }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-${{ matrix.name }}-
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 ${{ matrix.target }} -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 ${{ matrix.target }} --prefix out
+
+      - name: Package
+        run: tools/package_release.sh ${{ matrix.name }} out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/diffkeep-${{ matrix.name }}.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*/diffkeep-*.zip
+          draft: true
+          generate_release_notes: true
+          body: |
+            Both builds need an x86-64 CPU with AVX2 (2013 or later) and carry their
+            own libvips and FFmpeg beside the executable. FFmpeg is a GPL build, so
+            each package as a whole is distributed under the GPL; DiffKeep's own code
+            is MIT. See `BUNDLED_LIBRARIES.txt` and `licenses/` inside the zip.
+
+            **Windows:** unzip and run `DiffKeep.exe`.
+
+            **Linux:** unzip and run `DiffKeep`. Needs glibc 2.31 or newer (Ubuntu
+            20.04, Debian 11 and later).
+
+            Search models aren't included: download them from Settings.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

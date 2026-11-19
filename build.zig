@@ -4,6 +4,10 @@ const Translator = @import("translate_c").Translator;
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_windows = target.result.os.tag == .windows;
+    // A release build carries its own libvips and FFmpeg (see `Pinned`): a
+    // Windows build always, a Linux one when asked.
+    const bundle_libs = is_windows or (b.option(bool, "bundle-libs", "Linux: link the pinned libvips and FFmpeg packages and install them beside the executable, instead of the system's (a release build)") orelse false);
 
     // Version string from git, computed on every build: a configure-time
     // lookup would be cached by Zig 0.17 and go stale. Embedded via
@@ -48,6 +52,10 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.link_libcpp = true;
     const os = target.result.os.tag;
     if (os == .linux) {
+        // A cross build doesn't search the system's libraries either. X11, Xi and
+        // wayland-client are on every desktop the release runs on; link against
+        // the build machine's (CI installs their -dev packages).
+        if (!target.query.isNative()) exe.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
         exe.root_module.linkSystemLibrary("X11", .{});
         exe.root_module.linkSystemLibrary("Xi", .{});
         exe.root_module.linkSystemLibrary("wayland-client", .{});
@@ -106,6 +114,12 @@ pub fn build(b: *std.Build) !void {
     });
     // Platform header translations the app imports (also used by `check`).
     var os_imports: std.ArrayList(std.Build.Module.Import) = .empty;
+    // A cross build (a release asks for an older glibc) doesn't search the
+    // system's headers: take X11's and Wayland's from SDL's header package.
+    const linux_headers: ?std.Build.LazyPath = if (os == .linux and !target.query.isNative())
+        (try b.dependencyLazy("sdl_linux_deps", .{})).path("include")
+    else
+        null;
     if (os == .linux) {
         const x11_c: Translator = .init(translate_c, .{
             .name = "x11_c",
@@ -124,6 +138,10 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
+        if (linux_headers) |h| {
+            x11_c.addIncludePath(h);
+            wayland_c.addIncludePath(h);
+        }
         try os_imports.append(b.allocator, .{ .name = "x11_c", .module = x11_c.mod });
         try os_imports.append(b.allocator, .{ .name = "wayland_c", .module = wayland_c.mod });
     }
@@ -185,7 +203,29 @@ pub fn build(b: *std.Build) !void {
         .flags = &.{},
     });
     vips_helper_mod.addIncludePath(b.path("lib/vips"));
-    vips_helper_mod.linkSystemLibrary("vips", .{});
+    const vips_pinned = if (is_windows) try Pinned.link(b, vips_helper_mod, &.{.{
+        .dep = "vips_win",
+        .includes = &.{ "include", "include/glib-2.0", "lib/glib-2.0/include" },
+        .libs = &.{ "lib/libvips.lib", "lib/libgio-2.0.lib", "lib/libgobject-2.0.lib", "lib/libglib-2.0.lib" },
+        .dll_dir = "bin",
+        .licenses = &.{ "LICENSE", "versions.json" },
+    }}) else if (bundle_libs) try Pinned.link(b, vips_helper_mod, &.{
+        .{
+            .dep = "vips_linux_dev",
+            .includes = &.{ "include", "include/glib-2.0" },
+        },
+        .{
+            .dep = "vips_linux",
+            .includes = &.{"lib/glib-2.0/include"},
+            // One library: sharp's build folds libvips' dependencies and glib into it.
+            .shared = &.{"lib/libvips-cpp.so.8.18.7"},
+            .licenses = &.{ "README.md", "versions.json" },
+        },
+    }) else blk: {
+        vips_helper_mod.linkSystemLibrary("vips", .{});
+        break :blk null;
+    };
+    if (vips_pinned) |l| l.installWith(b.getInstallStep());
 
     const vips_helper_lib = b.addLibrary(.{
         .name = "vips_helper",
@@ -198,8 +238,8 @@ pub fn build(b: *std.Build) !void {
     });
 
     // *** video (libav*) ***
-    // System-linked like vips; pkg-config (default for linkSystemLibrary) supplies
-    // the per-platform include/lib paths. The C wrapper itself is fully portable.
+    // Linked like vips: the system's through pkg-config, or the pinned build.
+    // The C wrapper itself is fully portable.
     const av_libs = [_][]const u8{ "avformat", "avcodec", "avutil", "swscale", "swresample" };
     const video_helper_mod = b.createModule(.{
         .target = target,
@@ -211,7 +251,22 @@ pub fn build(b: *std.Build) !void {
         .flags = &.{},
     });
     video_helper_mod.addIncludePath(b.path("lib/video"));
-    for (av_libs) |lib| video_helper_mod.linkSystemLibrary(lib, .{});
+    const av_pinned = if (is_windows) try Pinned.link(b, video_helper_mod, &.{.{
+        .dep = "ffmpeg_win",
+        .includes = &.{"include"},
+        .libs = &.{ "lib/avformat.lib", "lib/avcodec.lib", "lib/avutil.lib", "lib/swscale.lib", "lib/swresample.lib" },
+        .dll_dir = "bin",
+        .licenses = &.{"LICENSE.txt"},
+    }}) else if (bundle_libs) try Pinned.link(b, video_helper_mod, &.{.{
+        .dep = "ffmpeg_linux",
+        .includes = &.{"include"},
+        .shared = &.{ "lib/libavformat.so.62", "lib/libavcodec.so.62", "lib/libavutil.so.60", "lib/libswscale.so.9", "lib/libswresample.so.6" },
+        .licenses = &.{"LICENSE.txt"},
+    }}) else blk: {
+        for (av_libs) |lib| video_helper_mod.linkSystemLibrary(lib, .{});
+        break :blk null;
+    };
+    if (av_pinned) |l| l.installWith(b.getInstallStep());
 
     const video_helper_lib = b.addLibrary(.{
         .name = "video_helper",
@@ -235,6 +290,7 @@ pub fn build(b: *std.Build) !void {
         .icons = icons_dep.module("icons"),
         .known_folders = known_folders,
         .git_version = git_version,
+        .pinned = .{ vips_pinned, av_pinned },
     };
     try wireCore(b, exe, exe.root_module, core);
 
@@ -272,10 +328,10 @@ pub fn build(b: *std.Build) !void {
     video_probe_exe.root_module.addImport("video", video_module);
     video_probe_exe.root_module.linkLibrary(vips_helper_lib);
     video_probe_exe.root_module.addIncludePath(b.path("lib/vips"));
-    video_probe_exe.root_module.linkSystemLibrary("vips", .{});
     video_probe_exe.root_module.addImport("vips", vips_module);
+    core.linkPinned(video_probe_exe.root_module);
     b.installArtifact(video_probe_exe);
-    const run_video_probe = b.addRunArtifact(video_probe_exe);
+    const run_video_probe = core.runPinned(b, b.addRunArtifact(video_probe_exe));
     run_video_probe.step.dependOn(b.getInstallStep());
     run_video_probe.addPassthruArgs();
     const video_probe_step = b.step("video_probe", "Probe a media file via libav* (dimensions, metadata tags, first frame)");
@@ -312,8 +368,9 @@ pub fn build(b: *std.Build) !void {
     // The embedder decodes a video's first frame for its image embedding.
     bench_embed_exe.root_module.addImport("video", video_module);
     bench_embed_exe.root_module.linkLibrary(video_helper_lib);
+    core.linkPinned(bench_embed_exe.root_module);
     try addTensorPencil(b, bench_embed_exe, bench_embed_exe.root_module);
-    const run_bench_embed = b.addRunArtifact(bench_embed_exe);
+    const run_bench_embed = core.runPinned(b, b.addRunArtifact(bench_embed_exe));
     run_bench_embed.addPassthruArgs();
     const bench_embed_step = b.step("bench_embed", "A/B retrieval quality + speed: current encoders vs EmbeddingGemma 2");
     bench_embed_step.dependOn(&run_bench_embed.step);
@@ -329,7 +386,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     try wireCore(b, bench_scan_exe, bench_scan_exe.root_module, core);
-    const run_bench_scan = b.addRunArtifact(bench_scan_exe);
+    const run_bench_scan = core.runPinned(b, b.addRunArtifact(bench_scan_exe));
     run_bench_scan.addPassthruArgs();
     const bench_scan_step = b.step("bench_scan", "Time a full library scan (parse/hash/thumbnail, no embeddings) of a folder");
     bench_scan_step.dependOn(&run_bench_scan.step);
@@ -377,7 +434,7 @@ pub fn build(b: *std.Build) !void {
     integration_tests.root_module.link_libcpp = true;
     try wireCore(b, integration_tests, diffkeep_test_module, core);
 
-    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+    test_step.dependOn(&core.runPinned(b, b.addRunArtifact(integration_tests)).step);
 
     // *** check-lib: `check` without SDL ***
     // The integration tests' build, compiled with no binary and no C
@@ -419,6 +476,21 @@ const Core = struct {
     icons: *std.Build.Module,
     known_folders: *std.Build.Module,
     git_version: std.Build.LazyPath,
+    /// The pinned libvips and FFmpeg, when the build bundles them (null: the
+    /// system's, which the shim libraries carry on themselves).
+    pinned: [2]?Pinned.Linked,
+
+    /// Link the pinned libraries, if any, into a binary that links the shims.
+    fn linkPinned(core: Core, module: *std.Build.Module) void {
+        for (core.pinned) |p| if (p) |l| l.linkInto(module);
+    }
+
+    /// A run of a binary from the cache: let it find the pinned libraries.
+    fn runPinned(core: Core, b: *std.Build, run: *std.Build.Step.Run) *std.Build.Step.Run {
+        const windows = run.producer != null and run.producer.?.rootModuleTarget().os.tag == .windows;
+        for (core.pinned) |p| if (p) |l| l.findFrom(b, run, windows);
+        return run;
+    }
 };
 
 /// Link `core`'s C libraries into `compile` and add its imports (plus
@@ -430,6 +502,7 @@ fn wireCore(b: *std.Build, compile: *std.Build.Step.Compile, import_mod: *std.Bu
     root.linkLibrary(core.sqlite_lib);
     root.linkLibrary(core.vips_lib);
     root.linkLibrary(core.video_lib);
+    core.linkPinned(root);
     try wireImports(b, compile, import_mod, core);
 }
 
@@ -468,3 +541,90 @@ fn addTensorPencil(b: *std.Build, exe: anytype, import_mod: *std.Build.Module) !
     });
     import_mod.addImport("TensorPencil", tp_dep.module("TensorPencil"));
 }
+
+/// A prebuilt library package (`build.zig.zon`) standing in for pkg-config: what a
+/// Windows build always links, and a Linux one under -Dbundle-libs, so a release
+/// carries its own libvips and FFmpeg. The same helper as TensorPencil's build.zig.
+const Pinned = struct {
+    dep: []const u8,
+    includes: []const []const u8 = &.{},
+    /// Import libs, linked by exact path: Zig's `-l` search does not try
+    /// every naming scheme these packages use (`libvips.lib`).
+    libs: []const []const u8 = &.{},
+    /// A directory whose DLLs install beside the executable (Windows).
+    dll_dir: ?[]const u8 = null,
+    /// Shared libraries, each linked by path and installed beside the executable
+    /// under its own name (its soname), which it finds through `$ORIGIN`.
+    shared: []const []const u8 = &.{},
+    /// Installed to `share/licenses/<dep>/`: the libraries ship with their terms.
+    licenses: []const []const u8 = &.{},
+
+    const Linked = struct {
+        /// Install the libraries beside the executable, and their licenses.
+        installs: []const *std.Build.Step,
+        /// The import libs and shared libraries, for `linkInto`.
+        objects: []const std.Build.LazyPath,
+        /// Shared libraries are found beside the executable (`$ORIGIN`).
+        rpath_origin: bool,
+        /// Where the libraries are, for a run of a binary that is not installed
+        /// (a dev tool or test run from the cache).
+        dir: ?[]const u8,
+
+        fn installWith(self: Linked, step: *std.Build.Step) void {
+            for (self.installs) |s| step.dependOn(s);
+        }
+
+        /// Link the libraries into an executable's (or test's) root module. The
+        /// C shims are static libraries, which don't carry these on to what
+        /// links them, so every binary that links a shim takes them itself.
+        fn linkInto(self: Linked, module: *std.Build.Module) void {
+            for (self.objects) |o| module.addObjectFile(o);
+            if (self.rpath_origin) module.addRPathSpecial("$ORIGIN");
+        }
+
+        /// Let `run` (of a binary in the cache) find the libraries.
+        fn findFrom(self: Linked, b: *std.Build, run: *std.Build.Step.Run, windows: bool) void {
+            const dir = self.dir orelse return;
+            const name = if (windows) "PATH" else "LD_LIBRARY_PATH";
+            const sep = if (windows) ";" else ":";
+            const prev = run.getEnvMap().get(name) orelse b.graph.environ_map.get(name) orelse "";
+            run.setEnvironmentVariable(name, if (prev.len == 0) dir else b.fmt("{s}{s}{s}", .{ dir, sep, prev }));
+        }
+    };
+
+    /// Points `module` (the C shim's) at every package's headers, and returns
+    /// the libraries for the binaries that link it (`Linked.linkInto`).
+    fn link(b: *std.Build, module: *std.Build.Module, pkgs: []const Pinned) !Linked {
+        var installs: std.ArrayList(*std.Build.Step) = .empty;
+        var objects: std.ArrayList(std.Build.LazyPath) = .empty;
+        var shared = false;
+        var dir: ?[]const u8 = null;
+        for (pkgs) |pkg| {
+            // A missing package returns `build` here; the runner fetches it and reruns.
+            const d = try b.dependencyLazy(pkg.dep, .{});
+            for (pkg.includes) |p| module.addIncludePath(d.path(p));
+            for (pkg.libs) |p| try objects.append(b.allocator, d.path(p));
+            if (pkg.dll_dir) |sub| {
+                // Recursive, so vips' loader modules keep the subdirectory it looks in.
+                const dlls = b.addInstallDirectory(.{
+                    .source_dir = d.path(sub),
+                    .install_dir = .bin,
+                    .install_subdir = "",
+                    .include_extensions = &.{".dll"},
+                });
+                try installs.append(b.allocator, &dlls.step);
+                dir = try d.builder.root.joinString(b.allocator, sub);
+            }
+            for (pkg.shared) |p| {
+                shared = true;
+                try objects.append(b.allocator, d.path(p));
+                try installs.append(b.allocator, &b.addInstallBinFile(d.path(p), std.Io.Dir.path.basename(p)).step);
+                dir = try d.builder.root.joinString(b.allocator, std.Io.Dir.path.dirname(p).?);
+            }
+            for (pkg.licenses) |p| {
+                try installs.append(b.allocator, &b.addInstallFile(d.path(p), b.fmt("share/licenses/{s}/{s}", .{ pkg.dep, std.Io.Dir.path.basename(p) })).step);
+            }
+        }
+        return .{ .installs = installs.items, .objects = objects.items, .rpath_origin = shared, .dir = dir };
+    }
+};

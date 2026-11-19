@@ -1,0 +1,112 @@
+name: CI
+
+# Every push to main and every pull request: build and test on Linux against the
+# system's libvips and FFmpeg, build the release targets (Linux with its bundled
+# libraries, Windows cross-compiled), and compile the macOS code (no macOS SDL
+# without Apple's SDK, so `check-lib`, not a binary).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config \
+            libvips-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libx11-dev libxi-dev libwayland-dev
+
+      # The debug test binaries are large; past setup-zig's default 2 GB limit it
+      # clears the whole cache before saving, so every run would start cold.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          cache-size-limit: 4096
+
+      # Zig 0.17 keeps packages in `zig-pkg/`, which setup-zig does not cache.
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-test-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-test-
+
+      # A fresh runner downloads every package at once and GitHub sometimes drops
+      # one of those connections. Listing the steps runs the build script, which
+      # fetches and compiles nothing else, so a retry only repeats downloads.
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            zig build -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
+
+      - name: Build
+        run: zig build
+
+      - name: Tests
+        run: zig build test
+
+  targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            cmd: zig build -Dtarget=x86_64-linux-gnu.2.31 -Dbundle-libs
+          - name: windows-x86_64
+            cmd: zig build -Dtarget=x86_64-windows-gnu
+          - name: macos-check
+            cmd: zig build check-lib -Dtarget=aarch64-macos
+
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # A cross-built Linux binary links the build machine's X11, Xi and
+      # wayland-client (see build.zig).
+      - name: Install X11 and Wayland libraries
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libwayland-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          cache-key: ${{ matrix.name }}
+          cache-size-limit: 4096
+
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ matrix.name }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkg-${{ matrix.name }}-
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3; do
+            ${{ matrix.cmd }} -l > /dev/null && exit 0
+            echo "fetch attempt $i failed"; sleep 20
+          done
+          exit 1
+
+      - name: Build
+        run: ${{ matrix.cmd }}

@@ -17,10 +17,13 @@ List of tasks that need doing. Mark as completed when done; user will remove onc
       -Dtarget=aarch64-macos` (all but the SDL layer). Fixed what they found: the
       Windows/macOS drag sources' missing methods, Windows command-line parsing,
       sqlite's flags on macOS, and `SQLITE_TRANSIENT` on aarch64.
-- [ ] Full Windows and macOS binaries can't be built from Linux: libvips (with glib)
-      and FFmpeg are system libraries, and macOS SDL needs Apple's SDK. Build natively
-      (Windows: MSYS2 mingw packages; macOS: Homebrew) and fix what that finds; the
-      drag-and-drop C files (`lib/dnd/`) and app.zig's macOS paths are unchecked.
+- [ ] Windows now cross-builds from Linux against pinned libvips/FFmpeg packages
+      (`zig build -Dtarget=x86_64-windows-gnu`) and runs under Wine (`--version`,
+      `video_probe`), but has never been run on real Windows: check the GUI, the
+      drag-and-drop (`lib/dnd/dnd_win32.c`), file watcher and Show in Explorer there.
+- [ ] macOS binaries: macOS SDL needs Apple's SDK, so build natively (Homebrew
+      libvips/FFmpeg, or pinned packages like Windows) and fix what that finds;
+      `lib/dnd/dnd_macos.m` and app.zig's macOS paths are unchecked.
 - [x] Prompts over 512 tokens got no prompt embedding (skipped, not truncated). They are
       now embedded with EmbeddingGemma's full window, split into at most 8 window-sized
       chunks and averaged past that (`embedPromptChunked`).

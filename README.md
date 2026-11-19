@@ -38,8 +38,9 @@ semantic or visual search. EmbeddingGemma is subject to the
 
 ## Building
 
-DiffKeep builds with **Zig 0.17.0**. Linux is the supported build today; Windows
-and macOS code compiles but full binaries aren't produced yet.
+DiffKeep builds with **Zig 0.17.0**. Release builds for Linux and Windows
+(x86-64) are on the [releases page](https://github.com/DiffKeep/DiffKeep/releases);
+macOS isn't built yet.
 
 System libraries (Debian/Ubuntu package names):
 
@@ -55,6 +56,10 @@ zig build run        # build and run
 zig build            # build only (silent on success)
 zig build test       # unit and integration tests
 ```
+
+A release build carries its own libvips and FFmpeg instead of the system's:
+`zig build -Dbundle-libs` on Linux, and always for Windows, which cross-compiles
+from Linux (`zig build -Dtarget=x86_64-windows-gnu`).
 
 `zig build run -- --config <dir>` uses `<dir>/DiffKeep.cfg` instead of the
 default config, for a throwaway setup.

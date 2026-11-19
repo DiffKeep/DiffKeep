@@ -5,7 +5,8 @@ const vips = @import("vips");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
     _ = args.skip();
     const path = args.next() orelse {
         std.log.err("usage: video_probe <file> [max_dim]", .{});

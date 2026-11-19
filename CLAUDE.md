@@ -36,6 +36,13 @@ zig build test
 zig build check -Dtarget=x86_64-windows-gnu      # whole app
 zig build check-lib -Dtarget=aarch64-macos       # minus the SDL layer (macOS SDL needs Apple's SDK)
 
+# Release builds (what .github/workflows/release.yml runs on a v* tag): carry their own
+# libvips + FFmpeg (pinned in build.zig.zon) beside the executable. Windows always does;
+# Linux with -Dbundle-libs (needs libx11-dev libxi-dev libwayland-dev on the build machine).
+zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -Dtarget=x86_64-linux-gnu.2.31 -Dbundle-libs --prefix out
+zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -Dtarget=x86_64-windows-gnu --prefix out
+tools/package_release.sh linux-x86_64 out        # -> dist/diffkeep-linux-x86_64.zip
+
 # Dev tools (not part of the GUI)
 zig build video_probe -- file.mp4         # probe a media file's streams/metadata/first frame
 zig build test_tp_batch -- ...            # TensorPencil single vs batch embed throughput
@@ -79,7 +86,7 @@ DiffKeep is a desktop image-library manager for AI-generated images, built with 
 | `src/parse/comfy.zig` | Parses ComfyUI workflow JSON embedded in PNG metadata (`tEXt` chunks). |
 | `src/parse/generator.zig` | Which tool made an image (ComfyUI, A1111, Forge, TensorPencil) from the same metadata sections; stored by name in `images.generator` and filterable. TensorPencil is known by `Version: TensorPencil …`, or `Prompt syntax:` on older images. |
 | `src/reveal.zig` | "Show in File Manager": `explorer /select`, `open -R`, or the freedesktop `FileManager1.ShowItems` D-Bus call with an `xdg-open` fallback, run on a detached thread. Reached through `platform.revealInFileManager`. |
-| `src/about.zig` | The About dialog (version, DiffKeep's MIT license) and the one list of third-party and model license notices. Keep it, and the full texts in `THIRD_PARTY_LICENSES.txt` (installed next to the binary), in step with new dependencies, fonts, icons and models; check what actually lands in the binary, not just build.zig.zon (dvui embeds Bitstream Vera; SDL 3 compiles in HIDAPI and yuv2rgb). Release bundles that ship libvips/FFmpeg must use LGPL builds (not FFmpeg `--enable-gpl` builds) and add each bundled library's notice. |
+| `src/about.zig` | The About dialog (version, DiffKeep's MIT license) and the one list of third-party and model license notices. Keep it, and the full texts in `THIRD_PARTY_LICENSES.txt` (installed next to the binary), in step with new dependencies, fonts, icons and models; check what actually lands in the binary, not just build.zig.zon (dvui embeds Bitstream Vera; SDL 3 compiles in HIDAPI and yuv2rgb). Release bundles may ship GPL FFmpeg builds (DiffKeep is MIT, which is GPL-compatible; in-app generation will need x264 to encode, as TensorPencil's muxer does), never `--enable-nonfree` ones. Whatever is bundled, ship each bundled library's license text and its exact source (or the build's published source), and say in the release that the bundle as a whole is GPL when FFmpeg is a GPL build. |
 | `src/image/png-data.zig` | Low-level PNG chunk reader for extracting raw metadata bytes. |
 | `src/vips.zig` | Thin Zig wrapper around libvips (via `lib/vips/vips_helper.c`) for thumbnail generation. `vips.init` sets one worker per vips operation (our own threads supply the parallelism; measured faster and leaner than the per-core default). |
 | `src/sqlite.zig` | Low-level Zig bindings for the bundled SQLite + sqlite-vec C libraries. |

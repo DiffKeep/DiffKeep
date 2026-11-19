@@ -5,3 +5,4 @@ Models/
 /.idea/libraries/Zig_SDK.xml
 /.idea/ZigBrains.iml
 /.idea/zigbrains.xml
+dist/
