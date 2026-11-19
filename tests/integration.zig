@@ -13,6 +13,7 @@ const io = std.testing.io;
 /// replays the later migrations. A migration that can't simply run twice
 /// (ALTER TABLE ADD COLUMN, CREATE without IF NOT EXISTS) is undone here.
 fn rewindSchema(db: *dk.VectorDb, version: u32) !void {
+    if (version < 18) try db.db.exec("ALTER TABLE images DROP COLUMN generator;");
     if (version < 17) try db.db.exec(
         \\DROP TRIGGER images_embeddings_au_hash;
         \\DROP TRIGGER images_prompt_embedding_au;
@@ -717,6 +718,7 @@ const ToolbarFix = struct {
     right_w: f32 = 280,
     right_w_open: f32 = 280,
     total_image_count: i64 = 0,
+    about: dk.about.AboutState = .{},
 
     fn deinit(self: *ToolbarFix) void {
         self.filters.deinit(alloc);
@@ -733,6 +735,7 @@ const ToolbarFix = struct {
             .grid = &self.grid,
             .cfg = &self.cfg,
             .settings = &self.settings,
+            .about = &self.about,
             .db_stats = &self.db_stats,
             .trash_stats = &self.trash_stats,
             .duplicate_count = &self.duplicate_count,
@@ -3523,6 +3526,62 @@ test "app: whole main-window frames run headless, from start-up to shutdown" {
     try dvui.testing.writeText("zzz");
     try framesUntil(&app, showsNoImages);
     try std.testing.expect(app.grid.?.isRelevanceRanked());
+
+    // The toolbar's info button opens About; its Close button closes it.
+    try dvui.testing.moveTo("nav-about");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(appFrame);
+    try std.testing.expect(app.about.open);
+    try dvui.testing.expectVisible("about-dialog");
+    try dvui.testing.moveTo("about-close");
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(appFrame);
+    try std.testing.expect(!app.about.open);
+}
+
+var g_revealed: [256]u8 = undefined;
+var g_revealed_len: usize = 0;
+
+fn spyReveal(_: std.Io, path: []const u8) void {
+    @memcpy(g_revealed[0..path.len], path);
+    g_revealed_len = path.len;
+}
+
+test "app: Show in File Manager reveals the image's file" {
+    const dir = "/tmp/diffkeep_test_app_reveal";
+    const cwd = std.Io.Dir.cwd();
+    try freshDir(dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir ++ "/lib");
+    try cwd.createDirPath(io, dir ++ "/data");
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/a.png", .data = plain_png });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/lib/b.png", .data = plain_png });
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/DiffKeep.cfg", .data = "{\"data_path\": \"" ++ dir ++ "/data/diffkeep.db\"}" });
+    try dk.vips.init();
+
+    var app: dk.app_state.AppState = undefined;
+    try app.init(io, alloc, null, .{}, try alloc.dupe(u8, dir ++ "/DiffKeep.cfg"));
+    defer app.deinit();
+    const mgr = &app.library_manager.?;
+    _ = try mgr.addLibrary(dir ++ "/lib");
+    try waitForScans(mgr);
+
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 1200, .h = 800 } });
+    defer t.deinit();
+    dk.style.install();
+    g_app_under_test = &app;
+    try framesUntil(&app, showsBothImages);
+
+    dk.platform.init(.{ .reveal_in_file_manager = spyReveal });
+    defer dk.platform.init(.{});
+    g_revealed_len = 0;
+    const grid = &app.grid.?;
+    const entry = grid.images.items[0];
+    grid.reveal_requested = true;
+    grid.reveal_id = entry.id;
+    try dvui.testing.settle(appFrame);
+    try std.testing.expect(!grid.reveal_requested);
+    try std.testing.expectEqualStrings(entry.path, g_revealed[0..g_revealed_len]);
 }
 
 // ── Videos ────────────────────────────────────────────────────────────────────
@@ -3565,6 +3624,95 @@ test "scan: a video gets its poster thumbnail and prompt from the scan" {
     var details = (try fx.db.getImageDetails(alloc, img.id)).?;
     defer details.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 5), details.seed.?);
+    try std.testing.expectEqual(dk.Generator.comfyui, details.generator.?);
+}
+
+// ── Generator detection ───────────────────────────────────────────────────────
+
+/// A valid 1x1 RGBA PNG carrying one `tEXt` chunk (`keyword`, `text`).
+fn pngWithText(a: std.mem.Allocator, keyword: []const u8, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "\x89PNG\r\n\x1a\n");
+    const chunk = struct {
+        fn f(al: std.mem.Allocator, o: *std.ArrayList(u8), kind: *const [4]u8, parts: []const []const u8) !void {
+            var len: u32 = 0;
+            for (parts) |part| len += @intCast(part.len);
+            var be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &be, len, .big);
+            try o.appendSlice(al, &be);
+            var crc: std.hash.Crc32 = .init();
+            try o.appendSlice(al, kind);
+            crc.update(kind);
+            for (parts) |part| {
+                try o.appendSlice(al, part);
+                crc.update(part);
+            }
+            std.mem.writeInt(u32, &be, crc.final(), .big);
+            try o.appendSlice(al, &be);
+        }
+    }.f;
+    // 1x1, 8-bit RGBA.
+    try chunk(a, &out, "IHDR", &.{&.{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0 }});
+    try chunk(a, &out, "tEXt", &.{ keyword, &.{0}, text });
+    // One scanline (filter 0 + one pixel) in a stored deflate block.
+    const raw = [_]u8{ 0, 255, 0, 0, 255 };
+    var adler: [4]u8 = undefined;
+    std.mem.writeInt(u32, &adler, std.hash.Adler32.hash(&raw), .big);
+    try chunk(a, &out, "IDAT", &.{ &.{ 0x78, 0x01, 0x01, 5, 0, 0xfa, 0xff }, &raw, &adler });
+    try chunk(a, &out, "IEND", &.{});
+    return out.toOwnedSlice(a);
+}
+
+test "scan: the generator is detected, stored and filterable" {
+    const dir = "/tmp/diffkeep_test_scan_generator";
+    try freshDir(dir);
+    const files = [_]struct { name: []const u8, keyword: []const u8, text: []const u8 }{
+        .{ .name = "tp.png", .keyword = "parameters", .text = "a cat\nSteps: 20, Sampler: Euler, Seed: 1, Version: TensorPencil 0.4.0" },
+        .{ .name = "tp_old.png", .keyword = "parameters", .text = "a dog\nSteps: 20, Sampler: Euler, Seed: 1, Prompt syntax: ComfyUI" },
+        .{ .name = "forge.png", .keyword = "parameters", .text = "a fox\nSteps: 20, Sampler: Euler, Version: f2.0.1v1.10.1" },
+        .{ .name = "comfy.png", .keyword = "prompt", .text = "{\"3\":{\"class_type\":\"KSampler\",\"inputs\":{}}}" },
+        .{ .name = "none.png", .keyword = "Software", .text = "some editor" },
+    };
+    for (files) |f| {
+        const bytes = try pngWithText(alloc, f.keyword, f.text);
+        defer alloc.free(bytes);
+        const p = try std.Io.Dir.path.join(alloc, &.{ dir, f.name });
+        defer alloc.free(p);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes });
+    }
+    var fx: ScanFixture = undefined;
+    try fx.init(dir, false);
+    defer fx.deinit();
+
+    const G = dk.Generator;
+    const want = [_]?G{ .tensorpencil, .tensorpencil, .forge, .comfyui, null };
+    for (files, want) |f, w| {
+        var img = try fx.row(f.name);
+        defer img.deinit(alloc);
+        try std.testing.expectEqual(w, img.generator);
+        var details = (try fx.db.getImageDetails(alloc, img.id)).?;
+        defer details.deinit(alloc);
+        try std.testing.expectEqual(w, details.generator);
+    }
+
+    const names = try fx.db.getDistinctColumnValues(alloc, .generator);
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("ComfyUI", names[0]);
+    try std.testing.expectEqualStrings("Forge", names[1]);
+    try std.testing.expectEqualStrings("TensorPencil", names[2]);
+
+    const filters = [_]dk.ActiveFilter{.{ .column = .generator, .value = "TensorPencil" }};
+    const res = try fx.db.listImagesFiltered(alloc, null, null, null, &filters);
+    defer {
+        for (res) |e| alloc.free(e.path);
+        alloc.free(res);
+    }
+    try std.testing.expectEqual(@as(usize, 2), res.len);
 }
 
 // ── Sorting ───────────────────────────────────────────────────────────────────
@@ -4183,13 +4331,11 @@ test "db: upgrading drops prompt vectors that may span past the local attention 
         short_id = try searchableImage(&db, lib, "/lib/short.png", "m", 0);
         long_id = try searchableImage(&db, lib, "/lib/long.png", "m", 0);
         // Before the edit below: v17's trigger would drop the vector itself.
+        // Raw SQL: today's `saveImage` writes columns a v15 schema lacks.
         try rewindSchema(&db, 15);
-        var img = try db.findOrCreateImage(alloc, lib, "/lib/long.png");
-        defer img.deinit(alloc);
-        alloc.free(img.positivePromptText.?);
-        img.positivePromptText = try alloc.alloc(u8, 241);
-        @memset(@constCast(img.positivePromptText.?), 'a');
-        try db.saveImage(&img);
+        var buf: [96]u8 = undefined;
+        try db.db.exec(try std.mem.printSentinel(&buf,
+            "UPDATE images SET positive_prompt_text = printf('%.241c', 'a') WHERE id = {d}", .{long_id}, 0));
     }
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 

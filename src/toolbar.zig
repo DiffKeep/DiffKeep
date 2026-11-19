@@ -7,6 +7,7 @@ const image_grid_mod = @import("image_grid.zig");
 const config_mod = @import("config.zig");
 const filter_modal_mod = @import("filter_modal.zig");
 const settings_modal_mod = @import("settings_modal.zig");
+const about_mod = @import("about.zig");
 const search_mod = @import("search.zig");
 const sidebar_mod = @import("sidebar.zig");
 const detail_panel_mod = @import("detail_panel.zig");
@@ -29,6 +30,7 @@ pub const RenderCtx = struct {
     grid: *?image_grid_mod.GridState,
     cfg: *const config_mod.Config,
     settings: *settings_modal_mod.SettingsModalState,
+    about: *about_mod.AboutState,
     db_stats: *?db_mod.DbStats,
     trash_stats: *?db_mod.TrashStats,
     duplicate_count: *i64,
@@ -276,7 +278,7 @@ pub fn renderToolbar(ctx: RenderCtx) void {
             const sort_mode_tvg = switch (grid.sort_mode) {
                 .date   => icons.tvg.lucide.calendar,
                 .name   => icons.tvg.lucide.@"a-arrow-down",
-                .random => icons.tvg.entypo.shuffle,
+                .random => icons.tvg.lucide.shuffle,
             };
             const sort_mode_tip = switch (grid.sort_mode) {
                 .date   => i18n.t(.toolbar_sort_by_date),
@@ -601,6 +603,18 @@ pub fn renderStatusBar(ctx: RenderCtx) void {
     }
 
     _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+    if (dvui.buttonIcon(@src(), i18n.t(.nav_about), dvui.entypo.info_with_circle, .{}, .{}, .{
+        .min_size_content = .{ .w = 14, .h = 14 },
+        .gravity_y = 0.5,
+        .padding = dvui.Rect.all(4),
+        .margin = .{ .w = 2 },
+        .corners = style.R.chip,
+        .background = false,
+        .color_text = .{ .color = style.C.text_dim },
+        .tag = "nav-about",
+    })) {
+        ctx.about.open = true;
+    }
     if (dvui.buttonIcon(@src(), i18n.t(.nav_settings), dvui.entypo.cog, .{}, .{}, .{
         .min_size_content = .{ .w = 14, .h = 14 },
         .gravity_y = 0.5,

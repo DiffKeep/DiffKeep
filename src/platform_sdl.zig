@@ -9,12 +9,14 @@ const platform = @import("platform.zig");
 const window_state = @import("window_state.zig");
 const config_mod = @import("config.zig");
 const media = @import("media.zig");
+const reveal = @import("reveal.zig");
 
 pub const vtable: platform.Vtable = .{
     .copy_image_file = copyImageFile,
     .open_folder_dialog = openFolderDialog,
     .set_window_fullscreen = setWindowFullscreen,
     .capture_window_state = captureWindowState,
+    .reveal_in_file_manager = reveal.reveal,
     .audio_open = audioOpen,
     .audio_feed = audioFeed,
     .audio_queued = audioQueued,

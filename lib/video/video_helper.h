@@ -33,6 +33,7 @@ typedef struct {
     int height;
     char *workflow; /* "workflow" tag (ComfyUI), or NULL */
     char *prompt;   /* "prompt" tag (ComfyUI), or NULL */
+    char *parameters; /* "parameters" tag (A1111-style; TensorPencil), or NULL */
 } DiffkeepVideoScan;
 
 /* Open `filename` once: read its ComfyUI tags and decode the first frame,

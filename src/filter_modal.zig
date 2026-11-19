@@ -13,6 +13,7 @@ pub fn filterColumnLabel(kind: db_mod.FilterColumn) [:0]const u8 {
         .model     => i18n.t(.detail_model),
         .sampler   => i18n.t(.detail_sampler),
         .scheduler => i18n.t(.detail_scheduler),
+        .generator => i18n.t(.detail_generator),
         .format    => i18n.t(.detail_format),
         .resource_type => i18n.t(.detail_resource_type),
     };
@@ -137,7 +138,7 @@ pub const FilterModalState = struct {
         // Kind selector: the same segmented well the toolbar uses for search
         // modes, because it is the same kind of choice — one of a fixed set.
         {
-            const kinds = [_]db_mod.FilterColumn{ .model, .sampler, .scheduler, .format, .resource_type };
+            const kinds = [_]db_mod.FilterColumn{ .generator, .model, .sampler, .scheduler, .format, .resource_type };
             var labels: [kinds.len][]const u8 = undefined;
             var active: usize = 0;
             for (kinds, 0..) |kind, i| {

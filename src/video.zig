@@ -31,15 +31,19 @@ pub const ScanData = struct {
     frame: ?Frame,
     workflow: ?[]u8,
     prompt: ?[]u8,
+    /// A1111-style "parameters" tag (TensorPencil's videos), or null.
+    parameters: ?[]u8,
 
     pub fn deinit(self: ScanData, allocator: std.mem.Allocator) void {
         if (self.frame) |f| allocator.free(f.pixels);
         if (self.workflow) |w| allocator.free(w);
         if (self.prompt) |p| allocator.free(p);
+        if (self.parameters) |p| allocator.free(p);
     }
 };
 
-/// Open `path` once for a scan: its ComfyUI "workflow"/"prompt" tags and its
+/// Open `path` once for a scan: its ComfyUI "workflow"/"prompt" tags, its
+/// "parameters" tag (TensorPencil) and its
 /// first frame, fitted to `max_dim` px on the long edge (0 = native).
 pub fn scanFile(allocator: std.mem.Allocator, path: [:0]const u8, max_dim: u32) !ScanData {
     var raw: c.DiffkeepVideoScan = undefined;
@@ -50,6 +54,8 @@ pub fn scanFile(allocator: std.mem.Allocator, path: [:0]const u8, max_dim: u32) 
     errdefer if (workflow) |w| allocator.free(w);
     const prompt = if (raw.prompt) |p| try allocator.dupe(u8, std.mem.span(p)) else null;
     errdefer if (prompt) |p| allocator.free(p);
+    const parameters = if (raw.parameters) |p| try allocator.dupe(u8, std.mem.span(p)) else null;
+    errdefer if (parameters) |p| allocator.free(p);
     const frame: ?Frame = if (raw.pixels) |px| blk: {
         const len: usize = @intCast(raw.width * raw.height * 4);
         break :blk .{
@@ -58,7 +64,7 @@ pub fn scanFile(allocator: std.mem.Allocator, path: [:0]const u8, max_dim: u32) 
             .height = @intCast(raw.height),
         };
     } else null;
-    return .{ .frame = frame, .workflow = workflow, .prompt = prompt };
+    return .{ .frame = frame, .workflow = workflow, .prompt = prompt, .parameters = parameters };
 }
 
 /// Read a format-level metadata tag (e.g. "workflow"/"prompt"); null if absent.

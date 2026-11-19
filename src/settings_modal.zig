@@ -10,6 +10,7 @@ const library_manager_mod = @import("library_manager.zig");
 const search_mod = @import("search.zig");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
+const about = @import("about.zig");
 
 const log = std.log.scoped(.settings);
 
@@ -311,6 +312,18 @@ pub const SettingsModalState = struct {
                         }
                     }
                 }
+                // The mirror is ungated, so users never see Google's license
+                // prompt: name the terms here, beside the download.
+                dvui.labelNoFmt(@src(), i18n.t(.settings_gemma_terms), .{}, .{
+                    .color_text = .{ .color = style.C.text_dim },
+                    .padding = .{},
+                });
+                dvui.labelNoFmt(@src(), about.gemma_terms_url, .{}, .{
+                    .font = style.F.mono,
+                    .color_text = .{ .color = style.C.text_dim },
+                    .padding = .{},
+                    .margin = .{ .h = 4 },
+                });
 
                 fieldHead(@src(), i18n.t(.settings_mmproj_path), 10);
                 {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite");
 const models = @import("models.zig");
+const Generator = @import("parse/generator.zig").Generator;
 const log = std.log.scoped(.db);
 
 pub const TrashStats = struct {
@@ -56,6 +57,7 @@ pub const ImageDetails = struct {
     sampler: ?[]const u8,
     scheduler: ?[]const u8,
     loras: ?[]const u8,
+    generator: ?Generator = null,
     trashed_at: ?[]const u8, // formatted by SQLite as "YYYY-MM-DD HH:MM:SS"
     // Populated from file-system after DB query, not stored in DB.
     width: ?u32 = null,
@@ -240,6 +242,10 @@ const migrations = [_][:0]const u8{
     \\  UPDATE images SET prompt_embed_skip = NULL WHERE id = new.id;
     \\END;
     ,
+    // v18: the tool that generated the image (`parse/generator.zig`), by
+    // name. Rows scanned before this stay NULL until their file is re-parsed.
+    \\ALTER TABLE images ADD COLUMN generator TEXT;
+    ,
 };
 
 /// Bounds of the half-open range [`folder/`, `folder0`) holding exactly the
@@ -317,6 +323,8 @@ fn setupSchema(allocator: std.mem.Allocator, path: []const u8) !void {
 
 pub const FilterColumn = enum {
     model, sampler, scheduler,
+    /// The generating tool's name (`parse/generator.zig`).
+    generator,
     /// Virtual column: not stored, derived from the file extension of
     /// `library_path` at query time. See listImagesFiltered / getDistinctColumnValues.
     format,
@@ -839,6 +847,7 @@ pub const VectorDb = struct {
         img.sampler = try dupeOpt(allocator, &stmt, 11);
         img.scheduler = try dupeOpt(allocator, &stmt, 12);
         img.loras = try dupeOpt(allocator, &stmt, 16);
+        img.generator = if (stmt.columnIsNull(17)) null else Generator.fromName(stmt.columnText(17));
         log.debug("found existing image id={d} {s}", .{ img.id, image_path });
         return img;
     }
@@ -863,7 +872,8 @@ pub const VectorDb = struct {
         if (image.steps) |v| try stmt.bind(11, v) else try stmt.bindNull(11);
         if (image.seed) |v| try stmt.bind(12, v) else try stmt.bindNull(12);
         if (image.loras) |v| try stmt.bind(13, v) else try stmt.bindNull(13);
-        try stmt.bind(14, image.id);
+        if (image.generator) |g| try stmt.bind(14, g.name()) else try stmt.bindNull(14);
+        try stmt.bind(15, image.id);
 
         _ = try stmt.step();
     }
@@ -1883,7 +1893,7 @@ pub const VectorDb = struct {
         var stmt = try self.db.prepare(
             \\SELECT library_id, library_path, creation_date, positive_prompt_text, negative_prompt_text,
             \\       model, cfg, steps, seed, sampler, scheduler, loras,
-            \\       DATETIME(trashed_at, 'unixepoch')
+            \\       DATETIME(trashed_at, 'unixepoch'), generator
             \\FROM images WHERE id = ?
         );
         defer stmt.deinit();
@@ -1945,6 +1955,7 @@ pub const VectorDb = struct {
             .sampler = sampler,
             .scheduler = scheduler,
             .loras = loras,
+            .generator = if (stmt.columnIsNull(13)) null else Generator.fromName(stmt.columnText(13)),
             .trashed_at = trashed_at,
         };
     }

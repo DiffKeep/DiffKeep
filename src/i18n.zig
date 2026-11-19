@@ -6,6 +6,13 @@ pub const Strings = struct {
     nav_library: [:0]const u8,
     nav_search: [:0]const u8,
     nav_settings: [:0]const u8,
+    nav_about: [:0]const u8,
+    about_heading: [:0]const u8,
+    about_version: [:0]const u8,
+    about_copyright: [:0]const u8,
+    about_third_party: [:0]const u8,
+    about_models: [:0]const u8,
+    about_full_texts: [:0]const u8,
 
     // Accessibility labels for icon-only buttons.
     a11y_search_clear: [:0]const u8,
@@ -52,6 +59,7 @@ pub const Strings = struct {
     detail_prompt: [:0]const u8,
     detail_negative_prompt: [:0]const u8,
     detail_model: [:0]const u8,
+    detail_generator: [:0]const u8,
     detail_sampler: [:0]const u8,
     detail_scheduler: [:0]const u8,
     detail_cfg: [:0]const u8,
@@ -110,6 +118,7 @@ pub const Strings = struct {
 
     context_copy_prompt: [:0]const u8,
     context_copy_image: [:0]const u8,
+    context_show_in_folder: [:0]const u8,
     context_reparse: [:0]const u8,
     context_send_to_trash: [:0]const u8,
     context_restore_from_trash: [:0]const u8,
@@ -175,6 +184,7 @@ pub const Strings = struct {
     search_no_model_hint: [:0]const u8,
 
     settings_download_text_model: [:0]const u8,
+    settings_gemma_terms: [:0]const u8,
     settings_download_siglip2: [:0]const u8,
     settings_download_running: [:0]const u8,
 
@@ -191,6 +201,13 @@ pub const en: Strings = .{
     .nav_library = "Library",
     .nav_search = "Search",
     .nav_settings = "Settings",
+    .nav_about = "About DiffKeep",
+    .about_heading = "About DiffKeep",
+    .about_version = "Version",
+    .about_copyright = "Copyright \u{00a9} 2026 Fifth Interactive LLC. Released under the MIT License.",
+    .about_third_party = "Third-party software",
+    .about_models = "Models (downloaded on request)",
+    .about_full_texts = "The full license texts are in this file, shipped with DiffKeep:",
     .a11y_search_clear = "Clear search",
     .a11y_remove_filter = "Remove filter",
     .a11y_add_library = "Add library",
@@ -233,6 +250,7 @@ pub const en: Strings = .{
     .detail_prompt = "Prompt",
     .detail_negative_prompt = "Negative Prompt",
     .detail_model = "Model",
+    .detail_generator = "Generator",
     .detail_sampler = "Sampler",
     .detail_scheduler = "Scheduler",
     .detail_cfg = "CFG Scale",
@@ -291,6 +309,7 @@ pub const en: Strings = .{
 
     .context_copy_prompt = "Copy Prompt",
     .context_copy_image = "Copy Image",
+    .context_show_in_folder = "Show in File Manager",
     .context_reparse = "Reparse Metadata",
     .context_send_to_trash = "Send to Trash",
     .context_restore_from_trash = "Restore from Trash",
@@ -356,6 +375,7 @@ pub const en: Strings = .{
     .search_no_model_hint = "No model configured \u{2014} open Settings to add a model path",
 
     .settings_download_text_model = "Download EmbeddingGemma",
+    .settings_gemma_terms = "EmbeddingGemma is provided under and subject to the Gemma Terms of Use:",
     .settings_download_siglip2 = "Download SigLIP2",
     .settings_download_running = "Downloading\u{2026}",
 

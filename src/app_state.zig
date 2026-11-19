@@ -25,10 +25,12 @@ const filter_modal_mod = @import("filter_modal.zig");
 const folder_loader_mod = @import("folder_loader.zig");
 const delete_dialog_mod = @import("delete_dialog.zig");
 const settings_modal_mod = @import("settings_modal.zig");
+const about_mod = @import("about.zig");
 const search_mod = @import("search.zig");
 const image_ops_mod = @import("image_ops.zig");
 const toolbar_mod = @import("toolbar.zig");
 const style = @import("style.zig");
+const platform = @import("platform.zig");
 
 const log = std.log.scoped(.app);
 
@@ -112,6 +114,7 @@ pub const AppState = struct {
     delete_dialog: delete_dialog_mod.DeleteDialogState = .{},
     search: search_mod.SearchState = .{},
     settings: settings_modal_mod.SettingsModalState = .{},
+    about: about_mod.AboutState = .{},
     active_filters: std.ArrayList(db_mod.ActiveFilter) = .empty,
     filter_modal: filter_modal_mod.FilterModalState = .{},
     pending_bulk: PendingBulk = .none,
@@ -563,6 +566,11 @@ pub const AppState = struct {
             if (grid.entryById(grid.copy_image_id)) |e|
                 detail_panel_mod.copyImageToClipboard(e.path, self.gpa, self.io);
         }
+        if (grid.reveal_requested) {
+            grid.reveal_requested = false;
+            if (grid.entryById(grid.reveal_id)) |e|
+                platform.revealInFileManager(self.io, e.path);
+        }
         if (grid.reparse_requested) {
             grid.reparse_requested = false;
             if (self.db) |*db| if (self.library_manager) |*mgr| {
@@ -664,6 +672,7 @@ pub const AppState = struct {
             .grid = &self.grid,
             .cfg = &self.cfg,
             .settings = &self.settings,
+            .about = &self.about,
             .db_stats = &self.db_stats,
             .trash_stats = &self.trash_stats,
             .duplicate_count = &self.duplicate_count,
@@ -692,6 +701,7 @@ pub const AppState = struct {
             if (self.counts) |*c| c.clear(cache);
         }
         if (settings_was_open and !self.settings.open) self.onSettingsClosed();
+        self.about.render();
 
         // ── Delete confirmation, bulk confirmation, filters ───────────────
         try self.delete_dialog.render(self.cfg.trash_enabled, if (self.grid) |*g| g else null, if (self.file_ops) |*o| o else null, self.gpa);

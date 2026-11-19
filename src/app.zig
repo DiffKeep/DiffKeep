@@ -76,13 +76,21 @@ fn viewersSetFavorite(id: u64, favorite: bool) void {
 
 // ── dvui callbacks ───────────────────────────────────────────────────────────
 
-/// Read `--config` / `-c <dir>` into `g_config_arg`.
+/// Read `--config` / `-c <dir>` into `g_config_arg`. `--version` / `-v`
+/// prints the version and exits before any window opens.
 fn parseArgs(init: std.process.Init) !void {
     // Windows needs an allocator to decode the command line.
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer it.deinit();
     _ = it.skip(); // skip argv[0] (executable path)
     while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            var buf: [256]u8 = undefined;
+            var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
+            try w.interface.print("DiffKeep {s}\n", .{app_version});
+            try w.interface.flush();
+            std.process.exit(0);
+        }
         if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
             if (it.next()) |val| {
                 g_config_arg = try std.Io.Dir.path.join(init.gpa, &.{ val, "DiffKeep.cfg" });
@@ -127,6 +135,7 @@ fn appInit(win: *dvui.Window) !void {
         .viewers_remove = viewersRemove,
         .viewers_set_favorite = viewersSetFavorite,
     }, config_path);
+    g_app.about.version = app_version;
     g_app_ready = true;
 
     log.info("DiffKeep {s} — config: {s}", .{ app_version, g_app.config_path orelse "(none)" });

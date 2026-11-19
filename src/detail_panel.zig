@@ -327,6 +327,12 @@ pub fn renderContent(d: db_mod.ImageDetails) void {
         prose(@src(), v);
     }
 
+    if (d.generator) |g| {
+        var hrow = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer hrow.deinit();
+        metaColumn(@src(), i18n.t(.detail_generator), "{s}", .{g.name()});
+    }
+
     if (d.model) |v| {
         dvui.label(@src(), "{s}", .{i18n.t(.detail_model)}, bp);
         var tl = dvui.textLayout(@src(), .{}, lp.override(.{ .font = style.F.mono_wrap, .color_text = .{ .color = style.C.text_hi } }));

@@ -32,6 +32,9 @@ pub const Vtable = struct {
     set_window_fullscreen: *const fn (handle: ?*anyopaque, fullscreen: bool) void = noopSetWindowFullscreen,
     /// Sample a window's current geometry into `out` (see config.WindowState).
     capture_window_state: *const fn (handle: ?*anyopaque, out: *config_mod.WindowState) void = noopCaptureWindowState,
+    /// Show the file at `path` in the system file manager (see reveal.zig).
+    /// Returns at once; the work runs in the background.
+    reveal_in_file_manager: *const fn (io: std.Io, path: []const u8) void = noopRevealInFileManager,
 
     // ── Audio output (interleaved f32) ───────────────────────────────────────
     /// Open a playback stream; returns an opaque handle, or null if unavailable
@@ -69,6 +72,10 @@ pub fn captureWindowState(handle: ?*anyopaque, out: *config_mod.WindowState) voi
     vtable.capture_window_state(handle, out);
 }
 
+pub fn revealInFileManager(io: std.Io, path: []const u8) void {
+    vtable.reveal_in_file_manager(io, path);
+}
+
 pub fn audioOpen(sample_rate: i32, channels: i32) ?*anyopaque {
     return vtable.audio_open(sample_rate, channels);
 }
@@ -95,6 +102,7 @@ fn noopCopyImageFile(_: []const u8, _: std.mem.Allocator, _: std.Io) void {}
 fn noopOpenFolderDialog(_: ?*anyopaque, _: FolderPickedFn) void {}
 fn noopSetWindowFullscreen(_: ?*anyopaque, _: bool) void {}
 fn noopCaptureWindowState(_: ?*anyopaque, _: *config_mod.WindowState) void {}
+fn noopRevealInFileManager(_: std.Io, _: []const u8) void {}
 fn noopAudioOpen(_: i32, _: i32) ?*anyopaque {
     return null;
 }

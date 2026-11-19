@@ -185,6 +185,7 @@ int diffkeep_video_scan(const char *filename, int max_dim, DiffkeepVideoScan *ou
     if (open_input(filename, &fmt) != 0) return -1;
     out->workflow = dup_tag(fmt, "workflow");
     out->prompt = dup_tag(fmt, "prompt");
+    out->parameters = dup_tag(fmt, "parameters");
     first_frame(fmt, max_dim, &out->pixels, &out->width, &out->height);
     avformat_close_input(&fmt);
     return 0;
@@ -194,6 +195,7 @@ void diffkeep_video_scan_free(DiffkeepVideoScan *s) {
     free(s->pixels);
     free(s->workflow);
     free(s->prompt);
+    free(s->parameters);
     memset(s, 0, sizeof(*s));
 }
 

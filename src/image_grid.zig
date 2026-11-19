@@ -152,6 +152,8 @@ pub const GridState = struct {
     copy_prompt_id: u64 = 0,
     copy_image_requested: bool = false,
     copy_image_id: u64 = 0,
+    reveal_requested: bool = false,
+    reveal_id: u64 = 0,
     reparse_requested: bool = false,
     reparse_id: u64 = 0,
     // Favorite toggle — set when a grid star is clicked, consumed by app.zig.
@@ -1141,6 +1143,15 @@ pub const GridState = struct {
                     self.copy_image_id = entry.id;
                 }
                 if (self.view_mode != .trash) { // library or duplicates
+                    // A trashed file lives under the app's own trash folder,
+                    // which is no place to send the user.
+                    if (dvui.menuItemLabel(@src(), i18n.t(.context_show_in_folder), .{},
+                        .{ .expand = .horizontal }) != null)
+                    {
+                        fm.close();
+                        self.reveal_requested = true;
+                        self.reveal_id = entry.id;
+                    }
                     if (dvui.menuItemLabel(@src(), i18n.t(.context_reparse), .{},
                         .{ .expand = .horizontal }) != null)
                     {

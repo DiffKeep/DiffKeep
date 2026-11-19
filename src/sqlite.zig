@@ -304,7 +304,7 @@ pub const Database = struct {
         .find_image =
             \\SELECT id, library_id, library_path, creation_date, positive_prompt_text,
             \\       negative_prompt_text, generated_description, thumbnail, hash, mtime,
-            \\       model, sampler, scheduler, cfg, steps, seed, loras
+            \\       model, sampler, scheduler, cfg, steps, seed, loras, generator
             \\FROM images
             \\WHERE library_id = ? AND library_path = ? AND trashed_at IS NULL
         ,
@@ -329,7 +329,8 @@ pub const Database = struct {
             \\    cfg = ?,
             \\    steps = ?,
             \\    seed = ?,
-            \\    loras = ?
+            \\    loras = ?,
+            \\    generator = ?
             \\WHERE id = ?
         ,
     };

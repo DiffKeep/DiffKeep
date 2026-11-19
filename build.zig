@@ -68,6 +68,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     b.installArtifact(exe);
+    // The licenses travel with the binary: About names the third-party file.
+    b.installFile("LICENSE", "bin/LICENSE");
+    b.installFile("THIRD_PARTY_LICENSES.txt", "bin/THIRD_PARTY_LICENSES.txt");
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -1,5 +1,6 @@
 const std = @import("std");
 const vips = @import("vips");
+const Generator = @import("parse/generator.zig").Generator;
 
 pub const Library = struct {
     id: u64,
@@ -28,6 +29,7 @@ pub const Image = struct {
     steps: ?i64 = null,
     seed: ?i64 = null,
     loras: ?[]const u8 = null, // newline-separated list
+    generator: ?Generator = null,
 
     pub fn deinit(self: *Image, allocator: std.mem.Allocator) void {
         allocator.free(self.libraryPath);

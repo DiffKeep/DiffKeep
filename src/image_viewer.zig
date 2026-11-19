@@ -854,6 +854,13 @@ pub const ViewerState = struct {
             }
         }
 
+        // Not for a trashed image: it sits in the app's own trash folder.
+        if (self.currentImage()) |img| if (img.trash_name == null and
+            iconButton(i18n.t(.context_show_in_folder), icons.tvg.lucide.@"folder-open", 17))
+        {
+            platform.revealInFileManager(self.io, img.path);
+        };
+
         if (self.dnd_available and self.images.items.len > 0) {
             if (dragButton(i18n.t(.viewer_drag), icons.tvg.lucide.grab, 9)) self.drag_requested = true;
         }

@@ -2,6 +2,7 @@ const std = @import("std");
 const db_mod = @import("db.zig");
 const png_mod = @import("image/png-data.zig");
 const comfy_mod = @import("parse/comfy.zig");
+const generator_mod = @import("parse/generator.zig");
 const models = @import("models.zig");
 const notifier_mod = @import("notifier.zig");
 const embed_worker = @import("embed_worker.zig");
@@ -494,11 +495,13 @@ fn processVideo(ctx: ScanCtx, image: *models.Image, current_mtime: i64, aa: std.
         // Out of memory, the row isn't saved: the next scan reads it again.
         if (data.workflow) |w| sections.append(aa, .{ .keyword = "workflow", .text = w }) catch return oom(ctx.path);
         if (data.prompt) |p| sections.append(aa, .{ .keyword = "prompt", .text = p }) catch return oom(ctx.path);
+        if (data.parameters) |p| sections.append(aa, .{ .keyword = "parameters", .text = p }) catch return oom(ctx.path);
     } else |err| log.warn("video open {s}: {}", .{ std.Io.Dir.path.basename(ctx.path), err });
 
     var parser = comfy_mod.ComfyParser.init(aa);
     const result = parser.parseImageMetadata(sections.items) catch return oom(ctx.path);
     applyParseResult(ctx.allocator, image, result) catch return oom(ctx.path);
+    image.generator = generator_mod.detect(sections.items);
 
     // Hash the file for duplicate detection, streamed: videos can be huge.
     if (hashFile(ctx.io, ctx.path)) |hash_hex| {
@@ -630,6 +633,7 @@ pub fn processFile(ctx: ScanCtx) void {
     // Replace the stored metadata with what this version of the file carries
     // (none, if it was rewritten without any).
     applyParseResult(ctx.allocator, &image, maybe_result) catch return oom(ctx.path);
+    image.generator = generator_mod.detect(sections.items);
     if (image.hash) |h| ctx.allocator.free(h);
     image.hash = null;
     image.hash = ctx.allocator.dupe(u8, &hash_hex) catch return oom(ctx.path);
