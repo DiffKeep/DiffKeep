@@ -1,5 +1,5 @@
 //! Build-time helper: prints the app version from git, e.g. "v0.3-12-gabc123",
-//! suffixed "(DIRTY)" when the working tree has changes. Prints "dev" when git
+//! suffixed "(DIRTY)" when tracked files have changes. Prints "dev" when git
 //! or the repository is unavailable, so a source tarball still builds.
 //! Run on every build by build.zig (`has_side_effects`), never at configure
 //! time, whose result Zig caches.
@@ -14,7 +14,9 @@ pub fn main(init: std.process.Init) !void {
 fn describe(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
     const tag = try git(arena, io, &.{ "git", "describe", "--tags", "--always" });
     if (tag.len == 0) return error.NoVersion;
-    const status = try git(arena, io, &.{ "git", "status", "--porcelain" });
+    // Tracked files only: a build's own output (a release's `--prefix out`) is
+    // untracked and must not mark the build dirty.
+    const status = try git(arena, io, &.{ "git", "status", "--porcelain", "--untracked-files=no" });
     if (status.len > 0) return arena.print("{s}(DIRTY)", .{tag});
     return tag;
 }
