@@ -16,7 +16,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .TensorPencil = .{ .path = "../TensorPencil" },
         .icons = .{
             .url = "git+https://github.com/nat3Github/zig-lib-icons#b7299b19fa11caa5be93ef49743d8fc31a4bf9a0",
             .hash = "icons-0.1.0-iJxA-VrGMwAVIStBxqDPFeC3wdnANtYyDrNfYXNz95OW",
@@ -32,6 +31,10 @@
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
             .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
+        },
+        .TensorPencil = .{
+            .url = "https://github.com/qskousen/TensorPencil/archive/c22974451cd27abe1e5d65c60bc1f790db487e4f.tar.gz",
+            .hash = "TensorPencil-0.0.0-uccI1bL7wQoMwMdftOie2HzxKPjNTjJDNbYSqsCgAhPQ",
         },
     },
     .paths = .{

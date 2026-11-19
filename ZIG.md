@@ -285,3 +285,9 @@ aligned on aarch64, so the comptime cast is rejected ("requires aligned
 address"). x86_64 has no such alignment, so it only shows on Apple Silicon / ARM
 Linux. `sqlite.zig` binds text with its own `sqlite3_malloc` copy and
 `sqlite3_free` as the destructor instead (`bindTextCopy`).
+
+## `zig fetch --save=NAME` over a `.path` dependency writes `.path = "<url>"`
+
+Re-saving a dependency that is currently `.path = "../X"` keeps the `.path`
+field and puts the URL in it, with no `.hash`. Delete the old entry first, then
+`zig fetch --save=NAME <url>` writes a fresh `.url` + `.hash`.

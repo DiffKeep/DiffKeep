@@ -1,0 +1,38 @@
+#!/bin/sh
+# Refuses a commit whose build.zig.zon doesn't pin TensorPencil to the public
+# repo at a full commit sha: a local `.path` dependency can't be built by anyone
+# else. Enable with: git config core.hooksPath tools/hooks
+#
+# Checks the staged build.zig.zon (what is being committed), not the working copy.
+
+zon=$(git show :build.zig.zon 2>/dev/null) || exit 0 # not staged/tracked: nothing to check
+
+# The TensorPencil entry, from `.TensorPencil = .{` to its closing `}`.
+entry=$(printf '%s\n' "$zon" | awk '
+    /\.TensorPencil[ \t]*=/ { on = 1 }
+    on { print; if ($0 ~ /}/) exit }
+')
+
+fail() {
+    echo "pre-commit: $1" >&2
+    echo "  Push the TensorPencil commit to GitHub, then run:" >&2
+    echo "  zig fetch --save=TensorPencil https://github.com/qskousen/TensorPencil/archive/<full commit sha>.tar.gz" >&2
+    echo "  (see CLAUDE.md, Ground Rules)" >&2
+    exit 1
+}
+
+[ -n "$entry" ] || fail "no TensorPencil dependency found in build.zig.zon"
+
+if printf '%s\n' "$entry" | grep -q '\.path[ \t]*='; then
+    fail "build.zig.zon points TensorPencil at a local path"
+fi
+
+# Either the commit's tarball (preferred: one snapshot, not the whole history)
+# or a git URL pinned to the commit.
+printf '%s\n' "$entry" | grep -Eq '\.url[ \t]*=[ \t]*"(https://github\.com/qskousen/TensorPencil/archive/[0-9a-f]{40}\.tar\.gz|git\+https://github\.com/qskousen/TensorPencil(\.git)?(\?ref=[^#"]*)?#[0-9a-f]{40})"' ||
+    fail "TensorPencil must be pinned to github.com/qskousen/TensorPencil at a full 40-character commit sha"
+
+printf '%s\n' "$entry" | grep -q '\.hash[ \t]*=' ||
+    fail "TensorPencil entry has no .hash (use zig fetch --save to add it)"
+
+exit 0
